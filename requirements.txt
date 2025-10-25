@@ -1,0 +1,7 @@
+#jax-metal==0.1.1
+jaxlib==0.4.38
+jax==0.4.38
+numpy==1.26.4
+torch
+pytest==8.3.2
+transformers==4.57.1

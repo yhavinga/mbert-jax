@@ -1,0 +1,33 @@
+# Bytecode and caches
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+.idea/
+
+# Notebooks & editor clutter
+.ipynb_checkpoints/
+.DS_Store
+
+# Logs and run artifacts
+*.log
+pytest.out
+err.log
+
+# Python packaging/build dirs
+build/
+dist/
+*.egg-info/
+
+# Hugging Face / model caches
+/.cache/
+
+# Local data or checkpoints dropped during experiments
+artifacts/checkpoints/
+artifacts/tmp/

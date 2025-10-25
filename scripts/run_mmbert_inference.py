@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Run ModernBERT masked-LM inference using converted PyTorch weights."""
+"""Run ModernBERT masked-LM inference comparing JAX and PyTorch implementations."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import torch
-from transformers import AutoConfig, AutoTokenizer
+from transformers import AutoConfig, AutoTokenizer, AutoModelForMaskedLM
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -70,6 +70,11 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Allow transformers to hit the network if files are missing locally.",
     )
+    parser.add_argument(
+        "--jax-only",
+        action="store_true",
+        help="Only run JAX inference (skip PyTorch comparison).",
+    )
     return parser.parse_args()
 
 
@@ -117,7 +122,7 @@ def _format_prediction(tokenizer, input_ids: np.ndarray, mask_idx: int, token_id
     return tokenizer.decode(filled, skip_special_tokens=True)
 
 
-def _run_inference(
+def _run_jax_inference(
     model: ModernBertForMaskedLM,
     params: dict,
     input_ids: jnp.ndarray,
@@ -130,6 +135,16 @@ def _run_inference(
         deterministic=True,
     )
     return np.asarray(outputs.logits)
+
+
+def _run_pytorch_inference(
+    model: torch.nn.Module,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+) -> np.ndarray:
+    with torch.no_grad():
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+    return outputs.logits.cpu().numpy()
 
 
 def main() -> None:
@@ -165,9 +180,6 @@ def main() -> None:
         snapshot_dir = _resolve_snapshot_dir(args.model_name)
         checkpoint_path = snapshot_dir / "pytorch_model.bin"
 
-    pt_params = _load_state_dict(checkpoint_path)
-    flax_params = convert_pytorch_state_dict_to_flax(pt_params, config)
-
     encodings = tokenizer(
         args.texts,
         return_tensors="np",
@@ -175,16 +187,31 @@ def main() -> None:
         truncation=True,
         max_length=args.max_length,
     )
-    input_ids = jnp.array(encodings["input_ids"], dtype=jnp.int32)
-    attention_mask = jnp.array(encodings["attention_mask"], dtype=jnp.int32)
-
-    model = ModernBertForMaskedLM(config)
-    logits = _run_inference(model, flax_params, input_ids, attention_mask)
-
     input_ids_np = np.asarray(encodings["input_ids"])
+    attention_mask_np = np.asarray(encodings["attention_mask"])
     mask_token_id = tokenizer.mask_token_id
 
-    print("\n=== ModernBERT Masked-LM Inference ===")
+    # Run JAX inference
+    pt_params = _load_state_dict(checkpoint_path)
+    flax_params = convert_pytorch_state_dict_to_flax(pt_params, config)
+    jax_model = ModernBertForMaskedLM(config)
+    input_ids_jax = jnp.array(input_ids_np, dtype=jnp.int32)
+    attention_mask_jax = jnp.array(attention_mask_np, dtype=jnp.int32)
+    jax_logits = _run_jax_inference(jax_model, flax_params, input_ids_jax, attention_mask_jax)
+
+    # Run PyTorch inference (unless --jax-only)
+    pt_logits = None
+    if not args.jax_only:
+        pt_model = AutoModelForMaskedLM.from_pretrained(
+            args.model_name,
+            local_files_only=not args.remote_files_ok,
+        )
+        pt_model.eval()
+        input_ids_pt = torch.from_numpy(input_ids_np)
+        attention_mask_pt = torch.from_numpy(attention_mask_np)
+        pt_logits = _run_pytorch_inference(pt_model, input_ids_pt, attention_mask_pt)
+
+    print("\n=== ModernBERT Masked-LM Inference Comparison ===")
     for idx, text in enumerate(args.texts):
         mask_positions = np.where(input_ids_np[idx] == mask_token_id)[0]
         print(f"\nPrompt {idx}: {text}")
@@ -193,17 +220,38 @@ def main() -> None:
             continue
 
         for mask_pos in mask_positions:
-            token_logits = logits[idx, mask_pos]
-            token_probs = np.asarray(jax.nn.softmax(jnp.array(token_logits)))
-            top_ids, top_scores = _topk(token_logits, args.top_k)
-            print(f"  Mask position {mask_pos} (token idx {mask_pos}):")
-            for rank, (token_id, logit) in enumerate(zip(top_ids, top_scores), start=1):
-                prob = float(token_probs[token_id])
+            jax_token_logits = jax_logits[idx, mask_pos]
+            jax_token_probs = np.asarray(jax.nn.softmax(jnp.array(jax_token_logits)))
+            jax_top_ids, jax_top_scores = _topk(jax_token_logits, args.top_k)
+
+            print(f"  Mask position {mask_pos}:")
+            print("    JAX predictions:")
+            for rank, (token_id, logit) in enumerate(zip(jax_top_ids, jax_top_scores), start=1):
+                prob = float(jax_token_probs[token_id])
                 token_str = tokenizer.convert_ids_to_tokens(int(token_id))
                 suggestion = _format_prediction(tokenizer, input_ids_np[idx], mask_pos, int(token_id))
                 print(
-                    f"    {rank:>2}. {token_str:<12} logit={logit: .4f} prob={prob: .4f} -> {suggestion}"
+                    f"      {rank:>2}. {token_str:<12} logit={logit: .4f} prob={prob: .4f} -> {suggestion}"
                 )
+
+            if pt_logits is not None:
+                pt_token_logits = pt_logits[idx, mask_pos]
+                pt_token_probs = torch.softmax(torch.from_numpy(pt_token_logits), dim=-1).numpy()
+                pt_top_ids, pt_top_scores = _topk(pt_token_logits, args.top_k)
+
+                print("    PyTorch predictions:")
+                for rank, (token_id, logit) in enumerate(zip(pt_top_ids, pt_top_scores), start=1):
+                    prob = float(pt_token_probs[token_id])
+                    token_str = tokenizer.convert_ids_to_tokens(int(token_id))
+                    suggestion = _format_prediction(tokenizer, input_ids_np[idx], mask_pos, int(token_id))
+                    print(
+                        f"      {rank:>2}. {token_str:<12} logit={logit: .4f} prob={prob: .4f} -> {suggestion}"
+                    )
+
+                # Show max absolute difference
+                max_diff = np.abs(jax_logits[idx, mask_pos] - pt_logits[idx, mask_pos]).max()
+                mean_diff = np.abs(jax_logits[idx, mask_pos] - pt_logits[idx, mask_pos]).mean()
+                print(f"    Logit differences: max={max_diff:.6f}, mean={mean_diff:.6f}")
 
 
 if __name__ == "__main__":

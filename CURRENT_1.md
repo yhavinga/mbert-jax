@@ -205,6 +205,7 @@ JAX_PLATFORMS=cpu python -m pytest tests/ -v
 - Dumped ModernBERT-base reference artifacts (`jhu-clsp_mmBERT-base_config.json` + `_batch.npz`) via `scripts/py_reference_dump.py` in offline mode so we can reuse the same conversion flow as the small model.
 - Refactored `tests/test_parity_mmbert_small.py` to parameterize over reference cases (small + base): fixtures now resolve configs/batches/state dicts per model, pick the snapshot pinned by `refs/main`, and assert the config knobs against case-specific expectations.
 - Relaxed the hidden-state check to gate on both absolute (1e-3) and relative (1e-4) tolerances so large-magnitude base activations (>800) no longer trigger false failures while still flagging real divergences; the test output now logs the relative diff for debugging.
+- Added `scripts/run_mmbert_inference.py`, a CLI that loads a cached PyTorch checkpoint, converts it on the fly, and prints top-k `[MASK]` predictions (requires the HF tokenizer + `tiktoken` available locally).
 - Captured a full CPU parity run covering all tests + both checkpoints:  
   `JAX_PLATFORMS=cpu python -m pytest tests/test_parity_mmbert_small.py -xvs`
 

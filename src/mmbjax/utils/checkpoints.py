@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Mapping
 
 import jax.numpy as jnp
 import numpy as np
@@ -12,10 +12,15 @@ import numpy as np
 from ..configuration_mmbbert import MMBertConfig
 
 
-def load_hf_config_as_mmbert(path: str | Path) -> MMBertConfig:
-    """Load HuggingFace ModernBERT config and map to MMBertConfig."""
-    with Path(path).open("r", encoding="utf-8") as f:
-        hf_cfg = json.load(f)
+def load_hf_config_as_mmbert(source: str | Path | Mapping[str, Any]) -> MMBertConfig:
+    """Load HuggingFace ModernBERT config (path or dict) and map to MMBertConfig."""
+    if isinstance(source, (str, Path)):
+        with Path(source).open("r", encoding="utf-8") as f:
+            hf_cfg = json.load(f)
+    elif isinstance(source, Mapping):
+        hf_cfg = dict(source)
+    else:
+        raise TypeError(f"Unsupported config source type: {type(source)!r}")
     
     # Map HF field names to our config
     mapped = {

@@ -68,6 +68,7 @@
    - Handle LayerNorm weights (bias may be absent depending on config) and final decoder tie.
    - Support optional removal of biases if Flax config disables them; warn if PyTorch checkpoint contains bias tensors but config expects none.
 2. Verification script `scripts/compare_pt_flax.py`: loads PyTorch + Flax models, runs identical batch, reports max |diff| on hidden states & logits. Target: <1e-5 relative.
+3. Demo CLI `scripts/run_mmbert_inference.py`: convert a cached HF checkpoint on the fly and print top-k `[MASK]` completions so we can manually spot-check Dutch prompts.
 
 ### Phase 5 – Testing & Validation (2 days)
 - **Unit tests** (`tests/`):

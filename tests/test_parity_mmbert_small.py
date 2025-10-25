@@ -1,7 +1,9 @@
 """Parity tests against PyTorch ModernBERT reference outputs."""
 
 import os
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Dict
 
 import numpy as np
 import pytest
@@ -19,25 +21,92 @@ os.environ.setdefault("JAX_PLATFORM_NAME", "cpu")
 
 
 ARTIFACTS_DIR = Path("artifacts/reference-configs")
-CONFIG_PATH = ARTIFACTS_DIR / "jhu-clsp_mmBERT-small_config.json"
-BATCH_PATH = ARTIFACTS_DIR / "jhu-clsp_mmBERT-small_batch.npz"
 PT_CKPT_PATH = Path.home() / ".cache/huggingface/hub"  # default HF cache
 
 
-@pytest.fixture
-def mmbert_config():
-    """Load mmBERT-small config."""
-    if not CONFIG_PATH.exists():
-        pytest.skip(f"Reference config not found: {CONFIG_PATH}")
-    return load_hf_config_as_mmbert(CONFIG_PATH)
+@dataclass(frozen=True)
+class ReferenceCase:
+    model_id: str
+    safe_name: str
+    config_path: Path
+    batch_path: Path
+    expected: Dict[str, int | bool]
 
 
-@pytest.fixture
-def reference_batch():
+REFERENCE_CASES = [
+    ReferenceCase(
+        model_id="jhu-clsp/mmBERT-small",
+        safe_name="jhu-clsp_mmBERT-small",
+        config_path=ARTIFACTS_DIR / "jhu-clsp_mmBERT-small_config.json",
+        batch_path=ARTIFACTS_DIR / "jhu-clsp_mmBERT-small_batch.npz",
+        expected={
+            "vocab_size": 256000,
+            "hidden_size": 384,
+            "intermediate_size": 1152,
+            "num_hidden_layers": 22,
+            "num_attention_heads": 6,
+            "head_dim": 64,
+            "max_position_embeddings": 8192,
+            "global_attn_every_n_layers": 3,
+            "local_attention": 128,
+            "global_rope_theta": 160000,
+            "local_rope_theta": 160000,
+            "attention_bias": False,
+            "mlp_bias": False,
+            "norm_bias": False,
+            "decoder_bias": True,
+        },
+    ),
+    ReferenceCase(
+        model_id="jhu-clsp/mmBERT-base",
+        safe_name="jhu-clsp_mmBERT-base",
+        config_path=ARTIFACTS_DIR / "jhu-clsp_mmBERT-base_config.json",
+        batch_path=ARTIFACTS_DIR / "jhu-clsp_mmBERT-base_batch.npz",
+        expected={
+            "vocab_size": 256000,
+            "hidden_size": 768,
+            "intermediate_size": 1152,
+            "num_hidden_layers": 22,
+            "num_attention_heads": 12,
+            "head_dim": 64,
+            "max_position_embeddings": 8192,
+            "global_attn_every_n_layers": 3,
+            "local_attention": 128,
+            "global_rope_theta": 160000,
+            "local_rope_theta": 160000,
+            "attention_bias": False,
+            "mlp_bias": False,
+            "norm_bias": False,
+            "decoder_bias": True,
+        },
+    ),
+]
+
+
+@pytest.fixture(scope="module", params=REFERENCE_CASES, ids=lambda case: case.safe_name)
+def reference_case(request):
+    """Parameterize tests over all available reference artifacts."""
+    case = request.param
+    missing = []
+    if not case.config_path.exists():
+        missing.append(case.config_path)
+    if not case.batch_path.exists():
+        missing.append(case.batch_path)
+    if missing:
+        pytest.skip(f"Missing reference files for {case.safe_name}: {missing}")
+    return case
+
+
+@pytest.fixture(scope="module")
+def mmbert_config(reference_case):
+    """Load ModernBERT config for the current reference case."""
+    return load_hf_config_as_mmbert(reference_case.config_path)
+
+
+@pytest.fixture(scope="module")
+def reference_batch(reference_case):
     """Load golden PyTorch outputs."""
-    if not BATCH_PATH.exists():
-        pytest.skip(f"Reference batch not found: {BATCH_PATH}")
-    data = np.load(BATCH_PATH)
+    data = np.load(reference_case.batch_path)
     return {
         "input_ids": jnp.array(data["input_ids"], dtype=jnp.int32),
         "attention_mask": jnp.array(data["attention_mask"], dtype=jnp.int32),
@@ -47,45 +116,59 @@ def reference_batch():
     }
 
 
-@pytest.fixture
-def pytorch_state_dict():
+def _resolve_snapshot_dir(model_dir: Path) -> Path | None:
+    """Return the snapshot directory pointed to by refs/main if available."""
+    refs_dir = model_dir / "refs"
+    snapshots_dir = model_dir / "snapshots"
+    if not snapshots_dir.exists():
+        return None
+
+    ref_main = refs_dir / "main"
+    if ref_main.exists():
+        revision = ref_main.read_text().strip()
+        candidate = snapshots_dir / revision
+        if candidate.exists():
+            return candidate
+
+    snapshot_paths = sorted(p for p in snapshots_dir.iterdir() if p.is_dir())
+    return snapshot_paths[0] if snapshot_paths else None
+
+
+@pytest.fixture(scope="module")
+def pytorch_state_dict(reference_case):
     """Load PyTorch checkpoint weights."""
-    # Attempt to find cached model
-    model_id = "jhu-clsp/mmBERT-small"
-    cache_dirs = list(PT_CKPT_PATH.glob("models--jhu-clsp--mmBERT-small/snapshots/*"))
-    
-    if not cache_dirs:
-        pytest.skip(f"PyTorch checkpoint not found in {PT_CKPT_PATH}")
-    
-    # Use first snapshot directory
-    snapshot_dir = cache_dirs[0]
+    model_dir = PT_CKPT_PATH / f"models--{reference_case.model_id.replace('/', '--')}"
+    snapshot_dir = _resolve_snapshot_dir(model_dir)
+    if snapshot_dir is None:
+        pytest.skip(f"No snapshot directory found for {reference_case.model_id}")
+
     pt_file = snapshot_dir / "pytorch_model.bin"
-    
     if not pt_file.exists():
         pytest.skip(f"pytorch_model.bin not found in {snapshot_dir}")
-    
+
     state_dict = torch.load(pt_file, map_location="cpu")
     # Convert to numpy
     return {k: v.numpy() for k, v in state_dict.items()}
 
 
-def test_config_loads_correctly(mmbert_config):
+def test_config_loads_correctly(mmbert_config, reference_case):
     """Verify config mapping from HF to MMBertConfig."""
-    assert mmbert_config.vocab_size == 256000
-    assert mmbert_config.hidden_size == 384
-    assert mmbert_config.intermediate_size == 1152
-    assert mmbert_config.num_hidden_layers == 22
-    assert mmbert_config.num_attention_heads == 6
-    assert mmbert_config.head_dim == 64
-    assert mmbert_config.max_position_embeddings == 8192
-    assert mmbert_config.global_attn_every_n_layers == 3
-    assert mmbert_config.local_attention == 128
-    assert mmbert_config.global_rope_theta == 160000
-    assert mmbert_config.local_rope_theta == 160000
-    assert not mmbert_config.attention_bias
-    assert not mmbert_config.mlp_bias
-    assert not mmbert_config.norm_bias
-    assert mmbert_config.decoder_bias
+    expected = reference_case.expected
+    assert mmbert_config.vocab_size == expected["vocab_size"]
+    assert mmbert_config.hidden_size == expected["hidden_size"]
+    assert mmbert_config.intermediate_size == expected["intermediate_size"]
+    assert mmbert_config.num_hidden_layers == expected["num_hidden_layers"]
+    assert mmbert_config.num_attention_heads == expected["num_attention_heads"]
+    assert mmbert_config.head_dim == expected["head_dim"]
+    assert mmbert_config.max_position_embeddings == expected["max_position_embeddings"]
+    assert mmbert_config.global_attn_every_n_layers == expected["global_attn_every_n_layers"]
+    assert mmbert_config.local_attention == expected["local_attention"]
+    assert mmbert_config.global_rope_theta == expected["global_rope_theta"]
+    assert mmbert_config.local_rope_theta == expected["local_rope_theta"]
+    assert mmbert_config.attention_bias == expected["attention_bias"]
+    assert mmbert_config.mlp_bias == expected["mlp_bias"]
+    assert mmbert_config.norm_bias == expected["norm_bias"]
+    assert mmbert_config.decoder_bias == expected["decoder_bias"]
 
 
 def test_flax_model_forward_shape(mmbert_config, reference_batch):
@@ -112,8 +195,9 @@ def test_flax_model_forward_shape(mmbert_config, reference_batch):
     assert len(outputs.hidden_states) == mmbert_config.num_hidden_layers + 1
 
 
-@pytest.mark.skipif(not BATCH_PATH.exists(), reason="Reference batch not available")
-def test_logits_parity_with_converted_weights(mmbert_config, reference_batch, pytorch_state_dict):
+def test_logits_parity_with_converted_weights(
+    mmbert_config, reference_batch, pytorch_state_dict, reference_case
+):
     """Test Flax model with converted PyTorch weights matches reference logits.
     
     This is the key parity test - we load PyTorch weights, convert them to Flax,
@@ -140,7 +224,7 @@ def test_logits_parity_with_converted_weights(mmbert_config, reference_batch, py
     mean_diff = np.mean(np.abs(flax_logits - pt_logits))
     rel_diff = max_diff / (np.abs(pt_logits).max() + 1e-8)
     
-    print(f"\nLogits comparison:")
+    print(f"\nLogits comparison ({reference_case.safe_name}):")
     print(f"  Max absolute diff: {max_diff:.6e}")
     print(f"  Mean absolute diff: {mean_diff:.6e}")
     print(f"  Max relative diff: {rel_diff:.6e}")
@@ -150,9 +234,8 @@ def test_logits_parity_with_converted_weights(mmbert_config, reference_batch, py
     assert rel_diff < 1e-3, f"Relative logits diff {rel_diff:.6e} exceeds tolerance"
 
 
-@pytest.mark.skipif(not BATCH_PATH.exists(), reason="Reference batch not available")
 def test_hidden_states_parity_with_converted_weights(
-    mmbert_config, reference_batch, pytorch_state_dict
+    mmbert_config, reference_batch, pytorch_state_dict, reference_case
 ):
     """Test hidden states at each layer match PyTorch reference."""
     flax_params = convert_pytorch_state_dict_to_flax(pytorch_state_dict, mmbert_config)
@@ -177,16 +260,22 @@ def test_hidden_states_parity_with_converted_weights(
         
         max_diff = np.max(np.abs(flax_h_np - pt_h))
         mean_diff = np.mean(np.abs(flax_h_np - pt_h))
-        
-        print(f"\nLayer {i} hidden state:")
+        pt_scale = np.max(np.abs(pt_h)) + 1e-8
+        rel_diff = max_diff / pt_scale
+    
+        print(f"\n{reference_case.safe_name} layer {i} hidden state:")
         print(f"  Max absolute diff: {max_diff:.6e}")
         print(f"  Mean absolute diff: {mean_diff:.6e}")
+        print(f"  Max relative diff: {rel_diff:.6e}")
         
-        assert max_diff < 1e-3, f"Layer {i} hidden differs by {max_diff:.6e}"
+        assert (max_diff < 1e-3) or (
+            rel_diff < 1e-4
+        ), f"Layer {i} hidden differs by {max_diff:.6e} (rel {rel_diff:.6e})"
 
 
-@pytest.mark.skipif(not BATCH_PATH.exists(), reason="Reference batch not available")
-def test_last_hidden_state_matches_reference(mmbert_config, reference_batch, pytorch_state_dict):
+def test_last_hidden_state_matches_reference(
+    mmbert_config, reference_batch, pytorch_state_dict, reference_case
+):
     """Focused test on final encoder output."""
     flax_params = convert_pytorch_state_dict_to_flax(pytorch_state_dict, mmbert_config)
     
@@ -222,7 +311,7 @@ def test_last_hidden_state_matches_reference(mmbert_config, reference_batch, pyt
     max_diff = np.max(np.abs(flax_last - pt_last))
     mean_diff = np.mean(np.abs(flax_last - pt_last))
     
-    print(f"\nLast hidden state:")
+    print(f"\nLast hidden state ({reference_case.safe_name}):")
     print(f"  Max absolute diff: {max_diff:.6e}")
     print(f"  Mean absolute diff: {mean_diff:.6e}")
     

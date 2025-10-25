@@ -139,7 +139,6 @@ def main() -> None:
         tokenizer = AutoTokenizer.from_pretrained(
             tokenizer_name,
             local_files_only=not args.remote_files_ok,
-            use_fast=False,
         )
     except ValueError as exc:
         if "tiktoken" in str(exc).lower():

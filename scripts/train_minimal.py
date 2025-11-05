@@ -325,69 +325,26 @@ def load_dataset_for_training(dataset_name="yhavinga/mc4_nl_cleaned",
     return dataset
 
 
-def save_checkpoint(state, step: int, checkpoint_dir: str = "checkpoints"):
-    """Save checkpoint using orbax for TPU-optimized I/O."""
-    # Ensure absolute path for orbax
+def create_checkpoint_manager(checkpoint_dir: str, checkpoint_every: int, max_to_keep: int = 3):
+    """Create CheckpointManager for async checkpointing on TPU."""
     checkpoint_dir = Path(checkpoint_dir).absolute()
-    checkpoint_path = checkpoint_dir / f"checkpoint_{step}"
-    checkpoint_path.mkdir(parents=True, exist_ok=True)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    # Save using orbax (TPU-optimized)
-    checkpointer = ocp.PyTreeCheckpointer()
-    checkpointer.save(
-        checkpoint_path,
-        {"state": state, "step": step},
-        force=True,
+    # Configure async checkpointing
+    options = ocp.CheckpointManagerOptions(
+        max_to_keep=max_to_keep,
+        save_interval_steps=checkpoint_every,
+        enable_async_checkpointing=True,  # Enables background saves
     )
 
-    # Also save metadata
-    metadata = {
-        "step": step,
-        "timestamp": datetime.now().isoformat(),
-        "jax_version": jax.__version__,
-        "backend": jax.default_backend(),
-    }
+    # Create manager with StandardCheckpointer for TrainState
+    checkpoint_manager = ocp.CheckpointManager(
+        checkpoint_dir,
+        options=options,
+        metadata={"model": "ModernBERT", "version": "1.0"},
+    )
 
-    with open(checkpoint_path / "metadata.json", "w") as f:
-        json.dump(metadata, f, indent=2)
-
-    print(f"\n✓ Checkpoint saved to {checkpoint_path}")
-    return checkpoint_path
-
-
-def load_checkpoint(checkpoint_dir: str, step: Optional[int] = None):
-    """Load checkpoint from directory."""
-    checkpoint_dir = Path(checkpoint_dir)
-
-    if step is not None:
-        checkpoint_path = checkpoint_dir / f"checkpoint_{step}"
-    else:
-        # Find latest checkpoint, excluding temporary orbax directories
-        checkpoints = sorted([
-            cp for cp in checkpoint_dir.glob("checkpoint_*")
-            if not cp.name.endswith('.orbax-checkpoint-tmp')
-        ])
-        if not checkpoints:
-            return None
-        checkpoint_path = checkpoints[-1]
-        # Extract step number from checkpoint_XXX format
-        try:
-            step = int(checkpoint_path.name.split("_")[-1])
-        except ValueError:
-            print(f"Warning: Could not parse step from checkpoint {checkpoint_path.name}")
-            return None
-
-    if not checkpoint_path.exists():
-        return None
-
-    print(f"Loading checkpoint from {checkpoint_path}...")
-    checkpointer = ocp.PyTreeCheckpointer()
-    # Orbax requires absolute paths
-    absolute_path = checkpoint_path.resolve()
-    restored = checkpointer.restore(absolute_path)
-
-    print(f"✓ Checkpoint loaded from step {step}")
-    return restored
+    return checkpoint_manager
 
 
 def main(args):
@@ -507,36 +464,32 @@ def main(args):
     # JIT compile training step
     print("\nCompiling train_step...")
     train_step_jit = jax.jit(train_step)
-    
+
+    # Create checkpoint manager for async checkpointing
+    print("\nInitializing checkpoint manager...")
+    checkpoint_manager = create_checkpoint_manager(
+        checkpoint_dir=checkpoint_dir,
+        checkpoint_every=checkpoint_every,
+        max_to_keep=3,
+    )
+    print(f"  Checkpoint directory: {checkpoint_dir}")
+    print(f"  Async checkpointing: Enabled")
+    print(f"  Max checkpoints to keep: 3")
+
     # Check for existing checkpoints to resume from
-    checkpoint_dir = Path(checkpoint_dir)
-
-    # Clean up any stale temporary checkpoint directories
-    if checkpoint_dir.exists():
-        temp_dirs = list(checkpoint_dir.glob("*.orbax-checkpoint-tmp"))
-        if temp_dirs:
-            print(f"\nCleaning up {len(temp_dirs)} temporary checkpoint directories...")
-            for temp_dir in temp_dirs:
-                import shutil
-                shutil.rmtree(temp_dir, ignore_errors=True)
-                print(f"  Removed: {temp_dir.name}")
-
     start_step = 0
-    resume_checkpoint = load_checkpoint(str(checkpoint_dir))
+    latest_step = checkpoint_manager.latest_step()
 
-    if resume_checkpoint is not None:
-        # Reconstruct TrainState from the loaded dict
-        state_dict = resume_checkpoint["state"]
-        # Create a fresh state with loaded params, but let optimizer init its state
-        state = train_state.TrainState.create(
-            apply_fn=model.apply,
-            params=state_dict["params"],
-            tx=optimizer,
+    if latest_step is not None:
+        # Restore from latest checkpoint
+        print(f"\nRestoring checkpoint from step {latest_step}...")
+        restored = checkpoint_manager.restore(
+            latest_step,
+            args=ocp.args.StandardRestore(state)
         )
-        # Update the step count to match checkpoint
-        state = state.replace(step=state_dict["step"])
-        start_step = resume_checkpoint["step"]
-        print(f"\n✓ Resuming from step {start_step}")
+        state = restored
+        start_step = latest_step
+        print(f"✓ Resumed from step {start_step}")
     else:
         print("\n✓ Starting fresh training")
 
@@ -588,9 +541,13 @@ def main(args):
                     if step % (log_every * 5) == 0:  # Print occasionally
                         print(f"\nStep {step:4d} | Loss: {loss_value:.4f} | LR: {lr_value:.2e} | Tokens/s: {tokens_per_sec:.0f}")
 
-                # Checkpointing
+                # Checkpointing - happens async in background
                 if step > 0 and step % checkpoint_every == 0:
-                    save_checkpoint(state, step, str(checkpoint_dir))
+                    checkpoint_manager.save(
+                        step,
+                        args=ocp.args.StandardSave(state)
+                    )
+                    print(f"\n✓ Checkpoint saved (async) at step {step}")
                     print(f"  Elapsed time: {(time.time() - training_start_time)/60:.1f} minutes")
 
                 step += 1
@@ -600,7 +557,16 @@ def main(args):
                     break
 
     # Save final checkpoint
-    save_checkpoint(state, step, str(checkpoint_dir))
+    checkpoint_manager.save(
+        step,
+        args=ocp.args.StandardSave(state)
+    )
+    print(f"\n✓ Final checkpoint saved (async) at step {step}")
+
+    # Wait for all async checkpoints to complete before exiting
+    print("Waiting for async checkpoint operations to complete...")
+    checkpoint_manager.wait_until_finished()
+    print("✓ All checkpoints saved successfully")
 
     print("\n" + "=" * 70)
     print("TRAINING COMPLETE")

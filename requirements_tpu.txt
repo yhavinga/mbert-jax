@@ -1,0 +1,28 @@
+# TPU-specific requirements for mbert-jax
+# Install JAX for TPU separately with:
+# pip install jax[tpu] -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+
+# Core ML libraries (JAX will be installed via TPU-specific command)
+flax==0.8.2
+optax==0.2.2
+orbax-checkpoint==0.5.7  # For TPU-optimized checkpointing
+
+# Data and model libraries
+transformers==4.57.1
+datasets==2.18.0
+tokenizers>=0.13.0
+
+# Utilities
+numpy==1.26.4
+tqdm>=4.65.0
+rich>=13.0.0  # For better progress display
+tensorboardX==2.6.2  # For TPU-compatible logging
+
+# Development tools
+pytest==8.3.2
+black==24.3.0
+isort==5.13.0
+
+# Optional but recommended for TPU
+ml-collections==0.1.1  # For configuration management
+wandb==0.16.0  # For experiment tracking (optional)

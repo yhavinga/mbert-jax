@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Production training script - with HF best practices.
+Production training script - with HF best practices and TPU optimizations.
 Trains ModernBERT on Dutch data (mc4_nl_cleaned micro config).
 """
 
@@ -8,6 +8,10 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
+import os
+import json
+import time
+from datetime import datetime
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -18,6 +22,7 @@ from datasets import load_dataset
 from transformers import AutoTokenizer
 from tqdm import tqdm
 from typing import Dict, List, Optional, Tuple
+import orbax.checkpoint as ocp
 
 from mmbjax.configuration_mmbbert import MMBertConfig
 from mmbjax.heads.masked_lm import ModernBertForMaskedLM
@@ -215,7 +220,7 @@ def train_step(state, batch, dropout_rng):
 def load_dutch_dataset(tokenizer, split="train", max_samples=1000):
     """Load Dutch mc4_nl_cleaned micro dataset."""
     print(f"Loading Dutch dataset (yhavinga/mc4_nl_cleaned micro)...")
-    
+
     # Load streaming dataset
     dataset = load_dataset(
         "yhavinga/mc4_nl_cleaned",
@@ -223,21 +228,102 @@ def load_dutch_dataset(tokenizer, split="train", max_samples=1000):
         split=split,
         streaming=True,
     )
-    
+
     # Take limited samples and shuffle
     dataset = dataset.shuffle(seed=42, buffer_size=1000)
     dataset = dataset.take(max_samples)
-    
+
     return dataset
+
+
+def save_checkpoint(state, step: int, checkpoint_dir: str = "checkpoints"):
+    """Save checkpoint using orbax for TPU-optimized I/O."""
+    # Ensure absolute path for orbax
+    checkpoint_dir = Path(checkpoint_dir).absolute()
+    checkpoint_path = checkpoint_dir / f"checkpoint_{step}"
+    checkpoint_path.mkdir(parents=True, exist_ok=True)
+
+    # Save using orbax (TPU-optimized)
+    checkpointer = ocp.PyTreeCheckpointer()
+    checkpointer.save(
+        checkpoint_path,
+        {"state": state, "step": step},
+        force=True,
+    )
+
+    # Also save metadata
+    metadata = {
+        "step": step,
+        "timestamp": datetime.now().isoformat(),
+        "jax_version": jax.__version__,
+        "backend": jax.default_backend(),
+    }
+
+    with open(checkpoint_path / "metadata.json", "w") as f:
+        json.dump(metadata, f, indent=2)
+
+    print(f"\n✓ Checkpoint saved to {checkpoint_path}")
+    return checkpoint_path
+
+
+def load_checkpoint(checkpoint_dir: str, step: Optional[int] = None):
+    """Load checkpoint from directory."""
+    checkpoint_dir = Path(checkpoint_dir)
+
+    if step is not None:
+        checkpoint_path = checkpoint_dir / f"checkpoint_{step}"
+    else:
+        # Find latest checkpoint, excluding temporary orbax directories
+        checkpoints = sorted([
+            cp for cp in checkpoint_dir.glob("checkpoint_*")
+            if not cp.name.endswith('.orbax-checkpoint-tmp')
+        ])
+        if not checkpoints:
+            return None
+        checkpoint_path = checkpoints[-1]
+        # Extract step number from checkpoint_XXX format
+        try:
+            step = int(checkpoint_path.name.split("_")[-1])
+        except ValueError:
+            print(f"Warning: Could not parse step from checkpoint {checkpoint_path.name}")
+            return None
+
+    if not checkpoint_path.exists():
+        return None
+
+    print(f"Loading checkpoint from {checkpoint_path}...")
+    checkpointer = ocp.PyTreeCheckpointer()
+    # Orbax requires absolute paths
+    absolute_path = checkpoint_path.resolve()
+    restored = checkpointer.restore(absolute_path)
+
+    print(f"✓ Checkpoint loaded from step {step}")
+    return restored
 
 
 def main():
     print("=" * 70)
-    print("MODERNBERT DUTCH TRAINING - Production Run")
+    print("MODERNBERT DUTCH TRAINING - Production Run with TPU")
     print("=" * 70)
-    
+
+    # Detect TPU and adjust configuration
+    backend = jax.default_backend()
+    devices = jax.devices()
+    n_devices = len(devices)
+
+    print(f"\nDevice Configuration:")
+    print(f"  Backend: {backend}")
+    print(f"  Device count: {n_devices}")
+    if backend == 'tpu':
+        print(f"  TPU devices: {devices}")
+        # Adjust batch size for TPU v6e-1 (31GB HBM memory)
+        batch_size = 16  # Conservative for 254M model on TPU v6e-1
+        print(f"  ✓ TPU detected! Using optimized batch size: {batch_size}")
+    else:
+        batch_size = 8
+        print(f"  Using CPU/GPU with batch size: {batch_size}")
+
     # Training hyperparameters
-    batch_size = 8
     max_length = 512
     num_train_steps = 500
     warmup_steps = 50
@@ -245,6 +331,7 @@ def main():
     weight_decay = 0.01
     eval_every = 50
     log_every = 10
+    checkpoint_every = 100  # Checkpoint frequency
     
     # Model config (small for now)
     config = MMBertConfig(
@@ -323,6 +410,38 @@ def main():
     print("\nCompiling train_step...")
     train_step_jit = jax.jit(train_step)
     
+    # Check for existing checkpoints to resume from
+    checkpoint_dir = Path("checkpoints")
+
+    # Clean up any stale temporary checkpoint directories
+    if checkpoint_dir.exists():
+        temp_dirs = list(checkpoint_dir.glob("*.orbax-checkpoint-tmp"))
+        if temp_dirs:
+            print(f"\nCleaning up {len(temp_dirs)} temporary checkpoint directories...")
+            for temp_dir in temp_dirs:
+                import shutil
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                print(f"  Removed: {temp_dir.name}")
+
+    start_step = 0
+    resume_checkpoint = load_checkpoint(str(checkpoint_dir))
+
+    if resume_checkpoint is not None:
+        # Reconstruct TrainState from the loaded dict
+        state_dict = resume_checkpoint["state"]
+        # Create a fresh state with loaded params, but let optimizer init its state
+        state = train_state.TrainState.create(
+            apply_fn=model.apply,
+            params=state_dict["params"],
+            tx=optimizer,
+        )
+        # Update the step count to match checkpoint
+        state = state.replace(step=state_dict["step"])
+        start_step = resume_checkpoint["step"]
+        print(f"\n✓ Resuming from step {start_step}")
+    else:
+        print("\n✓ Starting fresh training")
+
     # Training loop
     print("\n" + "=" * 70)
     print("TRAINING START")
@@ -330,57 +449,77 @@ def main():
     print(f"Total steps: {num_train_steps}")
     print(f"Batch size: {batch_size}")
     print(f"Sequence length: {max_length}")
+    print(f"Checkpoint every: {checkpoint_every} steps")
+    if start_step > 0:
+        print(f"Resuming from step: {start_step}")
     print()
-    
-    step = 0
+
+    step = start_step
     batch_buffer = []
-    
-    with tqdm(total=num_train_steps, desc="Training") as pbar:
+    training_start_time = time.time()
+
+    with tqdm(total=num_train_steps - start_step, desc="Training", initial=0) as pbar:
         for example in dataset:
             batch_buffer.append(example)
-            
+
             if len(batch_buffer) >= batch_size:
                 # Create batch
                 batch = collator(batch_buffer, max_length=max_length)
                 batch_buffer = []
-                
+
                 # Training step
                 state, loss, dropout_rng = train_step_jit(state, batch, dropout_rng)
-                
+
                 # Logging
                 if step % log_every == 0:
                     loss_value = float(loss)
                     lr_value = float(lr_schedule(step))
                     n_masked = int(jnp.sum(batch["labels"] != -100))
-                    
+
+                    # Calculate throughput
+                    elapsed = time.time() - training_start_time
+                    tokens_per_sec = (step - start_step) * batch_size * max_length / elapsed if elapsed > 0 else 0
+
                     pbar.set_postfix({
                         "loss": f"{loss_value:.4f}",
                         "lr": f"{lr_value:.2e}",
                         "masked": n_masked,
+                        "tok/s": f"{tokens_per_sec:.0f}",
                     })
-                    
+
                     if step % (log_every * 5) == 0:  # Print occasionally
-                        print(f"\nStep {step:4d} | Loss: {loss_value:.4f} | LR: {lr_value:.2e}")
-                
+                        print(f"\nStep {step:4d} | Loss: {loss_value:.4f} | LR: {lr_value:.2e} | Tokens/s: {tokens_per_sec:.0f}")
+
+                # Checkpointing
+                if step > 0 and step % checkpoint_every == 0:
+                    save_checkpoint(state, step, str(checkpoint_dir))
+                    print(f"  Elapsed time: {(time.time() - training_start_time)/60:.1f} minutes")
+
                 step += 1
                 pbar.update(1)
-                
+
                 if step >= num_train_steps:
                     break
-    
+
+    # Save final checkpoint
+    save_checkpoint(state, step, str(checkpoint_dir))
+
     print("\n" + "=" * 70)
     print("TRAINING COMPLETE")
     print("=" * 70)
     print(f"Final loss: {float(loss):.4f}")
     print(f"Total steps: {step}")
+    print(f"Training time: {(time.time() - training_start_time)/60:.1f} minutes")
+
+    if backend == 'tpu':
+        print(f"\nTPU Performance:")
+        print(f"  Tokens/second: {tokens_per_sec:.0f}")
+        print(f"  Samples/second: {tokens_per_sec / max_length:.1f}")
+
     print()
     print("✓ Training completed successfully!")
-    print("✓ Next steps:")
-    print("  - Add checkpointing")
-    print("  - Add validation loop")
-    print("  - Scale to full model (22 layers)")
-    print("  - Try longer sequences (2k-8k tokens)")
-    print("  - Evaluate on Dutch benchmarks")
+    print(f"✓ Checkpoints saved to: {checkpoint_dir}")
+    print("\nTo continue training, simply run the script again!")
 
 
 if __name__ == "__main__":

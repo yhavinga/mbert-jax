@@ -99,12 +99,6 @@ def parse_args():
         help="Logging frequency in steps (default: 10)"
     )
     parser.add_argument(
-        "--max-samples",
-        type=int,
-        default=5000,
-        help="Maximum samples to load from dataset (default: 5000)"
-    )
-    parser.add_argument(
         "--checkpoint-dir",
         type=str,
         default="checkpoints",
@@ -305,8 +299,7 @@ def train_step(state, batch, dropout_rng):
 
 def load_dataset_for_training(dataset_name="yhavinga/mc4_nl_cleaned",
                               dataset_config="micro",
-                              split="train",
-                              max_samples=1000):
+                              split="train"):
     """Load dataset for training."""
     print(f"Loading dataset: {dataset_name} ({dataset_config})...")
 
@@ -318,9 +311,8 @@ def load_dataset_for_training(dataset_name="yhavinga/mc4_nl_cleaned",
         streaming=True,
     )
 
-    # Take limited samples and shuffle
+    # Shuffle dataset for better training
     dataset = dataset.shuffle(seed=42, buffer_size=1000)
-    dataset = dataset.take(max_samples)
 
     return dataset
 
@@ -457,8 +449,7 @@ def main(args):
     # Load dataset
     dataset = load_dataset_for_training(
         dataset_name=args.dataset,
-        dataset_config=args.dataset_config,
-        max_samples=args.max_samples
+        dataset_config=args.dataset_config
     )
     
     # JIT compile training step

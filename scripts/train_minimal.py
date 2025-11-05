@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
+import argparse
 import os
 import json
 import time
@@ -26,6 +27,91 @@ import orbax.checkpoint as ocp
 
 from mmbjax.configuration_mmbbert import MMBertConfig
 from mmbjax.heads.masked_lm import ModernBertForMaskedLM
+
+
+def parse_args():
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Train ModernBERT model with JAX/Flax"
+    )
+
+    # Core training arguments
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="yhavinga/mc4_nl_cleaned",
+        help="HuggingFace dataset name (default: yhavinga/mc4_nl_cleaned)"
+    )
+    parser.add_argument(
+        "--dataset-config",
+        type=str,
+        default="micro",
+        help="Dataset configuration/subset (default: micro)"
+    )
+    parser.add_argument(
+        "--max-length",
+        type=int,
+        default=512,
+        help="Maximum sequence length (default: 512)"
+    )
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=500,
+        help="Maximum training steps (default: 500)"
+    )
+
+    # Additional training arguments
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="Batch size (default: auto-detect based on backend)"
+    )
+    parser.add_argument(
+        "--learning-rate",
+        type=float,
+        default=5e-5,
+        help="Learning rate (default: 5e-5)"
+    )
+    parser.add_argument(
+        "--warmup-steps",
+        type=int,
+        default=50,
+        help="Number of warmup steps (default: 50)"
+    )
+    parser.add_argument(
+        "--weight-decay",
+        type=float,
+        default=0.01,
+        help="Weight decay (default: 0.01)"
+    )
+    parser.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=100,
+        help="Checkpoint frequency in steps (default: 100)"
+    )
+    parser.add_argument(
+        "--log-every",
+        type=int,
+        default=10,
+        help="Logging frequency in steps (default: 10)"
+    )
+    parser.add_argument(
+        "--max-samples",
+        type=int,
+        default=5000,
+        help="Maximum samples to load from dataset (default: 5000)"
+    )
+    parser.add_argument(
+        "--checkpoint-dir",
+        type=str,
+        default="checkpoints",
+        help="Directory to save checkpoints (default: checkpoints)"
+    )
+
+    return parser.parse_args()
 
 
 class FlaxDataCollatorForLanguageModeling:
@@ -217,14 +303,17 @@ def train_step(state, batch, dropout_rng):
     return state, loss, new_dropout_rng
 
 
-def load_dutch_dataset(tokenizer, split="train", max_samples=1000):
-    """Load Dutch mc4_nl_cleaned micro dataset."""
-    print(f"Loading Dutch dataset (yhavinga/mc4_nl_cleaned micro)...")
+def load_dataset_for_training(dataset_name="yhavinga/mc4_nl_cleaned",
+                              dataset_config="micro",
+                              split="train",
+                              max_samples=1000):
+    """Load dataset for training."""
+    print(f"Loading dataset: {dataset_name} ({dataset_config})...")
 
     # Load streaming dataset
     dataset = load_dataset(
-        "yhavinga/mc4_nl_cleaned",
-        "micro",
+        dataset_name,
+        dataset_config,
         split=split,
         streaming=True,
     )
@@ -301,9 +390,9 @@ def load_checkpoint(checkpoint_dir: str, step: Optional[int] = None):
     return restored
 
 
-def main():
+def main(args):
     print("=" * 70)
-    print("MODERNBERT DUTCH TRAINING - Production Run with TPU")
+    print("MODERNBERT TRAINING - Production Run with TPU")
     print("=" * 70)
 
     # Detect TPU and adjust configuration
@@ -314,7 +403,12 @@ def main():
     print(f"\nDevice Configuration:")
     print(f"  Backend: {backend}")
     print(f"  Device count: {n_devices}")
-    if backend == 'tpu':
+
+    # Batch size logic
+    if args.batch_size is not None:
+        batch_size = args.batch_size
+        print(f"  Using specified batch size: {batch_size}")
+    elif backend == 'tpu':
         print(f"  TPU devices: {devices}")
         # Adjust batch size for TPU v6e-1 (31GB HBM memory)
         batch_size = 16  # Conservative for 254M model on TPU v6e-1
@@ -323,15 +417,15 @@ def main():
         batch_size = 8
         print(f"  Using CPU/GPU with batch size: {batch_size}")
 
-    # Training hyperparameters
-    max_length = 512
-    num_train_steps = 500
-    warmup_steps = 50
-    learning_rate = 5e-5
-    weight_decay = 0.01
-    eval_every = 50
-    log_every = 10
-    checkpoint_every = 100  # Checkpoint frequency
+    # Training hyperparameters from args
+    max_length = args.max_length
+    num_train_steps = args.max_steps
+    warmup_steps = args.warmup_steps
+    learning_rate = args.learning_rate
+    weight_decay = args.weight_decay
+    log_every = args.log_every
+    checkpoint_every = args.checkpoint_every
+    checkpoint_dir = args.checkpoint_dir
     
     # Model config (small for now)
     config = MMBertConfig(
@@ -404,14 +498,18 @@ def main():
     )
     
     # Load dataset
-    dataset = load_dutch_dataset(tokenizer, max_samples=5000)
+    dataset = load_dataset_for_training(
+        dataset_name=args.dataset,
+        dataset_config=args.dataset_config,
+        max_samples=args.max_samples
+    )
     
     # JIT compile training step
     print("\nCompiling train_step...")
     train_step_jit = jax.jit(train_step)
     
     # Check for existing checkpoints to resume from
-    checkpoint_dir = Path("checkpoints")
+    checkpoint_dir = Path(checkpoint_dir)
 
     # Clean up any stale temporary checkpoint directories
     if checkpoint_dir.exists():
@@ -523,4 +621,5 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+    main(args)

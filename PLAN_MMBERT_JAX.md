@@ -3,7 +3,7 @@
 ## 0. Goal & Success Criteria
 - Reproduce Hugging Face `ModernBertModel` (a.k.a. MMBERT) in pure JAX/Flax with parity for forward passes, masked-LM head, and attention behavior (global/local alternation + dual RoPE scales).
 - Load at least one published checkpoint (`answerdotai/ModernBERT-small` or `ModernBERT-base`) via a conversion script and match PyTorch logits within 1e-5 relative tolerance for a deterministic test batch.
-- Support both padded (standard) and unpadded (FlashAttention-style) execution paths so we can scale to ≥8k tokens without quadratic blowups.
+- Support both the baseline padded attention path and an accelerated `jax-flash-attn2` execution mode (CPU/TPU) so we can scale to ≥8k tokens without quadratic blowups.
 - Enable Dutch-domain pre-training by exposing the same configuration knobs as PyTorch (rope scales, local window, dropout knobs, sparse prediction flags, classifier pooling choices).
 
 ## 1. Reference Baseline & Recon
@@ -19,12 +19,12 @@
   - Single fused `Wqkv` linear (bias governed by `attention_bias`) projecting to `[batch, seq, 3 * heads * head_dim]`.
   - Alternating global/local layers defined by `(layer_idx % global_attn_every_n_layers == 0)` ⇒ layer 0, N, 2N… are global; others use local window `[−local/2, +local/2]`.
   - Dual RoPE scales: global layers use `global_rope_theta`, locals use `local_rope_theta` (fall back to global if local is None); RoPE dim equals head_dim.
-  - Supports attention implementations: baseline (padded) softmax, FlashAttention-style varlen path (requires unpadding & packing), and SDPA fallback. JAX plan: start with padded attention + mask, then add optional block-sparse/flash path once correctness is proven.
+  - Supports attention implementations: baseline (padded) softmax plus an optional `jax-flash-attn2` path that consumes the same padded tensors + masks (varlen handling stays inside the library). Keep a clean toggle between the two modes.
 - **Sliding-window mask**: For non-global layers, replace the 4D attention mask with one that masks out tokens beyond ±`local_attention/2`. Needs to compose with padding mask (i.e., `-inf` outside window *or* padded positions).
 - **FFN/MLP**: GeGLU variant — `Wi` outputs 2×intermediate → split into `(act_input, gate)` with `ACT2FN[hidden_activation]` applied to the first chunk before elementwise product with the second chunk; `Wo` projects back to hidden. Bias toggled by `mlp_bias`, dropout by `mlp_dropout`.
 - **Dropouts**: `attention_dropout`, `embedding_dropout`, `mlp_dropout`, `classifier_dropout` must all be configurable.
 - **Prediction head**: dense (bias controlled by `classifier_bias`) → activation (`classifier_activation`) → LayerNorm → decoder (weights tied to embeddings, bias flag `decoder_bias`).
-- **Unpadding utilities**: PyTorch version unpads inputs when using FlashAttention, producing `(indices, cu_seqlens, max_seqlen)` and later repads outputs. We need analogous JAX helpers (likely with `jax.vmap`/`segment_sum`) to unlock efficient long-context inference.
+- **FlashAttention integration**: Rely on `jax-flash-attn2` for long-context acceleration; feed it padded Q/K/V tensors and attention masks, letting the library manage varlen packing internally.
 - **Init scheme**: truncated normal with layer-specific stds (`initializer_range`, `initializer_range/√(2L)` for outputs, `hidden_size^-0.5` for classifier); preserve to ease weight conversion parity.
 
 ## 3. Work Phases
@@ -50,14 +50,14 @@
    - Fused dense for QKV (bias flag), reshape to `[batch, heads, seq, head_dim]`.
    - Choose theta per layer; call RoPE helper.
    - For local layers, pass sliding-window mask; for global, fall back to standard mask.
-   - Provide two execution paths: (a) padded softmax attention using `jax.nn.softmax` and mask addition; (b) optional experimental FlashAttention path using `jax.experimental.pallas` or `jax.experimental.shard_map` once ready. Keep API that accepts `unpadded_qkv` + `indices` for future use.
+   - Provide two execution paths: (a) padded softmax attention using `jax.nn.softmax` and mask addition; (b) optional `jax-flash-attn2` call guarded by a config flag. Both paths operate on the same padded inputs and masks.
 5. **MLP/GeGLU** (`mmbjax/modules/mlp.py`): implement Wi split + gating exactly like PyTorch (activate first half, multiply by second, dropout, Wo). Honor `mlp_bias`, `mlp_dropout`.
-6. **Transformer layer** (`mmbjax/modules/layer.py`): pre-LN pipeline, identity norm for layer 0, gradient checkpoint option via `flax.linen.remat`. Accept/propagate `attention_mask`, `sliding_window_mask`, `position_ids`, `unpadded_metadata`.
+6. **Transformer layer** (`mmbjax/modules/layer.py`): pre-LN pipeline, identity norm for layer 0, gradient checkpoint option via `flax.linen.remat`. Accept/propagate `attention_mask`, `sliding_window_mask`, `position_ids`.
 
 ### Phase 3 – Encoder & Model Wrappers (2 days)
 - **Encoder**: stack `num_hidden_layers` layers, manage alternating attention by passing `layer_idx` so attention modules can compute `is_global = (layer_idx % config.global_attn_every_n_layers == 0)`.
 - **Final Norm**: apply same LN as embeddings with shared `norm_bias` semantics.
-- **Model module** (`mmbjax/modeling_mmbbert.py`): combine embeddings + encoder, expose `__call__(input_ids=None, inputs_embeds=None, attention_mask=None, position_ids=None, sliding_window_mask=None, deterministic=True, unpadded_metadata=None)`.
+- **Model module** (`mmbjax/modeling_mmbbert.py`): combine embeddings + encoder, expose `__call__(input_ids=None, inputs_embeds=None, attention_mask=None, position_ids=None, sliding_window_mask=None, deterministic=True)`.
 - **Heads**: MaskedLM (prediction head + decoder, tied weights), SequenceClassification/TokenClassification/QA/MultipleChoice mirroring PyTorch API including pooling choice (`cls` vs `mean`) and dropout. Respect `classifier_bias`, `classifier_dropout`, `classifier_activation`.
 - **Init**: implement truncated normal initializers that match PyTorch stds for embeddings/attention/MLP/out layers to minimize conversion drift.
 
@@ -79,19 +79,19 @@
   - Encoder parity on tiny configs (e.g., 2 layers, 2 heads) to keep tests fast.
 - **Integration tests**:
   - Load converted `ModernBERT-small` weights, run golden batch, assert closeness to saved PyTorch outputs.
-  - Verify unpadded->padded round trip matches padded path when FlashAttention shim disabled.
+  - Verify the `jax-flash-attn2` path produces numerically similar logits when enabled (within tolerance, acknowledging non-associativity).
   - Optional TPU/GPU multi-device smoke test using `pmap`/`pjit` with gradient checkpointing.
-- **Parity coverage status (Jan 2025)**: ModernBERT-small and ModernBERT-base golden fixtures now backstop logits + per-layer hidden-state parity (CPU, deterministic). Next milestones: add a mixed-precision parity sweep (bf16/fp16) and duplicate the checks once the Flash/unpadded attention path lands.
+- **Parity coverage status (Jan 2025)**: ModernBERT-small and ModernBERT-base golden fixtures now backstop logits + per-layer hidden-state parity (CPU, deterministic). Next milestones: add a mixed-precision parity sweep (bf16/fp16) and duplicate the checks once the FlashAttention path lands.
 
 ### Phase 6 – Training & Dutch Adaptation (ongoing)
 1. **Data pipeline**: adapt existing Dutch corpora loaders (mC4-nl, OSCAR-nl) using HF datasets + streaming; implement MLM masking strategy (15% with 80/10/10 rule).
 2. **Training loop** (`train.py`): `flax.training.train_state`, Optax AdamW with linear warmup + cosine decay, gradient accumulation support, logging (TensorBoard/W&B).
 3. **Resume from English weights**: replace embedding matrix / decoder with Dutch tokenizer, optionally average-case reinit for new vocab tokens.
-4. **Long-context validation**: run sequences up to 8k tokens, profile memory/latency, benchmark padded vs (future) unpadded path.
+4. **Long-context validation**: run sequences up to 8k tokens, profile memory/latency, benchmark padded vs `jax-flash-attn2` path.
 
 ### Phase 7 – Performance & Extras (optional)
-- Implement JAX FlashAttention kernel or integrate with `jax_flash_attention` project; wire in deterministic flag similar to PyTorch’s `deterministic_flash_attn`.
-- Add pad-unpad utilities using `jax.experimental.sparse` or `segment_sum` to avoid O(N²) cost on long sequences when not using flash attn.
+- Integrate and tune `jax-flash-attn2`: plumb feature flags, set sensible defaults per platform (CPU/TPU/GPU), and expose deterministic fallbacks.
+- Add monitoring hooks (profiling counters, logging) so we can compare padded vs flash paths quickly during sweeps.
 - Expose `reference_compile`-style toggle (e.g., `jit_compile` flag) for experiments with `jax.jit` vs `pjit`.
 - Implement sparse prediction mode if needed (mirrors PyTorch’s `sparse_prediction` branch in MLM loss).
 
@@ -106,4 +106,4 @@
 ## 5. Outstanding Questions / TODOs Before Coding
 - Confirm which checkpoints (e.g., `answerdotai/mmbert-small` vs `ModernBERT-small`) we target first and whether any use non-default bias flags.
 - Decide on initial hardware target (TPU vs GPU) to choose between `pmap`/`pjit` scaffolding.
-- Evaluate availability of JAX FlashAttention kernels; if none are production ready, schedule time to contribute or plan on efficient block-sparse masking instead.
+- Finalize hardware target (TPU vs GPU) to confirm `jax-flash-attn2` backend support and memory limits.

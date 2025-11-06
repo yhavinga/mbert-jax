@@ -3,9 +3,9 @@
 # pip install jax[tpu] -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
 
 # Core ML libraries (JAX will be installed via TPU-specific command)
-flax==0.8.2
-optax==0.2.2
-orbax-checkpoint==0.5.7  # For TPU-optimized checkpointing
+flax>=0.10.0  # Compatible with JAX 0.4.30+
+optax>=0.2.2  # Updated for better compatibility
+orbax-checkpoint>=0.11.0  # Fixed checkpoint compatibility with JAX 0.8.0
 
 # Data and model libraries
 transformers==4.57.1

@@ -34,31 +34,32 @@ check_status() {
     fi
 }
 
-# 1. Check Python version
+# 1. Check/Install Python 3.12
 echo -e "${YELLOW}Checking Python version...${NC}"
-python_version=$(python3 --version 2>&1 | grep -oE '[0-9]+\.[0-9]+')
-required_version="3.10"
 
-if [ "$(printf '%s\n' "$required_version" "$python_version" | sort -V | head -n1)" = "$required_version" ]; then
-    echo -e "${GREEN}✓${NC} Python $python_version (meets requirement >= $required_version)"
+# Check if python3.12 is available
+if command -v python3.12 &> /dev/null; then
+    PYTHON_CMD="python3.12"
+    python_version=$($PYTHON_CMD --version 2>&1 | grep -oE '[0-9]+\.[0-9]+')
+    echo -e "${GREEN}✓${NC} Python $python_version available"
 else
-    echo -e "${RED}✗${NC} Python $python_version is too old (need >= $required_version)"
-    exit 1
-fi
-
-# 2. Install venv if not available (common on minimal cloud images)
-echo ""
-echo -e "${YELLOW}Checking for python3-venv...${NC}"
-if ! python3 -m venv --help > /dev/null 2>&1; then
-    echo "Installing python3-venv package..."
+    echo -e "${YELLOW}Python 3.12 not found. Installing...${NC}"
+    # Add deadsnakes PPA for newer Python versions
+    sudo add-apt-repository -y ppa:deadsnakes/ppa > /dev/null 2>&1
     sudo apt-get update > /dev/null 2>&1
-    sudo apt-get install -y python3.10-venv > /dev/null 2>&1
-    check_status "python3-venv installed"
-else
-    echo -e "${GREEN}✓${NC} python3-venv is available"
+    sudo apt-get install -y python3.12 python3.12-venv python3.12-distutils > /dev/null 2>&1
+
+    if command -v python3.12 &> /dev/null; then
+        PYTHON_CMD="python3.12"
+        python_version=$($PYTHON_CMD --version 2>&1 | grep -oE '[0-9]+\.[0-9]+')
+        echo -e "${GREEN}✓${NC} Python $python_version installed successfully"
+    else
+        echo -e "${RED}✗${NC} Failed to install Python 3.12"
+        exit 1
+    fi
 fi
 
-# 3. Create or verify virtual environment
+# 2. Create or verify virtual environment
 echo ""
 echo -e "${YELLOW}Setting up virtual environment...${NC}"
 RECREATE_VENV=false
@@ -70,9 +71,14 @@ if [ "$FORCE_REINSTALL" = true ]; then
 # Check if venv exists and is functional
 elif [ -d "venv" ]; then
     if venv/bin/python -c "import sys; sys.exit(0)" 2>/dev/null; then
-        echo "Virtual environment exists and is functional"
+        venv_python_version=$(venv/bin/python --version 2>&1 | grep -oE '[0-9]+\.[0-9]+')
+        echo "Virtual environment exists with Python $venv_python_version"
+        # Check if venv has the right Python version
+        if [ "$venv_python_version" != "$python_version" ]; then
+            echo "Virtual environment has Python $venv_python_version but we need Python $python_version"
+            RECREATE_VENV=true
         # Check if JAX is already installed for TPU
-        if venv/bin/python -c "import jax; import sys; backend = jax.default_backend(); sys.exit(0 if backend == 'tpu' else 1)" 2>/dev/null; then
+        elif venv/bin/python -c "import jax; import sys; backend = jax.default_backend(); sys.exit(0 if backend == 'tpu' else 1)" 2>/dev/null; then
             echo -e "${GREEN}✓${NC} JAX for TPU already configured"
         else
             echo "JAX not configured for TPU, will reinstall..."
@@ -90,8 +96,8 @@ if [ "$RECREATE_VENV" = true ]; then
     if [ -d "venv" ]; then
         rm -rf venv
     fi
-    python3 -m venv venv
-    check_status "Virtual environment created"
+    $PYTHON_CMD -m venv venv
+    check_status "Virtual environment created with Python $python_version"
 else
     echo -e "${GREEN}✓${NC} Using existing virtual environment"
 fi

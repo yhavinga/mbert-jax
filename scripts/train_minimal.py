@@ -22,8 +22,9 @@ from flax.training import train_state
 from datasets import load_dataset
 from transformers import AutoTokenizer
 from tqdm import tqdm
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 import orbax.checkpoint as ocp
+import wandb
 
 from mmbjax.configuration_mmbbert import MMBertConfig
 from mmbjax.heads.masked_lm import ModernBertForMaskedLM
@@ -103,6 +104,25 @@ def parse_args():
         type=str,
         default="checkpoints",
         help="Directory to save checkpoints (default: checkpoints)"
+    )
+
+    # W&B arguments
+    parser.add_argument(
+        "--wandb-project",
+        type=str,
+        default="modernbert-mlm",
+        help="W&B project name (default: modernbert-mlm)"
+    )
+    parser.add_argument(
+        "--wandb-run-name",
+        type=str,
+        default=None,
+        help="W&B run name (default: auto-generated)"
+    )
+    parser.add_argument(
+        "--no-wandb",
+        action="store_true",
+        help="Disable W&B logging"
     )
 
     return parser.parse_args()
@@ -197,25 +217,102 @@ class FlaxDataCollatorForLanguageModeling:
         return inputs, labels
 
 
-def compute_mlm_loss(logits, labels):
-    """Compute cross-entropy loss on masked positions only."""
+def compute_mlm_loss_and_accuracy(logits, labels):
+    """Compute cross-entropy loss and accuracy on masked positions only."""
     # Flatten
     logits_flat = logits.reshape(-1, logits.shape[-1])
     labels_flat = labels.reshape(-1)
-    
+
     # Mask: only compute loss where labels != -100
     mask = labels_flat != -100
-    
+
     # Cross-entropy
     log_probs = jax.nn.log_softmax(logits_flat, axis=-1)
     target_log_probs = jnp.take_along_axis(
         log_probs, labels_flat[:, None], axis=-1
     ).squeeze(-1)
-    
-    # Masked mean
+
+    # Masked mean loss
     loss = -jnp.sum(target_log_probs * mask) / jnp.maximum(jnp.sum(mask), 1)
-    
-    return loss
+
+    # Compute accuracy on masked tokens
+    predictions = jnp.argmax(logits_flat, axis=-1)
+    correct = (predictions == labels_flat) * mask
+    accuracy = jnp.sum(correct) / jnp.maximum(jnp.sum(mask), 1)
+
+    # Compute perplexity
+    perplexity = jnp.exp(loss)
+
+    return loss, accuracy, perplexity
+
+
+def compute_gradient_norm(gradients):
+    """Compute global L2 norm of gradients."""
+    leaves = jax.tree_util.tree_leaves(gradients)
+    norm = jnp.sqrt(sum([jnp.sum(jnp.square(g)) for g in leaves]))
+    return norm
+
+
+def compute_parameter_norm(params):
+    """Compute global L2 norm of parameters."""
+    leaves = jax.tree_util.tree_leaves(params)
+    norm = jnp.sqrt(sum([jnp.sum(jnp.square(p)) for p in leaves]))
+    return norm
+
+
+def compute_update_ratio(gradients, params, learning_rate):
+    """Compute update/parameter ratio (Karpathy's favorite metric).
+
+    This should be around 0.001 for healthy training.
+    """
+    grad_norm = compute_gradient_norm(gradients)
+    param_norm = compute_parameter_norm(params)
+    # The actual update is grad * lr (for SGD-like optimizers)
+    update_norm = grad_norm * learning_rate
+    ratio = update_norm / jnp.maximum(param_norm, 1e-7)
+    return ratio
+
+
+def compute_per_layer_gradient_norms(gradients):
+    """Compute gradient norms for each layer type."""
+    flat_grads = traverse_util.flatten_dict(gradients)
+
+    layer_norms = {}
+
+    # Embedding layer
+    embedding_grads = {k: v for k, v in flat_grads.items() if "embeddings" in str(k)}
+    if embedding_grads:
+        layer_norms["embeddings"] = jnp.sqrt(
+            sum([jnp.sum(jnp.square(g)) for g in embedding_grads.values()])
+        )
+
+    # Encoder layers (attention and FFN)
+    for i in range(12):  # Assuming max 12 layers
+        layer_key = f"layer_{i}"
+        layer_grads = {k: v for k, v in flat_grads.items() if layer_key in str(k)}
+        if layer_grads:
+            # Attention sublayer
+            attn_grads = {k: v for k, v in layer_grads.items() if "attention" in str(k)}
+            if attn_grads:
+                layer_norms[f"encoder_{i}_attention"] = jnp.sqrt(
+                    sum([jnp.sum(jnp.square(g)) for g in attn_grads.values()])
+                )
+
+            # FFN sublayer
+            ffn_grads = {k: v for k, v in layer_grads.items() if "ffn" in str(k) or "intermediate" in str(k) or "output" in str(k)}
+            if ffn_grads:
+                layer_norms[f"encoder_{i}_ffn"] = jnp.sqrt(
+                    sum([jnp.sum(jnp.square(g)) for g in ffn_grads.values()])
+                )
+
+    # LM head
+    lm_head_grads = {k: v for k, v in flat_grads.items() if "lm_head" in str(k) or "predictions" in str(k)}
+    if lm_head_grads:
+        layer_norms["lm_head"] = jnp.sqrt(
+            sum([jnp.sum(jnp.square(g)) for g in lm_head_grads.values()])
+        )
+
+    return layer_norms
 
 
 def create_train_state(
@@ -275,10 +372,10 @@ def create_train_state(
     return optimizer, lr_schedule
 
 
-def train_step(state, batch, dropout_rng):
-    """Single training step with proper RNG handling."""
+def train_step(state, batch, dropout_rng, learning_rate, compute_per_layer=False):
+    """Single training step with proper RNG handling and comprehensive metrics."""
     dropout_rng, new_dropout_rng = jax.random.split(dropout_rng)
-    
+
     def loss_fn(params):
         output = state.apply_fn(
             {"params": params},
@@ -289,12 +386,37 @@ def train_step(state, batch, dropout_rng):
         )
         # Extract logits
         logits = output.logits if hasattr(output, "logits") else output["logits"]
-        return compute_mlm_loss(logits, batch["labels"])
-    
-    loss, grads = jax.value_and_grad(loss_fn)(state.params)
+        loss, accuracy, perplexity = compute_mlm_loss_and_accuracy(logits, batch["labels"])
+        return loss, (logits, accuracy, perplexity)
+
+    (loss, (logits, accuracy, perplexity)), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
+
+    # Compute gradient metrics
+    grad_norm = compute_gradient_norm(grads)
+    param_norm = compute_parameter_norm(state.params)
+
+    # Use the passed learning rate
+    update_ratio = compute_update_ratio(grads, state.params, learning_rate)
+
+    # Apply gradients
     state = state.apply_gradients(grads=grads)
-    
-    return state, loss, new_dropout_rng
+
+    # Build metrics dict
+    metrics = {
+        "loss": loss,
+        "accuracy": accuracy,
+        "perplexity": perplexity,
+        "grad_norm": grad_norm,
+        "param_norm": param_norm,
+        "update_ratio": update_ratio,
+    }
+
+    # Optionally compute per-layer gradient norms
+    if compute_per_layer:
+        layer_norms = compute_per_layer_gradient_norms(grads)
+        metrics["layer_grad_norms"] = layer_norms
+
+    return state, metrics, new_dropout_rng
 
 
 def load_dataset_for_training(dataset_name="yhavinga/mc4_nl_cleaned",
@@ -390,7 +512,50 @@ def main(args):
     print(f"  Hidden size: {config.hidden_size}")
     print(f"  Attention heads: {config.num_attention_heads}")
     print(f"  Max seq length: {config.max_position_embeddings}")
-    
+
+    # Initialize W&B
+    if not args.no_wandb:
+        print("\nInitializing W&B...")
+        wandb_config = {
+            # Model config
+            "model_layers": config.num_hidden_layers,
+            "model_hidden_size": config.hidden_size,
+            "model_attention_heads": config.num_attention_heads,
+            "model_intermediate_size": config.intermediate_size,
+            "model_max_position_embeddings": config.max_position_embeddings,
+            "model_vocab_size": config.vocab_size,
+
+            # Training config
+            "batch_size": batch_size,
+            "max_length": max_length,
+            "num_train_steps": num_train_steps,
+            "warmup_steps": warmup_steps,
+            "learning_rate": learning_rate,
+            "weight_decay": weight_decay,
+            "mlm_probability": 0.15,
+            "gradient_clipping": 1.0,
+
+            # Dataset
+            "dataset": args.dataset,
+            "dataset_config": args.dataset_config,
+
+            # Infrastructure
+            "backend": backend,
+            "n_devices": n_devices,
+            "device_type": str(devices[0].device_kind) if devices else "unknown",
+        }
+
+        wandb.init(
+            project=args.wandb_project,
+            name=args.wandb_run_name,
+            config=wandb_config,
+            tags=["modernbert", "mlm", backend, args.dataset_config],
+        )
+        print(f"  ✓ W&B run initialized: {wandb.run.name}")
+        print(f"  ✓ Project: {args.wandb_project}")
+    else:
+        print("\n✓ W&B logging disabled (--no-wandb)")
+
     # Initialize model
     print("\nInitializing model...")
     model = ModernBertForMaskedLM(config)
@@ -454,7 +619,8 @@ def main(args):
     
     # JIT compile training step
     print("\nCompiling train_step...")
-    train_step_jit = jax.jit(train_step)
+    # JIT compile with static argnums for compute_per_layer
+    train_step_jit = jax.jit(train_step, static_argnums=(4,))
 
     # Create checkpoint manager for async checkpointing
     print("\nInitializing checkpoint manager...")
@@ -509,28 +675,70 @@ def main(args):
                 batch = collator(batch_buffer, max_length=max_length)
                 batch_buffer = []
 
-                # Training step
-                state, loss, dropout_rng = train_step_jit(state, batch, dropout_rng)
+                # Training step - use per-layer metrics every 100 steps
+                compute_per_layer = (step % 100 == 0)
+                current_lr = float(lr_schedule(step))
+                state, metrics, dropout_rng = train_step_jit(state, batch, dropout_rng, current_lr, compute_per_layer)
 
                 # Logging
                 if step % log_every == 0:
-                    loss_value = float(loss)
-                    lr_value = float(lr_schedule(step))
+                    # Extract metrics
+                    loss_value = float(metrics["loss"])
+                    accuracy_value = float(metrics["accuracy"]) * 100  # Convert to percentage
+                    perplexity_value = float(metrics["perplexity"])
+                    grad_norm_value = float(metrics["grad_norm"])
+                    param_norm_value = float(metrics["param_norm"])
+                    update_ratio_value = float(metrics["update_ratio"])
+
+                    lr_value = current_lr  # Already computed above
                     n_masked = int(jnp.sum(batch["labels"] != -100))
 
                     # Calculate throughput
                     elapsed = time.time() - training_start_time
                     tokens_per_sec = (step - start_step) * batch_size * max_length / elapsed if elapsed > 0 else 0
+                    samples_per_sec = tokens_per_sec / max_length
+                    steps_per_sec = (step - start_step) / elapsed if elapsed > 0 else 0
 
+                    # Update progress bar
                     pbar.set_postfix({
                         "loss": f"{loss_value:.4f}",
+                        "acc": f"{accuracy_value:.1f}%",
+                        "ppl": f"{perplexity_value:.1f}",
                         "lr": f"{lr_value:.2e}",
-                        "masked": n_masked,
-                        "tok/s": f"{tokens_per_sec:.0f}",
+                        "grad": f"{grad_norm_value:.2f}",
+                        "ratio": f"{update_ratio_value:.4f}",
                     })
 
-                    if step % (log_every * 5) == 0:  # Print occasionally
-                        print(f"\nStep {step:4d} | Loss: {loss_value:.4f} | LR: {lr_value:.2e} | Tokens/s: {tokens_per_sec:.0f}")
+                    # Log to W&B
+                    if not args.no_wandb:
+                        wandb_log = {
+                            "train/loss": loss_value,
+                            "train/accuracy": accuracy_value,
+                            "train/perplexity": perplexity_value,
+                            "train/learning_rate": lr_value,
+                            "train/grad_norm": grad_norm_value,
+                            "train/param_norm": param_norm_value,
+                            "train/update_ratio": update_ratio_value,
+                            "train/n_masked_tokens": n_masked,
+                            "train/masking_percentage": n_masked / (batch_size * max_length) * 100,
+                            "performance/tokens_per_sec": tokens_per_sec,
+                            "performance/samples_per_sec": samples_per_sec,
+                            "performance/steps_per_sec": steps_per_sec,
+                            "step": step,
+                        }
+
+                        # Add per-layer gradient norms if available
+                        if "layer_grad_norms" in metrics:
+                            for layer_name, grad_norm in metrics["layer_grad_norms"].items():
+                                wandb_log[f"gradients/{layer_name}"] = float(grad_norm)
+
+                        wandb.log(wandb_log, step=step)
+
+                    if step % (log_every * 5) == 0:  # Print detailed stats occasionally
+                        print(f"\nStep {step:4d} | Loss: {loss_value:.4f} | Acc: {accuracy_value:.1f}% | "
+                              f"PPL: {perplexity_value:.1f} | LR: {lr_value:.2e} | "
+                              f"Grad: {grad_norm_value:.2f} | Ratio: {update_ratio_value:.4f} | "
+                              f"Tok/s: {tokens_per_sec:.0f}")
 
                 # Checkpointing - happens async in background
                 if step > 0 and step % checkpoint_every == 0:
@@ -562,7 +770,9 @@ def main(args):
     print("\n" + "=" * 70)
     print("TRAINING COMPLETE")
     print("=" * 70)
-    print(f"Final loss: {float(loss):.4f}")
+    print(f"Final loss: {float(metrics['loss']):.4f}")
+    print(f"Final accuracy: {float(metrics['accuracy']) * 100:.1f}%")
+    print(f"Final perplexity: {float(metrics['perplexity']):.1f}")
     print(f"Total steps: {step}")
     print(f"Training time: {(time.time() - training_start_time)/60:.1f} minutes")
 
@@ -570,6 +780,16 @@ def main(args):
         print(f"\nTPU Performance:")
         print(f"  Tokens/second: {tokens_per_sec:.0f}")
         print(f"  Samples/second: {tokens_per_sec / max_length:.1f}")
+
+    # Log final metrics to W&B
+    if not args.no_wandb:
+        wandb.summary["final_loss"] = float(metrics['loss'])
+        wandb.summary["final_accuracy"] = float(metrics['accuracy']) * 100
+        wandb.summary["final_perplexity"] = float(metrics['perplexity'])
+        wandb.summary["total_steps"] = step
+        wandb.summary["training_time_minutes"] = (time.time() - training_start_time) / 60
+        wandb.finish()
+        print("\n✓ W&B run finished successfully")
 
     print()
     print("✓ Training completed successfully!")

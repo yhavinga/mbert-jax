@@ -67,6 +67,44 @@ rsync -avz --progress --delete \
     "${LOCAL_DIR}/" "${TPU_HOST}:${REMOTE_DIR}/"
 
 echo ""
+echo -e "${GREEN}=== Files Synced ===${NC}"
+
+# Sync authentication tokens
+echo ""
+echo -e "${YELLOW}Syncing authentication tokens...${NC}"
+
+# Sync HuggingFace token if it exists
+HF_TOKEN_PATH="$HOME/.cache/huggingface/token"
+if [ -f "${HF_TOKEN_PATH}" ]; then
+    echo -n "  Copying HuggingFace token... "
+    ssh "${TPU_HOST}" "mkdir -p ~/.cache/huggingface"
+    scp -q "${HF_TOKEN_PATH}" "${TPU_HOST}:~/.cache/huggingface/token"
+    echo -e "${GREEN}✓${NC}"
+else
+    echo -e "  ${YELLOW}No HuggingFace token found at ${HF_TOKEN_PATH}${NC}"
+fi
+
+# Sync Wandb credentials if they exist (.netrc contains wandb API key)
+WANDB_NETRC_PATH="$HOME/.netrc"
+if [ -f "${WANDB_NETRC_PATH}" ]; then
+    echo -n "  Copying Wandb credentials... "
+    scp -q "${WANDB_NETRC_PATH}" "${TPU_HOST}:~/.netrc"
+    ssh "${TPU_HOST}" "chmod 600 ~/.netrc"
+    echo -e "${GREEN}✓${NC}"
+else
+    echo -e "  ${YELLOW}No Wandb credentials found at ${WANDB_NETRC_PATH}${NC}"
+fi
+
+# Also check for wandb config directory
+WANDB_CONFIG_DIR="$HOME/.config/wandb"
+if [ -d "${WANDB_CONFIG_DIR}" ]; then
+    echo -n "  Copying Wandb config directory... "
+    ssh "${TPU_HOST}" "mkdir -p ~/.config"
+    scp -qr "${WANDB_CONFIG_DIR}" "${TPU_HOST}:~/.config/"
+    echo -e "${GREEN}✓${NC}"
+fi
+
+echo ""
 echo -e "${GREEN}=== Deployment Complete ===${NC}"
 echo ""
 echo "Next steps:"
@@ -83,7 +121,7 @@ ssh "${TPU_HOST}" "cd ${REMOTE_DIR} && du -sh ."
 echo ""
 
 # Optional: Automatically run setup if flag is passed
-if [[ "$1" == "--setup" ]]; then
+if [[ "$1" == "--setup" || "$1" == "--force-setup" ]]; then
     echo -e "${YELLOW}Running remote setup...${NC}"
     ssh "${TPU_HOST}" "cd ${REMOTE_DIR} && chmod +x setup_on_tpu.sh && ./setup_on_tpu.sh"
 fi

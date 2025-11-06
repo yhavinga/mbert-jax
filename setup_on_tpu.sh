@@ -1,8 +1,18 @@
 #!/bin/bash
 # Setup script to run on TPU VM after deployment
 # Installs JAX for TPU and all project dependencies
+#
+# Usage: ./setup_on_tpu.sh [--force]
+#   --force: Force reinstall all dependencies even if already installed
 
 set -e  # Exit on error
+
+# Parse arguments
+FORCE_REINSTALL=false
+if [[ "$1" == "--force" ]]; then
+    FORCE_REINSTALL=true
+    echo "Force reinstall mode enabled"
+fi
 
 # Colors for output
 RED='\033[0;31m'
@@ -48,15 +58,43 @@ else
     echo -e "${GREEN}✓${NC} python3-venv is available"
 fi
 
-# 3. Create virtual environment
+# 3. Create or verify virtual environment
 echo ""
-echo -e "${YELLOW}Creating virtual environment...${NC}"
-if [ -d "venv" ]; then
-    echo "Virtual environment already exists, recreating..."
-    rm -rf venv
+echo -e "${YELLOW}Setting up virtual environment...${NC}"
+RECREATE_VENV=false
+
+# Force reinstall if requested
+if [ "$FORCE_REINSTALL" = true ]; then
+    echo "Force reinstall requested, will recreate virtual environment"
+    RECREATE_VENV=true
+# Check if venv exists and is functional
+elif [ -d "venv" ]; then
+    if venv/bin/python -c "import sys; sys.exit(0)" 2>/dev/null; then
+        echo "Virtual environment exists and is functional"
+        # Check if JAX is already installed for TPU
+        if venv/bin/python -c "import jax; import sys; backend = jax.default_backend(); sys.exit(0 if backend == 'tpu' else 1)" 2>/dev/null; then
+            echo -e "${GREEN}✓${NC} JAX for TPU already configured"
+        else
+            echo "JAX not configured for TPU, will reinstall..."
+            RECREATE_VENV=true
+        fi
+    else
+        echo "Virtual environment is corrupted, recreating..."
+        RECREATE_VENV=true
+    fi
+else
+    RECREATE_VENV=true
 fi
-python3 -m venv venv
-check_status "Virtual environment created"
+
+if [ "$RECREATE_VENV" = true ]; then
+    if [ -d "venv" ]; then
+        rm -rf venv
+    fi
+    python3 -m venv venv
+    check_status "Virtual environment created"
+else
+    echo -e "${GREEN}✓${NC} Using existing virtual environment"
+fi
 
 # 3. Activate virtual environment
 echo ""
@@ -64,30 +102,55 @@ echo -e "${YELLOW}Activating virtual environment...${NC}"
 source venv/bin/activate
 check_status "Virtual environment activated"
 
-# 4. Upgrade pip
+# 4. Upgrade pip (if needed)
 echo ""
-echo -e "${YELLOW}Upgrading pip...${NC}"
-pip install --upgrade pip wheel setuptools > /dev/null 2>&1
-check_status "pip upgraded"
+echo -e "${YELLOW}Checking pip...${NC}"
+if [ "$RECREATE_VENV" = true ]; then
+    pip install --upgrade pip wheel setuptools > /dev/null 2>&1
+    check_status "pip upgraded"
+else
+    echo -e "${GREEN}✓${NC} pip already configured"
+fi
 
-# 5. Install JAX for TPU
+# 5. Install JAX for TPU (if needed)
 echo ""
-echo -e "${YELLOW}Installing JAX for TPU...${NC}"
-echo "This may take a few minutes..."
-pip install --upgrade "jax[tpu]" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html > /dev/null 2>&1
-check_status "JAX for TPU installed"
+echo -e "${YELLOW}Checking JAX for TPU...${NC}"
+if [ "$RECREATE_VENV" = true ] || ! python -c "import jax; import sys; sys.exit(0 if jax.default_backend() == 'tpu' else 1)" 2>/dev/null; then
+    echo "Installing JAX for TPU..."
+    echo "This may take a few minutes..."
+    pip install --upgrade "jax[tpu]" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html > /dev/null 2>&1
+    check_status "JAX for TPU installed"
+else
+    echo -e "${GREEN}✓${NC} JAX for TPU already installed"
+fi
 
-# 6. Install project requirements
+# 6. Install or verify project requirements
 echo ""
-echo -e "${YELLOW}Installing project dependencies...${NC}"
+echo -e "${YELLOW}Checking project dependencies...${NC}"
 if [ -f "requirements_tpu.txt" ]; then
-    pip install -r requirements_tpu.txt > /dev/null 2>&1
-    check_status "Project dependencies installed"
+    # Check if key packages are installed
+    NEED_INSTALL=false
+    if [ "$RECREATE_VENV" = true ]; then
+        NEED_INSTALL=true
+    else
+        # Check for key packages
+        if ! python -c "import flax, optax, transformers, datasets" 2>/dev/null; then
+            NEED_INSTALL=true
+        fi
+    fi
+
+    if [ "$NEED_INSTALL" = true ]; then
+        echo "Installing project dependencies..."
+        pip install -r requirements_tpu.txt > /dev/null 2>&1
+        check_status "Project dependencies installed"
+    else
+        echo -e "${GREEN}✓${NC} Project dependencies already installed"
+    fi
 else
     echo -e "${RED}Warning: requirements_tpu.txt not found${NC}"
     echo "Installing basic requirements..."
     pip install -r requirements.txt > /dev/null 2>&1
-    pip install flax optax datasets tqdm > /dev/null 2>&1
+    pip install flax optax datasets tqdm wandb > /dev/null 2>&1
     check_status "Basic dependencies installed"
 fi
 
@@ -131,7 +194,42 @@ mkdir -p logs
 mkdir -p outputs
 check_status "Output directories created"
 
-# 10. Display system information
+# 10. Verify authentication tokens
+echo ""
+echo -e "${YELLOW}Verifying authentication tokens...${NC}"
+
+# Check HuggingFace token
+if [ -f "$HOME/.cache/huggingface/token" ]; then
+    echo -e "${GREEN}✓${NC} HuggingFace token found"
+    # Try to validate token by checking it can be read
+    if python3 -c "
+import sys
+try:
+    from huggingface_hub import HfApi
+    api = HfApi()
+    user = api.whoami()
+    print(f'  Authenticated as: {user[\"name\"]}')
+except Exception as e:
+    print(f'  Token validation skipped: {str(e)}')
+" 2>/dev/null; then
+        :
+    fi
+else
+    echo -e "${YELLOW}⚠${NC} No HuggingFace token found"
+    echo "  To add: huggingface-cli login (on local machine, then redeploy)"
+fi
+
+# Check Wandb credentials
+if [ -f "$HOME/.netrc" ] && grep -q "api.wandb.ai" "$HOME/.netrc" 2>/dev/null; then
+    echo -e "${GREEN}✓${NC} Wandb credentials found in .netrc"
+elif [ -d "$HOME/.config/wandb" ]; then
+    echo -e "${GREEN}✓${NC} Wandb config directory found"
+else
+    echo -e "${YELLOW}⚠${NC} No Wandb credentials found"
+    echo "  To add: wandb login (on local machine, then redeploy)"
+fi
+
+# 11. Display system information
 echo ""
 echo -e "${BLUE}=== System Information ===${NC}"
 echo -e "Hostname: ${YELLOW}$(hostname)${NC}"
@@ -153,14 +251,23 @@ echo "  - Watch logs: ${YELLOW}tail -f logs/training.log${NC}"
 echo "  - TPU utilization: ${YELLOW}gcloud compute tpus tpu-vm ssh tpu-v6 --command='top'${NC}"
 echo ""
 
-# Create activation reminder
+# Create activation reminder with token paths
 cat > activate.sh << 'EOF'
 #!/bin/bash
 source venv/bin/activate
 export JAX_PLATFORMS=tpu
 export TF_CPP_MIN_LOG_LEVEL=0
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
+
+# Set HuggingFace token path if it exists
+if [ -f "$HOME/.cache/huggingface/token" ]; then
+    export HF_TOKEN_PATH="$HOME/.cache/huggingface/token"
+    export HUGGING_FACE_HUB_TOKEN=$(cat "$HF_TOKEN_PATH" 2>/dev/null || echo "")
+fi
+
 echo "Environment activated for TPU training"
+echo "TPU backend: $(python -c 'import jax; print(jax.default_backend())' 2>/dev/null || echo 'Not detected')"
+echo "TPU devices: $(python -c 'import jax; print(len(jax.devices()))' 2>/dev/null || echo '0')"
 EOF
 chmod +x activate.sh
 

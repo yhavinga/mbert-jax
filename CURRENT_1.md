@@ -254,7 +254,7 @@ JAX_PLATFORMS=cpu python -m pytest tests/ -v
 
 ```
 Python: 3.12.10
-JAX: 0.4.38
+JAX: 0.8.0
 Flax: (from jax)
 PyTorch: latest
 Transformers: 4.57.1

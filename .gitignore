@@ -31,3 +31,10 @@ dist/
 # Local data or checkpoints dropped during experiments
 artifacts/checkpoints/
 artifacts/tmp/
+
+# TPU configuration (auto-generated, template is tracked)
+ssh_config
+
+# Google Cloud SDK (downloaded locally)
+google-cloud-sdk/
+google-cloud-cli-darwin-arm.tar.gz

@@ -240,7 +240,7 @@ def main():
     results['imports'] = check_imports()
 
     if not results['imports']:
-        print("\n⚠️  Missing required packages. Please run setup_on_tpu.sh first!")
+        print("\n⚠️  Missing required packages.")
         sys.exit(1)
 
     results['tpu'] = check_tpu_devices()

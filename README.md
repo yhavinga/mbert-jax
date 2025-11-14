@@ -21,11 +21,13 @@ Core architecture complete. Masked LM head validated against PyTorch reference. 
 - GeGLU MLP with proper bias/dropout flags
 - Weight conversion from HuggingFace checkpoints
 - Masked language modeling head
+- MLM training with AdamW optimizer
+- TPU support with async checkpointing
 
 **TODO:**
 - Unpadded/FlashAttention execution path
-- Full training loop with optimizer states
-- Dutch pre-training configs
+- Multi-device data parallelism (pmap/pjit)
+- Mixed precision training (bf16/fp16)
 
 ## Quick Start
 
@@ -117,7 +119,28 @@ Golden tensors in `artifacts/reference-configs/` provide deterministic regressio
 
 ## Training
 
-Not yet implemented. Current focus: inference parity and weight loading. Training loop will use `optax` for optimization and standard cross-entropy loss. See `PLAN_MMBERT_JAX.md` Phase 3.
+Masked language modeling (MLM) training is implemented in `scripts/train_minimal.py`. Includes AdamW optimization, W&B logging, and TPU support.
+
+```bash
+# Train on CPU/GPU
+python scripts/train_minimal.py \
+  --batch_size 16 \
+  --num_epochs 3 \
+  --learning_rate 1e-4
+
+# Train on TPU with Dutch data
+python scripts/train_minimal.py \
+  --dataset yhavinga/mc4_nl_cleaned \
+  --batch-size 16 \
+  --wandb-project mbert_dutch
+
+# Resume from checkpoint
+python scripts/train_minimal.py \
+  --checkpoint_dir checkpoints/run_123 \
+  --resume
+```
+
+Features: gradient clipping, linear warmup/decay, comprehensive metrics (perplexity, gradient norms, update ratio), async checkpointing for spot instances.
 
 ## License
 

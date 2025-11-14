@@ -1,7 +1,11 @@
 #jax-metal==0.1.1
-jaxlib==0.4.38
-jax==0.4.38
+jaxlib==0.8.0
+jax==0.8.0
 numpy==1.26.4
 torch
 pytest==8.3.2
 transformers==4.57.1
+
+# CLI tools
+rich>=13.0.0
+pyyaml>=6.0

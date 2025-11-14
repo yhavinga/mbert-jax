@@ -53,7 +53,7 @@ def parse_args():
         "--max-length",
         type=int,
         default=512,
-        help="Maximum sequence length (default: 512)"
+        help="Training sequence length in tokens (default: 512)"
     )
     parser.add_argument(
         "--max-steps",
@@ -481,8 +481,7 @@ def main(args):
         print(f"  Using specified batch size: {batch_size}")
     elif backend == 'tpu':
         print(f"  TPU devices: {devices}")
-        # Adjust batch size for TPU v6e-1 (31GB HBM memory)
-        batch_size = 16  # Conservative for 254M model on TPU v6e-1
+        batch_size = 16
         print(f"  ✓ TPU detected! Using optimized batch size: {batch_size}")
     else:
         batch_size = 8
@@ -499,19 +498,21 @@ def main(args):
     checkpoint_dir = args.checkpoint_dir
     
     # Model config (small for now)
+    # Following ModernBERT's strategy: set max capacity to 8192 from the start
+    # but train with shorter sequences initially for efficiency
     config = MMBertConfig(
         vocab_size=256000,
         hidden_size=768,
         num_hidden_layers=6,  # Medium size for testing
         num_attention_heads=12,
         intermediate_size=3072,
-        max_position_embeddings=2048,
+        max_position_embeddings=8192,  # Model capacity for long sequences
     )
     print(f"\nModel config:")
     print(f"  Layers: {config.num_hidden_layers}")
     print(f"  Hidden size: {config.hidden_size}")
     print(f"  Attention heads: {config.num_attention_heads}")
-    print(f"  Max seq length: {config.max_position_embeddings}")
+    print(f"  Max pos embeddings: {config.max_position_embeddings}")
 
     # Initialize W&B
     if not args.no_wandb:
@@ -656,7 +657,7 @@ def main(args):
     print("=" * 70)
     print(f"Total steps: {num_train_steps}")
     print(f"Batch size: {batch_size}")
-    print(f"Sequence length: {max_length}")
+    print(f"Training seq length: {max_length} tokens")
     print(f"Checkpoint every: {checkpoint_every} steps")
     if start_step > 0:
         print(f"Resuming from step: {start_step}")

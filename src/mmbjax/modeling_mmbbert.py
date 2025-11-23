@@ -35,11 +35,12 @@ class ModernBertEncoder(nn.Module):
             )
             for idx in range(self.config.num_hidden_layers)
         ]
+        # Keep LayerNorm in FP32 for numerical stability in mixed precision
         self.final_layer_norm = nn.LayerNorm(
             epsilon=self.config.norm_eps,
             use_bias=self.config.norm_bias,
             use_scale=True,
-            dtype=self.dtype,
+            dtype=jnp.float32,  # Always FP32 for stability
             param_dtype=self.param_dtype,
         )
         self.has_local_layers = any(

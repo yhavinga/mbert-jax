@@ -228,28 +228,12 @@ cmd_deploy() {
     # Sync files
     log_info "Syncing files to TPU..."
     rsync -avz --progress --delete \
-        --exclude='venv/' \
-        --exclude='.venv/' \
-        --exclude='__pycache__/' \
-        --exclude='*.pyc' \
-        --exclude='.pytest_cache/' \
-        --exclude='.cache/' \
-        --exclude='artifacts/reference-configs/*.npz' \
-        --exclude='*.log' \
-        --exclude='.DS_Store' \
-        --exclude='.git/' \
-        --exclude='*.egg-info/' \
-        --exclude='build/' \
-        --exclude='dist/' \
-        --exclude='*.pth' \
-        --exclude='*.pkl' \
-        --exclude='*.h5' \
-        --exclude='*.safetensors' \
-        --exclude='wandb/' \
-        --exclude='.ipynb_checkpoints/' \
+        --exclude-from='.rsyncignore' \
+        --exclude='experiments/' \
+        --exclude='analysis/' \
+        --exclude='checkpoint*/' \
         --exclude='ssh_config' \
         --exclude='google-cloud-sdk/' \
-        --exclude='*.tar.gz' \
         --rsh="ssh -F ssh_config" \
         . "${TPU_NAME}:${REMOTE_DIR}/"
 

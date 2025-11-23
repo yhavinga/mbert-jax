@@ -19,11 +19,12 @@ class ModernBertLayer(nn.Module):
     param_dtype: jnp.dtype = jnp.float32
 
     def setup(self) -> None:
+        # Keep LayerNorm in FP32 for numerical stability in mixed precision
         self.attention_norm = nn.LayerNorm(
             epsilon=self.config.norm_eps,
             use_bias=self.config.norm_bias,
             use_scale=True,
-            dtype=self.dtype,
+            dtype=jnp.float32,  # Always FP32 for stability
             param_dtype=self.param_dtype,
         )
         self.attention = ModernBertAttention(
@@ -32,11 +33,12 @@ class ModernBertLayer(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
         )
+        # Keep LayerNorm in FP32 for numerical stability in mixed precision
         self.mlp_norm = nn.LayerNorm(
             epsilon=self.config.norm_eps,
             use_bias=self.config.norm_bias,
             use_scale=True,
-            dtype=self.dtype,
+            dtype=jnp.float32,  # Always FP32 for stability
             param_dtype=self.param_dtype,
         )
         self.mlp = ModernBertMLP(

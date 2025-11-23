@@ -46,6 +46,9 @@ htmlcov/
 *.safetensors
 *.ckpt
 checkpoints/
+checkpoint*/
+experiments/
+analysis/
 outputs/
 
 # Large reference files

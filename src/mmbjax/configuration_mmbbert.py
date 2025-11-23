@@ -63,6 +63,10 @@ class MMBertConfig:
     output_hidden_states: bool = False
     use_return_dict: bool = True
 
+    # Mixed precision configuration
+    compute_dtype: str = "float32"  # Dtype for computations: "float32", "bfloat16", "float16"
+    param_dtype: str = "float32"     # Dtype for parameter storage: "float32", "bfloat16", "float16"
+
     # Non-HF helpers
     model_type: str = field(default="modernbert", init=False)
 

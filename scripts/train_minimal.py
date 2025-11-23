@@ -64,10 +64,10 @@ def parse_args():
 
     # Additional training arguments
     parser.add_argument(
-        "--batch-size",
+        "--per-device-batch-size",
         type=int,
         default=None,
-        help="Batch size (default: auto-detect based on backend)"
+        help="Batch size per device (default: 16 for TPU, 8 for GPU/CPU)"
     )
     parser.add_argument(
         "--learning-rate",
@@ -123,6 +123,22 @@ def parse_args():
         "--no-wandb",
         action="store_true",
         help="Disable W&B logging"
+    )
+
+    # Mixed precision arguments
+    parser.add_argument(
+        "--compute-dtype",
+        type=str,
+        choices=["float32", "bfloat16", "float16"],
+        default=None,
+        help="Dtype for computations (default: bfloat16 on TPU, float32 on GPU/CPU)"
+    )
+    parser.add_argument(
+        "--param-dtype",
+        type=str,
+        choices=["float32", "bfloat16", "float16"],
+        default="float32",
+        help="Dtype for parameter storage (default: float32 for stability)"
     )
 
     return parser.parse_args()
@@ -439,7 +455,8 @@ def load_dataset_for_training(dataset_name="yhavinga/mc4_nl_cleaned",
     return dataset
 
 
-def create_checkpoint_manager(checkpoint_dir: str, checkpoint_every: int, max_to_keep: int = 3):
+def create_checkpoint_manager(checkpoint_dir: str, checkpoint_every: int, max_to_keep: int = 3,
+                             wandb_run_id: Optional[str] = None):
     """Create CheckpointManager for async checkpointing on TPU."""
     checkpoint_dir = Path(checkpoint_dir).absolute()
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -452,10 +469,14 @@ def create_checkpoint_manager(checkpoint_dir: str, checkpoint_every: int, max_to
     )
 
     # Create manager with StandardCheckpointer for TrainState
+    metadata = {"model": "ModernBERT", "version": "1.0"}
+    if wandb_run_id:
+        metadata["wandb_run_id"] = wandb_run_id
+
     checkpoint_manager = ocp.CheckpointManager(
         checkpoint_dir,
         options=options,
-        metadata={"model": "ModernBERT", "version": "1.0"},
+        metadata=metadata,
     )
 
     return checkpoint_manager
@@ -474,18 +495,28 @@ def main(args):
     print(f"\nDevice Configuration:")
     print(f"  Backend: {backend}")
     print(f"  Device count: {n_devices}")
+    if backend == 'tpu':
+        print(f"  TPU devices: {devices}")
 
     # Batch size logic
-    if args.batch_size is not None:
-        batch_size = args.batch_size
-        print(f"  Using specified batch size: {batch_size}")
+    if args.per_device_batch_size is not None:
+        per_device_batch_size = args.per_device_batch_size
     elif backend == 'tpu':
-        print(f"  TPU devices: {devices}")
-        batch_size = 16
-        print(f"  ✓ TPU detected! Using optimized batch size: {batch_size}")
+        per_device_batch_size = 16  # Optimized for TPU v4-8
     else:
-        batch_size = 8
-        print(f"  Using CPU/GPU with batch size: {batch_size}")
+        per_device_batch_size = 8   # Conservative default for GPU/CPU
+
+    # Calculate total batch size across all devices
+    total_batch_size = per_device_batch_size * n_devices
+
+    # Display batch size information clearly
+    print(f"\nBatch Size Configuration:")
+    print(f"  Per-device batch size: {per_device_batch_size}")
+    print(f"  Total batch size: {total_batch_size} (= {per_device_batch_size} × {n_devices} devices)")
+
+    # Note: batch_size represents per-device batch size throughout the code
+    # JAX automatically handles data parallelism across devices internally
+    batch_size = per_device_batch_size
 
     # Training hyperparameters from args
     max_length = args.max_length
@@ -497,6 +528,17 @@ def main(args):
     checkpoint_every = args.checkpoint_every
     checkpoint_dir = args.checkpoint_dir
     
+    # Determine dtype based on backend and arguments
+    if args.compute_dtype is not None:
+        compute_dtype_str = args.compute_dtype
+    elif backend == 'tpu':
+        compute_dtype_str = "bfloat16"  # Default to bf16 on TPU for efficiency
+        print(f"\n✓ Using bfloat16 precision on TPU (use --compute-dtype to override)")
+    else:
+        compute_dtype_str = "float32"  # Default to fp32 on GPU/CPU
+
+    param_dtype_str = args.param_dtype
+
     # Model config (small for now)
     # Following ModernBERT's strategy: set max capacity to 8192 from the start
     # but train with shorter sequences initially for efficiency
@@ -507,12 +549,52 @@ def main(args):
         num_attention_heads=12,
         intermediate_size=3072,
         max_position_embeddings=8192,  # Model capacity for long sequences
+        compute_dtype=compute_dtype_str,
+        param_dtype=param_dtype_str,
     )
     print(f"\nModel config:")
     print(f"  Layers: {config.num_hidden_layers}")
     print(f"  Hidden size: {config.hidden_size}")
     print(f"  Attention heads: {config.num_attention_heads}")
     print(f"  Max pos embeddings: {config.max_position_embeddings}")
+    print(f"  Compute dtype: {compute_dtype_str}")
+    print(f"  Param dtype: {param_dtype_str}")
+
+    # Check for existing checkpoints early to determine if we're resuming
+    print("\nChecking for existing checkpoints...")
+    checkpoint_dir_path = Path(checkpoint_dir).absolute()
+    wandb_run_id = None
+    resuming_from_checkpoint = False
+
+    if checkpoint_dir_path.exists():
+        # Create a temporary checkpoint manager to check for checkpoints
+        temp_options = ocp.CheckpointManagerOptions(
+            max_to_keep=3,
+            save_interval_steps=checkpoint_every,
+            enable_async_checkpointing=True,
+        )
+        temp_checkpoint_manager = ocp.CheckpointManager(
+            checkpoint_dir_path,
+            options=temp_options,
+        )
+        latest_step = temp_checkpoint_manager.latest_step()
+
+        if latest_step is not None:
+            resuming_from_checkpoint = True
+            print(f"  Found checkpoint at step {latest_step}")
+
+            # Try to get W&B run ID from metadata
+            try:
+                metadata = temp_checkpoint_manager.metadata()
+                if metadata and "wandb_run_id" in metadata:
+                    wandb_run_id = metadata["wandb_run_id"]
+                    print(f"  Found W&B run ID in checkpoint: {wandb_run_id}")
+            except:
+                print("  No W&B run ID found in checkpoint metadata")
+        else:
+            print("  No checkpoints found in directory")
+    else:
+        print("  Checkpoint directory does not exist yet")
 
     # Initialize W&B
     if not args.no_wandb:
@@ -527,7 +609,8 @@ def main(args):
             "model_vocab_size": config.vocab_size,
 
             # Training config
-            "batch_size": batch_size,
+            "per_device_batch_size": per_device_batch_size,
+            "total_batch_size": total_batch_size,
             "max_length": max_length,
             "num_train_steps": num_train_steps,
             "warmup_steps": warmup_steps,
@@ -546,20 +629,42 @@ def main(args):
             "device_type": str(devices[0].device_kind) if devices else "unknown",
         }
 
-        wandb.init(
-            project=args.wandb_project,
-            name=args.wandb_run_name,
-            config=wandb_config,
-            tags=["modernbert", "mlm", backend, args.dataset_config],
-        )
-        print(f"  ✓ W&B run initialized: {wandb.run.name}")
-        print(f"  ✓ Project: {args.wandb_project}")
+        # Initialize W&B - either resume existing run or create new one
+        if wandb_run_id and resuming_from_checkpoint:
+            # Resume existing W&B run
+            wandb.init(
+                project=args.wandb_project,
+                id=wandb_run_id,
+                resume="must",
+                config=wandb_config,
+            )
+            print(f"  ✓ W&B run resumed: {wandb.run.name} (ID: {wandb_run_id})")
+            print(f"  ✓ Project: {args.wandb_project}")
+        else:
+            # Create new W&B run
+            wandb.init(
+                project=args.wandb_project,
+                name=args.wandb_run_name,
+                config=wandb_config,
+                tags=["modernbert", "mlm", backend, args.dataset_config],
+            )
+            wandb_run_id = wandb.run.id
+            print(f"  ✓ W&B run initialized: {wandb.run.name} (ID: {wandb_run_id})")
+            print(f"  ✓ Project: {args.wandb_project}")
     else:
         print("\n✓ W&B logging disabled (--no-wandb)")
 
-    # Initialize model
+    # Initialize model with dtype configuration
     print("\nInitializing model...")
-    model = ModernBertForMaskedLM(config)
+    # Convert string dtypes to JAX dtypes
+    compute_dtype = getattr(jnp, compute_dtype_str)
+    param_dtype = getattr(jnp, param_dtype_str)
+
+    model = ModernBertForMaskedLM(
+        config,
+        dtype=compute_dtype,
+        param_dtype=param_dtype
+    )
     
     # Init params
     rng = jax.random.PRNGKey(42)
@@ -605,7 +710,7 @@ def main(args):
     tokenizer = AutoTokenizer.from_pretrained("jhu-clsp/mmBERT-small")
     print(f"  Vocab size: {tokenizer.vocab_size}")
     print(f"  Mask token: {tokenizer.mask_token} (ID: {tokenizer.mask_token_id})")
-    
+
     # Create data collator
     collator = FlaxDataCollatorForLanguageModeling(
         tokenizer=tokenizer,
@@ -617,7 +722,7 @@ def main(args):
         dataset_name=args.dataset,
         dataset_config=args.dataset_config
     )
-    
+
     # JIT compile training step
     print("\nCompiling train_step...")
     # JIT compile with static argnums for compute_per_layer
@@ -629,6 +734,7 @@ def main(args):
         checkpoint_dir=checkpoint_dir,
         checkpoint_every=checkpoint_every,
         max_to_keep=3,
+        wandb_run_id=wandb_run_id if not args.no_wandb else None,
     )
     print(f"  Checkpoint directory: {checkpoint_dir}")
     print(f"  Async checkpointing: Enabled")
@@ -641,22 +747,42 @@ def main(args):
     if latest_step is not None:
         # Restore from latest checkpoint
         print(f"\nRestoring checkpoint from step {latest_step}...")
-        restored = checkpoint_manager.restore(
+        # For now, just restore state directly (old format)
+        # This avoids memory leak from trying to restore into pre-populated dict
+        state = checkpoint_manager.restore(
             latest_step,
             args=ocp.args.StandardRestore(state)
         )
-        state = restored
+        print(f"✓ Restored checkpoint from step {latest_step}")
+        # Note: RNG state will be reset for old checkpoints
+        # New checkpoints with RNG state will be supported after all old checkpoints expire
+
         start_step = latest_step
         print(f"✓ Resumed from step {start_step}")
     else:
         print("\n✓ Starting fresh training")
+
+    # Skip already-processed batches when resuming
+    if start_step > 0:
+        examples_to_skip = start_step * batch_size
+        print(f"\nResuming from step {start_step}...")
+        print(f"Skipping {examples_to_skip:,} examples in streaming dataset")
+        print("Note: HuggingFace .skip() must download/process examples sequentially")
+        print("This may take 5-15 minutes depending on network speed...")
+
+        # Use the built-in skip method - it's slow but correct
+        # This modifies the dataset to skip the first N examples
+        dataset = dataset.skip(examples_to_skip)
+
+        print(f"✓ Dataset positioned at step {start_step}")
 
     # Training loop
     print("\n" + "=" * 70)
     print("TRAINING START")
     print("=" * 70)
     print(f"Total steps: {num_train_steps}")
-    print(f"Batch size: {batch_size}")
+    print(f"Per-device batch size: {per_device_batch_size}")
+    print(f"Total batch size: {total_batch_size} (across {n_devices} devices)")
     print(f"Training seq length: {max_length} tokens")
     print(f"Checkpoint every: {checkpoint_every} steps")
     if start_step > 0:
@@ -667,12 +793,14 @@ def main(args):
     batch_buffer = []
     training_start_time = time.time()
 
-    with tqdm(total=num_train_steps - start_step, desc="Training", initial=0) as pbar:
+    with tqdm(total=num_train_steps, desc="Training", initial=start_step) as pbar:
         for example in dataset:
             batch_buffer.append(example)
 
+            # Collect examples until we have enough for one per-device batch
+            # JAX will automatically replicate this batch across all devices
             if len(batch_buffer) >= batch_size:
-                # Create batch
+                # Create batch - this will be replicated to all devices by JAX's pmap
                 batch = collator(batch_buffer, max_length=max_length)
                 batch_buffer = []
 
@@ -742,7 +870,7 @@ def main(args):
                               f"Tok/s: {tokens_per_sec:.0f}")
 
                 # Checkpointing - happens async in background
-                if step > 0 and step % checkpoint_every == 0:
+                if step > start_step and step % checkpoint_every == 0:
                     checkpoint_manager.save(
                         step,
                         args=ocp.args.StandardSave(state)

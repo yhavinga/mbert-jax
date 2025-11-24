@@ -78,14 +78,33 @@ def parse_args():
     parser.add_argument(
         "--warmup-steps",
         type=int,
-        default=50,
-        help="Number of warmup steps (default: 50)"
+        default=10000,
+        help="Number of warmup steps (default: 10000)"
     )
     parser.add_argument(
         "--weight-decay",
         type=float,
         default=0.01,
         help="Weight decay (default: 0.01)"
+    )
+    parser.add_argument(
+        "--lr-schedule",
+        type=str,
+        choices=["inverse_sqrt", "linear", "cosine", "constant"],
+        default="inverse_sqrt",
+        help="Learning rate schedule type (default: inverse_sqrt)"
+    )
+    parser.add_argument(
+        "--layer-norm-lr-factor",
+        type=float,
+        default=0.1,
+        help="Learning rate factor for layer norm parameters (default: 0.1 = 10x smaller)"
+    )
+    parser.add_argument(
+        "--min-lr",
+        type=float,
+        default=1e-7,
+        help="Minimum learning rate (default: 1e-7, prevents decay to zero)"
     )
     parser.add_argument(
         "--checkpoint-every",
@@ -332,60 +351,198 @@ def compute_per_layer_gradient_norms(gradients):
 
 
 def create_train_state(
-    model, 
+    model,
     learning_rate: float,
     num_train_steps: int,
     warmup_steps: int,
     weight_decay: float = 0.01,
+    lr_schedule_type: str = "inverse_sqrt",
+    layer_norm_lr_factor: float = 0.1,
+    min_lr: float = 1e-7,
 ):
-    """Create training state with proper optimizer."""
-    
-    # Learning rate schedule: linear warmup + linear decay
-    warmup_fn = optax.linear_schedule(
-        init_value=0.0,
-        end_value=learning_rate,
-        transition_steps=warmup_steps,
-    )
-    decay_fn = optax.linear_schedule(
-        init_value=learning_rate,
-        end_value=0.0,
-        transition_steps=num_train_steps - warmup_steps,
-    )
-    lr_schedule = optax.join_schedules(
-        schedules=[warmup_fn, decay_fn],
-        boundaries=[warmup_steps],
-    )
+    """Create training state with proper optimizer.
+
+    Args:
+        model: The model to train
+        learning_rate: Peak learning rate
+        num_train_steps: Total number of training steps
+        warmup_steps: Number of warmup steps
+        weight_decay: Weight decay coefficient
+        lr_schedule_type: Type of LR schedule ("inverse_sqrt", "linear", "cosine", "constant")
+        layer_norm_lr_factor: LR multiplier for layer norm parameters (e.g., 0.1 for 10x smaller)
+        min_lr: Minimum learning rate (prevents decay to zero)
+    """
+
+    # Create the selected learning rate schedule
+    if lr_schedule_type == "inverse_sqrt":
+        # Classic Transformer schedule: warmup then inverse sqrt decay
+        def inverse_sqrt_schedule(step):
+            # Handle step 0 with JAX control flow (not Python if)
+            step = jnp.maximum(step, 1)  # Avoid divide by zero
+
+            warmup_factor = jnp.minimum(step / warmup_steps, 1.0)
+            decay_factor = jnp.where(
+                step < warmup_steps,
+                1.0,
+                jnp.sqrt(warmup_steps / step)
+            )
+            lr = learning_rate * warmup_factor * decay_factor
+
+            # Special case: step 0 should have LR = 0
+            lr = jnp.where(step == 1, 0.0, lr)
+
+            return jnp.maximum(lr, min_lr)
+        lr_schedule = inverse_sqrt_schedule
+
+    elif lr_schedule_type == "linear":
+        # Original linear warmup + linear decay (but with min_lr)
+        warmup_fn = optax.linear_schedule(
+            init_value=0.0,
+            end_value=learning_rate,
+            transition_steps=warmup_steps,
+        )
+        decay_fn = optax.linear_schedule(
+            init_value=learning_rate,
+            end_value=min_lr,  # Changed from 0.0 to min_lr
+            transition_steps=num_train_steps - warmup_steps,
+        )
+        lr_schedule = optax.join_schedules(
+            schedules=[warmup_fn, decay_fn],
+            boundaries=[warmup_steps],
+        )
+
+    elif lr_schedule_type == "cosine":
+        # Cosine annealing with warmup
+        lr_schedule = optax.warmup_cosine_decay_schedule(
+            init_value=0.0,
+            peak_value=learning_rate,
+            warmup_steps=warmup_steps,
+            decay_steps=num_train_steps,
+            end_value=min_lr,
+        )
+
+    elif lr_schedule_type == "constant":
+        # Constant LR after warmup (useful for debugging)
+        warmup_fn = optax.linear_schedule(
+            init_value=0.0,
+            end_value=learning_rate,
+            transition_steps=warmup_steps,
+        )
+        constant_fn = optax.constant_schedule(learning_rate)
+        lr_schedule = optax.join_schedules(
+            schedules=[warmup_fn, constant_fn],
+            boundaries=[warmup_steps],
+        )
+    else:
+        raise ValueError(f"Unknown lr_schedule_type: {lr_schedule_type}")
     
     # Weight decay mask: exclude bias and LayerNorm from decay
     def decay_mask_fn(params):
+        """Create mask for weight decay: True = apply decay, False = no decay.
+
+        Following standard practice, we exclude:
+        1. All bias parameters
+        2. All LayerNorm/normalization parameters
+        """
         flat_params = traverse_util.flatten_dict(params)
-        
-        # Find LayerNorm parameters
-        layer_norm_candidates = ["layer_norm", "layernorm", "ln"]
-        layer_norm_params = set()
-        for layer_norm_name in layer_norm_candidates:
-            for layer in flat_params.keys():
-                if layer_norm_name in "".join(layer).lower():
-                    layer_norm_params.add(layer[-2:])
-        
-        # Mask: decay everything EXCEPT bias and LayerNorm params
-        flat_mask = {
-            path: (path[-1] != "bias" and path[-2:] not in layer_norm_params)
-            for path in flat_params
-        }
+
+        # Create mask
+        flat_mask = {}
+        for path in flat_params:
+            path_str = "/".join(str(p) for p in path).lower()
+
+            # Check if this parameter should be excluded from weight decay
+            no_decay = (
+                # Bias terms
+                path[-1] == "bias" or
+                # LayerNorm parameters (various naming conventions)
+                "layer_norm" in path_str or
+                "layernorm" in path_str or
+                ".ln." in path_str or
+                "_ln." in path_str or
+                # Normalization layers
+                "_norm/" in path_str or  # Added: catches mlp_norm/scale
+                "_norm." in path_str or
+                "norm/scale" in path_str or  # Added: catches any norm/scale
+                "norm/bias" in path_str or   # Added: catches any norm/bias
+                "norm.scale" in path_str or
+                "norm.bias" in path_str or
+                # Common variants
+                "norm_" in path_str or
+                ".norm_" in path_str or
+                ".norm/" in path_str or  # Added: another variant
+                # Final layer norm
+                "final_layer_norm" in path_str or
+                "final_norm" in path_str
+            )
+
+            # True = apply weight decay, False = no weight decay
+            flat_mask[path] = not no_decay
+
         return traverse_util.unflatten_dict(flat_mask)
     
-    # Optimizer: gradient clipping + AdamW with masked weight decay
-    optimizer = optax.chain(
-        optax.clip_by_global_norm(1.0),  # Gradient clipping
-        optax.adamw(
+    # Create optimizer with optional separate learning rate for layer norms
+    if layer_norm_lr_factor != 1.0:
+        # Create schedule for layer norm parameters (scaled by factor)
+        if callable(lr_schedule):
+            # For custom schedules (like inverse_sqrt), wrap them
+            ln_lr_schedule = lambda step: lr_schedule(step) * layer_norm_lr_factor
+        else:
+            # For optax schedules, we need to scale them differently
+            # This is a bit hacky but works for optax schedules
+            ln_lr_schedule = optax.scale_by_schedule(
+                lambda step: layer_norm_lr_factor
+            )
+
+        # Create label function to identify layer norm parameters
+        def label_fn(path):
+            """Label parameters as 'layer_norm' or 'other'."""
+            path_str = "/".join(path)
+            # Check if this is a layer norm parameter
+            if any(ln in path_str.lower() for ln in ["layer_norm", "layernorm", "ln", "norm.scale", "norm.bias"]):
+                return "layer_norm"
+            return "other"
+
+        # Create the multi-transform optimizer
+        # First, we need the two different AdamW optimizers
+        main_adamw = optax.adamw(
             learning_rate=lr_schedule,
             weight_decay=weight_decay,
             mask=decay_mask_fn,
-        ),
-    )
-    
-    return optimizer, lr_schedule
+        )
+
+        ln_adamw = optax.adamw(
+            learning_rate=ln_lr_schedule,
+            weight_decay=0.0,  # Usually no weight decay for layer norms
+            mask=None,  # Layer norms are already excluded from weight decay
+        )
+
+        # Use multi_transform to apply different optimizers based on parameter path
+        multi_optimizer = optax.multi_transform(
+            transforms={"layer_norm": ln_adamw, "other": main_adamw},
+            param_labels=label_fn,
+        )
+
+        # Combine with gradient clipping
+        optimizer = optax.chain(
+            optax.clip_by_global_norm(1.0),  # Gradient clipping
+            multi_optimizer,
+        )
+
+        # For logging purposes, return both schedules
+        return optimizer, (lr_schedule, ln_lr_schedule)
+    else:
+        # Standard optimizer without special layer norm treatment
+        optimizer = optax.chain(
+            optax.clip_by_global_norm(1.0),  # Gradient clipping
+            optax.adamw(
+                learning_rate=lr_schedule,
+                weight_decay=weight_decay,
+                mask=decay_mask_fn,
+            ),
+        )
+
+        return optimizer, (lr_schedule, None)
 
 
 def train_step(state, batch, dropout_rng, learning_rate, compute_per_layer=False):
@@ -524,6 +681,9 @@ def main(args):
     warmup_steps = args.warmup_steps
     learning_rate = args.learning_rate
     weight_decay = args.weight_decay
+    lr_schedule_type = args.lr_schedule
+    layer_norm_lr_factor = args.layer_norm_lr_factor
+    min_lr = args.min_lr
     log_every = args.log_every
     checkpoint_every = args.checkpoint_every
     checkpoint_dir = args.checkpoint_dir
@@ -615,6 +775,9 @@ def main(args):
             "num_train_steps": num_train_steps,
             "warmup_steps": warmup_steps,
             "learning_rate": learning_rate,
+            "lr_schedule": lr_schedule_type,
+            "layer_norm_lr_factor": layer_norm_lr_factor,
+            "min_lr": min_lr,
             "weight_decay": weight_decay,
             "mlm_probability": 0.15,
             "gradient_clipping": 1.0,
@@ -688,22 +851,84 @@ def main(args):
     # Create optimizer and training state
     print("\nCreating optimizer...")
     print(f"  Learning rate: {learning_rate}")
+    print(f"  LR schedule: {lr_schedule_type}")
     print(f"  Warmup steps: {warmup_steps}")
+    print(f"  Min LR: {min_lr}")
     print(f"  Weight decay: {weight_decay}")
-    
-    optimizer, lr_schedule = create_train_state(
+    if layer_norm_lr_factor != 1.0:
+        print(f"  Layer norm LR factor: {layer_norm_lr_factor} (LR = {learning_rate * layer_norm_lr_factor})")
+
+    optimizer, lr_schedules = create_train_state(
         model,
         learning_rate=learning_rate,
         num_train_steps=num_train_steps,
         warmup_steps=warmup_steps,
         weight_decay=weight_decay,
+        lr_schedule_type=lr_schedule_type,
+        layer_norm_lr_factor=layer_norm_lr_factor,
+        min_lr=min_lr,
     )
+
+    # Unpack schedules
+    if isinstance(lr_schedules, tuple):
+        lr_schedule, ln_lr_schedule = lr_schedules
+    else:
+        lr_schedule, ln_lr_schedule = lr_schedules, None
     
     state = train_state.TrainState.create(
         apply_fn=model.apply,
         params=params,
         tx=optimizer,
     )
+
+    # Log weight decay assignment for verification (only when using same LR for all)
+    if layer_norm_lr_factor == 1.0:
+        print("\nWeight Decay Assignment:")
+        # Re-create the decay mask function to check assignments
+        flat_params_check = traverse_util.flatten_dict(params)
+        decay_info = []
+
+        for path in flat_params_check.keys():
+            path_str = "/".join(str(p) for p in path).lower()
+
+            # Same logic as in decay_mask_fn
+            no_decay = (
+                path[-1] == "bias" or
+                "layer_norm" in path_str or
+                "layernorm" in path_str or
+                ".ln." in path_str or
+                "_ln." in path_str or
+                "_norm/" in path_str or
+                "_norm." in path_str or
+                "norm/scale" in path_str or
+                "norm/bias" in path_str or
+                "norm.scale" in path_str or
+                "norm.bias" in path_str or
+                "norm_" in path_str or
+                ".norm_" in path_str or
+                ".norm/" in path_str or
+                "final_layer_norm" in path_str or
+                "final_norm" in path_str
+            )
+
+            decay_info.append((path, not no_decay))
+
+        with_decay = sum(1 for _, has_decay in decay_info if has_decay)
+        without_decay = sum(1 for _, has_decay in decay_info if not has_decay)
+
+        print(f"  Parameters WITH weight decay: {with_decay}")
+        print(f"  Parameters WITHOUT weight decay: {without_decay}")
+
+        # Show examples
+        print("\n  Examples excluded from weight decay:")
+        shown = 0
+        for path, has_decay in decay_info:
+            if not has_decay and shown < 5:
+                print(f"    - {'/'.join(str(p) for p in path)}")
+                shown += 1
+    else:
+        print(f"\nUsing separate layer norm LR (factor={layer_norm_lr_factor}):")
+        print("  Layer norms automatically have weight_decay=0")
     
     # Load tokenizer
     print("\nLoading tokenizer...")
@@ -807,6 +1032,7 @@ def main(args):
                 # Training step - use per-layer metrics every 100 steps
                 compute_per_layer = (step % 100 == 0)
                 current_lr = float(lr_schedule(step))
+                # Note: We pass the main LR to train_step, layer norm LR is handled internally by optimizer
                 state, metrics, dropout_rng = train_step_jit(state, batch, dropout_rng, current_lr, compute_per_layer)
 
                 # Logging
@@ -820,6 +1046,8 @@ def main(args):
                     update_ratio_value = float(metrics["update_ratio"])
 
                     lr_value = current_lr  # Already computed above
+                    # Compute layer norm LR if different
+                    ln_lr_value = float(ln_lr_schedule(step)) if ln_lr_schedule else lr_value
                     n_masked = int(jnp.sum(batch["labels"] != -100))
 
                     # Calculate throughput
@@ -855,6 +1083,10 @@ def main(args):
                             "performance/steps_per_sec": steps_per_sec,
                             "step": step,
                         }
+
+                        # Add layer norm LR if different
+                        if ln_lr_schedule:
+                            wandb_log["train/layer_norm_lr"] = ln_lr_value
 
                         # Add per-layer gradient norms if available
                         if "layer_grad_norms" in metrics:

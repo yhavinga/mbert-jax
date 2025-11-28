@@ -160,6 +160,20 @@ def parse_args():
         help="Dtype for parameter storage (default: float32 for stability)"
     )
 
+    # Tokenizer arguments
+    parser.add_argument(
+        "--tokenizer",
+        type=str,
+        default="jhu-clsp/mmBERT-small",
+        help="HuggingFace tokenizer name (default: jhu-clsp/mmBERT-small)"
+    )
+    parser.add_argument(
+        "--vocab-size",
+        type=int,
+        default=None,
+        help="Override vocab size (default: auto-detect from tokenizer, rounded to multiple of 128 for TPU)"
+    )
+
     return parser.parse_args()
 
 
@@ -699,11 +713,37 @@ def main(args):
 
     param_dtype_str = args.param_dtype
 
+    # Load tokenizer BEFORE model config (to determine vocab_size)
+    print("\nLoading tokenizer...")
+    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
+
+    # Ensure mask token exists (required for MLM)
+    if tokenizer.mask_token is None:
+        tokenizer.add_special_tokens({'mask_token': '<mask>'})
+        print(f"  Added <mask> token (ID: {tokenizer.mask_token_id})")
+
+    # Determine vocab size
+    tokenizer_vocab_size = len(tokenizer)  # Includes added special tokens
+
+    if args.vocab_size is not None:
+        # User override
+        if args.vocab_size < tokenizer_vocab_size:
+            raise ValueError(f"--vocab-size ({args.vocab_size}) must be >= tokenizer size ({tokenizer_vocab_size})")
+        vocab_size = args.vocab_size
+    else:
+        # Auto-round to multiple of 128 for TPU efficiency
+        vocab_size = ((tokenizer_vocab_size + 127) // 128) * 128
+
+    print(f"  Tokenizer: {args.tokenizer}")
+    print(f"  Tokenizer vocab: {tokenizer_vocab_size}")
+    print(f"  Model vocab_size: {vocab_size} (padded for TPU)")
+    print(f"  Mask token: {tokenizer.mask_token} (ID: {tokenizer.mask_token_id})")
+
     # Model config (small for now)
     # Following ModernBERT's strategy: set max capacity to 8192 from the start
     # but train with shorter sequences initially for efficiency
     config = MMBertConfig(
-        vocab_size=256000,
+        vocab_size=vocab_size,  # Auto-detected from tokenizer
         hidden_size=768,
         num_hidden_layers=6,  # Medium size for testing
         num_attention_heads=12,
@@ -713,6 +753,7 @@ def main(args):
         param_dtype=param_dtype_str,
     )
     print(f"\nModel config:")
+    print(f"  Vocab size: {config.vocab_size}")
     print(f"  Layers: {config.num_hidden_layers}")
     print(f"  Hidden size: {config.hidden_size}")
     print(f"  Attention heads: {config.num_attention_heads}")
@@ -929,12 +970,6 @@ def main(args):
     else:
         print(f"\nUsing separate layer norm LR (factor={layer_norm_lr_factor}):")
         print("  Layer norms automatically have weight_decay=0")
-    
-    # Load tokenizer
-    print("\nLoading tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained("jhu-clsp/mmBERT-small")
-    print(f"  Vocab size: {tokenizer.vocab_size}")
-    print(f"  Mask token: {tokenizer.mask_token} (ID: {tokenizer.mask_token_id})")
 
     # Create data collator
     collator = FlaxDataCollatorForLanguageModeling(

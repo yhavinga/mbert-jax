@@ -174,6 +174,38 @@ def parse_args():
         help="Override vocab size (default: auto-detect from tokenizer, rounded to multiple of 128 for TPU)"
     )
 
+    # Model architecture arguments
+    parser.add_argument(
+        "--hidden-size",
+        type=int,
+        default=768,
+        help="Hidden size / embedding dimension (default: 768)"
+    )
+    parser.add_argument(
+        "--num-layers",
+        type=int,
+        default=22,
+        help="Number of transformer layers (default: 22)"
+    )
+    parser.add_argument(
+        "--num-heads",
+        type=int,
+        default=12,
+        help="Number of attention heads (default: 12)"
+    )
+    parser.add_argument(
+        "--intermediate-size",
+        type=int,
+        default=3072,
+        help="MLP intermediate size (default: 3072)"
+    )
+    parser.add_argument(
+        "--global-attn-every-n-layers",
+        type=int,
+        default=3,
+        help="Global attention frequency (default: 3, meaning layers 0,3,6,... use global attention)"
+    )
+
     return parser.parse_args()
 
 
@@ -739,15 +771,16 @@ def main(args):
     print(f"  Model vocab_size: {vocab_size} (padded for TPU)")
     print(f"  Mask token: {tokenizer.mask_token} (ID: {tokenizer.mask_token_id})")
 
-    # Model config (small for now)
+    # Model config from CLI arguments
     # Following ModernBERT's strategy: set max capacity to 8192 from the start
     # but train with shorter sequences initially for efficiency
     config = MMBertConfig(
         vocab_size=vocab_size,  # Auto-detected from tokenizer
-        hidden_size=768,
-        num_hidden_layers=6,  # Medium size for testing
-        num_attention_heads=12,
-        intermediate_size=3072,
+        hidden_size=args.hidden_size,
+        num_hidden_layers=args.num_layers,
+        num_attention_heads=args.num_heads,
+        intermediate_size=args.intermediate_size,
+        global_attn_every_n_layers=args.global_attn_every_n_layers,
         max_position_embeddings=8192,  # Model capacity for long sequences
         compute_dtype=compute_dtype_str,
         param_dtype=param_dtype_str,
@@ -757,6 +790,8 @@ def main(args):
     print(f"  Layers: {config.num_hidden_layers}")
     print(f"  Hidden size: {config.hidden_size}")
     print(f"  Attention heads: {config.num_attention_heads}")
+    print(f"  Intermediate size: {config.intermediate_size}")
+    print(f"  Global attn every N layers: {config.global_attn_every_n_layers}")
     print(f"  Max pos embeddings: {config.max_position_embeddings}")
     print(f"  Compute dtype: {compute_dtype_str}")
     print(f"  Param dtype: {param_dtype_str}")
@@ -806,6 +841,7 @@ def main(args):
             "model_hidden_size": config.hidden_size,
             "model_attention_heads": config.num_attention_heads,
             "model_intermediate_size": config.intermediate_size,
+            "model_global_attn_every_n_layers": config.global_attn_every_n_layers,
             "model_max_position_embeddings": config.max_position_embeddings,
             "model_vocab_size": config.vocab_size,
 

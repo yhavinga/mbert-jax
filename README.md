@@ -142,6 +142,8 @@ python scripts/train_minimal.py \
 
 Features: gradient clipping, linear warmup/decay, comprehensive metrics (perplexity, gradient norms, update ratio), async checkpointing for spot instances.
 
+Model architecture is configurable via `--hidden-size`, `--num-layers`, `--num-heads`, `--intermediate-size`. Run with `--help` for all options.
+
 ## License
 
 Code follows ModernBERT's Apache 2.0 license. This is a clean-room port (no copied PyTorch code except for reference comparison).

@@ -14,6 +14,8 @@ import json
 import time
 from datetime import datetime
 import jax
+# Initialize distributed system for multi-host TPU (must be before other JAX calls)
+jax.distributed.initialize()
 import jax.numpy as jnp
 import numpy as np
 import optax
@@ -28,6 +30,46 @@ import wandb
 
 from mmbjax.configuration_mmbbert import MMBertConfig
 from mmbjax.heads.masked_lm import ModernBertForMaskedLM
+
+
+def is_coordinator():
+    """Returns True if this is process 0 (coordinator).
+
+    In multi-host TPU training, only the coordinator should:
+    - Initialize W&B
+    - Log to W&B
+    - Print progress updates
+    - Show tqdm progress bars
+
+    All processes should:
+    - Run training steps (JAX SPMD)
+    - Call checkpoint save (Orbax coordinates internally)
+    """
+    return jax.process_index() == 0
+
+
+def prepare_state_for_checkpoint(state):
+    """Prepare TrainState for multi-host checkpointing.
+
+    In multi-host JAX, arrays from jit are host-local. For Orbax to serialize
+    them properly, we convert all arrays to NumPy arrays first.
+
+    This works because our arrays are replicated (same values on all devices),
+    so any host can provide the values. See: https://github.com/google/orbax/issues/844
+    """
+    if jax.process_count() == 1:
+        return state  # Single-host doesn't need this
+
+    # Convert all JAX arrays to NumPy arrays for checkpointing
+    # This avoids the host-local array serialization issues
+    def to_numpy(x):
+        if isinstance(x, jax.Array):
+            return np.array(x)
+        return x
+
+    # Apply to all leaves in the state pytree
+    numpy_state = jax.tree_util.tree_map(to_numpy, state)
+    return numpy_state
 
 
 def parse_args():
@@ -641,10 +683,13 @@ def train_step(state, batch, dropout_rng, learning_rate, compute_per_layer=False
 def load_dataset_for_training(dataset_name="yhavinga/mc4_nl_cleaned",
                               dataset_config="micro",
                               split="train"):
-    """Load dataset for training."""
-    print(f"Loading dataset: {dataset_name} ({dataset_config})...")
+    """Load dataset for training with multi-host sharding support."""
+    from datasets.distributed import split_dataset_by_node
 
-    # Load streaming dataset
+    if is_coordinator():
+        print(f"Loading dataset: {dataset_name} ({dataset_config})...")
+
+    # Load streaming dataset (mc4_nl_cleaned is pre-shuffled)
     dataset = load_dataset(
         dataset_name,
         dataset_config,
@@ -652,26 +697,65 @@ def load_dataset_for_training(dataset_name="yhavinga/mc4_nl_cleaned",
         streaming=True,
     )
 
-    # Shuffle dataset for better training
-    dataset = dataset.shuffle(seed=42, buffer_size=1000)
+    # Shard across processes for multi-host training
+    process_count = jax.process_count()
+    if process_count > 1:
+        dataset = split_dataset_by_node(
+            dataset,
+            rank=jax.process_index(),
+            world_size=process_count
+        )
+        if is_coordinator():
+            print(f"  Dataset sharded across {process_count} processes")
 
     return dataset
 
 
 def create_checkpoint_manager(checkpoint_dir: str, checkpoint_every: int, max_to_keep: int = 3,
                              wandb_run_id: Optional[str] = None):
-    """Create CheckpointManager for async checkpointing on TPU."""
-    checkpoint_dir = Path(checkpoint_dir).absolute()
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    """Create CheckpointManager for checkpointing.
 
-    # Configure async checkpointing
+    IMPORTANT: For multi-host TPU training, checkpoint_dir MUST be a GCS path (gs://...).
+    Local paths don't work because Orbax requires shared storage that all processes can access.
+    See: https://github.com/google/orbax/issues/999
+
+    All processes must call this function and participate in checkpointing - Orbax
+    coordinates internally.
+    """
+    is_gcs = str(checkpoint_dir).startswith('gs://')
+    is_multi_host = jax.process_count() > 1
+
+    # For multi-host, local storage doesn't work - Orbax requires shared storage
+    # Return None for ALL processes to disable checkpointing
+    if is_multi_host and not is_gcs:
+        if is_coordinator():
+            print("\n" + "=" * 70)
+            print("WARNING: Multi-host training requires GCS for checkpointing!")
+            print("=" * 70)
+            print(f"  Current path: {checkpoint_dir}")
+            print("  Local paths don't work because each TPU host has separate storage.")
+            print("  Checkpointing will be DISABLED for this run.")
+            print("  To enable checkpointing, use: --checkpoint-dir gs://your-bucket/path")
+            print("=" * 70 + "\n")
+        return None
+
+    # Set up checkpoint directory (only for single-host local paths)
+    if not is_gcs:
+        checkpoint_dir_path = Path(checkpoint_dir).absolute()
+        checkpoint_dir_path.mkdir(parents=True, exist_ok=True)
+        checkpoint_dir = checkpoint_dir_path
+
+    # Use async checkpointing for GCS (recommended for multi-host)
+    use_async = is_gcs
+
     options = ocp.CheckpointManagerOptions(
         max_to_keep=max_to_keep,
         save_interval_steps=checkpoint_every,
-        enable_async_checkpointing=True,  # Enables background saves
+        enable_async_checkpointing=use_async,
+        create=True,  # Auto-create checkpoint directory if it doesn't exist
     )
 
-    # Create manager with StandardCheckpointer for TrainState
+    # Create manager - all processes must create this for Orbax coordination
     metadata = {"model": "ModernBERT", "version": "1.0"}
     if wandb_run_id:
         metadata["wandb_run_id"] = wandb_run_id
@@ -686,20 +770,24 @@ def create_checkpoint_manager(checkpoint_dir: str, checkpoint_every: int, max_to
 
 
 def main(args):
-    print("=" * 70)
-    print("MODERNBERT TRAINING - Production Run with TPU")
-    print("=" * 70)
-
     # Detect TPU and adjust configuration
     backend = jax.default_backend()
     devices = jax.devices()
     n_devices = len(devices)
+    process_count = jax.process_count()
+    process_idx = jax.process_index()
 
-    print(f"\nDevice Configuration:")
-    print(f"  Backend: {backend}")
-    print(f"  Device count: {n_devices}")
-    if backend == 'tpu':
-        print(f"  TPU devices: {devices}")
+    if is_coordinator():
+        print("=" * 70)
+        print("MODERNBERT TRAINING - Production Run with TPU")
+        print("=" * 70)
+        print(f"\nDevice Configuration:")
+        print(f"  Backend: {backend}")
+        print(f"  Device count: {n_devices}")
+        if process_count > 1:
+            print(f"  Multi-host: {process_count} processes (this is process {process_idx})")
+        if backend == 'tpu':
+            print(f"  TPU devices: {devices}")
 
     # Batch size logic
     if args.per_device_batch_size is not None:
@@ -713,9 +801,10 @@ def main(args):
     total_batch_size = per_device_batch_size * n_devices
 
     # Display batch size information clearly
-    print(f"\nBatch Size Configuration:")
-    print(f"  Per-device batch size: {per_device_batch_size}")
-    print(f"  Total batch size: {total_batch_size} (= {per_device_batch_size} × {n_devices} devices)")
+    if is_coordinator():
+        print(f"\nBatch Size Configuration:")
+        print(f"  Per-device batch size: {per_device_batch_size}")
+        print(f"  Total batch size: {total_batch_size} (= {per_device_batch_size} × {n_devices} devices)")
 
     # Note: batch_size represents per-device batch size throughout the code
     # JAX automatically handles data parallelism across devices internally
@@ -739,20 +828,23 @@ def main(args):
         compute_dtype_str = args.compute_dtype
     elif backend == 'tpu':
         compute_dtype_str = "bfloat16"  # Default to bf16 on TPU for efficiency
-        print(f"\n✓ Using bfloat16 precision on TPU (use --compute-dtype to override)")
+        if is_coordinator():
+            print(f"\n✓ Using bfloat16 precision on TPU (use --compute-dtype to override)")
     else:
         compute_dtype_str = "float32"  # Default to fp32 on GPU/CPU
 
     param_dtype_str = args.param_dtype
 
     # Load tokenizer BEFORE model config (to determine vocab_size)
-    print("\nLoading tokenizer...")
+    if is_coordinator():
+        print("\nLoading tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
 
     # Ensure mask token exists (required for MLM)
     if tokenizer.mask_token is None:
         tokenizer.add_special_tokens({'mask_token': '<mask>'})
-        print(f"  Added <mask> token (ID: {tokenizer.mask_token_id})")
+        if is_coordinator():
+            print(f"  Added <mask> token (ID: {tokenizer.mask_token_id})")
 
     # Determine vocab size
     tokenizer_vocab_size = len(tokenizer)  # Includes added special tokens
@@ -766,10 +858,11 @@ def main(args):
         # Auto-round to multiple of 128 for TPU efficiency
         vocab_size = ((tokenizer_vocab_size + 127) // 128) * 128
 
-    print(f"  Tokenizer: {args.tokenizer}")
-    print(f"  Tokenizer vocab: {tokenizer_vocab_size}")
-    print(f"  Model vocab_size: {vocab_size} (padded for TPU)")
-    print(f"  Mask token: {tokenizer.mask_token} (ID: {tokenizer.mask_token_id})")
+    if is_coordinator():
+        print(f"  Tokenizer: {args.tokenizer}")
+        print(f"  Tokenizer vocab: {tokenizer_vocab_size}")
+        print(f"  Model vocab_size: {vocab_size} (padded for TPU)")
+        print(f"  Mask token: {tokenizer.mask_token} (ID: {tokenizer.mask_token_id})")
 
     # Model config from CLI arguments
     # Following ModernBERT's strategy: set max capacity to 8192 from the start
@@ -782,58 +875,52 @@ def main(args):
         intermediate_size=args.intermediate_size,
         global_attn_every_n_layers=args.global_attn_every_n_layers,
         max_position_embeddings=8192,  # Model capacity for long sequences
+        pad_token_id=tokenizer.pad_token_id,
+        bos_token_id=tokenizer.bos_token_id,
+        eos_token_id=tokenizer.eos_token_id,
         compute_dtype=compute_dtype_str,
         param_dtype=param_dtype_str,
     )
-    print(f"\nModel config:")
-    print(f"  Vocab size: {config.vocab_size}")
-    print(f"  Layers: {config.num_hidden_layers}")
-    print(f"  Hidden size: {config.hidden_size}")
-    print(f"  Attention heads: {config.num_attention_heads}")
-    print(f"  Intermediate size: {config.intermediate_size}")
-    print(f"  Global attn every N layers: {config.global_attn_every_n_layers}")
-    print(f"  Max pos embeddings: {config.max_position_embeddings}")
-    print(f"  Compute dtype: {compute_dtype_str}")
-    print(f"  Param dtype: {param_dtype_str}")
+    if is_coordinator():
+        print(f"\nModel config:")
+        print(f"  Vocab size: {config.vocab_size}")
+        print(f"  Layers: {config.num_hidden_layers}")
+        print(f"  Hidden size: {config.hidden_size}")
+        print(f"  Attention heads: {config.num_attention_heads}")
+        print(f"  Intermediate size: {config.intermediate_size}")
+        print(f"  Global attn every N layers: {config.global_attn_every_n_layers}")
+        print(f"  Max pos embeddings: {config.max_position_embeddings}")
+        print(f"  Compute dtype: {compute_dtype_str}")
+        print(f"  Param dtype: {param_dtype_str}")
 
     # Check for existing checkpoints early to determine if we're resuming
-    print("\nChecking for existing checkpoints...")
-    checkpoint_dir_path = Path(checkpoint_dir).absolute()
+    # Only coordinator checks - W&B run ID recovery happens after checkpoint_manager is created
     wandb_run_id = None
     resuming_from_checkpoint = False
 
-    if checkpoint_dir_path.exists():
-        # Create a temporary checkpoint manager to check for checkpoints
-        temp_options = ocp.CheckpointManagerOptions(
-            max_to_keep=3,
-            save_interval_steps=checkpoint_every,
-            enable_async_checkpointing=True,
-        )
-        temp_checkpoint_manager = ocp.CheckpointManager(
-            checkpoint_dir_path,
-            options=temp_options,
-        )
-        latest_step = temp_checkpoint_manager.latest_step()
-
-        if latest_step is not None:
-            resuming_from_checkpoint = True
-            print(f"  Found checkpoint at step {latest_step}")
-
-            # Try to get W&B run ID from metadata
-            try:
-                metadata = temp_checkpoint_manager.metadata()
-                if metadata and "wandb_run_id" in metadata:
-                    wandb_run_id = metadata["wandb_run_id"]
-                    print(f"  Found W&B run ID in checkpoint: {wandb_run_id}")
-            except:
-                print("  No W&B run ID found in checkpoint metadata")
+    if is_coordinator():
+        print("\nChecking for existing checkpoints...")
+        is_gcs = str(checkpoint_dir).startswith('gs://')
+        if not is_gcs:
+            checkpoint_dir_path = Path(checkpoint_dir).absolute()
+            if checkpoint_dir_path.exists():
+                # Check for Orbax checkpoint subdirectories (they're named by step number)
+                checkpoint_subdirs = [d for d in checkpoint_dir_path.iterdir()
+                                      if d.is_dir() and d.name.isdigit()]
+                if checkpoint_subdirs:
+                    latest_step = max(int(d.name) for d in checkpoint_subdirs)
+                    resuming_from_checkpoint = True
+                    print(f"  Found checkpoint at step {latest_step}")
+                else:
+                    print("  No checkpoints found in directory")
+            else:
+                print("  Checkpoint directory does not exist yet")
         else:
-            print("  No checkpoints found in directory")
-    else:
-        print("  Checkpoint directory does not exist yet")
+            # For GCS, we'll check via checkpoint_manager later
+            print("  Will check GCS for existing checkpoints...")
 
-    # Initialize W&B
-    if not args.no_wandb:
+    # Initialize W&B (only on coordinator)
+    if not args.no_wandb and is_coordinator():
         print("\nInitializing W&B...")
         wandb_config = {
             # Model config
@@ -866,6 +953,7 @@ def main(args):
             # Infrastructure
             "backend": backend,
             "n_devices": n_devices,
+            "process_count": process_count,
             "device_type": str(devices[0].device_kind) if devices else "unknown",
         }
 
@@ -891,11 +979,12 @@ def main(args):
             wandb_run_id = wandb.run.id
             print(f"  ✓ W&B run initialized: {wandb.run.name} (ID: {wandb_run_id})")
             print(f"  ✓ Project: {args.wandb_project}")
-    else:
+    elif is_coordinator():
         print("\n✓ W&B logging disabled (--no-wandb)")
 
     # Initialize model with dtype configuration
-    print("\nInitializing model...")
+    if is_coordinator():
+        print("\nInitializing model...")
     # Convert string dtypes to JAX dtypes
     compute_dtype = getattr(jnp, compute_dtype_str)
     param_dtype = getattr(jnp, param_dtype_str)
@@ -923,17 +1012,19 @@ def main(args):
     
     # Count params
     param_count = sum(x.size for x in jax.tree.leaves(params))
-    print(f"  Parameters: {param_count:,} ({param_count/1e6:.1f}M)")
-    
+    if is_coordinator():
+        print(f"  Parameters: {param_count:,} ({param_count/1e6:.1f}M)")
+
     # Create optimizer and training state
-    print("\nCreating optimizer...")
-    print(f"  Learning rate: {learning_rate}")
-    print(f"  LR schedule: {lr_schedule_type}")
-    print(f"  Warmup steps: {warmup_steps}")
-    print(f"  Min LR: {min_lr}")
-    print(f"  Weight decay: {weight_decay}")
-    if layer_norm_lr_factor != 1.0:
-        print(f"  Layer norm LR factor: {layer_norm_lr_factor} (LR = {learning_rate * layer_norm_lr_factor})")
+    if is_coordinator():
+        print("\nCreating optimizer...")
+        print(f"  Learning rate: {learning_rate}")
+        print(f"  LR schedule: {lr_schedule_type}")
+        print(f"  Warmup steps: {warmup_steps}")
+        print(f"  Min LR: {min_lr}")
+        print(f"  Weight decay: {weight_decay}")
+        if layer_norm_lr_factor != 1.0:
+            print(f"  Layer norm LR factor: {layer_norm_lr_factor} (LR = {learning_rate * layer_norm_lr_factor})")
 
     optimizer, lr_schedules = create_train_state(
         model,
@@ -958,54 +1049,58 @@ def main(args):
         tx=optimizer,
     )
 
+    # Note: step counter sharding is handled automatically by Orbax during checkpoint restore
+    # No special handling needed here - TrainState.step is a Python int which works fine
+
     # Log weight decay assignment for verification (only when using same LR for all)
-    if layer_norm_lr_factor == 1.0:
-        print("\nWeight Decay Assignment:")
-        # Re-create the decay mask function to check assignments
-        flat_params_check = traverse_util.flatten_dict(params)
-        decay_info = []
+    if is_coordinator():
+        if layer_norm_lr_factor == 1.0:
+            print("\nWeight Decay Assignment:")
+            # Re-create the decay mask function to check assignments
+            flat_params_check = traverse_util.flatten_dict(params)
+            decay_info = []
 
-        for path in flat_params_check.keys():
-            path_str = "/".join(str(p) for p in path).lower()
+            for path in flat_params_check.keys():
+                path_str = "/".join(str(p) for p in path).lower()
 
-            # Same logic as in decay_mask_fn
-            no_decay = (
-                path[-1] == "bias" or
-                "layer_norm" in path_str or
-                "layernorm" in path_str or
-                ".ln." in path_str or
-                "_ln." in path_str or
-                "_norm/" in path_str or
-                "_norm." in path_str or
-                "norm/scale" in path_str or
-                "norm/bias" in path_str or
-                "norm.scale" in path_str or
-                "norm.bias" in path_str or
-                "norm_" in path_str or
-                ".norm_" in path_str or
-                ".norm/" in path_str or
-                "final_layer_norm" in path_str or
-                "final_norm" in path_str
-            )
+                # Same logic as in decay_mask_fn
+                no_decay = (
+                    path[-1] == "bias" or
+                    "layer_norm" in path_str or
+                    "layernorm" in path_str or
+                    ".ln." in path_str or
+                    "_ln." in path_str or
+                    "_norm/" in path_str or
+                    "_norm." in path_str or
+                    "norm/scale" in path_str or
+                    "norm/bias" in path_str or
+                    "norm.scale" in path_str or
+                    "norm.bias" in path_str or
+                    "norm_" in path_str or
+                    ".norm_" in path_str or
+                    ".norm/" in path_str or
+                    "final_layer_norm" in path_str or
+                    "final_norm" in path_str
+                )
 
-            decay_info.append((path, not no_decay))
+                decay_info.append((path, not no_decay))
 
-        with_decay = sum(1 for _, has_decay in decay_info if has_decay)
-        without_decay = sum(1 for _, has_decay in decay_info if not has_decay)
+            with_decay = sum(1 for _, has_decay in decay_info if has_decay)
+            without_decay = sum(1 for _, has_decay in decay_info if not has_decay)
 
-        print(f"  Parameters WITH weight decay: {with_decay}")
-        print(f"  Parameters WITHOUT weight decay: {without_decay}")
+            print(f"  Parameters WITH weight decay: {with_decay}")
+            print(f"  Parameters WITHOUT weight decay: {without_decay}")
 
-        # Show examples
-        print("\n  Examples excluded from weight decay:")
-        shown = 0
-        for path, has_decay in decay_info:
-            if not has_decay and shown < 5:
-                print(f"    - {'/'.join(str(p) for p in path)}")
-                shown += 1
-    else:
-        print(f"\nUsing separate layer norm LR (factor={layer_norm_lr_factor}):")
-        print("  Layer norms automatically have weight_decay=0")
+            # Show examples
+            print("\n  Examples excluded from weight decay:")
+            shown = 0
+            for path, has_decay in decay_info:
+                if not has_decay and shown < 5:
+                    print(f"    - {'/'.join(str(p) for p in path)}")
+                    shown += 1
+        else:
+            print(f"\nUsing separate layer norm LR (factor={layer_norm_lr_factor}):")
+            print("  Layer norms automatically have weight_decay=0")
 
     # Create data collator
     collator = FlaxDataCollatorForLanguageModeling(
@@ -1020,77 +1115,95 @@ def main(args):
     )
 
     # JIT compile training step
-    print("\nCompiling train_step...")
+    if is_coordinator():
+        print("\nCompiling train_step...")
     # JIT compile with static argnums for compute_per_layer
     train_step_jit = jax.jit(train_step, static_argnums=(4,))
 
     # Create checkpoint manager for async checkpointing
-    print("\nInitializing checkpoint manager...")
+    if is_coordinator():
+        print("\nInitializing checkpoint manager...")
     checkpoint_manager = create_checkpoint_manager(
         checkpoint_dir=checkpoint_dir,
         checkpoint_every=checkpoint_every,
         max_to_keep=3,
-        wandb_run_id=wandb_run_id if not args.no_wandb else None,
+        wandb_run_id=wandb_run_id if not args.no_wandb and is_coordinator() else None,
     )
-    print(f"  Checkpoint directory: {checkpoint_dir}")
-    print(f"  Async checkpointing: Enabled")
-    print(f"  Max checkpoints to keep: 3")
+    if is_coordinator():
+        print(f"  Checkpoint directory: {checkpoint_dir}")
+        print(f"  Async checkpointing: Enabled")
+        print(f"  Max checkpoints to keep: 3")
 
     # Check for existing checkpoints to resume from
+    # For multi-host with local storage: checkpoint_manager is None on non-coordinators
+    # They start fresh (no resume support without shared storage)
     start_step = 0
-    latest_step = checkpoint_manager.latest_step()
 
-    if latest_step is not None:
-        # Restore from latest checkpoint
-        print(f"\nRestoring checkpoint from step {latest_step}...")
-        # For now, just restore state directly (old format)
-        # This avoids memory leak from trying to restore into pre-populated dict
-        state = checkpoint_manager.restore(
-            latest_step,
-            args=ocp.args.StandardRestore(state)
-        )
-        print(f"✓ Restored checkpoint from step {latest_step}")
-        # Note: RNG state will be reset for old checkpoints
-        # New checkpoints with RNG state will be supported after all old checkpoints expire
+    if checkpoint_manager is not None:
+        latest_step = checkpoint_manager.latest_step()
 
-        start_step = latest_step
-        print(f"✓ Resumed from step {start_step}")
+        if latest_step is not None:
+            # Restore from latest checkpoint
+            if is_coordinator():
+                print(f"\nRestoring checkpoint from step {latest_step}...")
+            state = checkpoint_manager.restore(
+                latest_step,
+                args=ocp.args.StandardRestore(state)
+            )
+            if is_coordinator():
+                print(f"✓ Restored checkpoint from step {latest_step}")
+
+            start_step = latest_step
+            if is_coordinator():
+                print(f"✓ Resumed from step {start_step}")
+        else:
+            if is_coordinator():
+                print("\n✓ Starting fresh training")
     else:
-        print("\n✓ Starting fresh training")
+        # Non-coordinator on multi-host with local storage
+        if is_coordinator():
+            print("\n✓ Starting fresh training")
 
-    # Skip already-processed batches when resuming
-    if start_step > 0:
-        examples_to_skip = start_step * batch_size
+    # Calculate examples to skip when resuming (used in training loop)
+    # Note: We can't use dataset.skip() because it doesn't work with split_dataset_by_node
+    examples_to_skip = start_step * batch_size if start_step > 0 else 0
+    if start_step > 0 and is_coordinator():
         print(f"\nResuming from step {start_step}...")
-        print(f"Skipping {examples_to_skip:,} examples in streaming dataset")
-        print("Note: HuggingFace .skip() must download/process examples sequentially")
-        print("This may take 5-15 minutes depending on network speed...")
-
-        # Use the built-in skip method - it's slow but correct
-        # This modifies the dataset to skip the first N examples
-        dataset = dataset.skip(examples_to_skip)
-
-        print(f"✓ Dataset positioned at step {start_step}")
+        print(f"Will skip {examples_to_skip:,} examples per process during iteration")
 
     # Training loop
-    print("\n" + "=" * 70)
-    print("TRAINING START")
-    print("=" * 70)
-    print(f"Total steps: {num_train_steps}")
-    print(f"Per-device batch size: {per_device_batch_size}")
-    print(f"Total batch size: {total_batch_size} (across {n_devices} devices)")
-    print(f"Training seq length: {max_length} tokens")
-    print(f"Checkpoint every: {checkpoint_every} steps")
-    if start_step > 0:
-        print(f"Resuming from step: {start_step}")
-    print()
+    if is_coordinator():
+        print("\n" + "=" * 70)
+        print("TRAINING START")
+        print("=" * 70)
+        print(f"Total steps: {num_train_steps}")
+        print(f"Per-device batch size: {per_device_batch_size}")
+        print(f"Total batch size: {total_batch_size} (across {n_devices} devices)")
+        if process_count > 1:
+            print(f"Multi-host: {process_count} processes")
+        print(f"Training seq length: {max_length} tokens")
+        print(f"Checkpoint every: {checkpoint_every} steps")
+        if start_step > 0:
+            print(f"Resuming from step: {start_step}")
+        print()
 
     step = start_step
     batch_buffer = []
     training_start_time = time.time()
+    skipped_examples = 0
 
-    with tqdm(total=num_train_steps, desc="Training", initial=start_step) as pbar:
+    # Only show progress bar on coordinator
+    pbar = tqdm(total=num_train_steps, desc="Training", initial=start_step) if is_coordinator() else None
+
+    try:
         for example in dataset:
+            # Skip examples when resuming (can't use dataset.skip() with split_dataset_by_node)
+            if skipped_examples < examples_to_skip:
+                skipped_examples += 1
+                if skipped_examples % 10000 == 0 and is_coordinator():
+                    print(f"  Skipping... {skipped_examples:,}/{examples_to_skip:,} examples")
+                continue
+
             batch_buffer.append(example)
 
             # Collect examples until we have enough for one per-device batch
@@ -1106,8 +1219,8 @@ def main(args):
                 # Note: We pass the main LR to train_step, layer norm LR is handled internally by optimizer
                 state, metrics, dropout_rng = train_step_jit(state, batch, dropout_rng, current_lr, compute_per_layer)
 
-                # Logging
-                if step % log_every == 0:
+                # Logging (only on coordinator)
+                if step % log_every == 0 and is_coordinator():
                     # Extract metrics
                     loss_value = float(metrics["loss"])
                     accuracy_value = float(metrics["accuracy"]) * 100  # Convert to percentage
@@ -1128,16 +1241,17 @@ def main(args):
                     steps_per_sec = (step - start_step) / elapsed if elapsed > 0 else 0
 
                     # Update progress bar
-                    pbar.set_postfix({
-                        "loss": f"{loss_value:.4f}",
-                        "acc": f"{accuracy_value:.1f}%",
-                        "ppl": f"{perplexity_value:.1f}",
-                        "lr": f"{lr_value:.2e}",
-                        "grad": f"{grad_norm_value:.2f}",
-                        "ratio": f"{update_ratio_value:.4f}",
-                    })
+                    if pbar:
+                        pbar.set_postfix({
+                            "loss": f"{loss_value:.4f}",
+                            "acc": f"{accuracy_value:.1f}%",
+                            "ppl": f"{perplexity_value:.1f}",
+                            "lr": f"{lr_value:.2e}",
+                            "grad": f"{grad_norm_value:.2f}",
+                            "ratio": f"{update_ratio_value:.4f}",
+                        })
 
-                    # Log to W&B
+                    # Log to W&B (only on coordinator, already guarded)
                     if not args.no_wandb:
                         wandb_log = {
                             "train/loss": loss_value,
@@ -1172,61 +1286,83 @@ def main(args):
                               f"Grad: {grad_norm_value:.2f} | Ratio: {update_ratio_value:.4f} | "
                               f"Tok/s: {tokens_per_sec:.0f}")
 
-                # Checkpointing - happens async in background
-                if step > start_step and step % checkpoint_every == 0:
+                # Checkpointing
+                # checkpoint_manager is None for non-coordinators with local storage
+                if step > start_step and step % checkpoint_every == 0 and checkpoint_manager is not None:
+                    # Prepare state for multi-host checkpointing (converts step to global array)
+                    ckpt_state = prepare_state_for_checkpoint(state)
                     checkpoint_manager.save(
                         step,
-                        args=ocp.args.StandardSave(state)
+                        args=ocp.args.StandardSave(ckpt_state)
                     )
-                    print(f"\n✓ Checkpoint saved (async) at step {step}")
-                    print(f"  Elapsed time: {(time.time() - training_start_time)/60:.1f} minutes")
+                    if is_coordinator():
+                        print(f"\n✓ Checkpoint saved at step {step}")
+                        print(f"  Elapsed time: {(time.time() - training_start_time)/60:.1f} minutes")
 
                 step += 1
-                pbar.update(1)
+                if pbar:
+                    pbar.update(1)
 
                 if step >= num_train_steps:
                     break
 
-    # Save final checkpoint
-    checkpoint_manager.save(
-        step,
-        args=ocp.args.StandardSave(state)
-    )
-    print(f"\n✓ Final checkpoint saved (async) at step {step}")
+    finally:
+        # Close progress bar if it exists
+        if pbar:
+            pbar.close()
 
-    # Wait for all async checkpoints to complete before exiting
-    print("Waiting for async checkpoint operations to complete...")
-    checkpoint_manager.wait_until_finished()
-    print("✓ All checkpoints saved successfully")
+    # Save final checkpoint (only if checkpoint_manager exists)
+    if checkpoint_manager is not None:
+        # Prepare state for multi-host checkpointing (converts step to global array)
+        ckpt_state = prepare_state_for_checkpoint(state)
+        checkpoint_manager.save(
+            step,
+            args=ocp.args.StandardSave(ckpt_state)
+        )
+        if is_coordinator():
+            print(f"\n✓ Final checkpoint saved at step {step}")
 
-    print("\n" + "=" * 70)
-    print("TRAINING COMPLETE")
-    print("=" * 70)
-    print(f"Final loss: {float(metrics['loss']):.4f}")
-    print(f"Final accuracy: {float(metrics['accuracy']) * 100:.1f}%")
-    print(f"Final perplexity: {float(metrics['perplexity']):.1f}")
-    print(f"Total steps: {step}")
-    print(f"Training time: {(time.time() - training_start_time)/60:.1f} minutes")
+        # Wait for all async checkpoints to complete before exiting
+        if is_coordinator():
+            print("Waiting for checkpoint operations to complete...")
+        checkpoint_manager.wait_until_finished()
+        if is_coordinator():
+            print("✓ All checkpoints saved successfully")
 
-    if backend == 'tpu':
-        print(f"\nTPU Performance:")
-        print(f"  Tokens/second: {tokens_per_sec:.0f}")
-        print(f"  Samples/second: {tokens_per_sec / max_length:.1f}")
+    # Calculate final metrics for logging
+    elapsed = time.time() - training_start_time
+    tokens_per_sec = (step - start_step) * batch_size * max_length / elapsed if elapsed > 0 else 0
 
-    # Log final metrics to W&B
-    if not args.no_wandb:
+    if is_coordinator():
+        print("\n" + "=" * 70)
+        print("TRAINING COMPLETE")
+        print("=" * 70)
+        print(f"Final loss: {float(metrics['loss']):.4f}")
+        print(f"Final accuracy: {float(metrics['accuracy']) * 100:.1f}%")
+        print(f"Final perplexity: {float(metrics['perplexity']):.1f}")
+        print(f"Total steps: {step}")
+        print(f"Training time: {elapsed/60:.1f} minutes")
+
+        if backend == 'tpu':
+            print(f"\nTPU Performance:")
+            print(f"  Tokens/second: {tokens_per_sec:.0f}")
+            print(f"  Samples/second: {tokens_per_sec / max_length:.1f}")
+
+    # Log final metrics to W&B (only on coordinator)
+    if not args.no_wandb and is_coordinator():
         wandb.summary["final_loss"] = float(metrics['loss'])
         wandb.summary["final_accuracy"] = float(metrics['accuracy']) * 100
         wandb.summary["final_perplexity"] = float(metrics['perplexity'])
         wandb.summary["total_steps"] = step
-        wandb.summary["training_time_minutes"] = (time.time() - training_start_time) / 60
+        wandb.summary["training_time_minutes"] = elapsed / 60
         wandb.finish()
         print("\n✓ W&B run finished successfully")
 
-    print()
-    print("✓ Training completed successfully!")
-    print(f"✓ Checkpoints saved to: {checkpoint_dir}")
-    print("\nTo continue training, simply run the script again!")
+    if is_coordinator():
+        print()
+        print("✓ Training completed successfully!")
+        print(f"✓ Checkpoints saved to: {checkpoint_dir}")
+        print("\nTo continue training, simply run the script again!")
 
 
 if __name__ == "__main__":

@@ -23,11 +23,11 @@ Core architecture complete. Masked LM head validated against PyTorch reference. 
 - Masked language modeling head
 - MLM training with AdamW optimizer
 - TPU support with async checkpointing
+- Multi-host TPU training (v4-32 tested)
+- Mixed precision (bf16 default on TPU)
 
 **TODO:**
 - Unpadded/FlashAttention execution path
-- Multi-device data parallelism (pmap/pjit)
-- Mixed precision training (bf16/fp16)
 
 ## Quick Start
 
@@ -119,30 +119,33 @@ Golden tensors in `artifacts/reference-configs/` provide deterministic regressio
 
 ## Training
 
-Masked language modeling (MLM) training is implemented in `scripts/train_minimal.py`. Includes AdamW optimization, W&B logging, and TPU support.
+MLM training via `scripts/train_minimal.py`. Supports single-host (v4-8) and multi-host (v4-32) TPU.
 
 ```bash
-# Train on CPU/GPU
-python scripts/train_minimal.py \
-  --batch_size 16 \
-  --num_epochs 3 \
-  --learning_rate 1e-4
-
-# Train on TPU with Dutch data
+# Single-host TPU (v4-8)
 python scripts/train_minimal.py \
   --dataset yhavinga/mc4_nl_cleaned \
-  --batch-size 16 \
+  --dataset-config full \
+  --checkpoint-dir ./checkpoints \
   --wandb-project mbert_dutch
 
-# Resume from checkpoint
-python scripts/train_minimal.py \
-  --checkpoint_dir checkpoints/run_123 \
-  --resume
+# Multi-host TPU (v4-32) - requires GCS for checkpoints
+./tpu.sh --tpu-type v4-32 deploy
+./tpu.sh --tpu-type v4-32 run 'python scripts/train_minimal.py \
+  --dataset yhavinga/mc4_nl_cleaned \
+  --dataset-config full \
+  --checkpoint-dir gs://your-bucket/checkpoints \
+  --wandb-project mbert_dutch'
 ```
 
-Features: gradient clipping, linear warmup/decay, comprehensive metrics (perplexity, gradient norms, update ratio), async checkpointing for spot instances.
+**Multi-host gotcha:** GCS is mandatory. Local paths fail because each TPU host has separate storage. Before first run, create the metadata directory:
+```bash
+echo "" | gcloud storage cp - gs://your-bucket/checkpoints/metadata/.placeholder
+```
 
-Model architecture is configurable via `--hidden-size`, `--num-layers`, `--num-heads`, `--intermediate-size`. Run with `--help` for all options.
+Features: AdamW with gradient clipping, warmup + cosine/linear/inverse_sqrt decay, bf16 compute, async checkpointing, automatic resume.
+
+Architecture configurable via `--hidden-size`, `--num-layers`, `--num-heads`, `--intermediate-size`, `--global-attn-every-n-layers`. Run `--help` for all options.
 
 ## License
 

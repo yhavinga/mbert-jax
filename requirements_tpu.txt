@@ -27,3 +27,6 @@ isort==5.13.0
 # Optional but recommended for TPU
 ml-collections==0.1.1  # For configuration management
 wandb>=0.17.2  # For experiment tracking (NumPy 2.0+ compatible)
+
+# GCS support for multi-host checkpointing
+gcsfs>=2024.2.0  # Required for gs:// paths in Orbax checkpoints

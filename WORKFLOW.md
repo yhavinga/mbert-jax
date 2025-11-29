@@ -1,11 +1,32 @@
 # ModernBERT Training Workflow
 
 ## 1. Train (on TPU)
+
+### Single-host (v4-8)
 ```bash
 python scripts/train_minimal.py \
     --checkpoint-dir checkpoints/my_run \
     --wandb-project mbert_dutch
 ```
+
+### Multi-host (v4-32)
+```bash
+# Deploy code to all workers
+./tpu.sh --tpu-type v4-32 deploy
+
+# Create GCS metadata dir (first time only)
+echo "" | gcloud storage cp - gs://your-bucket/my_run/metadata/.placeholder
+
+# Run training
+./tpu.sh --tpu-type v4-32 run 'python scripts/train_minimal.py \
+    --checkpoint-dir gs://your-bucket/my_run \
+    --wandb-project mbert_dutch'
+
+# Monitor
+./tpu.sh --tpu-type v4-32 status
+```
+
+**Note:** Multi-host requires GCS (`gs://`) for checkpoints. Local paths don't work.
 
 ## 2. Convert (on TPU)
 ```bash

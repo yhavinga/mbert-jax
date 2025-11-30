@@ -28,7 +28,9 @@ echo "" | gcloud storage cp - gs://your-bucket/my_run/metadata/.placeholder
 
 **Note:** Multi-host requires GCS (`gs://`) for checkpoints. Local paths don't work.
 
-## 2. Convert (on TPU)
+## 2. Convert
+
+### Option A: On TPU (single-host v4-8 checkpoints)
 ```bash
 # Find latest step
 ls checkpoints/my_run/
@@ -37,6 +39,18 @@ ls checkpoints/my_run/
 python scripts/convert_checkpoint_on_tpu.py \
     --checkpoint checkpoints/my_run/2000000 \
     --output experiments/converted/my_run
+```
+
+### Option B: Locally (multi-host v4-32 GCS checkpoints)
+```bash
+# Download from GCS
+gcloud storage cp -r gs://bucket/checkpoints/STEP experiments/gcs/STEP
+
+# Convert locally (CPU-only, no TPU needed)
+python scripts/convert_gcs_checkpoint.py \
+    --checkpoint experiments/gcs/STEP \
+    --output experiments/converted/my_run \
+    --num-layers 6 --hidden-size 768 --vocab-size 256000
 ```
 
 ## 3. Download (local)

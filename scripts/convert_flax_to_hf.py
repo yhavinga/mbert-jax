@@ -83,6 +83,31 @@ def map_flax_key_to_hf(flax_key: str) -> str:
     raise ValueError(f"Unknown Flax key: {flax_key}")
 
 
+def save_tokenizer_with_mask(tokenizer_name: str, output_dir: Path, vocab_size: int):
+    """Load tokenizer, add mask token if needed, resize to vocab_size, and save."""
+    from transformers import AutoTokenizer
+
+    print(f"\nLoading tokenizer: {tokenizer_name}")
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+
+    # Add mask token if missing (matches training script logic)
+    if tokenizer.mask_token is None:
+        tokenizer.add_special_tokens({"mask_token": "<mask>"})
+        print(f"  Added <mask> token at index {tokenizer.mask_token_id}")
+
+    # Ensure vocab size matches model (training may have added padding tokens)
+    if len(tokenizer) < vocab_size:
+        # Add padding tokens to reach target vocab_size
+        num_to_add = vocab_size - len(tokenizer)
+        print(f"  Adding {num_to_add} padding tokens to match vocab_size={vocab_size}")
+        # These won't be used but ensure vocab sizes match
+        tokenizer.add_tokens([f"<unused{i}>" for i in range(num_to_add)])
+
+    tokenizer.save_pretrained(output_dir)
+    print(f"✓ Saved tokenizer to {output_dir}")
+    print(f"  Vocab size: {len(tokenizer)}, mask_token_id: {tokenizer.mask_token_id}")
+
+
 def convert_flax_to_hf(input_dir: Path, output_dir: Path, verify: bool = True):
     """Convert Flax checkpoint to HuggingFace format."""
 
@@ -178,8 +203,8 @@ def convert_flax_to_hf(input_dir: Path, output_dir: Path, verify: bool = True):
         "attention_dropout": 0.0,
         "embedding_dropout": 0.0,
         "mlp_dropout": 0.0,
-        "global_attn_every_n_layers": 3,
-        "local_attention": 128,
+        "global_attn_every_n_layers": config.get("global_attn_every_n_layers", 3),
+        "local_attention": config.get("local_attention", 128),
         "torch_dtype": "float32",
         "transformers_version": "4.48.0",
     }
@@ -188,6 +213,11 @@ def convert_flax_to_hf(input_dir: Path, output_dir: Path, verify: bool = True):
     with open(config_path, 'w') as f:
         json.dump(hf_config, f, indent=2)
     print(f"Saved config to {config_path}")
+
+    # Save tokenizer if specified in config
+    tokenizer_name = config.get("tokenizer_name")
+    if tokenizer_name:
+        save_tokenizer_with_mask(tokenizer_name, output_dir, hf_config["vocab_size"])
 
     # Verify if requested
     if verify:
@@ -211,10 +241,15 @@ def verify_with_transformers(output_dir: Path):
     model = ModernBertForMaskedLM.from_pretrained(output_dir)
     print(f"  Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
-    # Use mmBERT tokenizer (256k vocab) - this is what the model was trained with
-    # NOTE: ModernBERT-base uses a different tokenizer (50k vocab) and won't work!
-    print("Loading tokenizer (jhu-clsp/mmBERT-small, vocab=256k)...")
-    tokenizer = AutoTokenizer.from_pretrained("jhu-clsp/mmBERT-small")
+    # Try to load tokenizer from output_dir (if saved with model)
+    # Fall back to mmBERT tokenizer for older checkpoints
+    tokenizer_path = output_dir / "tokenizer.json"
+    if tokenizer_path.exists():
+        print(f"Loading tokenizer from {output_dir}...")
+        tokenizer = AutoTokenizer.from_pretrained(output_dir)
+    else:
+        print("Loading tokenizer (jhu-clsp/mmBERT-small, vocab=256k)...")
+        tokenizer = AutoTokenizer.from_pretrained("jhu-clsp/mmBERT-small")
 
     # Test inference - use tokenizer's mask token
     mask = tokenizer.mask_token

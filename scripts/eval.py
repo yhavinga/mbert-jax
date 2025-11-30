@@ -35,6 +35,26 @@ from mmbjax.configuration_mmbbert import MMBertConfig
 from mmbjax.heads.masked_lm import ModernBertForMaskedLM
 
 
+def is_sentencepiece_tokenizer(tokenizer):
+    """Check if tokenizer is SentencePiece-based (LLaMA, etc.)."""
+    tokenizer_class = tokenizer.__class__.__name__
+    return any(x in tokenizer_class for x in ["Llama", "SentencePiece", "T5"])
+
+
+def format_mask_sentence(sentence: str, tokenizer) -> str:
+    """Format sentence with proper spacing around <mask> based on tokenizer type.
+    
+    SentencePiece tokenizers (LLaMA): spaces are explicit tokens (▁), so we need
+    to avoid extra spaces before <mask> to prevent '▁' token artifacts.
+    WordPiece tokenizers (BERT): spaces are implicit, so spacing doesn't matter.
+    """
+    if is_sentencepiece_tokenizer(tokenizer):
+        # Remove spaces before <mask> to avoid '▁' token before mask
+        # "De kat <mask>." -> "De kat<mask>."
+        sentence = sentence.replace(" <mask>", "<mask>")
+    return sentence
+
+
 def setup_database(db_path: str):
     """Create database and tables if they don't exist."""
     conn = sqlite3.connect(db_path)
@@ -162,7 +182,7 @@ def prepare_mlm_batch(texts, tokenizer, max_length=512):
 def eval_perplexity(params, config, args) -> Dict[str, Any]:
     """Evaluate perplexity on validation data."""
     print("Loading tokenizer and dataset...")
-    tokenizer = AutoTokenizer.from_pretrained("jhu-clsp/mmBERT-small")
+    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
 
     dataset = load_dataset(
         args.dataset or "yhavinga/mc4_nl_cleaned",
@@ -230,10 +250,10 @@ def eval_perplexity(params, config, args) -> Dict[str, Any]:
 def eval_inference(params, config, args) -> Dict[str, Any]:
     """Evaluate inference on test sentences."""
     print("Loading tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained("jhu-clsp/mmBERT-small")
+    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
     model = ModernBertForMaskedLM(config)
 
-    # Test sentences
+    # Test sentences (spacing around <mask> will be auto-adjusted)
     test_sentences = [
         "Amsterdam is de <mask> van Nederland.",
         "De kat zit op de <mask>.",
@@ -242,6 +262,12 @@ def eval_inference(params, config, args) -> Dict[str, Any]:
         "Nederland is bekend om zijn <mask>.",
         "De trein vertrekt om <mask> uur.",
     ]
+
+    # Check tokenizer type and format sentences appropriately
+    is_sp = is_sentencepiece_tokenizer(tokenizer)
+    if is_sp:
+        print(f"  Tokenizer type: SentencePiece - adjusting mask spacing")
+        test_sentences = [format_mask_sentence(s, tokenizer) for s in test_sentences]
 
     predictions_list = []
 
@@ -488,6 +514,12 @@ EXAMPLES:
         type=int,
         default=512,
         help="Maximum sequence length (default: 512)"
+    )
+    parser.add_argument(
+        "--tokenizer",
+        type=str,
+        default="jhu-clsp/mmBERT-small",
+        help="Tokenizer to use (default: jhu-clsp/mmBERT-small)"
     )
 
     args = parser.parse_args()

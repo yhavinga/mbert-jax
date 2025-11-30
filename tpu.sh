@@ -9,7 +9,7 @@ set -Eeuo pipefail
 
 PROJECT="t5-dutch-english"
 ZONE="us-central2-b"
-TPU_TYPE="v4-8"
+TPU_TYPE="v4-8"  # Default, can be overridden with --tpu-type
 TPU_NAME="tpu-v4-modernbert"
 RUNTIME_VERSION="tpu-ubuntu2204-base"
 SPOT_INSTANCE=false  # true for spot, false for on-demand
@@ -37,6 +37,24 @@ log_step()    { echo -e "\n${CYAN}==>${NC} $1\n"; }
 #############################################################################
 # HELPER FUNCTIONS
 #############################################################################
+
+is_multi_host() {
+    # v4-32 and larger are multi-host (pod slices)
+    # v4-8 is single host
+    [[ "$TPU_TYPE" == "v4-32" || "$TPU_TYPE" == "v4-64" || "$TPU_TYPE" == "v4-128" || \
+       "$TPU_TYPE" == "v5p-"* || "$TPU_TYPE" == "v5litepod-"* ]]
+}
+
+get_num_workers() {
+    # Return number of workers based on TPU type
+    case "$TPU_TYPE" in
+        v4-8)   echo 1 ;;
+        v4-32)  echo 4 ;;
+        v4-64)  echo 8 ;;
+        v4-128) echo 16 ;;
+        *)      echo 1 ;;  # Default to single worker
+    esac
+}
 
 check_gcloud_auth() {
     if ! gcloud auth list --filter=status:ACTIVE --format="value(account)" | grep -q .; then
@@ -92,7 +110,17 @@ EOF
 
 run_on_tpu() {
     local cmd="$1"
-    ssh -F ssh_config "$TPU_NAME" "$cmd"
+    if is_multi_host; then
+        # Multi-host: run on all workers via gcloud
+        gcloud compute tpus tpu-vm ssh "$TPU_NAME" \
+            --zone="$ZONE" \
+            --project="$PROJECT" \
+            --worker=all \
+            --command="$cmd"
+    else
+        # Single host: use SSH config
+        ssh -F ssh_config "$TPU_NAME" "$cmd"
+    fi
 }
 
 #############################################################################
@@ -113,6 +141,13 @@ cmd_status() {
     log_info "Zone: $ZONE"
     log_info "Project: $PROJECT"
     log_info "Type: $TPU_TYPE"
+
+    if is_multi_host; then
+        local num_workers=$(get_num_workers)
+        log_info "Mode: Multi-host ($num_workers workers)"
+    else
+        log_info "Mode: Single-host"
+    fi
 
     case "$state" in
         READY)
@@ -217,37 +252,94 @@ cmd_deploy() {
         log_error "TPU not ready (state: $state). Run: ./tpu.sh provision"
     fi
 
-    # Update SSH config if needed
-    if [[ ! -f ssh_config ]]; then
-        update_ssh_config "$(get_tpu_ip)"
-    fi
-
-    # Create remote directory
+    # Create remote directory on all workers
     run_on_tpu "mkdir -p $REMOTE_DIR"
 
-    # Sync files
-    log_info "Syncing files to TPU..."
-    rsync -avz --progress --delete \
-        --exclude-from='.rsyncignore' \
-        --exclude='experiments/' \
-        --exclude='analysis/' \
-        --exclude='checkpoint*/' \
-        --exclude='ssh_config' \
-        --exclude='google-cloud-sdk/' \
-        --rsh="ssh -F ssh_config" \
-        . "${TPU_NAME}:${REMOTE_DIR}/"
+    if is_multi_host; then
+        # Multi-host: use gcloud scp to all workers
+        local num_workers=$(get_num_workers)
+        log_info "Syncing files to $num_workers TPU workers..."
 
-    # Copy auth tokens if they exist
-    if [[ -f "$HOME/.cache/huggingface/token" ]]; then
-        log_info "Copying HuggingFace token..."
-        run_on_tpu "mkdir -p ~/.cache/huggingface"
-        scp -F ssh_config "$HOME/.cache/huggingface/token" "${TPU_NAME}:~/.cache/huggingface/"
-    fi
+        # Create a tarball excluding unnecessary files (faster than scp --recurse)
+        log_info "Creating archive..."
+        local tarball="/tmp/mbert-deploy-$$.tar.gz"
+        tar czf "$tarball" \
+            --exclude='experiments' \
+            --exclude='analysis' \
+            --exclude='./checkpoint-*' \
+            --exclude='ssh_config' \
+            --exclude='google-cloud-sdk' \
+            --exclude='__pycache__' \
+            --exclude='*.pyc' \
+            --exclude='.git' \
+            --exclude='venv' \
+            --exclude='*.tar.gz' \
+            .
 
-    if [[ -f "$HOME/.netrc" ]]; then
-        log_info "Copying Wandb credentials..."
-        scp -F ssh_config "$HOME/.netrc" "${TPU_NAME}:~/"
-        run_on_tpu "chmod 600 ~/.netrc"
+        # Copy tarball and extract on each worker
+        for worker in $(seq 0 $((num_workers - 1))); do
+            log_info "Deploying to worker $worker..."
+            gcloud compute tpus tpu-vm scp \
+                --zone="$ZONE" --project="$PROJECT" --worker="$worker" \
+                "$tarball" "${TPU_NAME}:/tmp/mbert-deploy.tar.gz"
+
+            gcloud compute tpus tpu-vm ssh "$TPU_NAME" \
+                --zone="$ZONE" --project="$PROJECT" --worker="$worker" \
+                --command="cd $REMOTE_DIR && tar xzf /tmp/mbert-deploy.tar.gz && rm /tmp/mbert-deploy.tar.gz"
+        done
+
+        rm -f "$tarball"
+
+        # Copy auth tokens to all workers
+        if [[ -f "$HOME/.cache/huggingface/token" ]]; then
+            log_info "Copying HuggingFace token to all workers..."
+            run_on_tpu "mkdir -p ~/.cache/huggingface"
+            for worker in $(seq 0 $((num_workers - 1))); do
+                gcloud compute tpus tpu-vm scp \
+                    --zone="$ZONE" --project="$PROJECT" --worker="$worker" \
+                    "$HOME/.cache/huggingface/token" "${TPU_NAME}:~/.cache/huggingface/"
+            done
+        fi
+
+        if [[ -f "$HOME/.netrc" ]]; then
+            log_info "Copying Wandb credentials to all workers..."
+            for worker in $(seq 0 $((num_workers - 1))); do
+                gcloud compute tpus tpu-vm scp \
+                    --zone="$ZONE" --project="$PROJECT" --worker="$worker" \
+                    "$HOME/.netrc" "${TPU_NAME}:~/"
+            done
+            run_on_tpu "chmod 600 ~/.netrc"
+        fi
+    else
+        # Single host: use SSH config + rsync
+        # Update SSH config if needed
+        if [[ ! -f ssh_config ]]; then
+            update_ssh_config "$(get_tpu_ip)"
+        fi
+
+        log_info "Syncing files to TPU..."
+        rsync -avz --progress --delete \
+            --exclude-from='.rsyncignore' \
+            --exclude='experiments/' \
+            --exclude='analysis/' \
+            --exclude='checkpoint*/' \
+            --exclude='ssh_config' \
+            --exclude='google-cloud-sdk/' \
+            --rsh="ssh -F ssh_config" \
+            . "${TPU_NAME}:${REMOTE_DIR}/"
+
+        # Copy auth tokens if they exist
+        if [[ -f "$HOME/.cache/huggingface/token" ]]; then
+            log_info "Copying HuggingFace token..."
+            run_on_tpu "mkdir -p ~/.cache/huggingface"
+            scp -F ssh_config "$HOME/.cache/huggingface/token" "${TPU_NAME}:~/.cache/huggingface/"
+        fi
+
+        if [[ -f "$HOME/.netrc" ]]; then
+            log_info "Copying Wandb credentials..."
+            scp -F ssh_config "$HOME/.netrc" "${TPU_NAME}:~/"
+            run_on_tpu "chmod 600 ~/.netrc"
+        fi
     fi
 
     log_success "Code deployed successfully!"
@@ -293,6 +385,10 @@ cmd_setup() {
     run_on_tpu "cd $REMOTE_DIR && source venv/bin/activate && \
         pip install -r requirements_tpu.txt > /dev/null 2>&1"
 
+    log_info "Installing mmbjax package..."
+    run_on_tpu "cd $REMOTE_DIR && source venv/bin/activate && \
+        pip install -e . > /dev/null 2>&1"
+
     log_success "Setup complete!"
     cmd_test
 }
@@ -326,13 +422,25 @@ print(f\"Computation test passed! Matrix shape: {y.shape}\")
 cmd_ssh() {
     log_step "Connecting to TPU"
 
-    if [[ ! -f ssh_config ]]; then
-        update_ssh_config "$(get_tpu_ip)"
-    fi
+    local worker="${1:-0}"
 
-    log_info "Connecting to $TPU_NAME..."
-    log_info "To activate environment: source $REMOTE_DIR/venv/bin/activate"
-    ssh -F ssh_config "$TPU_NAME"
+    if is_multi_host; then
+        local num_workers=$(get_num_workers)
+        log_info "Connecting to $TPU_NAME worker $worker (of $num_workers)..."
+        log_info "To activate environment: source $REMOTE_DIR/venv/bin/activate"
+        gcloud compute tpus tpu-vm ssh "$TPU_NAME" \
+            --zone="$ZONE" \
+            --project="$PROJECT" \
+            --worker="$worker"
+    else
+        if [[ ! -f ssh_config ]]; then
+            update_ssh_config "$(get_tpu_ip)"
+        fi
+
+        log_info "Connecting to $TPU_NAME..."
+        log_info "To activate environment: source $REMOTE_DIR/venv/bin/activate"
+        ssh -F ssh_config "$TPU_NAME"
+    fi
 }
 
 cmd_destroy() {
@@ -394,15 +502,25 @@ cmd_run() {
         log_error "Usage: ./tpu.sh run 'command to run on TPU'"
     fi
 
-    run_on_tpu "cd $REMOTE_DIR && source venv/bin/activate && $cmd"
+    run_on_tpu "cd $REMOTE_DIR && source venv/bin/activate && PYTHONPATH=\$PWD/src:\$PYTHONPATH $cmd"
 }
 
 show_help() {
+    local num_workers=$(get_num_workers)
+    local multi_host_info=""
+    if is_multi_host; then
+        multi_host_info=" (multi-host: $num_workers workers)"
+    fi
+
     echo -e "$(cat << EOF
 ${CYAN}TPU Management for mbert-jax${NC}
 
 ${GREEN}Usage:${NC}
-  ./tpu.sh [command] [options]
+  ./tpu.sh [--tpu-type TYPE] [command] [options]
+
+${GREEN}Global Options:${NC}
+  ${CYAN}--tpu-type TYPE${NC}  TPU accelerator type (default: v4-8)
+                    Examples: v4-8 (single), v4-32 (4 workers), v4-64 (8 workers)
 
 ${GREEN}Commands:${NC}
   ${CYAN}all${NC}        Full setup: provision + deploy + setup
@@ -411,16 +529,20 @@ ${GREEN}Commands:${NC}
   ${CYAN}deploy${NC}     Sync code to TPU
   ${CYAN}setup${NC}      Install dependencies on TPU
   ${CYAN}test${NC}       Test JAX and TPU setup
-  ${CYAN}ssh${NC}        Connect to TPU via SSH
-  ${CYAN}run${NC}        Run command on TPU
+  ${CYAN}ssh${NC}        Connect to TPU via SSH (use: ssh [worker] for multi-host)
+  ${CYAN}run${NC}        Run command on TPU (all workers for multi-host)
   ${CYAN}logs${NC}       Show TPU system logs
   ${CYAN}destroy${NC}    Delete TPU (saves money!)
 
-${GREEN}Configuration:${NC}
-  Edit this script to change:
+${GREEN}Examples:${NC}
+  ./tpu.sh status                           # Check v4-8 status
+  ./tpu.sh --tpu-type v4-32 provision       # Create v4-32 pod slice
+  ./tpu.sh --tpu-type v4-32 run 'python train.py'  # Run on all 4 workers
+
+${GREEN}Current Configuration:${NC}
   • Project: $PROJECT
   • Zone: $ZONE
-  • TPU: $TPU_NAME ($TPU_TYPE)
+  • TPU: $TPU_NAME ($TPU_TYPE)${multi_host_info}
   • Spot: $SPOT_INSTANCE
 EOF
 )"
@@ -431,6 +553,23 @@ EOF
 #############################################################################
 
 main() {
+    # Parse global options first (before command)
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --tpu-type)
+                TPU_TYPE="$2"
+                shift 2
+                ;;
+            --tpu-type=*)
+                TPU_TYPE="${1#*=}"
+                shift
+                ;;
+            *)
+                break  # Not a global option, must be a command
+                ;;
+        esac
+    done
+
     # Check gcloud auth
     check_gcloud_auth
 
@@ -468,7 +607,7 @@ main() {
             cmd_test
             ;;
         ssh)
-            cmd_ssh
+            cmd_ssh "$@"  # Pass worker argument if provided
             ;;
         run)
             cmd_run "$@"

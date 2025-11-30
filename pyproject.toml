@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mmbjax"
+version = "0.1.0"
+description = "ModernBERT JAX/Flax implementation"
+requires-python = ">=3.10"
+dependencies = []  # deps handled by requirements.txt
+
+[tool.setuptools.packages.find]
+where = ["src"]

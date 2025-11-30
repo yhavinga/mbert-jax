@@ -128,7 +128,7 @@ def load_checkpoint_on_tpu(checkpoint_path: str, config: MMBertConfig):
         return params
 
 
-def convert_to_cpu_format(params, output_dir: str, format: str = "both"):
+def convert_to_cpu_format(params, output_dir: str, config: MMBertConfig, format: str = "both"):
     """Convert params to CPU-friendly format."""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -177,12 +177,14 @@ def convert_to_cpu_format(params, output_dir: str, format: str = "both"):
         # Also save config for HF compatibility
         config_dict = {
             "model_type": "modernbert",
-            "vocab_size": 256000,
-            "hidden_size": 768,
-            "num_hidden_layers": 6,
-            "num_attention_heads": 12,
-            "intermediate_size": 3072,
-            "max_position_embeddings": 8192,
+            "vocab_size": config.vocab_size,
+            "hidden_size": config.hidden_size,
+            "num_hidden_layers": config.num_hidden_layers,
+            "num_attention_heads": config.num_attention_heads,
+            "intermediate_size": config.intermediate_size,
+            "max_position_embeddings": config.max_position_embeddings,
+            "global_attn_every_n_layers": config.global_attn_every_n_layers,
+            "local_attention": config.local_attention,
         }
 
         config_path = output_dir / "config.json"
@@ -222,10 +224,16 @@ def main():
     parser.add_argument("--format", type=str, default="both",
                         choices=["pickle", "safetensors", "both"],
                         help="Output format (default: both)")
-    parser.add_argument("--num-layers", type=int, default=6,
+    parser.add_argument("--num-layers", type=int, default=22,
                         help="Number of model layers")
-    parser.add_argument("--hidden-size", type=int, default=768,
+    parser.add_argument("--hidden-size", type=int, default=512,
                         help="Hidden size")
+    parser.add_argument("--vocab-size", type=int, default=32128,
+                        help="Vocabulary size")
+    parser.add_argument("--num-heads", type=int, default=8,
+                        help="Number of attention heads")
+    parser.add_argument("--intermediate-size", type=int, default=3072,
+                        help="MLP intermediate size")
     args = parser.parse_args()
 
     print("="*60)
@@ -239,11 +247,11 @@ def main():
 
     # Create config
     config = MMBertConfig(
-        vocab_size=256000,
+        vocab_size=args.vocab_size,
         hidden_size=args.hidden_size,
         num_hidden_layers=args.num_layers,
-        num_attention_heads=12,
-        intermediate_size=args.hidden_size * 4,
+        num_attention_heads=args.num_heads,
+        intermediate_size=args.intermediate_size,
         max_position_embeddings=8192,
     )
 
@@ -253,7 +261,7 @@ def main():
 
     # Convert to CPU format
     print("\n2. Converting to CPU-friendly format...")
-    convert_to_cpu_format(params, args.output, args.format)
+    convert_to_cpu_format(params, args.output, config, args.format)
 
     print("\n" + "="*60)
     print("✓ CONVERSION COMPLETE!")

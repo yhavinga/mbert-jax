@@ -164,8 +164,8 @@ def main():
     parser.add_argument("--num-heads", type=int, default=12)
     parser.add_argument("--intermediate-size", type=int, default=3072)
     parser.add_argument("--global-attn-every-n-layers", type=int, default=3)
-    parser.add_argument("--tokenizer", type=str, default=None,
-                        help="Tokenizer name/path (saved in config for HF conversion)")
+    parser.add_argument("--tokenizer", type=str, required=True,
+                        help="Tokenizer name/path (required for HF conversion)")
     args = parser.parse_args()
 
     checkpoint_path = Path(args.checkpoint)
@@ -199,10 +199,9 @@ def main():
         "local_attention": 128,
     }
 
-    # Add tokenizer if specified (for HF conversion)
-    if args.tokenizer:
-        config["tokenizer_name"] = args.tokenizer
-        print(f"  Tokenizer: {args.tokenizer}")
+    # Add tokenizer (required for HF conversion)
+    config["tokenizer_name"] = args.tokenizer
+    print(f"  Tokenizer: {args.tokenizer}")
 
     print(f"\nFinal config: vocab={config['vocab_size']}, hidden={config['hidden_size']}, "
           f"layers={config['num_hidden_layers']}, heads={config['num_attention_heads']}, "

@@ -26,7 +26,9 @@ echo "" | gcloud storage cp - gs://your-bucket/my_run/metadata/.placeholder
 ./tpu.sh --tpu-type v4-32 status
 ```
 
-**Note:** Multi-host requires GCS (`gs://`) for checkpoints. Local paths don't work.
+**Notes:** 
+- Multi-host requires GCS (`gs://`) for checkpoints. Local paths don't work.
+- Tokenizer handling: Train script adds `<mask>` token (ID=vocab_base) and pads to next 128 multiple.
 
 ## 2. Convert
 
@@ -47,10 +49,12 @@ python scripts/convert_checkpoint_on_tpu.py \
 gcloud storage cp -r gs://bucket/checkpoints/STEP experiments/gcs/STEP
 
 # Convert locally (CPU-only, no TPU needed)
+# IMPORTANT: --tokenizer is REQUIRED (adds <mask> token and pads vocab for TPU)
 python scripts/convert_gcs_checkpoint.py \
     --checkpoint experiments/gcs/STEP \
     --output experiments/converted/my_run \
-    --num-layers 6 --hidden-size 768 --vocab-size 256000
+    --num-layers 22 --hidden-size 512 --vocab-size 32128 \
+    --tokenizer yhavinga/dutch-llama-tokenizer
 ```
 
 ## 3. Download (local)
@@ -89,12 +93,15 @@ python scripts/analyze.py compare red_1m yellow_2m cosine_2m
 
 ## 7. Export to HuggingFace (optional)
 ```bash
+# Tokenizer info read from config.json (saved by convert_gcs_checkpoint.py)
+# Optional: override with --tokenizer yhavinga/dutch-llama-tokenizer
 python scripts/convert_flax_to_hf.py \
     --input experiments/converted/my_run \
     --output experiments/hf_modernbert/my_run
 
-# Load with transformers:
-# ModernBertForMaskedLM.from_pretrained("experiments/hf_modernbert/my_run")
+# Upload to HuggingFace Hub
+python -c "from huggingface_hub import HfApi; \
+HfApi().upload_folder('experiments/hf_modernbert/my_run', '<username>/<model-name>')"
 ```
 
 ---

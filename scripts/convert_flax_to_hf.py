@@ -108,7 +108,7 @@ def save_tokenizer_with_mask(tokenizer_name: str, output_dir: Path, vocab_size: 
     print(f"  Vocab size: {len(tokenizer)}, mask_token_id: {tokenizer.mask_token_id}")
 
 
-def convert_flax_to_hf(input_dir: Path, output_dir: Path, verify: bool = True):
+def convert_flax_to_hf(input_dir: Path, output_dir: Path, tokenizer_override: str = None, verify: bool = True):
     """Convert Flax checkpoint to HuggingFace format."""
 
     print(f"Loading Flax checkpoint from {input_dir}")
@@ -214,10 +214,12 @@ def convert_flax_to_hf(input_dir: Path, output_dir: Path, verify: bool = True):
         json.dump(hf_config, f, indent=2)
     print(f"Saved config to {config_path}")
 
-    # Save tokenizer if specified in config
-    tokenizer_name = config.get("tokenizer_name")
+    # Save tokenizer (use override if provided, otherwise from config)
+    tokenizer_name = tokenizer_override or config.get("tokenizer_name")
     if tokenizer_name:
         save_tokenizer_with_mask(tokenizer_name, output_dir, hf_config["vocab_size"])
+    else:
+        print("\nWARNING: No tokenizer specified. You must provide tokenizer separately.")
 
     # Verify if requested
     if verify:
@@ -310,6 +312,12 @@ def main():
         help="Output directory for HuggingFace checkpoint"
     )
     parser.add_argument(
+        "--tokenizer", "-t",
+        type=str,
+        required=False,
+        help="Tokenizer name/path (overrides config.json if specified)"
+    )
+    parser.add_argument(
         "--no-verify",
         action="store_true",
         help="Skip verification with transformers"
@@ -320,7 +328,9 @@ def main():
     input_dir = Path(args.input)
     output_dir = Path(args.output)
 
-    convert_flax_to_hf(input_dir, output_dir, verify=not args.no_verify)
+    convert_flax_to_hf(input_dir, output_dir, 
+                       tokenizer_override=args.tokenizer if hasattr(args, 'tokenizer') else None,
+                       verify=not args.no_verify)
 
     print(f"\nConversion complete!")
     print(f"Load with: ModernBertForMaskedLM.from_pretrained('{output_dir}')")

@@ -54,6 +54,7 @@ class ModernBertLayer(nn.Module):
         attention_mask: Optional[jnp.ndarray] = None,
         sliding_window_mask: Optional[jnp.ndarray] = None,
         position_ids: Optional[jnp.ndarray] = None,
+        segment_ids: Optional[jnp.ndarray] = None,
         deterministic: bool = True,
         output_attentions: bool = False,
     ) -> Tuple[jnp.ndarray, Optional[jnp.ndarray]]:
@@ -63,6 +64,7 @@ class ModernBertLayer(nn.Module):
             attention_mask=attention_mask,
             sliding_window_mask=sliding_window_mask,
             position_ids=position_ids,
+            segment_ids=segment_ids,
             deterministic=deterministic,
             output_attentions=output_attentions,
         )

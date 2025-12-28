@@ -7,14 +7,14 @@ set -Eeuo pipefail
 # CONFIGURATION - Edit these for your project
 #############################################################################
 
-PROJECT="t5-dutch-english"
-ZONE="us-central2-b"
-TPU_TYPE="v4-8"  # Default, can be overridden with --tpu-type
-TPU_NAME="tpu-v4-modernbert"
-RUNTIME_VERSION="tpu-ubuntu2204-base"
-SPOT_INSTANCE=false  # true for spot, false for on-demand
-REMOTE_DIR="~/mbert-jax"
-PYTHON_VERSION="3.11"
+PROJECT="${PROJECT:-t5-dutch-english}"
+ZONE="${ZONE:-us-central2-b}"
+TPU_TYPE="${TPU_TYPE:-v4-8}"  # Default, can be overridden with --tpu-type or env var
+TPU_NAME="${TPU_NAME:-tpu-v4-modernbert}"
+RUNTIME_VERSION="${RUNTIME_VERSION:-tpu-ubuntu2204-base}"
+SPOT_INSTANCE="${SPOT_INSTANCE:-false}"  # true for spot, false for on-demand
+REMOTE_DIR="${REMOTE_DIR:-~/mbert-jax}"
+PYTHON_VERSION="${PYTHON_VERSION:-3.11}"
 
 #############################################################################
 # COLORS AND LOGGING

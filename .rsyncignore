@@ -82,7 +82,7 @@ datasets/
 *.csv
 *.json
 *.jsonl
-*.txt
+# *.txt  # Disabled - we need requirements*.txt files
 *.tsv
 
 # Archives

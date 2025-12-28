@@ -99,6 +99,7 @@ class ModernBertAttention(nn.Module):
         attention_mask: Optional[jnp.ndarray] = None,
         sliding_window_mask: Optional[jnp.ndarray] = None,
         position_ids: Optional[jnp.ndarray] = None,
+        segment_ids: Optional[jnp.ndarray] = None,
         deterministic: bool = True,
         output_attentions: bool = False,
     ) -> Tuple[jnp.ndarray, Optional[jnp.ndarray]]:
@@ -107,6 +108,19 @@ class ModernBertAttention(nn.Module):
         attention_mask = _ensure_attention_mask(attention_mask, batch, seq_len, mask_dtype)
         # Use minimum float value (like PyTorch's -inf) instead of -1e9
         mask_value = jnp.array(jnp.finfo(mask_dtype).min, dtype=mask_dtype)
+
+        # Build block-diagonal mask from segment_ids for packed sequences
+        # When sequences are packed, tokens from different documents must not attend to each other
+        segment_mask = None
+        if segment_ids is not None:
+            # segment_ids shape: [batch, seq_len]
+            # Create mask where tokens only attend within their segment (document)
+            # Output shape: [batch, num_heads, seq_len, seq_len] for broadcasting with attn_scores
+            seg_i = segment_ids[:, None, :, None]  # [b, 1, s, 1]
+            seg_j = segment_ids[:, None, None, :]  # [b, 1, 1, s]
+            segment_mask = (seg_i == seg_j).astype(mask_dtype)  # 1 where same segment, 0 otherwise
+            # Convert to additive mask (0 -> keep, 1 -> mask out)
+            segment_mask = (1.0 - segment_mask) * mask_value
 
         qkv = self.qkv(hidden_states)
         # PyTorch packs qkv as [batch, seq, 3, heads, head_dim]; keep that ordering
@@ -132,6 +146,10 @@ class ModernBertAttention(nn.Module):
         local_mask = self._maybe_sliding_window_mask(attention_mask, sliding_window_mask, mask_value)
         if local_mask is not None:
             attn_scores = attn_scores + local_mask.astype(mask_dtype)
+
+        # Apply block-diagonal segment mask to prevent cross-document attention
+        if segment_mask is not None:
+            attn_scores = attn_scores + segment_mask
 
         attn_probs = jnn.softmax(attn_scores, axis=-1).astype(self.dtype)
         attn_probs = self.attn_dropout(attn_probs, deterministic=deterministic)

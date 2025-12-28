@@ -6,6 +6,10 @@ torch
 pytest==8.3.2
 transformers==4.57.1
 
+# Data loading
+grain>=0.2.0
+
 # CLI tools
 rich>=13.0.0
+textual>=0.80.0
 pyyaml>=6.0

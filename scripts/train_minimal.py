@@ -9,6 +9,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 import argparse
+import gc
 import os
 import json
 import time
@@ -30,6 +31,14 @@ import wandb
 
 from mmbjax.configuration_mmbbert import MMBertConfig
 from mmbjax.heads.masked_lm import ModernBertForMaskedLM
+
+# Grain for sequence packing (optional, requires --use-packing)
+from mmbjax.training import (
+    GRAIN_AVAILABLE,
+    PackedMLMDataCollator,
+    TokenizeTransform,
+    create_packed_dataloader,
+)
 
 
 def is_coordinator():
@@ -247,6 +256,11 @@ def parse_args():
         default=3,
         help="Global attention frequency (default: 3, meaning layers 0,3,6,... use global attention)"
     )
+    parser.add_argument(
+        "--use-packing",
+        action="store_true",
+        help="Enable sequence packing using Grain library (more efficient training)"
+    )
 
     return parser.parse_args()
 
@@ -336,7 +350,7 @@ class FlaxDataCollatorForLanguageModeling:
         inputs[indices_random] = random_words[indices_random]
         
         # 10% of time: keep original token (no change needed)
-        
+
         return inputs, labels
 
 
@@ -638,12 +652,22 @@ def train_step(state, batch, dropout_rng, learning_rate, compute_per_layer=False
     dropout_rng, new_dropout_rng = jax.random.split(dropout_rng)
 
     def loss_fn(params):
+        # Prepare model inputs
+        model_kwargs = {
+            "input_ids": batch["input_ids"],
+            "attention_mask": batch["attention_mask"],
+            "deterministic": False,
+            "rngs": {"dropout": dropout_rng},
+        }
+        # Add optional parameters
+        if "position_ids" in batch:
+            model_kwargs["position_ids"] = batch["position_ids"]
+        if "segment_ids" in batch:
+            model_kwargs["segment_ids"] = batch["segment_ids"]
+
         output = state.apply_fn(
             {"params": params},
-            input_ids=batch["input_ids"],
-            attention_mask=batch["attention_mask"],
-            deterministic=False,
-            rngs={"dropout": dropout_rng},
+            **model_kwargs
         )
         # Extract logits
         logits = output.logits if hasattr(output, "logits") else output["logits"]
@@ -745,8 +769,9 @@ def create_checkpoint_manager(checkpoint_dir: str, checkpoint_every: int, max_to
         checkpoint_dir_path.mkdir(parents=True, exist_ok=True)
         checkpoint_dir = checkpoint_dir_path
 
-    # Use async checkpointing for GCS (recommended for multi-host)
-    use_async = is_gcs
+    # Only use async checkpointing for multi-host setups where it's beneficial
+    # For single-host (even with GCS), sync checkpointing avoids memory fragmentation
+    use_async = is_gcs and is_multi_host
 
     options = ocp.CheckpointManagerOptions(
         max_to_keep=max_to_keep,
@@ -1103,16 +1128,43 @@ def main(args):
             print("  Layer norms automatically have weight_decay=0")
 
     # Create data collator
-    collator = FlaxDataCollatorForLanguageModeling(
-        tokenizer=tokenizer,
-        mlm_probability=0.15,
-    )
-    
+    if args.use_packing:
+        collator = PackedMLMDataCollator(
+            tokenizer=tokenizer,
+            mlm_probability=0.15,
+        )
+    else:
+        collator = FlaxDataCollatorForLanguageModeling(
+            tokenizer=tokenizer,
+            mlm_probability=0.15,
+        )
+
     # Load dataset
-    dataset = load_dataset_for_training(
-        dataset_name=args.dataset,
-        dataset_config=args.dataset_config
-    )
+    if args.use_packing:
+        # Use Grain dataloader with packing
+        if is_coordinator():
+            print("\nCreating Grain dataloader with sequence packing...")
+        packed_dataloader = create_packed_dataloader(
+            dataset_name=args.dataset,
+            dataset_config=args.dataset_config,
+            tokenizer=tokenizer,
+            max_length=max_length,
+            batch_size=batch_size,  # Per-device batch size (same as non-packed)
+            num_workers=0,  # JAX compatible
+            shard_index=jax.process_index(),
+            shard_count=jax.process_count(),
+            seed=42,
+        )
+        if is_coordinator():
+            print(f"  ✓ Packing enabled: documents will be packed into {max_length}-token sequences")
+            print(f"  ✓ Per-device batch size: {batch_size}")
+        data_iter = iter(packed_dataloader)
+    else:
+        # Use existing data loading
+        dataset = load_dataset_for_training(
+            dataset_name=args.dataset,
+            dataset_config=args.dataset_config
+        )
 
     # JIT compile training step
     if is_coordinator():
@@ -1131,7 +1183,12 @@ def main(args):
     )
     if is_coordinator():
         print(f"  Checkpoint directory: {checkpoint_dir}")
-        print(f"  Async checkpointing: Enabled")
+        is_gcs = str(checkpoint_dir).startswith('gs://')
+        is_multi_host = jax.process_count() > 1
+        if is_gcs and is_multi_host:
+            print(f"  Async checkpointing: Enabled (multi-host)")
+        else:
+            print(f"  Async checkpointing: Disabled (single-host, sync for memory efficiency)")
         print(f"  Max checkpoints to keep: 3")
 
     # Check for existing checkpoints to resume from
@@ -1164,10 +1221,10 @@ def main(args):
         if is_coordinator():
             print("\n✓ Starting fresh training")
 
-    # Calculate examples to skip when resuming (used in training loop)
+    # Calculate examples to skip when resuming (only for non-packed)
     # Note: We can't use dataset.skip() because it doesn't work with split_dataset_by_node
-    examples_to_skip = start_step * batch_size if start_step > 0 else 0
-    if start_step > 0 and is_coordinator():
+    examples_to_skip = start_step * batch_size if start_step > 0 and not args.use_packing else 0
+    if start_step > 0 and is_coordinator() and not args.use_packing:
         print(f"\nResuming from step {start_step}...")
         print(f"Will skip {examples_to_skip:,} examples per process during iteration")
 
@@ -1183,6 +1240,8 @@ def main(args):
             print(f"Multi-host: {process_count} processes")
         print(f"Training seq length: {max_length} tokens")
         print(f"Checkpoint every: {checkpoint_every} steps")
+        if args.use_packing:
+            print(f"Sequence packing: ENABLED")
         if start_step > 0:
             print(f"Resuming from step: {start_step}")
         print()
@@ -1196,51 +1255,40 @@ def main(args):
     pbar = tqdm(total=num_train_steps, desc="Training", initial=start_step) if is_coordinator() else None
 
     try:
-        for example in dataset:
-            # Skip examples when resuming (can't use dataset.skip() with split_dataset_by_node)
-            if skipped_examples < examples_to_skip:
-                skipped_examples += 1
-                if skipped_examples % 10000 == 0 and is_coordinator():
-                    print(f"  Skipping... {skipped_examples:,}/{examples_to_skip:,} examples")
-                continue
+        if args.use_packing:
+            # Grain returns pre-batched data
+            for _ in range(num_train_steps - start_step):
+                # Get next packed batch from Grain
+                batch_raw = next(data_iter)
 
-            batch_buffer.append(example)
+                # Process batch through collator (applies MLM masking)
+                batch = collator(batch_raw)
 
-            # Collect examples until we have enough for one per-device batch
-            # JAX will automatically replicate this batch across all devices
-            if len(batch_buffer) >= batch_size:
-                # Create batch - this will be replicated to all devices by JAX's pmap
-                batch = collator(batch_buffer, max_length=max_length)
-                batch_buffer = []
+                # Convert to JAX arrays
+                batch = {k: jnp.array(v) for k, v in batch.items()}
 
-                # Training step - use per-layer metrics every 100 steps
+                # Training step
                 compute_per_layer = (step % 100 == 0)
                 current_lr = float(lr_schedule(step))
-                # Note: We pass the main LR to train_step, layer norm LR is handled internally by optimizer
                 state, metrics, dropout_rng = train_step_jit(state, batch, dropout_rng, current_lr, compute_per_layer)
 
                 # Logging (only on coordinator)
                 if step % log_every == 0 and is_coordinator():
-                    # Extract metrics
                     loss_value = float(metrics["loss"])
-                    accuracy_value = float(metrics["accuracy"]) * 100  # Convert to percentage
+                    accuracy_value = float(metrics["accuracy"]) * 100
                     perplexity_value = float(metrics["perplexity"])
                     grad_norm_value = float(metrics["grad_norm"])
                     param_norm_value = float(metrics["param_norm"])
                     update_ratio_value = float(metrics["update_ratio"])
 
-                    lr_value = current_lr  # Already computed above
-                    # Compute layer norm LR if different
+                    lr_value = current_lr
                     ln_lr_value = float(ln_lr_schedule(step)) if ln_lr_schedule else lr_value
                     n_masked = int(jnp.sum(batch["labels"] != -100))
 
-                    # Calculate throughput
                     elapsed = time.time() - training_start_time
-                    tokens_per_sec = (step - start_step) * batch_size * max_length / elapsed if elapsed > 0 else 0
-                    samples_per_sec = tokens_per_sec / max_length
+                    tokens_per_sec = (step - start_step) * total_batch_size * max_length / elapsed if elapsed > 0 else 0
                     steps_per_sec = (step - start_step) / elapsed if elapsed > 0 else 0
 
-                    # Update progress bar
                     if pbar:
                         pbar.set_postfix({
                             "loss": f"{loss_value:.4f}",
@@ -1248,10 +1296,10 @@ def main(args):
                             "ppl": f"{perplexity_value:.1f}",
                             "lr": f"{lr_value:.2e}",
                             "grad": f"{grad_norm_value:.2f}",
-                            "ratio": f"{update_ratio_value:.4f}",
+                            "ratio": f"{update_ratio_value:.2e}",
+                            "tok/s": f"{tokens_per_sec:.0f}",
                         })
 
-                    # Log to W&B (only on coordinator, already guarded)
                     if not args.no_wandb:
                         wandb_log = {
                             "train/loss": loss_value,
@@ -1262,42 +1310,29 @@ def main(args):
                             "train/param_norm": param_norm_value,
                             "train/update_ratio": update_ratio_value,
                             "train/n_masked_tokens": n_masked,
-                            "train/masking_percentage": n_masked / (batch_size * max_length) * 100,
                             "performance/tokens_per_sec": tokens_per_sec,
-                            "performance/samples_per_sec": samples_per_sec,
                             "performance/steps_per_sec": steps_per_sec,
                             "step": step,
                         }
-
-                        # Add layer norm LR if different
                         if ln_lr_schedule:
                             wandb_log["train/layer_norm_lr"] = ln_lr_value
-
-                        # Add per-layer gradient norms if available
-                        if "layer_grad_norms" in metrics:
-                            for layer_name, grad_norm in metrics["layer_grad_norms"].items():
-                                wandb_log[f"gradients/{layer_name}"] = float(grad_norm)
-
                         wandb.log(wandb_log, step=step)
 
-                    if step % (log_every * 5) == 0:  # Print detailed stats occasionally
-                        print(f"\nStep {step:4d} | Loss: {loss_value:.4f} | Acc: {accuracy_value:.1f}% | "
-                              f"PPL: {perplexity_value:.1f} | LR: {lr_value:.2e} | "
-                              f"Grad: {grad_norm_value:.2f} | Ratio: {update_ratio_value:.4f} | "
-                              f"Tok/s: {tokens_per_sec:.0f}")
-
                 # Checkpointing
-                # checkpoint_manager is None for non-coordinators with local storage
                 if step > start_step and step % checkpoint_every == 0 and checkpoint_manager is not None:
-                    # Prepare state for multi-host checkpointing (converts step to global array)
                     ckpt_state = prepare_state_for_checkpoint(state)
                     checkpoint_manager.save(
                         step,
                         args=ocp.args.StandardSave(ckpt_state)
                     )
+                    # Wait for checkpoint to complete before continuing
+                    checkpoint_manager.wait_until_finished()
+                    # Force garbage collection to release checkpoint references
+                    # Without this, Python may not GC in time, causing OOM on next steps
+                    del ckpt_state
+                    gc.collect()
                     if is_coordinator():
                         print(f"\n✓ Checkpoint saved at step {step}")
-                        print(f"  Elapsed time: {(time.time() - training_start_time)/60:.1f} minutes")
 
                 step += 1
                 if pbar:
@@ -1305,6 +1340,123 @@ def main(args):
 
                 if step >= num_train_steps:
                     break
+        else:
+            # Original non-packed training loop
+            for example in dataset:
+                # Skip examples when resuming (can't use dataset.skip() with split_dataset_by_node)
+                if skipped_examples < examples_to_skip:
+                    skipped_examples += 1
+                    if skipped_examples % 10000 == 0 and is_coordinator():
+                        print(f"  Skipping... {skipped_examples:,}/{examples_to_skip:,} examples")
+                    continue
+
+                batch_buffer.append(example)
+
+                # Collect examples until we have enough for one per-device batch
+                # JAX will automatically replicate this batch across all devices
+                if len(batch_buffer) >= batch_size:
+                    # Create batch - this will be replicated to all devices by JAX's pmap
+                    batch = collator(batch_buffer, max_length=max_length)
+                    batch_buffer = []
+
+                    # Training step - use per-layer metrics every 100 steps
+                    compute_per_layer = (step % 100 == 0)
+                    current_lr = float(lr_schedule(step))
+                    # Note: We pass the main LR to train_step, layer norm LR is handled internally by optimizer
+                    state, metrics, dropout_rng = train_step_jit(state, batch, dropout_rng, current_lr, compute_per_layer)
+
+                    # Logging (only on coordinator)
+                    if step % log_every == 0 and is_coordinator():
+                        # Extract metrics
+                        loss_value = float(metrics["loss"])
+                        accuracy_value = float(metrics["accuracy"]) * 100  # Convert to percentage
+                        perplexity_value = float(metrics["perplexity"])
+                        grad_norm_value = float(metrics["grad_norm"])
+                        param_norm_value = float(metrics["param_norm"])
+                        update_ratio_value = float(metrics["update_ratio"])
+
+                        lr_value = current_lr  # Already computed above
+                        # Compute layer norm LR if different
+                        ln_lr_value = float(ln_lr_schedule(step)) if ln_lr_schedule else lr_value
+                        n_masked = int(jnp.sum(batch["labels"] != -100))
+
+                        # Calculate throughput
+                        elapsed = time.time() - training_start_time
+                        tokens_per_sec = (step - start_step) * batch_size * max_length / elapsed if elapsed > 0 else 0
+                        samples_per_sec = tokens_per_sec / max_length
+                        steps_per_sec = (step - start_step) / elapsed if elapsed > 0 else 0
+
+                        # Update progress bar
+                        if pbar:
+                            pbar.set_postfix({
+                                "loss": f"{loss_value:.4f}",
+                                "acc": f"{accuracy_value:.1f}%",
+                                "ppl": f"{perplexity_value:.1f}",
+                                "lr": f"{lr_value:.2e}",
+                                "grad": f"{grad_norm_value:.2f}",
+                                "ratio": f"{update_ratio_value:.2e}",
+                            })
+
+                        # Log to W&B (only on coordinator, already guarded)
+                        if not args.no_wandb:
+                            wandb_log = {
+                                "train/loss": loss_value,
+                                "train/accuracy": accuracy_value,
+                                "train/perplexity": perplexity_value,
+                                "train/learning_rate": lr_value,
+                                "train/grad_norm": grad_norm_value,
+                                "train/param_norm": param_norm_value,
+                                "train/update_ratio": update_ratio_value,
+                                "train/n_masked_tokens": n_masked,
+                                "train/masking_percentage": n_masked / (batch_size * max_length) * 100,
+                                "performance/tokens_per_sec": tokens_per_sec,
+                                "performance/samples_per_sec": samples_per_sec,
+                                "performance/steps_per_sec": steps_per_sec,
+                                "step": step,
+                            }
+
+                            # Add layer norm LR if different
+                            if ln_lr_schedule:
+                                wandb_log["train/layer_norm_lr"] = ln_lr_value
+
+                            # Add per-layer gradient norms if available
+                            if "layer_grad_norms" in metrics:
+                                for layer_name, grad_norm in metrics["layer_grad_norms"].items():
+                                    wandb_log[f"gradients/{layer_name}"] = float(grad_norm)
+
+                            wandb.log(wandb_log, step=step)
+
+                        if step % (log_every * 5) == 0:  # Print detailed stats occasionally
+                            print(f"\nStep {step:4d} | Loss: {loss_value:.4f} | Acc: {accuracy_value:.1f}% | "
+                                  f"PPL: {perplexity_value:.1f} | LR: {lr_value:.2e} | "
+                                  f"Grad: {grad_norm_value:.2f} | Ratio: {update_ratio_value:.2e} | "
+                                  f"Tok/s: {tokens_per_sec:.0f}")
+
+                    # Checkpointing
+                    # checkpoint_manager is None for non-coordinators with local storage
+                    if step > start_step and step % checkpoint_every == 0 and checkpoint_manager is not None:
+                        # Prepare state for multi-host checkpointing (converts step to global array)
+                        ckpt_state = prepare_state_for_checkpoint(state)
+                        checkpoint_manager.save(
+                            step,
+                            args=ocp.args.StandardSave(ckpt_state)
+                        )
+                        # Wait for async checkpoint to complete to release memory before continuing
+                        # This prevents OOM from holding checkpoint data + training data simultaneously
+                        checkpoint_manager.wait_until_finished()
+                        # Force garbage collection to release any lingering references
+                        del ckpt_state
+                        gc.collect()
+                        if is_coordinator():
+                            print(f"\n✓ Checkpoint saved at step {step}")
+                            print(f"  Elapsed time: {(time.time() - training_start_time)/60:.1f} minutes")
+
+                    step += 1
+                    if pbar:
+                        pbar.update(1)
+
+                    if step >= num_train_steps:
+                        break
 
     finally:
         # Close progress bar if it exists

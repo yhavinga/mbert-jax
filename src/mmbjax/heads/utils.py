@@ -21,7 +21,9 @@ def cross_entropy_with_ignore_index(
     *,
     ignore_index: int = -100,
 ) -> jnp.ndarray:
-    mask = (labels != ignore_index).astype(logits.dtype)
+    # Force float32 for precision - log_softmax over 32K vocab loses precision in BF16
+    logits = logits.astype(jnp.float32)
+    mask = (labels != ignore_index).astype(jnp.float32)
     safe_labels = jnp.where(mask > 0, labels, 0)
     log_probs = jnn.log_softmax(logits, axis=-1)
     gathered = jnp.take_along_axis(log_probs, safe_labels[..., None], axis=-1).squeeze(-1)

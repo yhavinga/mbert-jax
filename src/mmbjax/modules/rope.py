@@ -90,12 +90,17 @@ def apply_rotary_emb(
         cos = cos[None, None, :, :]
         sin = sin[None, None, :, :]
 
-    cos = cos.astype(q.dtype)
-    sin = sin.astype(q.dtype)
-
-    q_out = (q * cos) + (rotate_half(q) * sin)
-    k_out = (k * cos) + (rotate_half(k) * sin)
-    return q_out, k_out
+    # Keep rotation in float32 for precision - BF16 causes position encoding errors
+    # See: https://openreview.net/forum?id=gwXfZ3xkUq (RoPE precision issues in BF16)
+    original_dtype = q.dtype
+    q_f32 = q.astype(jnp.float32)
+    k_f32 = k.astype(jnp.float32)
+    # cos/sin are already float32 from build_rotary_cache
+    
+    q_out = (q_f32 * cos) + (rotate_half(q_f32) * sin)
+    k_out = (k_f32 * cos) + (rotate_half(k_f32) * sin)
+    
+    return q_out.astype(original_dtype), k_out.astype(original_dtype)
 
 
 __all__ = [

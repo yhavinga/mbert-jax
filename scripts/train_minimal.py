@@ -97,8 +97,8 @@ def parse_args():
     parser.add_argument(
         "--dataset-config",
         type=str,
-        default="micro",
-        help="Dataset configuration/subset (default: micro)"
+        default=None,
+        help="Dataset configuration/subset (default: None, for datasets without configs)"
     )
     parser.add_argument(
         "--max-length",
@@ -261,6 +261,12 @@ def parse_args():
         action="store_true",
         help="Enable sequence packing using Grain library (more efficient training)"
     )
+    parser.add_argument(
+        "--num-epochs",
+        type=int,
+        default=None,
+        help="Number of epochs for packing mode (default: None = infinite, auto-restart on exhaustion)"
+    )
 
     return parser.parse_args()
 
@@ -356,6 +362,9 @@ class FlaxDataCollatorForLanguageModeling:
 
 def compute_mlm_loss_and_accuracy(logits, labels):
     """Compute cross-entropy loss and accuracy on masked positions only."""
+    # Force float32 - log_softmax over 32K vocab loses precision in BF16 on TPU
+    logits = logits.astype(jnp.float32)
+    
     # Flatten
     logits_flat = logits.reshape(-1, logits.shape[-1])
     labels_flat = labels.reshape(-1)
@@ -672,9 +681,20 @@ def train_step(state, batch, dropout_rng, learning_rate, compute_per_layer=False
         # Extract logits
         logits = output.logits if hasattr(output, "logits") else output["logits"]
         loss, accuracy, perplexity = compute_mlm_loss_and_accuracy(logits, batch["labels"])
-        return loss, (logits, accuracy, perplexity)
+        
+        # Diagnostics for debugging bfloat16 issues
+        logits_min = jnp.min(logits)
+        logits_max = jnp.max(logits)
+        logits_has_nan = jnp.any(jnp.isnan(logits))
+        logits_has_inf = jnp.any(jnp.isinf(logits))
+        
+        return loss, (logits, accuracy, perplexity, logits_min, logits_max, logits_has_nan, logits_has_inf)
 
-    (loss, (logits, accuracy, perplexity)), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
+    (loss, (logits, accuracy, perplexity, logits_min, logits_max, logits_has_nan, logits_has_inf)), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
+
+    # Check for NaN in gradients
+    grad_leaves = jax.tree_util.tree_leaves(grads)
+    grads_has_nan = jnp.any(jnp.array([jnp.any(jnp.isnan(g)) for g in grad_leaves]))
 
     # Compute gradient metrics
     grad_norm = compute_gradient_norm(grads)
@@ -694,6 +714,12 @@ def train_step(state, batch, dropout_rng, learning_rate, compute_per_layer=False
         "grad_norm": grad_norm,
         "param_norm": param_norm,
         "update_ratio": update_ratio,
+        # Diagnostics
+        "logits_min": logits_min,
+        "logits_max": logits_max,
+        "logits_has_nan": logits_has_nan,
+        "logits_has_inf": logits_has_inf,
+        "grads_has_nan": grads_has_nan,
     }
 
     # Optionally compute per-layer gradient norms
@@ -711,14 +737,22 @@ def load_dataset_for_training(dataset_name="yhavinga/mc4_nl_cleaned",
     from datasets.distributed import split_dataset_by_node
 
     if is_coordinator():
-        print(f"Loading dataset: {dataset_name} ({dataset_config})...")
+        config_str = f"({dataset_config})" if dataset_config else "(no config)"
+        print(f"Loading dataset: {dataset_name} {config_str}...")
 
     # Load streaming dataset (mc4_nl_cleaned is pre-shuffled)
+    # Only pass dataset_config if it's not None (for datasets without configs)
+    # reuse_cache_if_exists avoids timeout checking metadata for large datasets
+    # use_auth_token=True for gated datasets like CulturaX
+    # ignore_verifications=True skips slow checksum validation
     dataset = load_dataset(
         dataset_name,
         dataset_config,
         split=split,
         streaming=True,
+        download_mode="reuse_cache_if_exists",
+        use_auth_token=True,
+        ignore_verifications=True,
     )
 
     # Shard across processes for multi-host training
@@ -999,7 +1033,7 @@ def main(args):
                 project=args.wandb_project,
                 name=args.wandb_run_name,
                 config=wandb_config,
-                tags=["modernbert", "mlm", backend, args.dataset_config],
+                tags=["modernbert", "mlm", backend],
             )
             wandb_run_id = wandb.run.id
             print(f"  ✓ W&B run initialized: {wandb.run.name} (ID: {wandb_run_id})")
@@ -1242,6 +1276,14 @@ def main(args):
         print(f"Checkpoint every: {checkpoint_every} steps")
         if args.use_packing:
             print(f"Sequence packing: ENABLED")
+            # Check Adam optimizer state dtype - critical for bfloat16 stability
+            try:
+                opt_state = state.opt_state
+                # Navigate through optax structure to find first momentum buffer
+                first_leaf = jax.tree_util.tree_leaves(opt_state)[0]
+                print(f"Optimizer state dtype: {first_leaf.dtype} (should be float32)")
+            except Exception as e:
+                print(f"Could not check optimizer state dtype: {e}")
         if start_step > 0:
             print(f"Resuming from step: {start_step}")
         print()
@@ -1267,6 +1309,32 @@ def main(args):
                 # Convert to JAX arrays
                 batch = {k: jnp.array(v) for k, v in batch.items()}
 
+                # Debug: Print batch info for first batch only
+                if step == start_step and is_coordinator():
+                    seg_ids = batch["segment_ids"]
+                    pos_ids = batch["position_ids"]
+                    labels = batch["labels"]
+                    print("\n" + "="*60)
+                    print("PACKED BATCH DIAGNOSTICS (step 0)")
+                    print("="*60)
+                    print(f"Batch shape: {batch['input_ids'].shape}")
+                    print(f"Segment IDs row 0: {seg_ids[0, :30]}... (first 30)")
+                    print(f"Position IDs row 0: {pos_ids[0, :30]}... (first 30)")
+                    unique_segs = [len(set(int(x) for x in row)) for row in seg_ids]
+                    print(f"Unique segments per row: {unique_segs}")
+                    n_masked = int(jnp.sum(labels != -100))
+                    n_total = labels.size
+                    print(f"Masked tokens: {n_masked}/{n_total} ({100*n_masked/n_total:.1f}%)")
+                    # Check for segment -1 (padding)
+                    n_padding = int(jnp.sum(seg_ids == -1))
+                    print(f"Padding tokens (segment=-1): {n_padding}/{seg_ids.size} ({100*n_padding/seg_ids.size:.1f}%)")
+                    # Check attention_mask
+                    attn_mask = batch["attention_mask"]
+                    n_attn_zeros = int(jnp.sum(attn_mask == 0))
+                    print(f"Attention mask zeros (padding): {n_attn_zeros}/{attn_mask.size}")
+                    print("="*60 + "\n")
+
+
                 # Training step
                 compute_per_layer = (step % 100 == 0)
                 current_lr = float(lr_schedule(step))
@@ -1284,6 +1352,18 @@ def main(args):
                     lr_value = current_lr
                     ln_lr_value = float(ln_lr_schedule(step)) if ln_lr_schedule else lr_value
                     n_masked = int(jnp.sum(batch["labels"] != -100))
+
+                    # Diagnostic metrics
+                    logits_min = float(metrics["logits_min"])
+                    logits_max = float(metrics["logits_max"])
+                    logits_has_nan = bool(metrics["logits_has_nan"])
+                    logits_has_inf = bool(metrics["logits_has_inf"])
+                    grads_has_nan = bool(metrics["grads_has_nan"])
+                    
+                    # Print diagnostics for first 10 steps
+                    if step < start_step + 10:
+                        print(f"Step {step}: loss={loss_value:.4f}, logits=[{logits_min:.2f}, {logits_max:.2f}], "
+                              f"nan={logits_has_nan}, inf={logits_has_inf}, grad_nan={grads_has_nan}, grad_norm={grad_norm_value:.4f}")
 
                     elapsed = time.time() - training_start_time
                     tokens_per_sec = (step - start_step) * total_batch_size * max_length / elapsed if elapsed > 0 else 0

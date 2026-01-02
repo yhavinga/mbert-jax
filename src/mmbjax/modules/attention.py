@@ -151,9 +151,15 @@ class ModernBertAttention(nn.Module):
         if segment_mask is not None:
             attn_scores = attn_scores + segment_mask
 
-        attn_probs = jnn.softmax(attn_scores, axis=-1).astype(self.dtype)
+        # Softmax in float32 (attn_scores already cast to mask_dtype which is float32)
+        attn_probs = jnn.softmax(attn_scores, axis=-1)
         attn_probs = self.attn_dropout(attn_probs, deterministic=deterministic)
-        context = jnp.einsum("bhqk,bhkd->bhqd", attn_probs, value)
+        
+        # Keep value accumulation in float32 to avoid bfloat16 precision loss
+        # This is critical for segment masking where many attention weights are ~0
+        context = jnp.einsum("bhqk,bhkd->bhqd", attn_probs, value.astype(attn_probs.dtype))
+        context = context.astype(self.dtype)  # Cast back to compute dtype
+        
         context = jnp.transpose(context, (0, 2, 1, 3))
         context = context.reshape(batch, seq_len, self.config.hidden_size)
         context = self.out(context)

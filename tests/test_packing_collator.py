@@ -16,14 +16,71 @@ from src.mmbjax.heads.masked_lm import ModernBertForMaskedLM
 from src.mmbjax.training import PackedMLMDataCollator, TokenizeTransform
 
 
+@pytest.fixture
+def mock_tokenizer():
+    """Factory fixture creating MockTokenizer instances with configurable attributes.
+
+    Usage:
+        tokenizer = mock_tokenizer(vocab_size=100, all_special_ids=[0, 1, 2])
+    """
+    def _create(**kwargs):
+        defaults = {
+            "pad_token_id": 0,
+            "eos_token_id": 2,
+            "mask_token_id": 103,
+            "vocab_size": 30522,
+            "all_special_ids": [0, 101, 102, 103],
+        }
+        defaults.update(kwargs)
+
+        class MockTokenizer:
+            pass
+
+        for key, value in defaults.items():
+            setattr(MockTokenizer, key, value)
+
+        return MockTokenizer()
+
+    return _create
+
+
+@pytest.fixture
+def mock_callable_tokenizer():
+    """Factory fixture creating callable MockTokenizer instances (for TokenizeTransform).
+
+    Usage:
+        tokenizer = mock_callable_tokenizer(vocab_size=100)
+    """
+    def _create(**kwargs):
+        defaults = {
+            "pad_token_id": 0,
+            "eos_token_id": 2,
+            "mask_token_id": 103,
+            "vocab_size": 100,
+            "all_special_ids": [0, 1, 2],
+        }
+        defaults.update(kwargs)
+
+        class MockTokenizer:
+            def __call__(self, text, truncation=False, max_length=None, return_tensors=None, add_special_tokens=False):
+                words = text.split()[:max_length] if max_length else text.split()
+                return {"input_ids": [hash(w) % self.vocab_size for w in words]}
+
+        for key, value in defaults.items():
+            setattr(MockTokenizer, key, value)
+
+        return MockTokenizer()
+
+    return _create
+
+
 def test_tokenize_transform_adds_eos_token():
     """TokenizeTransform should append EOS token only if doc wasn't truncated."""
-    # Mock tokenizer that's callable like HF tokenizers
+    # This test uses a minimal callable tokenizer - keeping inline for clarity
     class MockTokenizer:
         eos_token_id = 2
 
         def __call__(self, text, truncation=False, max_length=None, return_tensors=None, add_special_tokens=False):
-            # Return dummy token IDs based on word count, respecting max_length
             words = text.split()
             if max_length and truncation:
                 words = words[:max_length]
@@ -48,22 +105,16 @@ def test_tokenize_transform_adds_eos_token():
         "Truncated doc should NOT have EOS token"
 
 
-def test_packed_mlm_collator_preserves_segments():
+def test_packed_mlm_collator_preserves_segments(mock_tokenizer):
     """Collator should preserve segment_ids structure."""
-    # Mock Grain output
     batch_raw = {
         "input_ids": [[1, 2, 3, 4, 5, 6, 7, 8]],
         "input_ids_segment_ids": [[0, 0, 0, 0, 1, 1, 1, 1]],
         "input_ids_positions": [[0, 1, 2, 3, 0, 1, 2, 3]],
     }
 
-    # Mock tokenizer
-    class MockTokenizer:
-        vocab_size = 30522
-        mask_token_id = 103
-        all_special_ids = [0, 101, 102, 103]
-
-    collator = PackedMLMDataCollator(MockTokenizer(), mlm_probability=0.15)
+    tokenizer = mock_tokenizer()
+    collator = PackedMLMDataCollator(tokenizer, mlm_probability=0.15)
 
     # Set seed for deterministic masking
     np.random.seed(42)
@@ -82,12 +133,9 @@ def test_packed_mlm_collator_preserves_segments():
     np.testing.assert_array_equal(result["position_ids"], batch_raw["input_ids_positions"])
 
 
-def test_packed_mlm_collator_never_masks_special_tokens():
+def test_packed_mlm_collator_never_masks_special_tokens(mock_tokenizer):
     """Special tokens should always have label=-100 (not masked)."""
-    class MockTokenizer:
-        vocab_size = 100
-        mask_token_id = 103
-        all_special_ids = [0, 1, 2, 3]  # Special token IDs
+    tokenizer = mock_tokenizer(vocab_size=100, all_special_ids=[0, 1, 2, 3])
 
     # Input with special tokens at specific positions
     batch_raw = {
@@ -96,7 +144,7 @@ def test_packed_mlm_collator_never_masks_special_tokens():
         "input_ids_positions": [[0, 1, 2, 3, 4, 5, 6, 7]],
     }
 
-    collator = PackedMLMDataCollator(MockTokenizer(), mlm_probability=1.0)  # Mask everything possible
+    collator = PackedMLMDataCollator(tokenizer, mlm_probability=1.0)  # Mask everything possible
 
     np.random.seed(42)
     result = collator(batch_raw)
@@ -109,12 +157,9 @@ def test_packed_mlm_collator_never_masks_special_tokens():
     assert labels[0, 7] == -100  # Position 7 has special token 3
 
 
-def test_packed_mlm_collator_attention_mask_all_ones():
+def test_packed_mlm_collator_attention_mask_all_ones(mock_tokenizer):
     """Packed sequences have no padding, so attention_mask should be all ones."""
-    class MockTokenizer:
-        vocab_size = 100
-        mask_token_id = 103
-        all_special_ids = [0, 1, 2]
+    tokenizer = mock_tokenizer(vocab_size=100, all_special_ids=[0, 1, 2])
 
     batch_raw = {
         "input_ids": [[1, 2, 3, 4, 5, 6, 7, 8]],
@@ -122,7 +167,7 @@ def test_packed_mlm_collator_attention_mask_all_ones():
         "input_ids_positions": [[0, 1, 2, 3, 0, 1, 2, 3]],
     }
 
-    collator = PackedMLMDataCollator(MockTokenizer(), mlm_probability=0.15)
+    collator = PackedMLMDataCollator(tokenizer, mlm_probability=0.15)
     np.random.seed(42)
     result = collator(batch_raw)
 
@@ -177,12 +222,9 @@ def test_masked_lm_with_segment_ids():
     assert output.logits.shape == (1, 8, config.vocab_size)
 
 
-def test_packed_mlm_collator_mlm_distribution():
+def test_packed_mlm_collator_mlm_distribution(mock_tokenizer):
     """Verify MLM masking distribution: 80% MASK, 10% random, 10% original."""
-    class MockTokenizer:
-        vocab_size = 1000
-        mask_token_id = 103
-        all_special_ids = [0, 1, 2]
+    tokenizer = mock_tokenizer(vocab_size=1000, all_special_ids=[0, 1, 2])
 
     # Simple input with no special tokens
     batch_raw = {
@@ -191,7 +233,7 @@ def test_packed_mlm_collator_mlm_distribution():
         "input_ids_positions": [[0, 1, 2, 3, 0, 1, 2, 3]],
     }
 
-    collator = PackedMLMDataCollator(MockTokenizer(), mlm_probability=1.0)
+    collator = PackedMLMDataCollator(tokenizer, mlm_probability=1.0)
     np.random.seed(42)
     result = collator(batch_raw)
 
@@ -203,18 +245,15 @@ def test_packed_mlm_collator_mlm_distribution():
     assert masked_positions.any()
 
     # Count MASK token replacements
-    mask_count = np.sum(input_ids == MockTokenizer.mask_token_id)
+    mask_count = np.sum(input_ids == tokenizer.mask_token_id)
 
     # At least one should be MASK
     assert mask_count > 0, "Expected at least one token to be replaced with MASK"
 
 
-def test_packed_mlm_collator_zero_mask_probability():
+def test_packed_mlm_collator_zero_mask_probability(mock_tokenizer):
     """With mlm_probability=0.0, no tokens should be masked."""
-    class MockTokenizer:
-        vocab_size = 100
-        mask_token_id = 103
-        all_special_ids = []
+    tokenizer = mock_tokenizer(vocab_size=100, all_special_ids=[])
 
     batch_raw = {
         "input_ids": [[10, 11, 12, 13, 14, 15, 16, 17]],
@@ -222,7 +261,7 @@ def test_packed_mlm_collator_zero_mask_probability():
         "input_ids_positions": [[0, 1, 2, 3, 0, 1, 2, 3]],
     }
 
-    collator = PackedMLMDataCollator(MockTokenizer(), mlm_probability=0.0)
+    collator = PackedMLMDataCollator(tokenizer, mlm_probability=0.0)
     result = collator(batch_raw)
 
     # No masking, so all labels should be -100
@@ -233,12 +272,12 @@ def test_packed_mlm_collator_zero_mask_probability():
     np.testing.assert_array_equal(result["input_ids"], batch_raw["input_ids"])
 
 
-def test_create_packed_dataloader_integration():
+def test_create_packed_dataloader_integration(mock_callable_tokenizer):
     """Integration test: Verify Grain packing pipeline works end-to-end.
 
     This test validates the complete Grain pipeline using StreamingBufferDataSource:
     stream -> StreamingBufferDataSource -> MapDataset -> shuffle -> map -> to_iter -> pack -> batch
-    
+
     Key insight: FirstFitPackIterDataset produces an IterDataset which must be
     iterated directly (it's not subscriptable, so DataLoader+IndexSampler won't work).
     """
@@ -247,23 +286,12 @@ def test_create_packed_dataloader_integration():
     if not GRAIN_AVAILABLE:
         pytest.skip("Grain not installed")
 
-    # Mock tokenizer that works like HF tokenizers
-    class MockTokenizer:
-        eos_token_id = 2
-        mask_token_id = 103
-        vocab_size = 100
-        all_special_ids = [0, 1, 2]
-
-        def __call__(self, text, truncation=False, max_length=None, return_tensors=None, add_special_tokens=False):
-            words = text.split()[:max_length] if max_length else text.split()
-            return {"input_ids": [hash(w) % self.vocab_size for w in words]}
-
     # Create test data as a GENERATOR (true streaming, no list buffering)
     def data_generator():
         for i in range(1, 20):  # 19 documents
             yield {"text": "hello world test " * i}  # Variable length documents
 
-    tokenizer = MockTokenizer()
+    tokenizer = mock_callable_tokenizer()
     max_length = 64
     batch_size = 2
 
@@ -310,7 +338,7 @@ def test_create_packed_dataloader_integration():
     print(f"  segment_ids row 0: {batch['input_ids_segment_ids'][0][:20]}...")
 
 
-def test_streaming_buffer_data_source():
+def test_streaming_buffer_data_source(mock_callable_tokenizer):
     """Test that StreamingBufferDataSource works with Grain packing."""
     from src.mmbjax.training import StreamingBufferDataSource, GRAIN_AVAILABLE, TokenizeTransform
     import grain.python as grain
@@ -319,28 +347,21 @@ def test_streaming_buffer_data_source():
     if not GRAIN_AVAILABLE:
         pytest.skip("Grain not installed")
 
-    # Mock tokenizer
-    class MockTokenizer:
-        eos_token_id = 2
-        def __call__(self, text, truncation=False, max_length=None, return_tensors=None, add_special_tokens=False):
-            words = text.split()[:max_length] if max_length else text.split()
-            return {"input_ids": [hash(w) % 100 for w in words]}
-
     # Create a GENERATOR (not a list) - this verifies lazy loading
     def data_generator():
         for i in range(1, 100):
             yield {"text": "word " * i}
 
-    tokenizer = MockTokenizer()
+    tokenizer = mock_callable_tokenizer()
     max_length = 32
     batch_size = 4
 
     # Use StreamingBufferDataSource with the generator
     source = StreamingBufferDataSource(data_generator(), max_buffer_size=50)
-    
+
     # Tokenize transform
     tokenize = TokenizeTransform(tokenizer, max_length)
-    
+
     # Build Grain pipeline
     map_ds = grain.MapDataset.source(source).map(tokenize.map)
     iter_ds = map_ds.to_iter_dataset()
@@ -363,4 +384,3 @@ def test_streaming_buffer_data_source():
 
     print(f"✓ Streaming buffer test passed: batch shape = {batch['input_ids'].shape}")
     print(f"  Buffer size used: {len(source._buffer)}")
-

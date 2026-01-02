@@ -29,10 +29,14 @@ class ModernBertLMHead(nn.Module):
             )
 
     def __call__(self, hidden_states: jnp.ndarray, embedding_kernel: jnp.ndarray) -> jnp.ndarray:
-        logits = jnp.einsum("bsh,vh->bsv", hidden_states, embedding_kernel)
+        # Keep logits computation in FP32 for precision
+        # The sum over hidden_size (1024) in BF16 loses precision
+        hidden_states_f32 = hidden_states.astype(jnp.float32)
+        embedding_kernel_f32 = embedding_kernel.astype(jnp.float32)
+        logits = jnp.einsum("bsh,vh->bsv", hidden_states_f32, embedding_kernel_f32)
         if self.config.decoder_bias:
-            logits = logits + self.bias
-        return logits
+            logits = logits + self.bias.astype(jnp.float32)
+        return logits  # Keep as float32 for downstream loss computation
 
 
 class ModernBertForMaskedLM(nn.Module):

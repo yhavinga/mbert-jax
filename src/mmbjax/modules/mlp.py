@@ -38,7 +38,9 @@ class ModernBertMLP(nn.Module):
         fused = self.wi(hidden_states)
         act_input, gate = jnp.split(fused, 2, axis=-1)
         act = self.activation(act_input)
-        act = act * gate
+        # Keep gate multiply in float32 for precision - small gate values after GeLU
+        # lose precision in BF16 (7-bit mantissa)
+        act = (act.astype(jnp.float32) * gate.astype(jnp.float32)).astype(self.dtype)
         act = self.dropout(act, deterministic=deterministic)
         return self.wo(act)
 

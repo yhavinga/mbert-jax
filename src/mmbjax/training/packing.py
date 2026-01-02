@@ -188,9 +188,13 @@ class PackedMLMDataCollator:
         # Apply MLM masking AFTER packing
         input_ids, labels = self.mask_tokens_packed(input_ids, segment_ids)
 
+        # CRITICAL: attention_mask must be 0 for padding tokens!
+        # With all 1s, model attends to garbage padding values, corrupting representations
+        attention_mask = np.where(is_padding, 0, 1).astype(np.int32)
+
         return {
             "input_ids": input_ids,
-            "attention_mask": np.ones_like(input_ids),  # All tokens are valid (no padding)
+            "attention_mask": attention_mask,
             "labels": labels,
             "position_ids": positions,
             "segment_ids": segment_ids,
@@ -243,7 +247,7 @@ class PackedMLMDataCollator:
 
 def create_packed_dataloader(
     dataset_name: str,
-    dataset_config: str,
+    dataset_config: Optional[str],
     tokenizer,
     max_length: int,
     batch_size: int,
@@ -277,9 +281,16 @@ def create_packed_dataloader(
         )
 
     # Load streaming dataset
-    print(f"Loading streaming dataset: {dataset_name} ({dataset_config})...")
+    config_str = f" ({dataset_config})" if dataset_config else " (no config)"
+    print(f"Loading streaming dataset: {dataset_name}{config_str}...")
+    # reuse_cache_if_exists avoids timeout checking metadata for large datasets (685+ files)
+    # use_auth_token=True for gated datasets like CulturaX
+    # ignore_verifications=True skips slow checksum validation (not needed for streaming)
     stream_dataset = load_dataset(
-        dataset_name, dataset_config, split="train", streaming=True
+        dataset_name, dataset_config, split="train", streaming=True,
+        download_mode="reuse_cache_if_exists",
+        use_auth_token=True,
+        ignore_verifications=True,
     )
 
     # Apply sharding for multi-host training BEFORE iterating

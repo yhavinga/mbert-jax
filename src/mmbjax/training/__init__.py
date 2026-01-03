@@ -6,6 +6,7 @@ ModernBERT models, including sequence packing with Google's Grain library.
 
 from .packing import (
     GRAIN_AVAILABLE,
+    EpochTrackingDataLoader,
     PackedMLMDataCollator,
     StreamingBufferDataSource,
     TokenizeTransform,
@@ -15,9 +16,11 @@ from .packing import (
 
 __all__ = [
     "GRAIN_AVAILABLE",
+    "EpochTrackingDataLoader",
     "PackedMLMDataCollator",
     "StreamingBufferDataSource",
     "TokenizeTransform",
     "create_packed_dataloader",
     "create_packed_dataset_streaming",
 ]
+

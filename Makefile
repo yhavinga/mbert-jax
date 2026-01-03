@@ -28,7 +28,7 @@ download:
 	@echo "✓ Reference artifacts downloaded to $(ARTIFACTS)"
 
 test:
-	$(BIN)/pytest tests/ -v
+	PYTHONPATH=$(CURDIR) $(BIN)/pytest tests/ -v
 
 lint:
 	@if $(BIN)/pip show ruff >/dev/null 2>&1; then \

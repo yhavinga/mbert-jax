@@ -384,3 +384,77 @@ def test_streaming_buffer_data_source(mock_callable_tokenizer):
 
     print(f"✓ Streaming buffer test passed: batch shape = {batch['input_ids'].shape}")
     print(f"  Buffer size used: {len(source._buffer)}")
+
+
+def test_epoch_tracking_dataloader_restarts(mock_callable_tokenizer):
+    """Test EpochTrackingDataLoader and pipeline exhaustion/restart.
+    
+    Validates:
+    1. EpochTrackingDataLoader initializes correctly
+    2. Pipeline can be exhausted and recreated (epoch restart simulation)
+    """
+    from src.mmbjax.training import EpochTrackingDataLoader, GRAIN_AVAILABLE, create_packed_dataset_streaming
+    
+    if not GRAIN_AVAILABLE:
+        pytest.skip("Grain not installed")
+    
+    tokenizer = mock_callable_tokenizer()
+    
+    # Test 1: EpochTrackingDataLoader initialization
+    loader = EpochTrackingDataLoader(
+        dataset_name="yhavinga/mc4_nl_cleaned",
+        dataset_config="micro",
+        tokenizer=tokenizer,
+        max_length=512,
+        batch_size=16,
+        seed=42,
+        num_epochs=None,
+    )
+    assert loader.epoch == 0
+    assert loader.num_epochs is None
+    print("✓ EpochTrackingDataLoader initialized correctly")
+    
+    # Test 2: Exhaust a finite dataset and verify we get batches
+    max_length = 32
+    batch_size = 2
+    
+    def data_generator():
+        for i in range(50):  # 50 documents
+            yield {"text": "hello world test sentence " * ((i % 5) + 1)}
+    
+    packed_dataset = create_packed_dataset_streaming(
+        stream_dataset=data_generator(),
+        tokenizer=tokenizer,
+        max_length=max_length,
+        batch_size=batch_size,
+    )
+    
+    # Exhaust the dataset
+    batch_count = 0
+    for batch in packed_dataset:
+        batch_count += 1
+        assert "input_ids" in batch
+        if batch_count > 200:  # Safety limit
+            break
+    
+    assert batch_count >= 1, f"Expected at least 1 batch, got {batch_count}"
+    print(f"✓ Epoch 1 exhaustion: got {batch_count} batches from 50 documents")
+    
+    # Test 3: Create fresh pipeline (simulating epoch restart)
+    packed_dataset_2 = create_packed_dataset_streaming(
+        stream_dataset=data_generator(),
+        tokenizer=tokenizer,
+        max_length=max_length,
+        batch_size=batch_size,
+    )
+    
+    batch_count_2 = 0
+    for batch in packed_dataset_2:
+        batch_count_2 += 1
+        if batch_count_2 > 200:
+            break
+    
+    assert batch_count_2 == batch_count, f"Expected {batch_count} batches in epoch 2, got {batch_count_2}"
+    print(f"✓ Epoch 2 restart: both epochs yielded {batch_count} batches")
+
+

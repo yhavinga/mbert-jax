@@ -24,6 +24,7 @@ __all__ = [
     "TokenizeTransform",
     "PackedMLMDataCollator",
     "StreamingBufferDataSource",
+    "EpochTrackingDataLoader",
     "create_packed_dataloader",
     "create_packed_dataset_streaming",
     "GRAIN_AVAILABLE",
@@ -100,11 +101,21 @@ class StreamingBufferDataSource:
             return self._stream_length
     
     def __getitem__(self, idx: int):
-        """Get item at index, fetching from stream if needed. Thread-safe."""
+        """Get item at index, fetching from stream if needed. Thread-safe.
+        
+        Handles race condition: if Grain's prefetch thread calls __len__ before
+        exhaustion (returns 10B) but __getitem__ is called after exhaustion,
+        we wrap the index to avoid IndexError. This effectively enables dataset
+        cycling for finite streams.
+        """
         self._ensure_available(idx)
         with self._lock:
             if idx < len(self._buffer):
                 return self._buffer[idx]
+            # Stream exhausted and idx >= buffer size: wrap around for cycling
+            if self._exhausted and len(self._buffer) > 0:
+                wrapped_idx = idx % len(self._buffer)
+                return self._buffer[wrapped_idx]
             raise IndexError(f'Index {idx} out of range (buffer size: {len(self._buffer)})')
 
 
@@ -255,11 +266,12 @@ def create_packed_dataloader(
     shard_index: int = 0,
     shard_count: int = 1,
     seed: int = 42,
+    num_epochs: Optional[int] = None,
 ):
-    """Create Grain dataset iterator with sequence packing (TRUE STREAMING).
+    """Create Grain dataset iterator with sequence packing and epoch restart.
 
-    Uses StreamingIterDataset to avoid buffering the entire dataset into memory.
-    Datasets are streamed directly from HuggingFace through the packing pipeline.
+    Uses EpochTrackingDataLoader to automatically restart the data pipeline
+    when the source dataset is exhausted, enabling multi-epoch training.
 
     Args:
         dataset_name: HuggingFace dataset name (e.g., "yhavinga/mc4_nl_cleaned")
@@ -270,57 +282,31 @@ def create_packed_dataloader(
         num_workers: Number of workers (unused, kept for API compatibility)
         shard_index: Index of this shard for multi-host training
         shard_count: Total number of shards
-        seed: Random seed for shuffling (applied at HF dataset level)
+        seed: Random seed for shuffling (epoch number is added for per-epoch variation)
+        num_epochs: Number of epochs to run (None = infinite, auto-restart forever)
 
     Returns:
-        IterDataset with sequence packing enabled (iterate directly with iter())
+        EpochTrackingDataLoader with sequence packing and epoch tracking
     """
     if grain is None:
         raise ImportError(
             "Grain is not installed. Install it with: pip install grain"
         )
 
-    # Load streaming dataset
     config_str = f" ({dataset_config})" if dataset_config else " (no config)"
-    print(f"Loading streaming dataset: {dataset_name}{config_str}...")
-    # reuse_cache_if_exists avoids timeout checking metadata for large datasets (685+ files)
-    # use_auth_token=True for gated datasets like CulturaX
-    # ignore_verifications=True skips slow checksum validation (not needed for streaming)
-    stream_dataset = load_dataset(
-        dataset_name, dataset_config, split="train", streaming=True,
-        download_mode="reuse_cache_if_exists",
-        use_auth_token=True,
-        ignore_verifications=True,
-    )
-
-    # Apply sharding for multi-host training BEFORE iterating
-    if shard_count > 1:
-        try:
-            from datasets.distributed import split_dataset_by_node
-            stream_dataset = split_dataset_by_node(
-                stream_dataset, rank=shard_index, world_size=shard_count
-            )
-            print(f"  Sharded: process {shard_index} of {shard_count}")
-        except ImportError:
-            # Fallback: manual strided iteration
-            print(f"  Warning: using manual sharding (shard {shard_index}/{shard_count})")
-            original_dataset = stream_dataset
-            def sharded_iter():
-                for i, item in enumerate(original_dataset):
-                    if i % shard_count == shard_index:
-                        yield item
-            stream_dataset = sharded_iter()
-
-    # Shuffle at HF level (shuffles the underlying shards)
-    if hasattr(stream_dataset, 'shuffle'):
-        stream_dataset = stream_dataset.shuffle(seed=seed, buffer_size=10000)
-
-    # Use streaming packing
-    return create_packed_dataset_streaming(
-        stream_dataset,
+    print(f"Creating EpochTrackingDataLoader for: {dataset_name}{config_str}")
+    print(f"  Epochs: {'infinite' if num_epochs is None else num_epochs}")
+    
+    return EpochTrackingDataLoader(
+        dataset_name=dataset_name,
+        dataset_config=dataset_config,
         tokenizer=tokenizer,
         max_length=max_length,
         batch_size=batch_size,
+        shard_index=shard_index,
+        shard_count=shard_count,
+        seed=seed,
+        num_epochs=num_epochs,
     )
 
 
@@ -378,3 +364,125 @@ def create_packed_dataset_streaming(
     batched_dataset = packed_dataset.batch(batch_size)
 
     return batched_dataset
+
+
+class EpochTrackingDataLoader:
+    """Wrapper that auto-restarts the data pipeline on epoch boundaries.
+    
+    When the underlying HuggingFace streaming dataset is exhausted, this class:
+    1. Logs the epoch completion
+    2. Recreates a fresh data pipeline for the next epoch
+    3. Continues yielding batches seamlessly
+    
+    This enables multi-epoch training without buffering the entire dataset in memory.
+    
+    Attributes:
+        epoch: Current epoch number (0-indexed, incremented after each full pass)
+        num_epochs: Maximum epochs to run (None = infinite)
+    """
+    
+    def __init__(
+        self,
+        dataset_name: str,
+        dataset_config: Optional[str],
+        tokenizer,
+        max_length: int,
+        batch_size: int,
+        shard_index: int = 0,
+        shard_count: int = 1,
+        seed: int = 42,
+        num_epochs: Optional[int] = None,
+    ):
+        """Initialize the epoch-tracking data loader.
+        
+        Args:
+            dataset_name: HuggingFace dataset name
+            dataset_config: Dataset configuration/subset
+            tokenizer: Tokenizer for text encoding
+            max_length: Maximum sequence length for packing
+            batch_size: Number of sequences per batch
+            shard_index: Index of this shard for multi-host training
+            shard_count: Total number of shards
+            seed: Random seed (epoch number is added for per-epoch variation)
+            num_epochs: Maximum epochs (None = infinite)
+        """
+        self.dataset_name = dataset_name
+        self.dataset_config = dataset_config
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.batch_size = batch_size
+        self.shard_index = shard_index
+        self.shard_count = shard_count
+        self.base_seed = seed
+        self.num_epochs = num_epochs
+        self.epoch = 0
+        self._current_iter = None
+    
+    def _load_stream_dataset(self):
+        """Load a fresh HuggingFace streaming dataset for one epoch."""
+        # reuse_cache_if_exists avoids timeout checking metadata for large datasets
+        # use_auth_token=True for gated datasets like CulturaX
+        # ignore_verifications=True skips slow checksum validation
+        stream_dataset = load_dataset(
+            self.dataset_name,
+            self.dataset_config,
+            split="train",
+            streaming=True,
+            download_mode="reuse_cache_if_exists",
+            use_auth_token=True,
+            ignore_verifications=True,
+        )
+        
+        # Apply sharding for multi-host training
+        if self.shard_count > 1:
+            try:
+                from datasets.distributed import split_dataset_by_node
+                stream_dataset = split_dataset_by_node(
+                    stream_dataset, rank=self.shard_index, world_size=self.shard_count
+                )
+            except ImportError:
+                # Fallback: manual strided iteration
+                original_dataset = stream_dataset
+                shard_index = self.shard_index
+                shard_count = self.shard_count
+                def sharded_iter():
+                    for i, item in enumerate(original_dataset):
+                        if i % shard_count == shard_index:
+                            yield item
+                stream_dataset = sharded_iter()
+        
+        # Shuffle with epoch-specific seed for different order each epoch
+        epoch_seed = self.base_seed + self.epoch
+        if hasattr(stream_dataset, 'shuffle'):
+            stream_dataset = stream_dataset.shuffle(seed=epoch_seed, buffer_size=10000)
+        
+        return stream_dataset
+    
+    def _create_pipeline(self):
+        """Create a fresh packed data pipeline for one epoch."""
+        stream_dataset = self._load_stream_dataset()
+        return create_packed_dataset_streaming(
+            stream_dataset,
+            tokenizer=self.tokenizer,
+            max_length=self.max_length,
+            batch_size=self.batch_size,
+        )
+    
+    def __iter__(self):
+        """Iterate through batches, auto-restarting on epoch boundaries."""
+        while self.num_epochs is None or self.epoch < self.num_epochs:
+            pipeline = self._create_pipeline()
+            try:
+                for batch in pipeline:
+                    yield batch
+            except StopIteration:
+                pass  # Normal end of epoch
+            
+            # Epoch completed
+            self.epoch += 1
+            print(f"[EpochTrackingDataLoader] Completed epoch {self.epoch} "
+                  f"(shard {self.shard_index}/{self.shard_count})")
+        
+        # If num_epochs is set, we stop here
+        print(f"[EpochTrackingDataLoader] Finished {self.num_epochs} epochs")
+

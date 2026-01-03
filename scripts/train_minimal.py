@@ -1175,7 +1175,7 @@ def main(args):
 
     # Load dataset
     if args.use_packing:
-        # Use Grain dataloader with packing
+        # Use Grain dataloader with packing and epoch tracking
         if is_coordinator():
             print("\nCreating Grain dataloader with sequence packing...")
         packed_dataloader = create_packed_dataloader(
@@ -1188,10 +1188,13 @@ def main(args):
             shard_index=jax.process_index(),
             shard_count=jax.process_count(),
             seed=42,
+            num_epochs=args.num_epochs,
         )
         if is_coordinator():
             print(f"  ✓ Packing enabled: documents will be packed into {max_length}-token sequences")
             print(f"  ✓ Per-device batch size: {batch_size}")
+            epochs_str = "infinite" if args.num_epochs is None else str(args.num_epochs)
+            print(f"  ✓ Epoch mode: {epochs_str} (auto-restart on exhaustion)")
         data_iter = iter(packed_dataloader)
     else:
         # Use existing data loading
@@ -1378,6 +1381,7 @@ def main(args):
                             "grad": f"{grad_norm_value:.2f}",
                             "ratio": f"{update_ratio_value:.2e}",
                             "tok/s": f"{tokens_per_sec:.0f}",
+                            "epoch": packed_dataloader.epoch,
                         })
 
                     if not args.no_wandb:
@@ -1390,6 +1394,7 @@ def main(args):
                             "train/param_norm": param_norm_value,
                             "train/update_ratio": update_ratio_value,
                             "train/n_masked_tokens": n_masked,
+                            "train/epoch": packed_dataloader.epoch,
                             "performance/tokens_per_sec": tokens_per_sec,
                             "performance/steps_per_sec": steps_per_sec,
                             "step": step,

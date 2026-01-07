@@ -321,6 +321,97 @@ def eval_inference(params, config, args) -> Dict[str, Any]:
     }
 
 
+def eval_pppl(params, config, args) -> Dict[str, Any]:
+    """Evaluate true Pseudo-Perplexity (PPPL) on validation data.
+    
+    Unlike training perplexity (random 15% masking, 1 pass), PPPL masks
+    each token one-at-a-time and measures prediction quality across all positions.
+    This is slower (O(N) forward passes per sentence) but gives a proper model
+    comparison metric used in the literature.
+    
+    Formula: PPPL = exp(-mean_log_prob) where mean_log_prob averages over
+    P(token_i | all other tokens) for each position i.
+    """
+    print("Loading tokenizer and dataset...")
+    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
+    
+    dataset = load_dataset(
+        args.dataset or "yhavinga/mc4_nl_cleaned",
+        args.dataset_config or "micro",
+        split=args.split or "validation",
+        streaming=False
+    )
+    
+    # Limit samples (PPPL is expensive, so default to fewer samples)
+    num_samples = min(args.num_samples, len(dataset))
+    dataset = dataset.select(range(num_samples))
+    
+    print(f"Evaluating PPPL on {num_samples} samples...")
+    model = ModernBertForMaskedLM(config)
+    
+    # Get special token IDs to skip
+    special_ids = set(tokenizer.all_special_ids)
+    mask_token_id = tokenizer.mask_token_id
+    
+    total_log_prob = 0.0
+    total_tokens = 0
+    
+    for sample in tqdm(dataset, desc="Computing PPPL", total=num_samples):
+        text = sample["text"]
+        
+        # Tokenize
+        inputs = tokenizer(
+            text,
+            truncation=True,
+            max_length=args.max_length,
+            return_tensors="np"
+        )
+        
+        input_ids = jnp.array(inputs["input_ids"])
+        attention_mask = jnp.array(inputs["attention_mask"])
+        seq_len = int(attention_mask.sum())
+        
+        # For each non-special token position, mask and predict
+        for i in range(seq_len):
+            token_id = int(input_ids[0, i])
+            
+            # Skip special tokens (CLS, SEP, PAD, etc.)
+            if token_id in special_ids:
+                continue
+            
+            # Mask this single position
+            masked_ids = input_ids.at[0, i].set(mask_token_id)
+            
+            # Forward pass
+            outputs = model.apply(
+                {"params": params},
+                input_ids=masked_ids,
+                attention_mask=attention_mask,
+                deterministic=True
+            )
+            
+            # Get log probability of the true token
+            # Force float32 for numerical stability
+            logits = outputs.logits[0, i].astype(jnp.float32)
+            log_probs = jax.nn.log_softmax(logits)
+            total_log_prob += float(log_probs[token_id])
+            total_tokens += 1
+    
+    # PPPL = exp(-mean_log_prob)
+    if total_tokens > 0:
+        mean_log_prob = total_log_prob / total_tokens
+        pppl = float(np.exp(-mean_log_prob))
+    else:
+        pppl = float('inf')
+    
+    return {
+        "pppl": pppl,
+        "mean_log_prob": mean_log_prob if total_tokens > 0 else None,
+        "total_tokens": total_tokens,
+        "num_samples": num_samples,
+    }
+
+
 def save_to_db(db_path: str, results: Dict, args, duration: float):
     """Save evaluation results to database."""
     conn = sqlite3.connect(db_path)
@@ -466,9 +557,9 @@ EXAMPLES:
     )
     parser.add_argument(
         "--eval-type",
-        choices=["perplexity", "inference"],
+        choices=["perplexity", "inference", "pppl"],
         default="perplexity",
-        help="Type of evaluation to run"
+        help="Type of evaluation to run (pppl = true pseudo-perplexity)"
     )
     parser.add_argument(
         "--db",
@@ -540,6 +631,12 @@ EXAMPLES:
         print(f"Perplexity: {results['perplexity']:.2f}")
         print(f"Accuracy: {results['accuracy']*100:.2f}%")
         print(f"Loss: {results['loss']:.4f}")
+    elif args.eval_type == "pppl":
+        results = eval_pppl(params, config, args)
+        print(f"\n{'=' * 40}")
+        print(f"Pseudo-Perplexity (PPPL): {results['pppl']:.2f}")
+        print(f"Mean Log Prob: {results.get('mean_log_prob', 'N/A'):.4f}")
+        print(f"Total Tokens: {results['total_tokens']:,}")
     else:  # inference
         results = eval_inference(params, config, args)
         print(f"\n{'=' * 40}")

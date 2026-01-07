@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any, Dict, Optional
 
 import numpy as np
 
+# Set HuggingFace Hub timeout before any HF imports - TPU networks can be slow
+os.environ.setdefault('HF_HUB_DOWNLOAD_TIMEOUT', '120')
 
 # Grain imports are optional - only needed when --use-packing is enabled
 try:
@@ -420,17 +423,16 @@ class EpochTrackingDataLoader:
     
     def _load_stream_dataset(self):
         """Load a fresh HuggingFace streaming dataset for one epoch."""
+
         # reuse_cache_if_exists avoids timeout checking metadata for large datasets
-        # use_auth_token=True for gated datasets like CulturaX
-        # ignore_verifications=True skips slow checksum validation
+        # token=True for gated datasets like CulturaX (use_auth_token is deprecated)
         stream_dataset = load_dataset(
             self.dataset_name,
             self.dataset_config,
             split="train",
             streaming=True,
             download_mode="reuse_cache_if_exists",
-            use_auth_token=True,
-            ignore_verifications=True,
+            token=True,
         )
         
         # Apply sharding for multi-host training

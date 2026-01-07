@@ -16,7 +16,11 @@ import time
 from datetime import datetime
 import jax
 # Initialize distributed system for multi-host TPU (must be before other JAX calls)
-jax.distributed.initialize()
+# On TPU/Slurm/MPI: auto-detects config. On local: fails gracefully (single-host).
+try:
+    jax.distributed.initialize()
+except ValueError:
+    pass  # No coordinator available - running locally, single-host mode
 import jax.numpy as jnp
 import numpy as np
 import optax
@@ -743,16 +747,14 @@ def load_dataset_for_training(dataset_name="yhavinga/mc4_nl_cleaned",
     # Load streaming dataset (mc4_nl_cleaned is pre-shuffled)
     # Only pass dataset_config if it's not None (for datasets without configs)
     # reuse_cache_if_exists avoids timeout checking metadata for large datasets
-    # use_auth_token=True for gated datasets like CulturaX
-    # ignore_verifications=True skips slow checksum validation
+    # token=True for gated datasets like CulturaX (use_auth_token is deprecated)
     dataset = load_dataset(
         dataset_name,
         dataset_config,
         split=split,
         streaming=True,
         download_mode="reuse_cache_if_exists",
-        use_auth_token=True,
-        ignore_verifications=True,
+        token=True,
     )
 
     # Shard across processes for multi-host training

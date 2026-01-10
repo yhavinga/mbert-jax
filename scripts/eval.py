@@ -183,7 +183,11 @@ def eval_perplexity(params, config, args) -> Dict[str, Any]:
     """Evaluate perplexity on validation data."""
     print("Loading tokenizer and dataset...")
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
-
+    
+    # Add mask token if not present (e.g., for LLaMA-based tokenizers)
+    if tokenizer.mask_token is None:
+        tokenizer.add_special_tokens({'mask_token': '<mask>'})
+        print(f"  Added <mask> token (ID: {tokenizer.mask_token_id})")
     dataset = load_dataset(
         args.dataset or "yhavinga/mc4_nl_cleaned",
         args.dataset_config or "micro",
@@ -251,6 +255,12 @@ def eval_inference(params, config, args) -> Dict[str, Any]:
     """Evaluate inference on test sentences."""
     print("Loading tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
+    
+    # Add mask token if not present (e.g., for LLaMA-based tokenizers)
+    if tokenizer.mask_token is None:
+        tokenizer.add_special_tokens({'mask_token': '<mask>'})
+        print(f"  Added <mask> token (ID: {tokenizer.mask_token_id})")
+    
     model = ModernBertForMaskedLM(config)
 
     # Test sentences (spacing around <mask> will be auto-adjusted)
@@ -334,6 +344,11 @@ def eval_pppl(params, config, args) -> Dict[str, Any]:
     """
     print("Loading tokenizer and dataset...")
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
+    
+    # Add mask token if not present (e.g., for LLaMA-based tokenizers)
+    if tokenizer.mask_token is None:
+        tokenizer.add_special_tokens({'mask_token': '<mask>'})
+        print(f"  Added <mask> token (ID: {tokenizer.mask_token_id})")
     
     dataset = load_dataset(
         args.dataset or "yhavinga/mc4_nl_cleaned",

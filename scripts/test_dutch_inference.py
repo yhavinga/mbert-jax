@@ -143,6 +143,11 @@ def main():
     print(f"\nLoading tokenizer: {args.tokenizer}...")
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
     
+    # Add mask token if not present (e.g., for LLaMA-based tokenizers)
+    if tokenizer.mask_token is None:
+        tokenizer.add_special_tokens({'mask_token': '<mask>'})
+        print(f"  Added <mask> token (ID: {tokenizer.mask_token_id})")
+    
     # Check tokenizer type and adjust sentences
     is_sp = is_sentencepiece_tokenizer(tokenizer)
     print(f"  Tokenizer type: {'SentencePiece' if is_sp else 'WordPiece'}")

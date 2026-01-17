@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -14,7 +14,7 @@ os.environ.setdefault('HF_HUB_DOWNLOAD_TIMEOUT', '120')
 try:
     import grain.python as grain
     from grain.python import experimental as grain_exp
-    from datasets import load_dataset
+    from datasets import load_dataset, interleave_datasets
     GRAIN_AVAILABLE = True
 except ImportError:
     GRAIN_AVAILABLE = False
@@ -30,6 +30,7 @@ __all__ = [
     "EpochTrackingDataLoader",
     "create_packed_dataloader",
     "create_packed_dataset_streaming",
+    "load_interleaved_streaming_dataset",
     "GRAIN_AVAILABLE",
 ]
 
@@ -260,21 +261,28 @@ class PackedMLMDataCollator:
 
 
 def create_packed_dataloader(
-    dataset_name: str,
-    dataset_config: Optional[str],
-    tokenizer,
-    max_length: int,
-    batch_size: int,
+    dataset_name: Optional[str] = None,
+    dataset_config: Optional[str] = None,
+    tokenizer=None,
+    max_length: int = 512,
+    batch_size: int = 16,
     num_workers: int = 0,
     shard_index: int = 0,
     shard_count: int = 1,
     seed: int = 42,
     num_epochs: Optional[int] = None,
+    # Multi-dataset mode parameters
+    dataset_configs: Optional[List[Dict[str, Any]]] = None,
+    shuffle_buffer_size: int = 10000,
+    stopping_strategy: str = "first_exhausted",
 ):
     """Create Grain dataset iterator with sequence packing and epoch restart.
 
     Uses EpochTrackingDataLoader to automatically restart the data pipeline
     when the source dataset is exhausted, enabling multi-epoch training.
+    
+    Can be called in single-dataset mode (dataset_name) or multi-dataset
+    mode (dataset_configs).
 
     Args:
         dataset_name: HuggingFace dataset name (e.g., "yhavinga/mc4_nl_cleaned")
@@ -287,6 +295,10 @@ def create_packed_dataloader(
         shard_count: Total number of shards
         seed: Random seed for shuffling (epoch number is added for per-epoch variation)
         num_epochs: Number of epochs to run (None = infinite, auto-restart forever)
+        dataset_configs: List of dataset configs for multi-dataset mode.
+            Each config is a dict with keys: name, config, weight
+        shuffle_buffer_size: Buffer size for streaming shuffle
+        stopping_strategy: "first_exhausted" or "all_exhausted"
 
     Returns:
         EpochTrackingDataLoader with sequence packing and epoch tracking
@@ -296,9 +308,19 @@ def create_packed_dataloader(
             "Grain is not installed. Install it with: pip install grain"
         )
 
-    config_str = f" ({dataset_config})" if dataset_config else " (no config)"
-    print(f"Creating EpochTrackingDataLoader for: {dataset_name}{config_str}")
+    if dataset_configs is not None:
+        # Multi-dataset mode
+        print(f"Creating EpochTrackingDataLoader with {len(dataset_configs)} interleaved datasets:")
+        for cfg in dataset_configs:
+            config_str = f" ({cfg.get('config')})" if cfg.get('config') else ""
+            weight_pct = cfg.get('weight', 1.0) * 100 / sum(c.get('weight', 1.0) for c in dataset_configs)
+            print(f"  - {cfg['name']}{config_str}: {weight_pct:.1f}%")
+    else:
+        # Single-dataset mode
+        config_str = f" ({dataset_config})" if dataset_config else " (no config)"
+        print(f"Creating EpochTrackingDataLoader for: {dataset_name}{config_str}")
     print(f"  Epochs: {'infinite' if num_epochs is None else num_epochs}")
+    print(f"  Shuffle buffer: {shuffle_buffer_size}")
     
     return EpochTrackingDataLoader(
         dataset_name=dataset_name,
@@ -310,6 +332,9 @@ def create_packed_dataloader(
         shard_count=shard_count,
         seed=seed,
         num_epochs=num_epochs,
+        dataset_configs=dataset_configs,
+        shuffle_buffer_size=shuffle_buffer_size,
+        stopping_strategy=stopping_strategy,
     )
 
 
@@ -369,7 +394,96 @@ def create_packed_dataset_streaming(
     return batched_dataset
 
 
+def load_interleaved_streaming_dataset(
+    dataset_configs: List[Dict[str, Any]],
+    shard_index: int = 0,
+    shard_count: int = 1,
+    seed: int = 42,
+    shuffle_buffer_size: int = 10000,
+    stopping_strategy: str = "first_exhausted",
+):
+    """Load multiple datasets and interleave them with probability weights.
+    
+    Uses HuggingFace's interleave_datasets() to combine multiple streaming
+    datasets into a single stream with configurable sampling probabilities.
+    
+    Args:
+        dataset_configs: List of dicts with keys:
+            - name: HuggingFace dataset name
+            - config: Dataset config/subset (or None)
+            - weight: Sampling probability (weights are normalized automatically)
+        shard_index: Index of this shard for multi-host training
+        shard_count: Total number of shards
+        seed: Random seed for shuffling
+        shuffle_buffer_size: Buffer size for streaming shuffle
+        stopping_strategy: "first_exhausted" or "all_exhausted"
+    
+    Returns:
+        Interleaved IterableDataset with shuffling applied
+    
+    Example:
+        >>> configs = [
+        ...     {"name": "yhavinga/mc4_nl_cleaned", "config": "micro", "weight": 0.5},
+        ...     {"name": "uonlp/CulturaX", "config": "nl", "weight": 0.25},
+        ... ]
+        >>> dataset = load_interleaved_streaming_dataset(configs)
+    """
+    if not GRAIN_AVAILABLE:
+        raise ImportError("Grain and datasets must be installed for interleaving")
+    
+    # Load each dataset as streaming
+    datasets_list = []
+    weights = []
+    
+    for cfg in dataset_configs:
+        ds = load_dataset(
+            cfg["name"],
+            cfg.get("config"),
+            split="train",
+            streaming=True,
+            download_mode="reuse_cache_if_exists",
+            token=True,
+        )
+        datasets_list.append(ds)
+        weights.append(cfg.get("weight", 1.0))
+    
+    # Normalize weights to probabilities
+    total_weight = sum(weights)
+    probabilities = [w / total_weight for w in weights]
+    
+    # Interleave datasets with probability weights
+    interleaved = interleave_datasets(
+        datasets_list,
+        probabilities=probabilities,
+        seed=seed,
+        stopping_strategy=stopping_strategy,
+    )
+    
+    # Apply sharding for multi-host training
+    if shard_count > 1:
+        try:
+            from datasets.distributed import split_dataset_by_node
+            interleaved = split_dataset_by_node(
+                interleaved, rank=shard_index, world_size=shard_count
+            )
+        except ImportError:
+            # Fallback: manual strided iteration
+            original = interleaved
+            def sharded_iter():
+                for i, item in enumerate(original):
+                    if i % shard_count == shard_index:
+                        yield item
+            interleaved = sharded_iter()
+    
+    # Apply shuffle buffer
+    if hasattr(interleaved, 'shuffle'):
+        interleaved = interleaved.shuffle(seed=seed, buffer_size=shuffle_buffer_size)
+    
+    return interleaved
+
+
 class EpochTrackingDataLoader:
+
     """Wrapper that auto-restarts the data pipeline on epoch boundaries.
     
     When the underlying HuggingFace streaming dataset is exhausted, this class:
@@ -386,21 +500,28 @@ class EpochTrackingDataLoader:
     
     def __init__(
         self,
-        dataset_name: str,
-        dataset_config: Optional[str],
-        tokenizer,
-        max_length: int,
-        batch_size: int,
+        dataset_name: Optional[str] = None,
+        dataset_config: Optional[str] = None,
+        tokenizer=None,
+        max_length: int = 512,
+        batch_size: int = 16,
         shard_index: int = 0,
         shard_count: int = 1,
         seed: int = 42,
         num_epochs: Optional[int] = None,
+        # Multi-dataset mode parameters
+        dataset_configs: Optional[List[Dict[str, Any]]] = None,
+        shuffle_buffer_size: int = 10000,
+        stopping_strategy: str = "first_exhausted",
     ):
         """Initialize the epoch-tracking data loader.
         
+        Can be initialized in single-dataset mode (dataset_name + dataset_config)
+        or multi-dataset mode (dataset_configs list).
+        
         Args:
-            dataset_name: HuggingFace dataset name
-            dataset_config: Dataset configuration/subset
+            dataset_name: HuggingFace dataset name (single-dataset mode)
+            dataset_config: Dataset configuration/subset (single-dataset mode)
             tokenizer: Tokenizer for text encoding
             max_length: Maximum sequence length for packing
             batch_size: Number of sequences per batch
@@ -408,9 +529,25 @@ class EpochTrackingDataLoader:
             shard_count: Total number of shards
             seed: Random seed (epoch number is added for per-epoch variation)
             num_epochs: Maximum epochs (None = infinite)
+            dataset_configs: List of dataset configs for multi-dataset mode.
+                Each config is a dict with keys: name, config, weight
+            shuffle_buffer_size: Buffer size for streaming shuffle
+            stopping_strategy: "first_exhausted" or "all_exhausted"
         """
-        self.dataset_name = dataset_name
-        self.dataset_config = dataset_config
+        # Determine mode
+        self.multi_dataset_mode = dataset_configs is not None
+        
+        if self.multi_dataset_mode:
+            self.dataset_configs = dataset_configs
+            self.dataset_name = None
+            self.dataset_config = None
+        else:
+            if dataset_name is None:
+                raise ValueError("Must provide either dataset_name or dataset_configs")
+            self.dataset_name = dataset_name
+            self.dataset_config = dataset_config
+            self.dataset_configs = None
+        
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.batch_size = batch_size
@@ -418,12 +555,27 @@ class EpochTrackingDataLoader:
         self.shard_count = shard_count
         self.base_seed = seed
         self.num_epochs = num_epochs
+        self.shuffle_buffer_size = shuffle_buffer_size
+        self.stopping_strategy = stopping_strategy
         self.epoch = 0
         self._current_iter = None
     
     def _load_stream_dataset(self):
         """Load a fresh HuggingFace streaming dataset for one epoch."""
-
+        epoch_seed = self.base_seed + self.epoch
+        
+        if self.multi_dataset_mode:
+            # Multi-dataset mode: use interleaved loader
+            return load_interleaved_streaming_dataset(
+                dataset_configs=self.dataset_configs,
+                shard_index=self.shard_index,
+                shard_count=self.shard_count,
+                seed=epoch_seed,
+                shuffle_buffer_size=self.shuffle_buffer_size,
+                stopping_strategy=self.stopping_strategy,
+            )
+        
+        # Single-dataset mode (original behavior)
         # reuse_cache_if_exists avoids timeout checking metadata for large datasets
         # token=True for gated datasets like CulturaX (use_auth_token is deprecated)
         stream_dataset = load_dataset(
@@ -454,9 +606,8 @@ class EpochTrackingDataLoader:
                 stream_dataset = sharded_iter()
         
         # Shuffle with epoch-specific seed for different order each epoch
-        epoch_seed = self.base_seed + self.epoch
         if hasattr(stream_dataset, 'shuffle'):
-            stream_dataset = stream_dataset.shuffle(seed=epoch_seed, buffer_size=10000)
+            stream_dataset = stream_dataset.shuffle(seed=epoch_seed, buffer_size=self.shuffle_buffer_size)
         
         return stream_dataset
     

@@ -1,0 +1,19 @@
+{
+    "datasets": [
+        {
+            "name": "HuggingFaceFW/fineweb-2",
+            "config": "nld_Latn",
+            "weight": 0.4
+        },
+        {
+            "name": "uonlp/CulturaX",
+            "config": "nl",
+            "weight": 0.3
+        },
+        {
+            "name": "yhavinga/mc4_nl_cleaned",
+            "config": "full",
+            "weight": 0.3
+        }
+    ]
+}

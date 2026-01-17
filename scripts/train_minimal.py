@@ -271,6 +271,27 @@ def parse_args():
         default=None,
         help="Number of epochs for packing mode (default: None = infinite, auto-restart on exhaustion)"
     )
+    
+    # Multi-dataset interleaving arguments
+    parser.add_argument(
+        "--datasets-config",
+        type=str,
+        default=None,
+        help="Path to JSON config file for multiple datasets. Format: {\"datasets\": [{\"name\": \"...\", \"config\": \"...\", \"weight\": 0.5}, ...]}"
+    )
+    parser.add_argument(
+        "--shuffle-buffer-size",
+        type=int,
+        default=10000,
+        help="Buffer size for streaming shuffle (default: 10000)"
+    )
+    parser.add_argument(
+        "--stopping-strategy",
+        type=str,
+        choices=["first_exhausted", "all_exhausted"],
+        default="first_exhausted",
+        help="Multi-dataset stopping strategy (default: first_exhausted)"
+    )
 
     return parser.parse_args()
 
@@ -1180,9 +1201,21 @@ def main(args):
         # Use Grain dataloader with packing and epoch tracking
         if is_coordinator():
             print("\nCreating Grain dataloader with sequence packing...")
+        
+        # Parse multi-dataset config if provided
+        dataset_configs = None
+        if args.datasets_config:
+            with open(args.datasets_config, 'r') as f:
+                config_data = json.load(f)
+            dataset_configs = config_data.get("datasets", config_data)
+            if is_coordinator():
+                print(f"  Loading {len(dataset_configs)} datasets from config:")
+                for cfg in dataset_configs:
+                    print(f"    - {cfg['name']} ({cfg.get('config', 'default')}): weight={cfg.get('weight', 1.0)}")
+        
         packed_dataloader = create_packed_dataloader(
-            dataset_name=args.dataset,
-            dataset_config=args.dataset_config,
+            dataset_name=args.dataset if not dataset_configs else None,
+            dataset_config=args.dataset_config if not dataset_configs else None,
             tokenizer=tokenizer,
             max_length=max_length,
             batch_size=batch_size,  # Per-device batch size (same as non-packed)
@@ -1191,6 +1224,9 @@ def main(args):
             shard_count=jax.process_count(),
             seed=42,
             num_epochs=args.num_epochs,
+            dataset_configs=dataset_configs,
+            shuffle_buffer_size=args.shuffle_buffer_size,
+            stopping_strategy=args.stopping_strategy,
         )
         if is_coordinator():
             print(f"  ✓ Packing enabled: documents will be packed into {max_length}-token sequences")

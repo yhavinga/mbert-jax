@@ -12,6 +12,7 @@ from .packing import (
     TokenizeTransform,
     create_packed_dataloader,
     create_packed_dataset_streaming,
+    load_interleaved_streaming_dataset,
 )
 
 __all__ = [
@@ -22,5 +23,6 @@ __all__ = [
     "TokenizeTransform",
     "create_packed_dataloader",
     "create_packed_dataset_streaming",
+    "load_interleaved_streaming_dataset",
 ]
 

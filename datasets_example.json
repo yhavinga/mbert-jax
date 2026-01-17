@@ -1,0 +1,19 @@
+{
+    "datasets": [
+        {
+            "name": "yhavinga/mc4_nl_cleaned",
+            "config": "micro",
+            "weight": 0.5
+        },
+        {
+            "name": "yhavinga/mc4_nl_cleaned",
+            "config": "tiny",
+            "weight": 0.25
+        },
+        {
+            "name": "yhavinga/mc4_nl_cleaned",
+            "config": "small",
+            "weight": 0.25
+        }
+    ]
+}

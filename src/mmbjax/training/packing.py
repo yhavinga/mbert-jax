@@ -25,12 +25,14 @@ except ImportError:
 
 __all__ = [
     "TokenizeTransform",
+    "FLANTokenizeTransform",
     "PackedMLMDataCollator",
+    "InstructionResponseMaskingCollator",
+    "HybridMaskingCollator",
     "StreamingBufferDataSource",
     "EpochTrackingDataLoader",
     "create_packed_dataloader",
     "create_packed_dataset_streaming",
-    "load_interleaved_streaming_dataset",
     "GRAIN_AVAILABLE",
 ]
 
@@ -171,6 +173,61 @@ class TokenizeTransform:
         }
 
 
+class FLANTokenizeTransform:
+    """Tokenize FLAN-format (inputs, targets) with separator for instruction-response masking.
+
+    Format: [inputs] </s> [targets] → 2 segments per example for differential masking.
+    """
+
+    def __init__(self, tokenizer, max_length: int):
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.sep_token_id = tokenizer.eos_token_id  # </s> token
+        import threading
+        self._lock = threading.Lock()
+
+    def map(self, element: Dict[str, Any]) -> Dict[str, Any]:
+        """Tokenize FLAN format (inputs, targets) with separator.
+
+        The dataset has 'inputs' (instruction) and 'targets' (response) fields.
+        We concatenate them with EOS token as separator.
+
+        Note: We reserve 1 token for the separator, so inputs+targets must fit in max_length-1.
+        """
+        with self._lock:  # Thread-safe tokenization for fast tokenizers
+            # Reserve 1 token for the separator
+            max_tokens_per_part = (self.max_length - 1) // 2
+
+            # Tokenize inputs (instruction)
+            inputs = self.tokenizer(
+                element["inputs"],
+                truncation=True,
+                max_length=max_tokens_per_part,
+                return_tensors=None,
+                add_special_tokens=False,
+            )["input_ids"]
+
+            # Calculate remaining space for targets
+            remaining_space = self.max_length - len(inputs) - 1  # -1 for separator
+
+            # Tokenize targets (response) with remaining space
+            targets = self.tokenizer(
+                element["targets"],
+                truncation=True,
+                max_length=remaining_space,
+                return_tensors=None,
+                add_special_tokens=False,
+            )["input_ids"]
+
+        # Concatenate: inputs + </s> + targets
+        input_ids = inputs + [self.sep_token_id] + targets
+
+        return {
+            "input_ids": np.array(input_ids, dtype=np.int32),
+            "length": len(input_ids),
+        }
+
+
 class PackedMLMDataCollator:
     """
     MLM collator for packed sequences from Grain.
@@ -260,6 +317,273 @@ class PackedMLMDataCollator:
         return input_ids, labels
 
 
+class InstructionResponseMaskingCollator:
+    """MLM collator with instruction/response masking for FLAN-style data.
+
+    Uses position-based heuristic to identify instruction vs response tokens:
+    - Scans each segment for first </s> (EOS token, id=2)
+    - Tokens before </s> → instruction part → mask_prob = 0.0 (no masking)
+    - Tokens after </s> → response part → mask_prob = 0.25 (harder training)
+
+    This works even when Grain splits sequences across packing boundaries.
+    """
+
+    def __init__(
+        self,
+        tokenizer,
+        instruction_mask_prob: float = 0.0,
+        response_mask_prob: float = 0.25,
+        sep_token_id: Optional[int] = None,
+    ):
+        self.tokenizer = tokenizer
+        self.instruction_mask_prob = instruction_mask_prob
+        self.response_mask_prob = response_mask_prob
+        # Default to EOS token (</s> for LLaMA tokenizers)
+        self.sep_token_id = sep_token_id if sep_token_id is not None else tokenizer.eos_token_id
+
+    def __call__(self, batch: Dict[str, Any]) -> Dict[str, np.ndarray]:
+        """Process a batch from Grain's FirstFitPackIterDataset."""
+        input_ids = np.array(batch["input_ids"])
+        segment_ids = np.array(batch["input_ids_segment_ids"])
+        positions = np.array(batch["input_ids_positions"])
+
+        # Fix padding token segment_id (same as PackedMLMDataCollator)
+        is_padding = (input_ids == self.tokenizer.pad_token_id)
+        segment_ids = np.where(is_padding, -1, segment_ids)
+
+        # Apply segment-aware MLM masking
+        input_ids, labels = self.mask_tokens_packed(input_ids, segment_ids)
+
+        # CRITICAL: attention_mask must be 0 for padding tokens
+        attention_mask = np.where(is_padding, 0, 1).astype(np.int32)
+
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+            "position_ids": positions,
+            "segment_ids": segment_ids,
+        }
+
+    def mask_tokens_packed(
+        self, input_ids: np.ndarray, segment_ids: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Apply position-aware MLM masking based on instruction/response segments.
+
+        For each segment:
+        1. Find first `</s>` token position
+        2. Tokens before `</s>` → instruction masking (0% by default)
+        3. Tokens after `</s>` → response masking (25% by default)
+        4. No `</s>` found → treat as instruction (0% masking)
+        """
+        labels = input_ids.copy()
+        probability_matrix = np.zeros(input_ids.shape, dtype=np.float32)
+
+        # Process each batch row independently
+        # (segment IDs are only meaningful within a single sequence)
+        for batch_idx in range(input_ids.shape[0]):
+            row_input_ids = input_ids[batch_idx]
+            row_segment_ids = segment_ids[batch_idx]
+
+            for seg_id in np.unique(row_segment_ids):
+                if seg_id == -1:  # Skip padding
+                    continue
+
+                # 1D mask for this segment within this row
+                seg_mask = (row_segment_ids == seg_id)
+                seg_tokens = row_input_ids[seg_mask]
+
+                # Find first </s> position in this segment
+                sep_positions = np.where(seg_tokens == self.sep_token_id)[0]
+
+                if len(sep_positions) == 0:
+                    # No separator → entire segment is instruction
+                    probability_matrix[batch_idx, seg_mask] = self.instruction_mask_prob
+                else:
+                    # Has separator - check if it's truly FLAN format or just trailing EOS
+                    first_sep_idx = sep_positions[0]
+                    # Get column indices where this segment is located
+                    seg_col_indices = np.where(seg_mask)[0]
+
+                    # Check if there are tokens AFTER the separator
+                    response_cols = seg_col_indices[first_sep_idx + 1:]
+                    
+                    if len(response_cols) == 0:
+                        # Separator is at the end (no response) → treat as instruction
+                        probability_matrix[batch_idx, seg_mask] = self.instruction_mask_prob
+                    else:
+                        # Has tokens after separator → true FLAN format → differential masking
+                        # Tokens before </s> → instruction (lower/no masking)
+                        instruction_cols = seg_col_indices[:first_sep_idx]
+                        probability_matrix[batch_idx, instruction_cols] = self.instruction_mask_prob
+
+                        # Tokens after </s> → response (higher masking)
+                        probability_matrix[batch_idx, response_cols] = self.response_mask_prob
+
+        # Don't mask special tokens (including </s> separator)
+        special_tokens_mask = np.array([
+            [1 if tok in self.tokenizer.all_special_ids else 0 for tok in ids]
+            for ids in input_ids.tolist()
+        ])
+        probability_matrix[special_tokens_mask.astype(bool)] = 0.0
+
+        # Sample and apply masking (80% MASK, 10% random, 10% original)
+        masked_indices = np.random.binomial(1, probability_matrix).astype(bool)
+        labels[~masked_indices] = -100
+
+        indices_replaced = (
+            np.random.binomial(1, np.full(labels.shape, 0.8)).astype(bool)
+            & masked_indices
+        )
+        input_ids[indices_replaced] = self.tokenizer.mask_token_id
+
+        indices_random = (
+            np.random.binomial(1, np.full(labels.shape, 0.5)).astype(bool)
+            & masked_indices & ~indices_replaced
+        )
+        random_words = np.random.randint(
+            self.tokenizer.vocab_size, size=labels.shape, dtype=np.int32
+        )
+        input_ids[indices_random] = random_words[indices_random]
+
+        return input_ids, labels
+
+
+class HybridMaskingCollator:
+    """Hybrid MLM collator that handles both standard and FLAN-style data in mixed batches.
+
+    Uses position-based heuristic:
+    - Segments WITH `</s>` (EOS token): 0% instruction / 25% response masking
+    - Segments WITHOUT `</s>`: 15% standard MLM masking
+
+    This enables mixing normal text datasets (MC4, web text) with instruction-tuning
+    datasets (FLAN) in a single training run.
+
+    The masking detection is automatic - no need to specify which datasets are which format.
+    Just ensure FLAN datasets use the `inputs_targets` format (which adds `</s>` separator).
+    """
+
+    def __init__(
+        self,
+        tokenizer,
+        standard_mask_prob: float = 0.15,
+        instruction_mask_prob: float = 0.0,
+        response_mask_prob: float = 0.25,
+        sep_token_id: Optional[int] = None,
+    ):
+        self.tokenizer = tokenizer
+        self.standard_mask_prob = standard_mask_prob
+        self.instruction_mask_prob = instruction_mask_prob
+        self.response_mask_prob = response_mask_prob
+        self.sep_token_id = sep_token_id if sep_token_id is not None else tokenizer.eos_token_id
+
+    def __call__(self, batch: Dict[str, Any]) -> Dict[str, np.ndarray]:
+        """Process a batch from Grain's FirstFitPackIterDataset."""
+        input_ids = np.array(batch["input_ids"])
+        segment_ids = np.array(batch["input_ids_segment_ids"])
+        positions = np.array(batch["input_ids_positions"])
+
+        # Fix padding token segment_id
+        is_padding = (input_ids == self.tokenizer.pad_token_id)
+        segment_ids = np.where(is_padding, -1, segment_ids)
+
+        # Apply hybrid MLM masking
+        input_ids, labels = self.mask_tokens_packed(input_ids, segment_ids)
+
+        # CRITICAL: attention_mask must be 0 for padding tokens
+        attention_mask = np.where(is_padding, 0, 1).astype(np.int32)
+
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+            "position_ids": positions,
+            "segment_ids": segment_ids,
+        }
+
+    def mask_tokens_packed(
+        self, input_ids: np.ndarray, segment_ids: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Apply hybrid MLM masking based on segment content.
+
+        For each segment:
+        - If `</s>` is found → FLAN format (0% instruction / 25% response)
+        - If no `</s>` → Standard format (15% uniform)
+        """
+        labels = input_ids.copy()
+        probability_matrix = np.zeros(input_ids.shape, dtype=np.float32)
+
+        # Process each batch row independently
+        # (segment IDs are only meaningful within a single sequence)
+        for batch_idx in range(input_ids.shape[0]):
+            row_input_ids = input_ids[batch_idx]
+            row_segment_ids = segment_ids[batch_idx]
+
+            for seg_id in np.unique(row_segment_ids):
+                if seg_id == -1:  # Skip padding
+                    continue
+
+                # 1D mask for this segment within this row
+                seg_mask = (row_segment_ids == seg_id)
+                seg_tokens = row_input_ids[seg_mask]
+
+                # Find first </s> position in this segment
+                sep_positions = np.where(seg_tokens == self.sep_token_id)[0]
+
+                if len(sep_positions) == 0:
+                    # No separator → standard text dataset → 15% masking
+                    probability_matrix[batch_idx, seg_mask] = self.standard_mask_prob
+                else:
+                    # Has separator - check if it's truly FLAN format or just trailing EOS
+                    first_sep_idx = sep_positions[0]
+                    # Get column indices where this segment is located
+                    seg_col_indices = np.where(seg_mask)[0]
+                    
+                    # Check if there are tokens AFTER the separator
+                    response_cols = seg_col_indices[first_sep_idx + 1:]
+                    
+                    if len(response_cols) == 0:
+                        # Separator is at the end (no response) → standard text → 15% masking
+                        # This happens when TokenizeTransform adds EOS at the end
+                        probability_matrix[batch_idx, seg_mask] = self.standard_mask_prob
+                    else:
+                        # Has tokens after separator → true FLAN format → differential masking
+                        # Tokens before </s> → instruction (0% masking)
+                        instruction_cols = seg_col_indices[:first_sep_idx]
+                        probability_matrix[batch_idx, instruction_cols] = self.instruction_mask_prob
+                        
+                        # Tokens after </s> → response (25% masking)
+                        probability_matrix[batch_idx, response_cols] = self.response_mask_prob
+
+        # Don't mask special tokens (including </s> separator)
+        special_tokens_mask = np.array([
+            [1 if tok in self.tokenizer.all_special_ids else 0 for tok in ids]
+            for ids in input_ids.tolist()
+        ])
+        probability_matrix[special_tokens_mask.astype(bool)] = 0.0
+
+        # Sample and apply masking (80% MASK, 10% random, 10% original)
+        masked_indices = np.random.binomial(1, probability_matrix).astype(bool)
+        labels[~masked_indices] = -100
+
+        indices_replaced = (
+            np.random.binomial(1, np.full(labels.shape, 0.8)).astype(bool)
+            & masked_indices
+        )
+        input_ids[indices_replaced] = self.tokenizer.mask_token_id
+
+        indices_random = (
+            np.random.binomial(1, np.full(labels.shape, 0.5)).astype(bool)
+            & masked_indices & ~indices_replaced
+        )
+        random_words = np.random.randint(
+            self.tokenizer.vocab_size, size=labels.shape, dtype=np.int32
+        )
+        input_ids[indices_random] = random_words[indices_random]
+
+        return input_ids, labels
+
+
 def create_packed_dataloader(
     dataset_name: Optional[str] = None,
     dataset_config: Optional[str] = None,
@@ -275,12 +599,14 @@ def create_packed_dataloader(
     dataset_configs: Optional[List[Dict[str, Any]]] = None,
     shuffle_buffer_size: int = 10000,
     stopping_strategy: str = "first_exhausted",
+    # Dataset format parameter
+    dataset_format: str = "text",
 ):
     """Create Grain dataset iterator with sequence packing and epoch restart.
 
     Uses EpochTrackingDataLoader to automatically restart the data pipeline
     when the source dataset is exhausted, enabling multi-epoch training.
-    
+
     Can be called in single-dataset mode (dataset_name) or multi-dataset
     mode (dataset_configs).
 
@@ -296,9 +622,10 @@ def create_packed_dataloader(
         seed: Random seed for shuffling (epoch number is added for per-epoch variation)
         num_epochs: Number of epochs to run (None = infinite, auto-restart forever)
         dataset_configs: List of dataset configs for multi-dataset mode.
-            Each config is a dict with keys: name, config, weight
+            Each config is a dict with keys: name, config, weight, format (optional)
         shuffle_buffer_size: Buffer size for streaming shuffle
         stopping_strategy: "first_exhausted" or "all_exhausted"
+        dataset_format: Dataset format - "text" or "inputs_targets" (single-dataset mode only)
 
     Returns:
         EpochTrackingDataLoader with sequence packing and epoch tracking
@@ -321,7 +648,7 @@ def create_packed_dataloader(
         print(f"Creating EpochTrackingDataLoader for: {dataset_name}{config_str}")
     print(f"  Epochs: {'infinite' if num_epochs is None else num_epochs}")
     print(f"  Shuffle buffer: {shuffle_buffer_size}")
-    
+
     return EpochTrackingDataLoader(
         dataset_name=dataset_name,
         dataset_config=dataset_config,
@@ -335,6 +662,7 @@ def create_packed_dataloader(
         dataset_configs=dataset_configs,
         shuffle_buffer_size=shuffle_buffer_size,
         stopping_strategy=stopping_strategy,
+        dataset_format=dataset_format,
     )
 
 
@@ -343,21 +671,24 @@ def create_packed_dataset_streaming(
     tokenizer,
     max_length: int,
     batch_size: int,
+    dataset_format: str = "text",
 ):
     """Create a packed IterDataset from a streaming dataset.
 
     Uses StreamingBufferDataSource to lazily load from the stream while
     providing the RandomAccessDataSource interface that Grain requires.
-    
+
     Note: Buffer grows unbounded as items are accessed. For large datasets,
     memory will grow over time. This is required because Grain's shuffling
     needs random access to previously-seen items.
 
     Args:
         stream_dataset: Any Python iterable yielding dicts with "text" field
+            (for format="text") or "inputs"/"targets" fields (for format="inputs_targets")
         tokenizer: Tokenizer with eos_token_id
         max_length: Maximum sequence length for packing
         batch_size: Number of packing bins (sequences per batch)
+        dataset_format: "text" for standard text datasets, "inputs_targets" for FLAN-style
 
     Returns:
         IterDataset that yields packed batches
@@ -370,9 +701,12 @@ def create_packed_dataset_streaming(
     # Wrap stream as a lazy-loading RandomAccessDataSource
     # No buffer limit - Grain needs random access to all items for shuffling
     source = StreamingBufferDataSource(stream_dataset)
-    
-    # Create tokenizer transform
-    tokenize = TokenizeTransform(tokenizer, max_length)
+
+    # Create tokenizer transform based on dataset format
+    if dataset_format == "inputs_targets":
+        tokenize = FLANTokenizeTransform(tokenizer, max_length)
+    else:  # Default to "text" format
+        tokenize = TokenizeTransform(tokenizer, max_length)
 
     # Build Grain pipeline: source -> tokenize -> to_iter -> pack -> batch
     map_dataset = grain.MapDataset.source(source).map(tokenize.map)
@@ -392,94 +726,6 @@ def create_packed_dataset_streaming(
     batched_dataset = packed_dataset.batch(batch_size)
 
     return batched_dataset
-
-
-def load_interleaved_streaming_dataset(
-    dataset_configs: List[Dict[str, Any]],
-    shard_index: int = 0,
-    shard_count: int = 1,
-    seed: int = 42,
-    shuffle_buffer_size: int = 10000,
-    stopping_strategy: str = "first_exhausted",
-):
-    """Load multiple datasets and interleave them with probability weights.
-    
-    Uses HuggingFace's interleave_datasets() to combine multiple streaming
-    datasets into a single stream with configurable sampling probabilities.
-    
-    Args:
-        dataset_configs: List of dicts with keys:
-            - name: HuggingFace dataset name
-            - config: Dataset config/subset (or None)
-            - weight: Sampling probability (weights are normalized automatically)
-        shard_index: Index of this shard for multi-host training
-        shard_count: Total number of shards
-        seed: Random seed for shuffling
-        shuffle_buffer_size: Buffer size for streaming shuffle
-        stopping_strategy: "first_exhausted" or "all_exhausted"
-    
-    Returns:
-        Interleaved IterableDataset with shuffling applied
-    
-    Example:
-        >>> configs = [
-        ...     {"name": "yhavinga/mc4_nl_cleaned", "config": "micro", "weight": 0.5},
-        ...     {"name": "uonlp/CulturaX", "config": "nl", "weight": 0.25},
-        ... ]
-        >>> dataset = load_interleaved_streaming_dataset(configs)
-    """
-    if not GRAIN_AVAILABLE:
-        raise ImportError("Grain and datasets must be installed for interleaving")
-    
-    # Load each dataset as streaming
-    datasets_list = []
-    weights = []
-    
-    for cfg in dataset_configs:
-        ds = load_dataset(
-            cfg["name"],
-            cfg.get("config"),
-            split="train",
-            streaming=True,
-            download_mode="reuse_cache_if_exists",
-            token=True,
-        )
-        datasets_list.append(ds)
-        weights.append(cfg.get("weight", 1.0))
-    
-    # Normalize weights to probabilities
-    total_weight = sum(weights)
-    probabilities = [w / total_weight for w in weights]
-    
-    # Interleave datasets with probability weights
-    interleaved = interleave_datasets(
-        datasets_list,
-        probabilities=probabilities,
-        seed=seed,
-        stopping_strategy=stopping_strategy,
-    )
-    
-    # Apply sharding for multi-host training
-    if shard_count > 1:
-        try:
-            from datasets.distributed import split_dataset_by_node
-            interleaved = split_dataset_by_node(
-                interleaved, rank=shard_index, world_size=shard_count
-            )
-        except ImportError:
-            # Fallback: manual strided iteration
-            original = interleaved
-            def sharded_iter():
-                for i, item in enumerate(original):
-                    if i % shard_count == shard_index:
-                        yield item
-            interleaved = sharded_iter()
-    
-    # Apply shuffle buffer
-    if hasattr(interleaved, 'shuffle'):
-        interleaved = interleaved.shuffle(seed=seed, buffer_size=shuffle_buffer_size)
-    
-    return interleaved
 
 
 class EpochTrackingDataLoader:
@@ -513,12 +759,14 @@ class EpochTrackingDataLoader:
         dataset_configs: Optional[List[Dict[str, Any]]] = None,
         shuffle_buffer_size: int = 10000,
         stopping_strategy: str = "first_exhausted",
+        # Dataset format parameter
+        dataset_format: str = "text",
     ):
         """Initialize the epoch-tracking data loader.
-        
+
         Can be initialized in single-dataset mode (dataset_name + dataset_config)
         or multi-dataset mode (dataset_configs list).
-        
+
         Args:
             dataset_name: HuggingFace dataset name (single-dataset mode)
             dataset_config: Dataset configuration/subset (single-dataset mode)
@@ -530,24 +778,27 @@ class EpochTrackingDataLoader:
             seed: Random seed (epoch number is added for per-epoch variation)
             num_epochs: Maximum epochs (None = infinite)
             dataset_configs: List of dataset configs for multi-dataset mode.
-                Each config is a dict with keys: name, config, weight
+                Each config is a dict with keys: name, config, weight, format (optional)
             shuffle_buffer_size: Buffer size for streaming shuffle
             stopping_strategy: "first_exhausted" or "all_exhausted"
+            dataset_format: Dataset format - "text" or "inputs_targets" (single-dataset mode)
         """
         # Determine mode
         self.multi_dataset_mode = dataset_configs is not None
-        
+
         if self.multi_dataset_mode:
             self.dataset_configs = dataset_configs
             self.dataset_name = None
             self.dataset_config = None
+            self.dataset_format = None  # Not used in multi-dataset mode
         else:
             if dataset_name is None:
                 raise ValueError("Must provide either dataset_name or dataset_configs")
             self.dataset_name = dataset_name
             self.dataset_config = dataset_config
             self.dataset_configs = None
-        
+            self.dataset_format = dataset_format
+
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.batch_size = batch_size
@@ -612,14 +863,180 @@ class EpochTrackingDataLoader:
         return stream_dataset
     
     def _create_pipeline(self):
-        """Create a fresh packed data pipeline for one epoch."""
-        stream_dataset = self._load_stream_dataset()
-        return create_packed_dataset_streaming(
-            stream_dataset,
-            tokenizer=self.tokenizer,
-            max_length=self.max_length,
-            batch_size=self.batch_size,
+        """Create a fresh packed data pipeline for one epoch.
+
+        For multi-dataset mode with different formats:
+        1. Load each dataset separately
+        2. Apply format-specific tokenization
+        3. Interleave tokenized streams
+        4. Pack the interleaved stream
+        """
+        if grain is None or grain_exp is None:
+            raise ImportError("Grain is not available")
+
+        if self.multi_dataset_mode:
+            # Multi-dataset mode: process each dataset separately, then interleave
+            return self._create_multi_dataset_pipeline()
+        else:
+            # Single-dataset mode: use the specified format
+            stream_dataset = self._load_stream_dataset()
+            return create_packed_dataset_streaming(
+                stream_dataset,
+                tokenizer=self.tokenizer,
+                max_length=self.max_length,
+                batch_size=self.batch_size,
+                dataset_format=self.dataset_format,
+            )
+
+    def _create_multi_dataset_pipeline(self):
+        """Create a data pipeline for multi-dataset mode with format support.
+
+        Each dataset is tokenized according to its format, then the tokenized
+        streams are interleaved and packed together.
+        """
+        epoch_seed = self.base_seed + self.epoch
+
+        # Load and tokenize each dataset separately
+        tokenized_streams = []
+        weights = []
+
+        for cfg in self.dataset_configs:
+            # Get dataset format (default to "text")
+            dataset_format = cfg.get("format", "text")
+
+            # Load the streaming dataset
+            stream = load_dataset(
+                cfg["name"],
+                cfg.get("config"),
+                split="train",
+                streaming=True,
+                download_mode="reuse_cache_if_exists",
+                token=True,
+            )
+
+            # Apply sharding if needed
+            if self.shard_count > 1:
+                try:
+                    from datasets.distributed import split_dataset_by_node
+                    stream = split_dataset_by_node(
+                        stream, rank=self.shard_index, world_size=self.shard_count
+                    )
+                except ImportError:
+                    # Fallback to manual strided iteration
+                    original_stream = stream
+                    def sharded_iter():
+                        for i, item in enumerate(original_stream):
+                            if i % self.shard_count == self.shard_index:
+                                yield item
+                    stream = sharded_iter()
+
+            # Shuffle
+            if hasattr(stream, 'shuffle'):
+                stream = stream.shuffle(seed=epoch_seed, buffer_size=self.shuffle_buffer_size)
+
+            # Wrap as buffer source for Grain
+            source = StreamingBufferDataSource(stream)
+
+            # Create appropriate tokenizer transform
+            if dataset_format == "inputs_targets":
+                tokenize = FLANTokenizeTransform(self.tokenizer, self.max_length)
+            else:
+                tokenize = TokenizeTransform(self.tokenizer, self.max_length)
+
+            # Create tokenized map dataset
+            # Disable prefetching to avoid thread safety issues with fast tokenizers
+            # (HuggingFace fast tokenizers use Rust and aren't thread-safe)
+            map_dataset = grain.MapDataset.source(source).map(tokenize.map)
+            iter_dataset = map_dataset.to_iter_dataset(
+                read_options=grain.ReadOptions(num_threads=1, prefetch_buffer_size=0)
+            )
+
+            tokenized_streams.append(iter_dataset)
+            weights.append(cfg.get("weight", 1.0))
+
+        # Normalize weights
+        total_weight = sum(weights)
+        probabilities = [w / total_weight for w in weights]
+
+        # Interleave tokenized streams using probability sampling
+        # (grain.MixIterDataset doesn't exist in all Grain versions)
+        class InterleavedIterDataset:
+            """Simple interleaving iterator that samples from multiple streams."""
+            def __init__(self, parents, probabilities, seed, stopping_strategy):
+                self.parents = parents
+                self.probabilities = probabilities
+                self.seed = seed
+                self.stopping_strategy = stopping_strategy
+
+            def __iter__(self):
+                import random
+                rng = random.Random(self.seed)
+                iterators = [iter(p) for p in self.parents]
+                exhausted = [False] * len(iterators)
+
+                while True:
+                    # Check stopping condition
+                    if self.stopping_strategy == "first_exhausted":
+                        if any(exhausted):
+                            break
+                    else:  # all_exhausted
+                        if all(exhausted):
+                            break
+
+                    # Sample which dataset to draw from (skip exhausted ones)
+                    available_probs = [
+                        p if not e else 0.0
+                        for p, e in zip(self.probabilities, exhausted)
+                    ]
+                    total = sum(available_probs)
+                    if total == 0:
+                        break
+                    normalized = [p / total for p in available_probs]
+
+                    # Weighted random choice
+                    r = rng.random()
+                    cumulative = 0.0
+                    chosen_idx = 0
+                    for i, prob in enumerate(normalized):
+                        cumulative += prob
+                        if r <= cumulative:
+                            chosen_idx = i
+                            break
+
+                    # Try to get next item from chosen iterator
+                    try:
+                        item = next(iterators[chosen_idx])
+                        yield item
+                    except StopIteration:
+                        exhausted[chosen_idx] = True
+
+        interleaved = InterleavedIterDataset(
+            parents=tokenized_streams,
+            probabilities=probabilities,
+            seed=epoch_seed,
+            stopping_strategy=self.stopping_strategy,
         )
+
+        # Wrap interleaved iterator as a proper Grain data source
+        # FirstFitPackIterDataset expects a Grain IterDataset, not a plain Python iterator
+        interleaved_source = StreamingBufferDataSource(iter(interleaved))
+        interleaved_map = grain.MapDataset.source(interleaved_source).map(lambda x: x)
+        interleaved_iter = interleaved_map.to_iter_dataset(
+            read_options=grain.ReadOptions(num_threads=1, prefetch_buffer_size=0)
+        )
+
+        # Apply packing to the interleaved tokenized stream
+        packed_dataset = grain_exp.FirstFitPackIterDataset(
+            parent=interleaved_iter,
+            length_struct={"input_ids": self.max_length},
+            num_packing_bins=self.batch_size,
+            shuffle_bins=True,
+            padding_struct={"input_ids": self.tokenizer.pad_token_id},
+        )
+
+        # Batch the packed sequences
+        batched_dataset = packed_dataset.batch(self.batch_size)
+        return batched_dataset
     
     def __iter__(self):
         """Iterate through batches, auto-restarting on epoch boundaries."""

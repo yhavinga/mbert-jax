@@ -12,13 +12,14 @@ Usage:
 Navigation:
     ←/→     Previous/next sequence
     ↑/↓     Select segment within sequence
+    m       Toggle masking visualization
     q       Quit
 
 UI Layout:
     Top-left:  Segment layout (position-ordered)
     Top-right: Block-diagonal attention mask
     Bottom-left: Cumulative statistics (all prefetched sequences)
-    Bottom-right: Decoded text (scrollable)
+    Bottom-right: Decoded text OR Masking visualization (toggle with 'm')
 """
 
 from __future__ import annotations
@@ -43,6 +44,13 @@ try:
 except ImportError:
     TEXTUAL_AVAILABLE = False
     App = object
+
+
+# Import masking collator for visualization
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+from mmbjax.training.packing import HybridMaskingCollator, FLANTokenizeTransform, EpochTrackingDataLoader
 
 
 # Grain and tokenizer imports
@@ -104,15 +112,18 @@ class TokenizeTransform:
     def __init__(self, tokenizer, max_length: int):
         self.tokenizer = tokenizer
         self.max_length = max_length
+        import threading
+        self._lock = threading.Lock()
 
     def map(self, element: Dict[str, Any]) -> Dict[str, Any]:
-        tokens = self.tokenizer(
-            element["text"],
-            truncation=True,
-            max_length=self.max_length,
-            return_tensors=None,
-            add_special_tokens=False,
-        )
+        with self._lock:  # Thread-safe tokenization for fast tokenizers
+            tokens = self.tokenizer(
+                element["text"],
+                truncation=True,
+                max_length=self.max_length,
+                return_tensors=None,
+                add_special_tokens=False,
+            )
         input_ids = tokens["input_ids"]
         was_truncated = len(input_ids) >= self.max_length
         if not was_truncated:
@@ -128,10 +139,18 @@ def create_packed_dataset_streaming(
     tokenizer,
     max_length: int,
     batch_size: int,
+    dataset_format: str = "text",
+    num_workers: int = 0,  # 0 = no prefetch (single-threaded)
 ):
     """Create a packed IterDataset from a streaming dataset."""
     source = StreamingBufferDataSource(stream_dataset)
-    tokenize = TokenizeTransform(tokenizer, max_length)
+
+    # Choose tokenizer transform based on dataset format
+    if dataset_format == "inputs_targets":
+        tokenize = FLANTokenizeTransform(tokenizer, max_length)
+    else:
+        tokenize = TokenizeTransform(tokenizer, max_length)
+
     map_dataset = grain.MapDataset.source(source).map(tokenize.map)
     iter_dataset = map_dataset.to_iter_dataset()
 
@@ -608,6 +627,165 @@ class DecodedTextPanel(Static):
         return content
 
 
+class MaskingView(Static):
+    """Display masking information for the current sequence.
+
+    Shows which tokens would be masked using the HybridMaskingCollator logic.
+    """
+
+    sequence_idx = reactive(0)
+    selected_segment = reactive(0)
+    show_masking = reactive(False)  # Make reactive so toggle triggers re-render
+    sequences: List[Dict[str, np.ndarray]] = field(default_factory=list)
+    tokenizer = None
+    mlm_collator: Optional[HybridMaskingCollator] = None
+
+    def __init__(self, sequences: List[Dict[str, np.ndarray]], tokenizer, **kwargs):
+        super().__init__(**kwargs)
+        self.sequences = sequences
+
+        # Get the EOS token ID BEFORE adding mask token
+        # (sequences were tokenized with this vocab)
+        original_eos_id = tokenizer.eos_token_id
+
+        # Ensure mask token exists (required for MLM)
+        if tokenizer.mask_token is None:
+            tokenizer.add_special_tokens({'mask_token': '<mask>'})
+
+        # Create collator with the ORIGINAL EOS ID (before mask token was added)
+        self.mlm_collator = HybridMaskingCollator(
+            tokenizer=tokenizer,
+            sep_token_id=original_eos_id
+        )
+
+        self.tokenizer = tokenizer
+
+    def watch_sequence_idx(self) -> None:
+        self.update(self.render_content())
+
+    def watch_selected_segment(self) -> None:
+        self.update(self.render_content())
+
+    def watch_show_masking(self) -> None:
+        """Re-render when masking view is toggled."""
+        self.update(self.render_content())
+
+    def toggle_view(self) -> None:
+        self.show_masking = not self.show_masking
+        self.update(self.render_content())
+
+    def render_masking_pattern(self, seq: Dict, max_display: int = 128) -> str:
+        """Render the actual masking pattern by running the masking collator."""
+        if not seq:
+            return "[dim italic]No data[/]"
+
+        try:
+            input_ids = seq["input_ids"].copy()
+            segment_ids = seq["segment_ids"].copy()
+
+            sep_token_id = self.mlm_collator.sep_token_id
+
+            # CRITICAL: Mark padding tokens as segment_id=-1 (matches HybridMaskingCollator.__call__)
+            pad_token_id = self.tokenizer.pad_token_id
+            is_padding = (input_ids == pad_token_id)
+            segment_ids = np.where(is_padding, -1, segment_ids)
+
+            # Run the actual masking FIRST so we can show results at top
+            input_ids_2d = input_ids.reshape(1, -1)
+            segment_ids_2d = segment_ids.reshape(1, -1)
+            _, labels_2d = self.mlm_collator.mask_tokens_packed(input_ids_2d, segment_ids_2d)
+            labels = labels_2d[0]
+
+            # Calculate masking stats
+            masked_positions = (labels != -100)
+            total_masked = int(masked_positions.sum())
+            padding_count = int(is_padding.sum())
+            real_tokens = len(input_ids) - padding_count
+
+            lines = []
+            lines.append("[b]MASKING VISUALIZATION[/b]")
+            lines.append("")
+
+            # === MASKING RESULTS AT TOP (most important info) ===
+            lines.append("[b green]Masking Results:[/]")
+            mask_pct = 100 * total_masked / max(real_tokens, 1)
+            lines.append(f"  [cyan]Total masked: {total_masked}/{real_tokens} tokens ({mask_pct:.1f}%)[/]")
+            if total_masked > 0:
+                positions = np.where(masked_positions)[0][:10].tolist()
+                lines.append(f"  [dim]First 10 masked positions: {positions}{'...' if total_masked > 10 else ''}[/]")
+            lines.append("")
+
+            # === PER-SEGMENT BREAKDOWN ===
+            lines.append("[b]Per-Segment Breakdown:[/]")
+            for seg_id in np.unique(segment_ids):
+                if seg_id == -1:  # Skip padding
+                    continue
+
+                seg_mask = (segment_ids == seg_id)
+                seg_tokens = input_ids[seg_mask]
+                seg_labels = labels[seg_mask]
+                sep_positions = np.where(seg_tokens == sep_token_id)[0]
+
+                if len(sep_positions) == 0:
+                    # Standard text format - no separator
+                    n_masked = int((seg_labels != -100).sum())
+                    pct = 100 * n_masked / max(len(seg_tokens), 1)
+                    lines.append(f"  [cyan]Segment {seg_id}[/] [dim](standard text, {len(seg_tokens)} tokens)[/]")
+                    lines.append(f"    Masked: [green]{n_masked}[/]/{len(seg_tokens)} ({pct:.1f}%)")
+                else:
+                    first_sep = sep_positions[0]
+                    resp_tokens = seg_tokens[first_sep + 1:]
+                    
+                    if len(resp_tokens) == 0:
+                        # Separator at end (no response) → standard text with trailing EOS
+                        n_masked = int((seg_labels != -100).sum())
+                        pct = 100 * n_masked / max(len(seg_tokens), 1)
+                        lines.append(f"  [cyan]Segment {seg_id}[/] [dim](standard text, {len(seg_tokens)} tokens, trailing EOS)[/]")
+                        lines.append(f"    Masked: [green]{n_masked}[/]/{len(seg_tokens)} ({pct:.1f}%)")
+                    else:
+                        # True FLAN format - has instruction/response separator
+                        inst_tokens = seg_tokens[:first_sep]
+                        inst_labels = seg_labels[:first_sep]
+                        resp_labels = seg_labels[first_sep + 1:]
+
+                        n_inst_masked = int((inst_labels != -100).sum())
+                        n_resp_masked = int((resp_labels != -100).sum())
+                        inst_pct = 100 * n_inst_masked / max(len(inst_tokens), 1)
+                        resp_pct = 100 * n_resp_masked / max(len(resp_tokens), 1)
+
+                        lines.append(f"  [cyan]Segment {seg_id}[/] [dim](FLAN format, sep at {first_sep})[/]")
+                        lines.append(f"    [green]Instruction[/]: {n_inst_masked}/{len(inst_tokens)} masked ({inst_pct:.1f}%)")
+                        lines.append(f"    [yellow]Response[/]:    {n_resp_masked}/{len(resp_tokens)} masked ({resp_pct:.1f}%)")
+
+            lines.append("")
+            lines.append("[dim]─" + "─" * 50 + "[/]")
+
+            # === COMPACT DEBUG INFO AT BOTTOM ===
+            lines.append("[dim]Debug info:[/]")
+            lines.append(f"  [dim]Seq len: {len(input_ids)} | Padding: {padding_count} | Sep token: {sep_token_id}[/]")
+            # Only show first 10 tokens, not the whole array
+            tokens_preview = input_ids[:10].tolist()
+            lines.append(f"  [dim]First 10 tokens: {tokens_preview}...[/]")
+            lines.append("")
+            lines.append("[dim]Press [m] to return to text view[/]")
+
+            return "\n".join(lines)
+        except Exception as e:
+            import traceback
+            return f"[red]Error:[/]\n[dim]{str(e)}[/]\n[dim]{traceback.format_exc()}[/]"
+
+    def render_content(self) -> str:
+        """Render the masking view."""
+        if not self.sequences:
+            return "[b]MASKING VISUALIZATION[/]\n\n[dim italic]Loading...[/]"
+
+        if not self.show_masking:
+            return "[b]MASKING VISUALIZATION[/]\n\n[dim italic]Press [m] to toggle masking view[/]"
+
+        seq = self.sequences[self.sequence_idx]
+        return self.render_masking_pattern(seq)
+
+
 class StatsPanel(Static):
     """Display cumulative statistics."""
 
@@ -707,6 +885,12 @@ class PackingDebugger(App):
         padding: 0 1;
     }
 
+    #masking-container {
+        width: 65%;
+        padding: 0 1;
+        display: none;  /* Hidden by default */
+    }
+
     SequenceView {
         height: 100%;
     }
@@ -720,6 +904,10 @@ class PackingDebugger(App):
     }
 
     DecodedTextPanel {
+        height: 100%;
+    }
+
+    MaskingView {
         height: 100%;
     }
 
@@ -752,6 +940,7 @@ class PackingDebugger(App):
 
         self.current_sequence = 0
         self.current_segment = 0
+        self.show_masking = False  # Toggle between text and masking view
 
     def _get_segments_in_sequence(self, seq_idx: int) -> List[int]:
         if not self.sequences:
@@ -784,19 +973,27 @@ class PackingDebugger(App):
                         id="attention-view"
                     )
 
-            # Bottom panel: stats and decoded text
+            # Bottom panel: stats and decoded text/masking view
             with Horizontal(id="bottom-panel"):
                 with Vertical(id="stats-container"):
                     yield StatsPanel(id="stats-panel")
 
+                # Two separate scrollable containers - only one visible at a time
+                # This ensures the visible content starts at top (no hidden sibling pushing it down)
                 with ScrollableContainer(id="text-container"):
                     yield DecodedTextPanel(
                         self.sequences,
                         self.tokenizer,
                         id="text-panel"
                     )
+                with ScrollableContainer(id="masking-container"):
+                    yield MaskingView(
+                        self.sequences,
+                        self.tokenizer,
+                        id="masking-panel"
+                    )
 
-        yield Static("[dim]←/→ Navigate sequences  │  ↑/↓ Select segment  │  [q] Quit[/]", id="help-line")
+        yield Static("[dim]←/→ Navigate sequences  │  ↑/↓ Select segment  │  [m] Toggle masking  │  [q] Quit[/]", id="help-line")
 
     def on_mount(self) -> None:
         stats_panel = self.query_one("#stats-panel", StatsPanel)
@@ -806,12 +1003,17 @@ class PackingDebugger(App):
         if segments:
             self.current_segment = segments[0]
 
+        # Initialize masking view state
+        masking_panel = self.query_one("#masking-panel", MaskingView)
+        masking_panel.show_masking = False
+
         self._update_widgets()
 
     def _update_widgets(self):
         sequence_view = self.query_one("#sequence-view", SequenceView)
         attention_view = self.query_one("#attention-view", AttentionView)
         text_panel = self.query_one("#text-panel", DecodedTextPanel)
+        masking_panel = self.query_one("#masking-panel", MaskingView)
         stats_panel = self.query_one("#stats-panel", StatsPanel)
 
         sequence_view.sequence_idx = self.current_sequence
@@ -822,7 +1024,18 @@ class PackingDebugger(App):
         text_panel.sequence_idx = self.current_sequence
         text_panel.selected_segment = self.current_segment
 
+        masking_panel.sequence_idx = self.current_sequence
+        masking_panel.selected_segment = self.current_segment
+        masking_panel.show_masking = self.show_masking
+
         stats_panel.set_stats(self.stats, self.max_length)
+
+        # Toggle container visibility (not just panel visibility)
+        # This ensures visible content starts at top of its own scroll container
+        text_container = self.query_one("#text-container")
+        masking_container = self.query_one("#masking-container")
+        text_container.display = not self.show_masking
+        masking_container.display = self.show_masking
 
     def _move_sequence(self, delta: int):
         new_idx = self.current_sequence + delta
@@ -860,6 +1073,10 @@ class PackingDebugger(App):
             self._move_segment(-1)
         elif event.key == "down":
             self._move_segment(1)
+        elif event.key == "m":
+            self.show_masking = not self.show_masking
+            self._update_widgets()
+
 
 
 # =============================================================================
@@ -906,6 +1123,20 @@ def parse_args():
         default=8,
         help="Batch size for packing (num_packing_bins)"
     )
+    parser.add_argument(
+        "--dataset-format",
+        type=str,
+        choices=["text", "inputs_targets"],
+        default="text",
+        help="Dataset format: 'text' or 'inputs_targets' for FLAN-style"
+    )
+    # Multi-dataset config (same format as train_minimal.py)
+    parser.add_argument(
+        "--datasets-config",
+        type=str,
+        default=None,
+        help="Path to JSON config file for multiple datasets. Overrides --dataset/--dataset-config/--dataset-format"
+    )
     return parser.parse_args()
 
 
@@ -926,27 +1157,78 @@ def main():
     print(f"  Tokenizer: {args.tokenizer}")
     print(f"  Vocab size: {len(tokenizer)}")
 
-    print("\nLoading dataset...")
-    stream_dataset = load_dataset(
-        args.dataset,
-        args.dataset_config,
-        split="train",
-        streaming=True
-    )
-    print(f"  Dataset: {args.dataset} ({args.dataset_config})")
+    # Check for multi-dataset config
+    if args.datasets_config:
+        import json
+        print(f"\nLoading datasets config: {args.datasets_config}")
+        with open(args.datasets_config) as f:
+            config = json.load(f)
+        dataset_configs = config["datasets"]
+        
+        print(f"  Found {len(dataset_configs)} datasets:")
+        total_weight = sum(d.get('weight', 1.0) for d in dataset_configs)
+        for d in dataset_configs:
+            pct = 100 * d.get('weight', 1.0) / total_weight
+            fmt = d.get('format', 'text')
+            print(f"    - {d['name']} ({d.get('config', 'default')}): {pct:.0f}%, format={fmt}")
+        
+        print("\nBuilding multi-dataset packing pipeline...")
+        # Use EpochTrackingDataLoader which supports multi-dataset mode
+        dataloader = EpochTrackingDataLoader(
+            dataset_name=None,  # Multi-dataset mode
+            dataset_config=None,
+            tokenizer=tokenizer,
+            max_length=args.max_length,
+            batch_size=args.batch_size,
+            shard_index=0,
+            shard_count=1,
+            seed=42,
+            num_epochs=1,  # Just need one epoch for debugging
+            dataset_configs=dataset_configs,
+            shuffle_buffer_size=1000,
+            stopping_strategy="first_exhausted",
+        )
+        # Get batches from the dataloader
+        print(f"\nPrefetching {args.prefetch} sequences...")
+        sequences = []
+        for batch in dataloader:
+            batch_size = batch["input_ids"].shape[0]
+            for i in range(batch_size):
+                sequences.append({
+                    "input_ids": batch["input_ids"][i],
+                    "segment_ids": batch["input_ids_segment_ids"][i],
+                    "positions": batch["input_ids_positions"][i],
+                })
+                if len(sequences) >= args.prefetch:
+                    break
+            if len(sequences) >= args.prefetch:
+                break
+    else:
+        # Single dataset mode (original behavior)
+        print("\nLoading dataset...")
+        stream_dataset = load_dataset(
+            args.dataset,
+            args.dataset_config,
+            split="train",
+            streaming=True
+        )
+        print(f"  Dataset: {args.dataset} ({args.dataset_config})")
 
-    print("\nBuilding packing pipeline...")
-    packed_dataset = create_packed_dataset_streaming(
-        stream_dataset=stream_dataset,
-        tokenizer=tokenizer,
-        max_length=args.max_length,
-        batch_size=args.batch_size,
-    )
-    print(f"  Max length: {args.max_length}")
-    print(f"  Batch size: {args.batch_size}")
+        print("\nBuilding packing pipeline...")
+        packed_dataset = create_packed_dataset_streaming(
+            stream_dataset=stream_dataset,
+            tokenizer=tokenizer,
+            max_length=args.max_length,
+            batch_size=args.batch_size,
+            dataset_format=args.dataset_format,
+        )
+        print(f"  Max length: {args.max_length}")
+        print(f"  Batch size: {args.batch_size}")
+        print(f"  Dataset format: {args.dataset_format}")
 
-    print(f"\nPrefetching {args.prefetch} sequences...")
-    sequences = get_individual_sequences(packed_dataset, n_sequences=args.prefetch)
+        print(f"\nPrefetching {args.prefetch} sequences...")
+        sequences = get_individual_sequences(packed_dataset, n_sequences=args.prefetch)
+    
     print(f"  Loaded {len(sequences)} sequences")
 
     if not sequences:

@@ -40,6 +40,8 @@ from mmbjax.heads.masked_lm import ModernBertForMaskedLM
 from mmbjax.training import (
     GRAIN_AVAILABLE,
     PackedMLMDataCollator,
+    InstructionResponseMaskingCollator,
+    HybridMaskingCollator,
     TokenizeTransform,
     create_packed_dataloader,
 )
@@ -291,6 +293,22 @@ def parse_args():
         choices=["first_exhausted", "all_exhausted"],
         default="first_exhausted",
         help="Multi-dataset stopping strategy (default: first_exhausted)"
+    )
+
+    # FLAN / instruction-response masking arguments
+    parser.add_argument(
+        "--dataset-format",
+        type=str,
+        choices=["text", "inputs_targets"],
+        default="text",
+        help="Dataset format: 'text' for standard text datasets, 'inputs_targets' for FLAN-style datasets (default: text)"
+    )
+    parser.add_argument(
+        "--masking-mode",
+        type=str,
+        choices=["standard", "instruction_response"],
+        default="standard",
+        help="Masking mode: 'standard' for uniform 15%% masking, 'instruction_response' for 0%% instruction/25%% response (default: standard)"
     )
 
     return parser.parse_args()
@@ -1186,10 +1204,56 @@ def main(args):
 
     # Create data collator
     if args.use_packing:
-        collator = PackedMLMDataCollator(
-            tokenizer=tokenizer,
-            mlm_probability=0.15,
-        )
+        # Check if using multi-dataset config
+        dataset_configs = None
+        has_flan_dataset = False
+        if args.datasets_config:
+            with open(args.datasets_config, 'r') as f:
+                config_data = json.load(f)
+            dataset_configs = config_data.get("datasets", config_data)
+            # Check if any dataset uses inputs_targets format
+            has_flan_dataset = any(
+                cfg.get("format") == "inputs_targets" for cfg in dataset_configs
+            )
+
+        # Select collator based on configuration
+        if dataset_configs and has_flan_dataset:
+            # Mixed datasets: use HybridMaskingCollator
+            # This handles both standard (15%) and FLAN (0%/25%) masking automatically
+            if args.masking_mode == "instruction_response":
+                if is_coordinator():
+                    print("\nUsing HybridMaskingCollator for mixed datasets:")
+                    print("  - Standard datasets: 15% uniform masking")
+                    print("  - FLAN datasets: 0% instruction / 25% response masking")
+                collator = HybridMaskingCollator(
+                    tokenizer=tokenizer,
+                    standard_mask_prob=0.15,
+                    instruction_mask_prob=0.0,
+                    response_mask_prob=0.25,
+                )
+            else:
+                # Standard mode for all
+                collator = PackedMLMDataCollator(
+                    tokenizer=tokenizer,
+                    mlm_probability=0.15,
+                )
+        elif args.dataset_format == "inputs_targets":
+            # Single FLAN dataset
+            collator = InstructionResponseMaskingCollator(
+                tokenizer=tokenizer,
+                instruction_mask_prob=0.0,
+                response_mask_prob=0.25,
+            )
+            if is_coordinator():
+                print("\nUsing InstructionResponseMaskingCollator:")
+                print("  - Instruction tokens: 0% masking")
+                print("  - Response tokens: 25% masking")
+        else:
+            # Standard single dataset
+            collator = PackedMLMDataCollator(
+                tokenizer=tokenizer,
+                mlm_probability=0.15,
+            )
     else:
         collator = FlaxDataCollatorForLanguageModeling(
             tokenizer=tokenizer,
@@ -1201,10 +1265,9 @@ def main(args):
         # Use Grain dataloader with packing and epoch tracking
         if is_coordinator():
             print("\nCreating Grain dataloader with sequence packing...")
-        
+
         # Parse multi-dataset config if provided
-        dataset_configs = None
-        if args.datasets_config:
+        if dataset_configs is None and args.datasets_config:
             with open(args.datasets_config, 'r') as f:
                 config_data = json.load(f)
             dataset_configs = config_data.get("datasets", config_data)
@@ -1212,7 +1275,7 @@ def main(args):
                 print(f"  Loading {len(dataset_configs)} datasets from config:")
                 for cfg in dataset_configs:
                     print(f"    - {cfg['name']} ({cfg.get('config', 'default')}): weight={cfg.get('weight', 1.0)}")
-        
+
         packed_dataloader = create_packed_dataloader(
             dataset_name=args.dataset if not dataset_configs else None,
             dataset_config=args.dataset_config if not dataset_configs else None,

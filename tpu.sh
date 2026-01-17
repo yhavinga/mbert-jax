@@ -266,14 +266,18 @@ cmd_deploy() {
         tar czf "$tarball" \
             --exclude='experiments' \
             --exclude='analysis' \
+            --exclude='checkpoints' \
             --exclude='./checkpoint-*' \
+            --exclude='artifacts' \
             --exclude='ssh_config' \
             --exclude='google-cloud-sdk' \
             --exclude='__pycache__' \
             --exclude='*.pyc' \
             --exclude='.git' \
+            --exclude='.idea' \
             --exclude='venv' \
             --exclude='*.tar.gz' \
+            --exclude='*.pdf' \
             .
 
         # Copy tarball and extract on each worker

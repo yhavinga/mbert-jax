@@ -40,6 +40,4 @@ google-cloud-sdk/
 google-cloud-cli-darwin-arm.tar.gz
 
 # Large checkpoint directories (downloaded/converted from GCS)
-experiments/gcs/
-experiments/converted/
-experiments/hf/
+experiments/checkpoints/

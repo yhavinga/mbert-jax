@@ -8,11 +8,11 @@ Uses Apple Silicon MPS acceleration when available.
 
 Usage:
     # First convert Flax checkpoint to HuggingFace format:
-    python scripts/convert_flax_to_hf.py -i experiments/converted/22L-mc4-lowlr \
-        -o experiments/hf/22L-mc4-lowlr
+    python scripts/convert_flax_to_hf.py -i experiments/checkpoints/flax/22L-mc4-lowlr \\
+        -o experiments/checkpoints/hf/22L-mc4-lowlr
 
     # Then run PPPL evaluation:
-    python scripts/eval_pppl_torch.py --checkpoint experiments/hf/22L-mc4-lowlr \
+    python scripts/eval_pppl_torch.py --checkpoint experiments/checkpoints/hf/22L-mc4-lowlr \\
         --num-samples 200
 """
 

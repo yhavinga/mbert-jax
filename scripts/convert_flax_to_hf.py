@@ -6,9 +6,9 @@ This script converts checkpoints from the mmbjax training format
 to HuggingFace-compatible ModernBERT format for inference and finetuning.
 
 Usage:
-    python scripts/convert_flax_to_hf.py \
-        --input experiments/converted/cosine_2m \
-        --output experiments/hf_modernbert/cosine_2m
+    python scripts/convert_flax_to_hf.py \\
+        --input experiments/checkpoints/flax/MODEL_NAME \\
+        --output experiments/checkpoints/hf/MODEL_NAME
 """
 
 import argparse

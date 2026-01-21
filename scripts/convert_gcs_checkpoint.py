@@ -6,12 +6,12 @@ them to pickle + safetensors format for downstream use.
 
 Usage:
     # Download from GCS first
-    gcloud storage cp -r gs://bucket/checkpoints/STEP experiments/gcs/STEP
+    gcloud storage cp -r gs://bucket/checkpoints/STEP experiments/checkpoints/orbax/NAME
 
     # Convert locally
-    python scripts/convert_gcs_checkpoint.py \
-        --checkpoint experiments/gcs/5000 \
-        --output experiments/converted/5000
+    python scripts/convert_gcs_checkpoint.py \\
+        --checkpoint experiments/checkpoints/orbax/NAME/STEP \\
+        --output experiments/checkpoints/flax/NAME
 """
 
 import sys

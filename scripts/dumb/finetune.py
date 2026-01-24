@@ -6,6 +6,8 @@ Usage:
         --checkpoint experiments/checkpoints/flax/22L-mc4-lowlr \
         --task dbrd \
         --output experiments/dumb/22L-mc4-lowlr/dbrd
+
+Supports data parallel training across multiple TPU/GPU devices using pmap.
 """
 
 import sys
@@ -23,6 +25,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+from flax import jax_utils
 from flax.training import train_state
 from tqdm import tqdm
 from transformers import AutoTokenizer
@@ -31,6 +34,10 @@ from mmbjax.configuration_mmbbert import MMBertConfig
 from mmbjax.heads.classification import ModernBertForSequenceClassification
 
 from data import TASKS, get_task
+
+
+# Number of devices for data parallelism
+NUM_DEVICES = jax.local_device_count()
 
 
 class TrainState(train_state.TrainState):
@@ -136,12 +143,16 @@ def collate_fn(batch: list[dict], pad_token_id: int, max_length: int) -> dict:
     }
 
 
-@jax.jit
-def train_step(
+def shard_batch(batch: dict) -> dict:
+    """Shard batch across devices for pmap."""
+    return {k: v.reshape(NUM_DEVICES, -1, *v.shape[1:]) for k, v in batch.items()}
+
+
+def _train_step(
     state: TrainState,
     batch: dict,
 ) -> tuple[TrainState, dict]:
-    """Single training step."""
+    """Single training step (inner function for pmap)."""
     dropout_rng, new_dropout_rng = jax.random.split(state.dropout_rng)
 
     def loss_fn(params):
@@ -158,9 +169,14 @@ def train_step(
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
     (loss, logits), grads = grad_fn(state.params)
 
+    # Average gradients across devices
+    grads = jax.lax.pmean(grads, axis_name="batch")
+    loss = jax.lax.pmean(loss, axis_name="batch")
+
     # Compute accuracy
     predictions = jnp.argmax(logits, axis=-1)
     accuracy = jnp.mean(predictions == batch["labels"])
+    accuracy = jax.lax.pmean(accuracy, axis_name="batch")
 
     state = state.apply_gradients(grads=grads)
     state = state.replace(dropout_rng=new_dropout_rng)
@@ -169,12 +185,15 @@ def train_step(
     return state, metrics
 
 
-@jax.jit
-def eval_step(
+# pmap'd train step
+p_train_step = jax.pmap(_train_step, axis_name="batch")
+
+
+def _eval_step(
     state: TrainState,
     batch: dict,
 ) -> dict:
-    """Single evaluation step."""
+    """Single evaluation step (inner function for pmap)."""
     outputs = state.apply_fn(
         {"params": state.params},
         batch["input_ids"],
@@ -190,28 +209,39 @@ def eval_step(
     return {"loss": outputs.loss, "correct": correct, "total": total}
 
 
+# pmap'd eval step
+p_eval_step = jax.pmap(_eval_step, axis_name="batch")
+
+
 def evaluate(state: TrainState, dataset, collate, batch_size: int) -> dict:
-    """Evaluate model on dataset."""
+    """Evaluate model on dataset using pmap."""
     total_loss = 0.0
     total_correct = 0
     total_samples = 0
 
+    # Batch size must be divisible by NUM_DEVICES
+    effective_batch_size = (batch_size // NUM_DEVICES) * NUM_DEVICES
+
     # Create batches
     indices = list(range(len(dataset)))
-    for i in range(0, len(indices), batch_size):
-        batch_indices = indices[i : i + batch_size]
+    for i in range(0, len(indices), effective_batch_size):
+        batch_indices = indices[i : i + effective_batch_size]
+        # Skip incomplete batches at the end
+        if len(batch_indices) < effective_batch_size:
+            continue
         batch = [dataset[j] for j in batch_indices]
         batch = collate(batch)
-        batch = {k: jnp.array(v) for k, v in batch.items()}
+        batch = shard_batch(batch)
 
-        metrics = eval_step(state, batch)
-        total_loss += float(metrics["loss"]) * len(batch_indices)
-        total_correct += int(metrics["correct"])
-        total_samples += int(metrics["total"])
+        metrics = p_eval_step(state, batch)
+        # Metrics are replicated, take first device's value
+        total_loss += float(metrics["loss"][0]) * len(batch_indices)
+        total_correct += int(jnp.sum(metrics["correct"]))
+        total_samples += int(jnp.sum(metrics["total"]))
 
     return {
-        "loss": total_loss / total_samples,
-        "accuracy": total_correct / total_samples,
+        "loss": total_loss / total_samples if total_samples > 0 else 0.0,
+        "accuracy": total_correct / total_samples if total_samples > 0 else 0.0,
     }
 
 
@@ -221,7 +251,7 @@ def main():
     parser.add_argument("--task", type=str, required=True, choices=list(TASKS.keys()), help="Task to fine-tune on")
     parser.add_argument("--output", type=str, required=True, help="Output directory for fine-tuned model")
     parser.add_argument("--epochs", type=int, default=3, help="Number of training epochs")
-    parser.add_argument("--batch-size", type=int, default=32, help="Batch size")
+    parser.add_argument("--batch-size", type=int, default=32, help="Per-device batch size")
     parser.add_argument("--learning-rate", type=float, default=2e-5, help="Learning rate")
     parser.add_argument("--max-length", type=int, default=512, help="Max sequence length")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
@@ -229,6 +259,7 @@ def main():
 
     print(f"Fine-tuning on task: {args.task}")
     print(f"Checkpoint: {args.checkpoint}")
+    print(f"Devices: {NUM_DEVICES}, Per-device batch size: {args.batch_size}, Total batch size: {args.batch_size * NUM_DEVICES}")
 
     # Load pretrained model
     checkpoint_path = Path(args.checkpoint)
@@ -254,8 +285,14 @@ def main():
         rng=rng,
     )
 
+    # Replicate state across devices for pmap
+    state = jax_utils.replicate(state)
+
     # Collate function
     collate = partial(collate_fn, pad_token_id=tokenizer.pad_token_id, max_length=args.max_length)
+
+    # Total batch size across all devices
+    total_batch_size = args.batch_size * NUM_DEVICES
 
     # Training loop
     best_val_accuracy = 0.0
@@ -274,26 +311,33 @@ def main():
         epoch_correct = 0
         num_batches = 0
 
-        pbar = tqdm(range(0, len(train_indices), args.batch_size), desc="Training")
+        pbar = tqdm(range(0, len(train_indices), total_batch_size), desc="Training")
         for i in pbar:
-            batch_indices = train_indices[i : i + args.batch_size]
+            batch_indices = train_indices[i : i + total_batch_size]
+            # Skip incomplete batches
+            if len(batch_indices) < total_batch_size:
+                continue
             batch = [dataset["train"][j] for j in batch_indices]
             batch = collate(batch)
-            batch = {k: jnp.array(v) for k, v in batch.items()}
+            batch = shard_batch(batch)
 
-            state, metrics = train_step(state, batch)
+            state, metrics = p_train_step(state, batch)
 
-            epoch_loss += float(metrics["loss"])
-            epoch_correct += float(metrics["accuracy"]) * len(batch_indices)
+            # Metrics are replicated, take first device's value
+            loss = float(metrics["loss"][0])
+            accuracy = float(metrics["accuracy"][0])
+
+            epoch_loss += loss
+            epoch_correct += accuracy * len(batch_indices)
             num_batches += 1
 
-            pbar.set_postfix({"loss": f"{metrics['loss']:.4f}", "acc": f"{metrics['accuracy']:.4f}"})
+            pbar.set_postfix({"loss": f"{loss:.4f}", "acc": f"{accuracy:.4f}"})
 
         train_accuracy = epoch_correct / len(train_indices)
         print(f"Train Loss: {epoch_loss / num_batches:.4f}, Train Accuracy: {train_accuracy:.4f}")
 
         # Validation
-        val_metrics = evaluate(state, dataset["validation"], collate, args.batch_size)
+        val_metrics = evaluate(state, dataset["validation"], collate, total_batch_size)
         print(f"Val Loss: {val_metrics['loss']:.4f}, Val Accuracy: {val_metrics['accuracy']:.4f}")
 
         # Save best model
@@ -301,8 +345,10 @@ def main():
             best_val_accuracy = val_metrics["accuracy"]
             print(f"New best! Saving checkpoint...")
 
+            # Unreplicate state to save single copy of params
+            unreplicated_state = jax_utils.unreplicate(state)
             with open(output_path / "params.pkl", "wb") as f:
-                pickle.dump(state.params, f)
+                pickle.dump(unreplicated_state.params, f)
 
             # Save config with num_labels
             config_dict = config.to_dict()
@@ -312,7 +358,7 @@ def main():
 
     # Final evaluation on test set
     print("\nEvaluating on test set...")
-    test_metrics = evaluate(state, dataset["test"], collate, args.batch_size)
+    test_metrics = evaluate(state, dataset["test"], collate, total_batch_size)
     print(f"Test Loss: {test_metrics['loss']:.4f}, Test Accuracy: {test_metrics['accuracy']:.4f}")
 
     # Save results
@@ -325,6 +371,8 @@ def main():
         "epochs": args.epochs,
         "learning_rate": args.learning_rate,
         "batch_size": args.batch_size,
+        "total_batch_size": total_batch_size,
+        "num_devices": NUM_DEVICES,
     }
     with open(output_path / "results.json", "w") as f:
         json.dump(results, f, indent=2)

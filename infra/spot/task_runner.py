@@ -129,6 +129,7 @@ def run_finetuning(
     import jax
     import jax.numpy as jnp
     import numpy as np
+    from flax import jax_utils
     from tqdm import tqdm
     from transformers import AutoTokenizer
 
@@ -140,13 +141,17 @@ def run_finetuning(
     sys.path.insert(0, str(Path(__file__).parent.parent.parent / "scripts" / "dumb"))
     from data import TASKS, get_task
     from finetune import (
+        NUM_DEVICES,
         TrainState,
         collate_fn,
         create_model_and_state,
         evaluate,
         load_pretrained_params,
-        train_step,
+        p_train_step,
+        shard_batch,
     )
+
+    print(f"[train] Devices: {NUM_DEVICES}")
 
     # Load checkpoint
     print(f"[train] Loading checkpoint from {checkpoint_path}")
@@ -175,11 +180,17 @@ def run_finetuning(
         rng=rng,
     )
 
+    # Replicate state across devices for pmap
+    state = jax_utils.replicate(state)
+
     # Calculate total steps
-    batch_size = 32
+    per_device_batch_size = 32
+    total_batch_size = per_device_batch_size * NUM_DEVICES
     epochs = 3
-    steps_per_epoch = len(dataset["train"]) // batch_size
+    steps_per_epoch = len(dataset["train"]) // total_batch_size
     total_steps = steps_per_epoch * epochs
+
+    print(f"[train] Per-device batch: {per_device_batch_size}, Total batch: {total_batch_size}")
 
     # Update state with total_steps
     s = state_ops.get_state(task_id)
@@ -209,26 +220,31 @@ def run_finetuning(
         epoch_correct = 0
         num_batches = 0
 
-        pbar = tqdm(range(0, len(train_indices), batch_size), desc="Training")
+        pbar = tqdm(range(0, len(train_indices), total_batch_size), desc="Training")
         for i in pbar:
-            batch_indices = train_indices[i : i + batch_size]
+            batch_indices = train_indices[i : i + total_batch_size]
+            # Skip incomplete batches
+            if len(batch_indices) < total_batch_size:
+                continue
             batch = [dataset["train"][j] for j in batch_indices]
             batch = collate(batch)
-            batch = {k: jnp.array(v) for k, v in batch.items()}
+            batch = shard_batch(batch)
 
-            state, metrics = train_step(state, batch)
+            state, metrics = p_train_step(state, batch)
 
-            epoch_loss += float(metrics["loss"])
-            epoch_correct += float(metrics["accuracy"]) * len(batch_indices)
+            # Metrics are replicated, take first device's value
+            loss = float(metrics["loss"][0])
+            accuracy = float(metrics["accuracy"][0])
+
+            epoch_loss += loss
+            epoch_correct += accuracy * len(batch_indices)
             num_batches += 1
             global_step += 1
 
             # Update heartbeat
             heartbeat.update(global_step, best_val_accuracy)
 
-            pbar.set_postfix(
-                {"loss": f"{metrics['loss']:.4f}", "acc": f"{metrics['accuracy']:.4f}"}
-            )
+            pbar.set_postfix({"loss": f"{loss:.4f}", "acc": f"{accuracy:.4f}"})
 
         train_accuracy = epoch_correct / len(train_indices)
         print(
@@ -236,7 +252,7 @@ def run_finetuning(
         )
 
         # Validation
-        val_metrics = evaluate(state, dataset["validation"], collate, batch_size)
+        val_metrics = evaluate(state, dataset["validation"], collate, total_batch_size)
         print(
             f"[train] Val Loss: {val_metrics['loss']:.4f}, Val Accuracy: {val_metrics['accuracy']:.4f}"
         )
@@ -246,8 +262,10 @@ def run_finetuning(
             best_val_accuracy = val_metrics["accuracy"]
             print(f"[train] New best! Saving checkpoint...")
 
+            # Unreplicate state to save single copy of params
+            unreplicated_state = jax_utils.unreplicate(state)
             with open(output_dir / "params.pkl", "wb") as f:
-                pickle.dump(state.params, f)
+                pickle.dump(unreplicated_state.params, f)
 
             config_dict = config.to_dict()
             config_dict["num_labels"] = task_config["num_labels"]
@@ -259,7 +277,7 @@ def run_finetuning(
 
     # Final evaluation on test set
     print("\n[train] Evaluating on test set...")
-    test_metrics = evaluate(state, dataset["test"], collate, batch_size)
+    test_metrics = evaluate(state, dataset["test"], collate, total_batch_size)
     print(
         f"[train] Test Loss: {test_metrics['loss']:.4f}, Test Accuracy: {test_metrics['accuracy']:.4f}"
     )
@@ -274,6 +292,8 @@ def run_finetuning(
         "test_loss": test_metrics["loss"],
         "epochs": epochs,
         "total_steps": total_steps,
+        "num_devices": NUM_DEVICES,
+        "total_batch_size": total_batch_size,
     }
 
     with open(output_dir / "results.json", "w") as f:

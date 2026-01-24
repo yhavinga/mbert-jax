@@ -150,6 +150,20 @@ def detect_preemptions():
             state_ops.put_state(s["task_id"], s)
 
 
+def cleanup_finished_vms():
+    """Delete VMs for completed or failed tasks."""
+    vms = {v["name"]: v["state"] for v in vm_ops.list_vms()}
+
+    for s in state_ops.list_states():
+        if s["status"] not in ("completed", "failed"):
+            continue
+
+        vm_name = s["vm_name"]
+        if vm_name in vms:
+            print(f"[cleanup] Deleting VM {vm_name} (task {s['status']})")
+            vm_ops.delete_vm(vm_name)
+
+
 def deploy_code(vm_name: str) -> bool:
     """Deploy code to a VM by cloning from GCS tarball."""
     print("  Creating code tarball...")
@@ -265,7 +279,6 @@ def launch_task(s: dict) -> bool:
         f"--checkpoint {gcs_checkpoint} "
         f"--task {task} "
         f"--output {gcs_output} "
-        f"--skip-install "
         f"> /tmp/task_runner.log 2>&1 &"
     )
     returncode, stdout, stderr = vm_ops.ssh_command(vm_name, cmd)
@@ -340,6 +353,9 @@ def cmd_run(args):
     try:
         while True:
             print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Checking...")
+
+            # Clean up VMs for finished tasks
+            cleanup_finished_vms()
 
             # Detect preemptions
             detect_preemptions()

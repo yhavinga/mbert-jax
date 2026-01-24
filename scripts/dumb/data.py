@@ -38,13 +38,10 @@ def load_dbrd(tokenizer: Callable, max_length: int = 512) -> DatasetDict:
 def load_sicknl(tokenizer: Callable, max_length: int = 128) -> DatasetDict:
     """Load SICK-NL for NLI classification.
 
-    3-class classification: entailment, neutral, contradiction.
+    3-class classification: entailment (0), neutral (1), contradiction (2).
     ~4.4K train, ~0.5K validation, ~4.9K test.
     """
     ds = load_dataset("maximedb/sick_nl")
-
-    # Map string labels to integers
-    label_map = {"entailment": 0, "neutral": 1, "contradiction": 2}
 
     def process(examples):
         # Tokenize sentence pairs
@@ -55,8 +52,8 @@ def load_sicknl(tokenizer: Callable, max_length: int = 128) -> DatasetDict:
             max_length=max_length,
             padding=False,
         )
-        # Convert string labels to integers
-        tokenized["label"] = [label_map[l] for l in examples["label"]]
+        # Label column is already integer (0, 1, 2)
+        tokenized["label"] = examples["label"]
         return tokenized
 
     # Keep only the columns we need

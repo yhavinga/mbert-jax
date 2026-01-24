@@ -62,8 +62,10 @@ class HeartbeatThread(threading.Thread):
 
 def download_from_gcs(gcs_path: str, local_path: str) -> bool:
     """Download a file or directory from GCS."""
+    # Create parent directory
+    os.makedirs(local_path, exist_ok=True)
     result = subprocess.run(
-        ["gcloud", "storage", "cp", "-r", gcs_path, local_path],
+        ["gcloud", "storage", "cp", "-r", f"{gcs_path}/*", local_path],
         capture_output=True,
         text=True,
     )

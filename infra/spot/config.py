@@ -11,10 +11,10 @@ GCS_RESULTS_DIR = f"gs://{GCS_BUCKET}/{GCS_PREFIX}/results"
 PROJECT = "t5-dutch-english"
 ZONE = "europe-west4-a"
 TPU_TYPE = "v6e-8"
-RUNTIME_VERSION = "tpu-ubuntu2204-base"
+RUNTIME_VERSION = "v2-alpha-tpuv6e"  # Trillium-specific runtime
 
 # Orchestration settings
-MAX_CONCURRENT_VMS = 2
+MAX_CONCURRENT_VMS = 1
 HEARTBEAT_INTERVAL = 60  # seconds
 HEARTBEAT_TIMEOUT = 300  # 5 minutes = presumed dead
 POLL_INTERVAL = 60  # seconds between orchestrator loops
@@ -28,8 +28,9 @@ CHECKPOINTS = [
 ]
 
 # DUMB tasks
-TASKS_PHASE1 = ["dbrd", "sicknl", "wicnl", "dpr", "copanl", "squadnl"]
-TASKS_PHASE2 = ["lassy", "sonar", "dalc"]  # After TST data acquired
+TASKS_PHASE1 = ["dbrd", "sicknl"]  # Only implemented loaders
+TASKS_PHASE2 = ["wicnl", "dpr", "copanl", "squadnl"]  # Need loaders
+TASKS_PHASE3 = ["lassy", "sonar", "dalc"]  # After TST data acquired
 
 # Remote directory on TPU VMs
 REMOTE_DIR = "~/mbert-jax"

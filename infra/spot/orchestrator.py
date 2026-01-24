@@ -12,9 +12,12 @@ Commands:
 """
 
 import argparse
+import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 from . import state as state_ops
 from . import vm_ops
@@ -147,6 +150,62 @@ def detect_preemptions():
             state_ops.put_state(s["task_id"], s)
 
 
+def deploy_code(vm_name: str) -> bool:
+    """Deploy code to a VM by cloning from GCS tarball."""
+    print("  Creating code tarball...")
+    with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as f:
+        tarball_path = f.name
+
+    # Create tarball with essential directories
+    tar_cmd = [
+        "tar", "-czf", tarball_path,
+        "--exclude=*.pyc",
+        "--exclude=__pycache__",
+        "--exclude=.git",
+        "--exclude=venv",
+        "--exclude=checkpoints",
+        "--exclude=experiments",
+        "--exclude=artifacts",
+        "--exclude=vendor/dumb",
+        "--exclude=*.pkl",
+        "--exclude=*.safetensors",
+        "-C", str(Path(__file__).parent.parent.parent),
+        "src", "scripts", "infra", "requirements.txt"
+    ]
+    result = subprocess.run(tar_cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"  [error] Failed to create tarball: {result.stderr}")
+        return False
+
+    # Upload to GCS
+    gcs_tarball = "gs://mbert-checkpoints/dumb-eval/code/mbert-jax.tar.gz"
+    print("  Uploading to GCS...")
+    result = subprocess.run(
+        ["gcloud", "storage", "cp", tarball_path, gcs_tarball],
+        capture_output=True, text=True
+    )
+    Path(tarball_path).unlink(missing_ok=True)
+    if result.returncode != 0:
+        print(f"  [error] Failed to upload tarball: {result.stderr}")
+        return False
+
+    # Download and extract on VM
+    print("  Extracting on VM...")
+    setup_cmd = (
+        f"mkdir -p {REMOTE_DIR} && "
+        f"cd {REMOTE_DIR} && "
+        f"gcloud storage cp {gcs_tarball} /tmp/code.tar.gz && "
+        f"tar -xzf /tmp/code.tar.gz && "
+        f"rm /tmp/code.tar.gz"
+    )
+    returncode, stdout, stderr = vm_ops.ssh_command(vm_name, setup_cmd)
+    if returncode != 0:
+        print(f"  [error] Failed to extract code: {stderr}")
+        return False
+
+    return True
+
+
 def launch_task(s: dict) -> bool:
     """Launch a single task. Returns True if successful."""
     task_id = s["task_id"]
@@ -185,7 +244,11 @@ def launch_task(s: dict) -> bool:
 
     # Deploy code to VM
     print(f"  Deploying code...")
-    # TODO: Implement code deployment (rsync or tarball)
+    if not deploy_code(vm_name):
+        s["status"] = "failed"
+        s["error"] = "Code deployment failed"
+        state_ops.put_state(task_id, s)
+        return False
 
     # Start task runner
     print(f"  Starting task runner...")
@@ -193,13 +256,16 @@ def launch_task(s: dict) -> bool:
     gcs_output = f"{GCS_RUNS_DIR}/{task_id}"
 
     # Run task_runner in background via nohup
+    # Need PYTHONPATH for src imports, and use python3 (system python with JAX)
     cmd = (
         f"cd {REMOTE_DIR} && "
-        f"nohup python -m infra.spot.task_runner "
+        f"export PYTHONPATH=$PWD/src:$PYTHONPATH && "
+        f"nohup python3 -m infra.spot.task_runner "
         f"--task-id {task_id} "
         f"--checkpoint {gcs_checkpoint} "
         f"--task {task} "
         f"--output {gcs_output} "
+        f"--skip-install "
         f"> /tmp/task_runner.log 2>&1 &"
     )
     returncode, stdout, stderr = vm_ops.ssh_command(vm_name, cmd)

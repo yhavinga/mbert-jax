@@ -1,0 +1,3 @@
+[submodule "vendor/dumb"]
+	path = vendor/dumb
+	url = https://github.com/wietsedv/dumb.git

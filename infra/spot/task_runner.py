@@ -92,11 +92,11 @@ def install_dependencies():
     """Install JAX and other dependencies on a fresh VM."""
     print("[setup] Installing dependencies...")
 
-    # Install JAX with TPU support
+    # Use python3 -m pip to ensure packages go to the right location
     commands = [
-        "pip install --upgrade pip",
-        "pip install jax[tpu] -f https://storage.googleapis.com/jax-releases/libtpu_releases.html",
-        "pip install flax optax transformers datasets tqdm",
+        "python3 -m pip install --upgrade pip",
+        "python3 -m pip install jax[tpu] -f https://storage.googleapis.com/jax-releases/libtpu_releases.html",
+        "python3 -m pip install flax optax transformers datasets tqdm",
     ]
 
     for cmd in commands:
@@ -105,6 +105,27 @@ def install_dependencies():
         if result.returncode != 0:
             print(f"  [error] {result.stderr}")
             return False
+
+    # Add user site-packages to sys.path so we can import the installed packages
+    import site
+    site.main()  # Reload site-packages
+    user_site = site.getusersitepackages()
+    if user_site not in sys.path:
+        sys.path.insert(0, user_site)
+        print(f"  Added {user_site} to sys.path")
+
+    # Invalidate import caches so Python sees newly installed packages
+    import importlib
+    importlib.invalidate_caches()
+
+    # Verify JAX is importable
+    print("  Verifying JAX installation...")
+    try:
+        import jax
+        print(f"  JAX {jax.__version__}, {len(jax.devices())} devices")
+    except ImportError as e:
+        print(f"  [error] JAX import failed: {e}")
+        return False
 
     print("[setup] Dependencies installed")
     return True

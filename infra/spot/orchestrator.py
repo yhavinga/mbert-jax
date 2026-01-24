@@ -355,6 +355,92 @@ def cmd_cleanup(args):
     print(f"\nDeleted {len(vms)} VMs")
 
 
+def cmd_test(args):
+    """Test spot VM lifecycle: create, SSH, optional TPU check, delete."""
+    vm_name = "dumb-test"
+    success = True
+
+    def cleanup():
+        print(f"\n[cleanup] Deleting test VM {vm_name}...")
+        if vm_ops.delete_vm(vm_name):
+            print("[cleanup] Done")
+        else:
+            print("[cleanup] Failed (VM may not exist)")
+
+    try:
+        # Step 1: Create VM
+        print(f"[1/5] Creating test VM {vm_name}...")
+        if not vm_ops.create_vm(vm_name):
+            print("[FAIL] VM creation failed")
+            return False
+
+        # Step 2: Wait for READY
+        print("[2/5] Waiting for READY state...")
+        for i in range(30):  # 5 minutes max
+            state = vm_ops.vm_state(vm_name)
+            if state == "READY":
+                print(f"[OK] VM ready after ~{i * 10}s")
+                break
+            if state is None:
+                print(f"[FAIL] VM disappeared during provisioning")
+                return False
+            print(f"  state={state}, waiting...")
+            time.sleep(10)
+        else:
+            print("[FAIL] VM not ready after 5 minutes")
+            cleanup()
+            return False
+
+        # Step 3: Test SSH
+        print("[3/5] Testing SSH connectivity...")
+        returncode, stdout, stderr = vm_ops.ssh_command(vm_name, "echo hello")
+        if returncode != 0:
+            print(f"[FAIL] SSH failed: {stderr}")
+            cleanup()
+            return False
+        if "hello" not in stdout:
+            print(f"[FAIL] SSH returned unexpected output: {stdout}")
+            cleanup()
+            return False
+        print("[OK] SSH working")
+
+        # Step 4: Test TPU (optional)
+        if not args.skip_tpu:
+            print("[4/5] Testing TPU devices...")
+            returncode, stdout, stderr = vm_ops.ssh_command(
+                vm_name,
+                "python3 -c 'import jax; devs = jax.devices(); print(f\"Found {len(devs)} devices: {devs}\")'"
+            )
+            if returncode != 0:
+                print(f"[WARN] TPU check failed: {stderr}")
+                print("  (This may be expected if JAX is not installed)")
+            else:
+                print(f"[OK] {stdout.strip()}")
+        else:
+            print("[4/5] Skipping TPU check (--skip-tpu)")
+
+        # Step 5: Cleanup
+        print("[5/5] Deleting test VM...")
+        if not vm_ops.delete_vm(vm_name):
+            print("[WARN] Failed to delete VM")
+            success = False
+        else:
+            print("[OK] VM deleted")
+
+        if success:
+            print("\nAll tests passed!")
+        return success
+
+    except KeyboardInterrupt:
+        print("\n[interrupted]")
+        cleanup()
+        return False
+    except Exception as e:
+        print(f"\n[ERROR] {e}")
+        cleanup()
+        return False
+
+
 def main():
     parser = argparse.ArgumentParser(description="Spot TPU VM orchestrator")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -382,6 +468,10 @@ def main():
     cleanup_parser = subparsers.add_parser("cleanup", help="Delete all VMs")
     cleanup_parser.add_argument("-f", "--force", action="store_true", help="Skip confirmation")
 
+    # test
+    test_parser = subparsers.add_parser("test", help="Test spot VM lifecycle")
+    test_parser.add_argument("--skip-tpu", action="store_true", help="Skip TPU device check")
+
     args = parser.parse_args()
 
     commands = {
@@ -392,6 +482,7 @@ def main():
         "run": cmd_run,
         "results": cmd_results,
         "cleanup": cmd_cleanup,
+        "test": cmd_test,
     }
 
     commands[args.command](args)

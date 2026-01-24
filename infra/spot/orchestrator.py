@@ -119,9 +119,9 @@ def cmd_status(args):
 
 
 def get_running_count() -> int:
-    """Count tasks that are running or provisioning."""
-    states = state_ops.list_states()
-    return sum(1 for s in states if s["status"] in ("running", "provisioning"))
+    """Count actual VMs (source of truth, not task states)."""
+    vms = vm_ops.list_vms()
+    return len(vms)
 
 
 def detect_preemptions():
@@ -151,11 +151,11 @@ def detect_preemptions():
 
 
 def cleanup_finished_vms():
-    """Delete VMs for completed or failed tasks."""
+    """Delete VMs for completed, failed, or preempted tasks."""
     vms = {v["name"]: v["state"] for v in vm_ops.list_vms()}
 
     for s in state_ops.list_states():
-        if s["status"] not in ("completed", "failed"):
+        if s["status"] not in ("completed", "failed", "preempted"):
             continue
 
         vm_name = s["vm_name"]
@@ -346,6 +346,58 @@ def cmd_resume(args):
     print(f"\nResumed {resumed} tasks")
 
 
+def resume_provisioning():
+    """Resume tasks stuck in provisioning where VM is already READY."""
+    vms = {v["name"]: v["state"] for v in vm_ops.list_vms()}
+
+    for s in state_ops.list_states():
+        if s["status"] != "provisioning":
+            continue
+
+        vm_name = s["vm_name"]
+        vm_state = vms.get(vm_name)
+
+        if vm_state == "READY":
+            print(f"[resume] {s['task_id']} - VM ready, deploying code...")
+
+            # Deploy code to VM
+            if not deploy_code(vm_name):
+                s["status"] = "failed"
+                s["error"] = "Code deployment failed"
+                state_ops.put_state(s["task_id"], s)
+                continue
+
+            # Start task runner
+            task_id = s["task_id"]
+            checkpoint = s["checkpoint"]
+            task = s["task"]
+            gcs_checkpoint = f"gs://mbert-checkpoints/dumb-eval/checkpoints/{checkpoint}"
+            gcs_output = f"{GCS_RUNS_DIR}/{task_id}"
+
+            cmd = (
+                f"cd {REMOTE_DIR} && "
+                f"export PYTHONPATH=$PWD/src:$PYTHONPATH && "
+                f"nohup python3 -m infra.spot.task_runner "
+                f"--task-id {task_id} "
+                f"--checkpoint {gcs_checkpoint} "
+                f"--task {task} "
+                f"--output {gcs_output} "
+                f"> /tmp/task_runner.log 2>&1 &"
+            )
+
+            rc, _, stderr = vm_ops.ssh_command(vm_name, cmd)
+            if rc != 0:
+                print(f"  [error] Failed to start task: {stderr}")
+                s["status"] = "failed"
+                s["error"] = f"SSH failed: {stderr}"
+                state_ops.put_state(s["task_id"], s)
+                continue
+
+            s["status"] = "running"
+            state_ops.put_state(s["task_id"], s)
+            print(f"  Task runner started")
+
+
 def cmd_run(args):
     """Continuous orchestration loop."""
     print("Starting orchestration loop (Ctrl+C to stop)...")
@@ -356,6 +408,9 @@ def cmd_run(args):
 
             # Clean up VMs for finished tasks
             cleanup_finished_vms()
+
+            # Resume tasks stuck in provisioning (VM ready but task not started)
+            resume_provisioning()
 
             # Detect preemptions
             detect_preemptions()

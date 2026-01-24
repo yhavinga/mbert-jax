@@ -65,7 +65,9 @@ def list_vms(prefix: str = "dumb-") -> list[dict]:
     vms = json.loads(result.stdout) if result.stdout.strip() else []
     filtered = []
     for vm in vms:
-        name = vm.get("name", "")
+        # name is full path like "projects/.../nodes/dumb-xxx", extract last part
+        full_name = vm.get("name", "")
+        name = full_name.split("/")[-1] if "/" in full_name else full_name
         if name.startswith(prefix):
             filtered.append({
                 "name": name,

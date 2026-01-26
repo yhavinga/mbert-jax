@@ -206,6 +206,10 @@ def run_finetuning(
 
     # Calculate total steps
     per_device_batch_size = 32
+    # Reduce memory pressure for dbrd (22L) to avoid HBM OOMs
+    if task == "dbrd":
+        per_device_batch_size = 24
+
     total_batch_size = per_device_batch_size * NUM_DEVICES
     epochs = 3
     steps_per_epoch = len(dataset["train"]) // total_batch_size

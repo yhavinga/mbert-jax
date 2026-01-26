@@ -234,12 +234,19 @@ def launch_task(s: dict) -> bool:
     s["started_at"] = datetime.now(timezone.utc).isoformat()
     state_ops.put_state(task_id, s)
 
-    # Create VM
-    print(f"  Creating VM {vm_name}...")
-    if not vm_ops.create_vm(vm_name):
-        print(f"  [error] Failed to create VM")
-        s["status"] = "failed"
-        s["error"] = "VM creation failed"
+    # Create VM with simple retry to handle spot capacity failures
+    vm_created = False
+    for attempt in range(3):
+        print(f"  Creating VM {vm_name}... (attempt {attempt+1}/3)")
+        if vm_ops.create_vm(vm_name):
+            vm_created = True
+            break
+        time.sleep(10)
+
+    if not vm_created:
+        print(f"  [error] Failed to create VM after 3 attempts")
+        s["status"] = "pending"
+        s["error"] = "VM creation failed (will retry)"
         state_ops.put_state(task_id, s)
         return False
 

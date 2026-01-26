@@ -14,7 +14,7 @@ TPU_TYPE = "v6e-8"
 RUNTIME_VERSION = "v2-alpha-tpuv6e"  # Trillium-specific runtime
 
 # Orchestration settings
-MAX_CONCURRENT_VMS = 1
+MAX_CONCURRENT_VMS = 4
 HEARTBEAT_INTERVAL = 60  # seconds
 HEARTBEAT_TIMEOUT = 300  # 5 minutes = presumed dead
 POLL_INTERVAL = 60  # seconds between orchestrator loops
@@ -25,6 +25,7 @@ CHECKPOINTS = [
     ("22L-2-mc4-3e5", "22l-2-mc4"),
     ("22L-3-mc4-packed-fp32", "22l-3-packed"),
     ("22L-4-culturax-packed-fp32", "culturax"),
+    ("22L-5-fineweb2-packed-fp32", "fineweb2"),
 ]
 
 # DUMB tasks

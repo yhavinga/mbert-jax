@@ -1,0 +1,11 @@
+{
+    "datasets": [
+        {
+            "name": "Open-Orca/FLAN",
+            "config": null,
+            "weight": 1.0,
+            "format": "inputs_targets",
+            "masking": "instruction_response"
+        }
+    ]
+}

@@ -1,0 +1,39 @@
+{
+    "datasets": [
+        {
+            "name": "HuggingFaceFW/fineweb-2",
+            "config": "nld_Latn",
+            "weight": 0.25,
+            "format": "text",
+            "masking": "standard"
+        },
+        {
+            "name": "HuggingFaceFW/fineweb",
+            "config": "default",
+            "weight": 0.30,
+            "format": "text",
+            "masking": "standard"
+        },
+        {
+            "name": "uonlp/CulturaX",
+            "config": "nl",
+            "weight": 0.20,
+            "format": "text",
+            "masking": "standard"
+        },
+        {
+            "name": "yhavinga/mc4_nl_cleaned",
+            "config": "full",
+            "weight": 0.20,
+            "format": "text",
+            "masking": "standard"
+        },
+        {
+            "name": "Open-Orca/FLAN",
+            "config": null,
+            "weight": 0.05,
+            "format": "inputs_targets",
+            "masking": "instruction_response"
+        }
+    ]
+}

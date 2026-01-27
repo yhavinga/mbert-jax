@@ -14,6 +14,8 @@ venv/
 # Notebooks & editor clutter
 .ipynb_checkpoints/
 .DS_Store
+CLAUDE.md
+AGENTS.md
 
 # Logs and run artifacts
 *.log
@@ -41,3 +43,19 @@ google-cloud-cli-darwin-arm.tar.gz
 
 # Large checkpoint directories (downloaded/converted from GCS)
 experiments/checkpoints/
+experiments/gcs/
+
+# Local-only documentation
+docs/
+
+# Databases (evaluation results, etc.)
+*.db
+
+# Backup files
+*~
+
+# Results directory (generated outputs)
+results/
+
+# Checkpoints (local training runs)
+checkpoints/

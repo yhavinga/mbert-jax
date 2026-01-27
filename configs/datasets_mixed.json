@@ -1,0 +1,18 @@
+{
+    "datasets": [
+        {
+            "name": "yhavinga/mc4_nl_cleaned",
+            "config": "micro",
+            "weight": 0.7,
+            "format": "text",
+            "masking": "standard"
+        },
+        {
+            "name": "Open-Orca/FLAN",
+            "config": "default",
+            "weight": 0.3,
+            "format": "inputs_targets",
+            "masking": "instruction_response"
+        }
+    ]
+}

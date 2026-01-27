@@ -12,7 +12,7 @@ Training on Dutch text requires full control over the model implementation. PyTo
 
 ## Status
 
-Core architecture complete. Masked LM head validated against PyTorch reference. Classification/QA heads implemented but need testing. See `PLAN_MMBERT_JAX.md` for detailed roadmap.
+Core architecture complete. Masked LM head validated against PyTorch reference. Classification/QA heads implemented but need testing.
 
 **Validated:**
 - Token embeddings + LayerNorm
@@ -53,20 +53,13 @@ Output shows side-by-side predictions with logit differences (typically <0.0001)
 ## Structure
 
 ```
+configs/              # Dataset YAML/JSON configurations
 src/mmbjax/
   configuration_mmbbert.py      # Config matching HF ModernBertConfig
   modeling_mmbbert.py            # Core transformer layers
   modules/                       # Embeddings, RoPE, masks, attention, MLP
   heads/                         # Masked LM, classification, QA
   utils/                         # Weight conversion, initializers
-
-scripts/
-  py_reference_dump.py           # Extract PyTorch golden tensors
-  run_mmbert_inference.py        # Interactive masked LM demo
-  debug_*.py                     # Layer-by-layer numerical validation
-
-tests/                           # Unit tests mirroring src structure
-vendor/pytorch_reference/        # Frozen HF transformers for diffing
 ```
 
 ## Design Notes
@@ -149,7 +142,7 @@ Architecture configurable via `--hidden-size`, `--num-layers`, `--num-heads`, `-
 
 ## License
 
-Code follows ModernBERT's Apache 2.0 license. This is a clean-room port (no copied PyTorch code except for reference comparison).
+This project is licensed under the **Apache License 2.0**. See the [LICENSE](LICENSE) file for the full text. Code follows ModernBERT's Apache 2.0 license. This is a clean-room port (no copied PyTorch code except for reference comparison).
 
 ## Performance Notes
 
@@ -159,4 +152,4 @@ Long sequences (>2k tokens) currently hit quadratic attention cost. Unpadded pat
 
 ## Contact
 
-Questions about Dutch pre-training setup or architectural choices: see `PLAN_MMBERT_JAX.md` or open an issue.
+Questions about Dutch pre-training setup or architectural choices: open an issue.

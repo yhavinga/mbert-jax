@@ -59,3 +59,4 @@ results/
 
 # Checkpoints (local training runs)
 checkpoints/
+scripts/.env

@@ -375,15 +375,11 @@ cmd_setup() {
     run_on_tpu "cd $REMOTE_DIR && source venv/bin/activate && pip install --upgrade pip setuptools wheel > /dev/null 2>&1"
 
     # Install JAX 0.8.0 for all TPU types
-    if [[ "$TPU_TYPE" == "v4"* ]]; then
-        log_info "Installing JAX 0.8.0 for TPU v4 compatibility..."
-        run_on_tpu "cd $REMOTE_DIR && source venv/bin/activate && \
-            pip uninstall -y jax jaxlib libtpu-nightly > /dev/null 2>&1 && \
-            pip install 'jax[tpu]==0.8.0' -f https://storage.googleapis.com/jax-releases/libtpu_releases.html > /dev/null 2>&1"
-    else
-        run_on_tpu "cd $REMOTE_DIR && source venv/bin/activate && \
-            pip install 'jax[tpu]==0.8.0' -f https://storage.googleapis.com/jax-releases/libtpu_releases.html > /dev/null 2>&1"
-    fi
+    # Force uninstall first to avoid version conflicts with pre-installed JAX
+    log_info "Installing JAX 0.8.0 for TPU..."
+    run_on_tpu "cd $REMOTE_DIR && source venv/bin/activate && \
+        pip uninstall -y jax jaxlib libtpu libtpu-nightly 2>/dev/null || true && \
+        pip install 'jax[tpu]==0.8.0' -f https://storage.googleapis.com/jax-releases/libtpu_releases.html"
 
     log_info "Installing project requirements..."
     run_on_tpu "cd $REMOTE_DIR && source venv/bin/activate && \

@@ -288,6 +288,12 @@ def parse_args():
         help="Buffer size for streaming shuffle (default: 10000)"
     )
     parser.add_argument(
+        "--gradient-accumulation-steps",
+        type=int,
+        default=1,
+        help="Number of micro-batches to accumulate before optimizer update (default: 1 = disabled)"
+    )
+    parser.add_argument(
         "--stopping-strategy",
         type=str,
         choices=["first_exhausted", "all_exhausted"],
@@ -513,18 +519,20 @@ def create_train_state(
     lr_schedule_type: str = "inverse_sqrt",
     layer_norm_lr_factor: float = 0.1,
     min_lr: float = 1e-7,
+    gradient_accumulation_steps: int = 1,
 ):
     """Create training state with proper optimizer.
 
     Args:
         model: The model to train
         learning_rate: Peak learning rate
-        num_train_steps: Total number of training steps
-        warmup_steps: Number of warmup steps
+        num_train_steps: Total number of training steps (optimizer steps, not micro-steps)
+        warmup_steps: Number of warmup steps (optimizer steps)
         weight_decay: Weight decay coefficient
         lr_schedule_type: Type of LR schedule ("inverse_sqrt", "linear", "cosine", "constant")
         layer_norm_lr_factor: LR multiplier for layer norm parameters (e.g., 0.1 for 10x smaller)
         min_lr: Minimum learning rate (prevents decay to zero)
+        gradient_accumulation_steps: Number of micro-batches to accumulate before update
     """
 
     # Create the selected learning rate schedule
@@ -683,6 +691,10 @@ def create_train_state(
             multi_optimizer,
         )
 
+        # Wrap with MultiSteps for gradient accumulation
+        if gradient_accumulation_steps > 1:
+            optimizer = optax.MultiSteps(optimizer, every_k_schedule=gradient_accumulation_steps)
+
         # For logging purposes, return both schedules
         return optimizer, (lr_schedule, ln_lr_schedule)
     else:
@@ -695,6 +707,10 @@ def create_train_state(
                 mask=decay_mask_fn,
             ),
         )
+
+        # Wrap with MultiSteps for gradient accumulation
+        if gradient_accumulation_steps > 1:
+            optimizer = optax.MultiSteps(optimizer, every_k_schedule=gradient_accumulation_steps)
 
         return optimizer, (lr_schedule, None)
 
@@ -900,11 +916,7 @@ def main(args):
     # Calculate total batch size across all devices
     total_batch_size = per_device_batch_size * n_devices
 
-    # Display batch size information clearly
-    if is_coordinator():
-        print(f"\nBatch Size Configuration:")
-        print(f"  Per-device batch size: {per_device_batch_size}")
-        print(f"  Total batch size: {total_batch_size} (= {per_device_batch_size} × {n_devices} devices)")
+    # Display batch size information clearly (gradient accumulation info added later after extraction)
 
     # Note: batch_size represents per-device batch size throughout the code
     # JAX automatically handles data parallelism across devices internally
@@ -922,6 +934,19 @@ def main(args):
     log_every = args.log_every
     checkpoint_every = args.checkpoint_every
     checkpoint_dir = args.checkpoint_dir
+    gradient_accumulation_steps = args.gradient_accumulation_steps
+
+    # Compute effective batch size
+    effective_batch_size = per_device_batch_size * n_devices * gradient_accumulation_steps
+
+    # Display batch size configuration
+    if is_coordinator():
+        print(f"\nBatch Size Configuration:")
+        print(f"  Per-device batch size: {per_device_batch_size}")
+        print(f"  Devices: {n_devices}")
+        print(f"  Gradient accumulation steps: {gradient_accumulation_steps}")
+        print(f"  Effective batch size: {effective_batch_size} (= {per_device_batch_size} × {n_devices} × {gradient_accumulation_steps})")
+        print(f"  Tokens per optimizer step: {effective_batch_size * max_length:,}")
     
     # Determine dtype based on backend and arguments
     if args.compute_dtype is not None:
@@ -1035,6 +1060,8 @@ def main(args):
             # Training config
             "per_device_batch_size": per_device_batch_size,
             "total_batch_size": total_batch_size,
+            "gradient_accumulation_steps": gradient_accumulation_steps,
+            "effective_batch_size": effective_batch_size,
             "max_length": max_length,
             "num_train_steps": num_train_steps,
             "warmup_steps": warmup_steps,
@@ -1125,6 +1152,8 @@ def main(args):
         print(f"  Weight decay: {weight_decay}")
         if layer_norm_lr_factor != 1.0:
             print(f"  Layer norm LR factor: {layer_norm_lr_factor} (LR = {learning_rate * layer_norm_lr_factor})")
+        if gradient_accumulation_steps > 1:
+            print(f"  Gradient accumulation: {gradient_accumulation_steps} micro-batches per optimizer step")
 
     optimizer, lr_schedules = create_train_state(
         model,
@@ -1135,6 +1164,7 @@ def main(args):
         lr_schedule_type=lr_schedule_type,
         layer_norm_lr_factor=layer_norm_lr_factor,
         min_lr=min_lr,
+        gradient_accumulation_steps=gradient_accumulation_steps,
     )
 
     # Unpack schedules
@@ -1371,13 +1401,15 @@ def main(args):
         print("\n" + "=" * 70)
         print("TRAINING START")
         print("=" * 70)
-        print(f"Total steps: {num_train_steps}")
+        print(f"Total optimizer steps: {num_train_steps}")
+        print(f"Gradient accumulation steps: {gradient_accumulation_steps}")
         print(f"Per-device batch size: {per_device_batch_size}")
-        print(f"Total batch size: {total_batch_size} (across {n_devices} devices)")
+        print(f"Effective batch size: {effective_batch_size} (= {per_device_batch_size} × {n_devices} × {gradient_accumulation_steps})")
         if process_count > 1:
             print(f"Multi-host: {process_count} processes")
         print(f"Training seq length: {max_length} tokens")
-        print(f"Checkpoint every: {checkpoint_every} steps")
+        print(f"Tokens per optimizer step: {effective_batch_size * max_length:,}")
+        print(f"Checkpoint every: {checkpoint_every} optimizer steps")
         if args.use_packing:
             print(f"Sequence packing: ENABLED")
             # Check Adam optimizer state dtype - critical for bfloat16 stability
@@ -1389,21 +1421,39 @@ def main(args):
             except Exception as e:
                 print(f"Could not check optimizer state dtype: {e}")
         if start_step > 0:
-            print(f"Resuming from step: {start_step}")
+            print(f"Resuming from micro_step: {start_step} (optimizer_step: {start_step // gradient_accumulation_steps})")
         print()
 
-    step = start_step
+    # With gradient accumulation:
+    # - micro_step: increments every forward pass (corresponds to state.step with MultiSteps)
+    # - optimizer_step: increments every gradient_accumulation_steps micro-steps (actual param updates)
+    # - start_step from checkpoint is micro_step
+    micro_step = start_step
+    start_optimizer_step = start_step // gradient_accumulation_steps
+    optimizer_step = start_optimizer_step
+
+    # Metric accumulators for averaging over accumulation window
+    accumulated_loss = 0.0
+    accumulated_accuracy = 0.0
+    accumulated_perplexity = 0.0
+    accumulated_grad_norm = 0.0
+    accumulated_param_norm = 0.0
+    accumulated_update_ratio = 0.0
+
     batch_buffer = []
     training_start_time = time.time()
     skipped_examples = 0
 
-    # Only show progress bar on coordinator
-    pbar = tqdm(total=num_train_steps, desc="Training", initial=start_step) if is_coordinator() else None
+    # Progress bar shows optimizer steps (not micro-steps)
+    pbar = tqdm(total=num_train_steps, desc="Training", initial=start_optimizer_step) if is_coordinator() else None
 
     try:
         if args.use_packing:
             # Grain returns pre-batched data
-            for _ in range(num_train_steps - start_step):
+            # Total micro-batches needed: (num_train_steps - start_optimizer_step) * gradient_accumulation_steps
+            total_micro_batches = (num_train_steps - start_optimizer_step) * gradient_accumulation_steps
+
+            for _ in range(total_micro_batches):
                 # Get next packed batch from Grain
                 batch_raw = next(data_iter)
 
@@ -1414,12 +1464,12 @@ def main(args):
                 batch = {k: jnp.array(v) for k, v in batch.items()}
 
                 # Debug: Print batch info for first batch only
-                if step == start_step and is_coordinator():
+                if micro_step == start_step and is_coordinator():
                     seg_ids = batch["segment_ids"]
                     pos_ids = batch["position_ids"]
                     labels = batch["labels"]
                     print("\n" + "="*60)
-                    print("PACKED BATCH DIAGNOSTICS (step 0)")
+                    print("PACKED BATCH DIAGNOSTICS (micro_step 0)")
                     print("="*60)
                     print(f"Batch shape: {batch['input_ids'].shape}")
                     print(f"Segment IDs row 0: {seg_ids[0, :30]}... (first 30)")
@@ -1439,95 +1489,130 @@ def main(args):
                     print("="*60 + "\n")
 
 
-                # Training step
-                compute_per_layer = (step % 100 == 0)
-                current_lr = float(lr_schedule(step))
+                # Training step (with MultiSteps, optimizer accumulates gradients internally)
+                # LR is passed for update_ratio logging; actual LR is handled by optax schedule
+                compute_per_layer = (optimizer_step % 100 == 0) and (micro_step % gradient_accumulation_steps == 0)
+                current_lr = float(lr_schedule(optimizer_step))
                 state, metrics, dropout_rng = train_step_jit(state, batch, dropout_rng, current_lr, compute_per_layer)
 
-                # Logging (only on coordinator)
-                if step % log_every == 0 and is_coordinator():
-                    loss_value = float(metrics["loss"])
-                    accuracy_value = float(metrics["accuracy"]) * 100
-                    perplexity_value = float(metrics["perplexity"])
-                    grad_norm_value = float(metrics["grad_norm"])
-                    param_norm_value = float(metrics["param_norm"])
-                    update_ratio_value = float(metrics["update_ratio"])
+                # Accumulate metrics for averaging over accumulation window
+                accumulated_loss += float(metrics["loss"])
+                accumulated_accuracy += float(metrics["accuracy"])
+                accumulated_perplexity += float(metrics["perplexity"])
+                accumulated_grad_norm += float(metrics["grad_norm"])
+                accumulated_param_norm += float(metrics["param_norm"])
+                accumulated_update_ratio += float(metrics["update_ratio"])
 
-                    lr_value = current_lr
-                    ln_lr_value = float(ln_lr_schedule(step)) if ln_lr_schedule else lr_value
-                    n_masked = int(jnp.sum(batch["labels"] != -100))
+                micro_step += 1
 
-                    # Diagnostic metrics
-                    logits_min = float(metrics["logits_min"])
-                    logits_max = float(metrics["logits_max"])
-                    logits_has_nan = bool(metrics["logits_has_nan"])
-                    logits_has_inf = bool(metrics["logits_has_inf"])
-                    grads_has_nan = bool(metrics["grads_has_nan"])
-                    
-                    # Print diagnostics for first 10 steps
-                    if step < start_step + 10:
-                        print(f"Step {step}: loss={loss_value:.4f}, logits=[{logits_min:.2f}, {logits_max:.2f}], "
-                              f"nan={logits_has_nan}, inf={logits_has_inf}, grad_nan={grads_has_nan}, grad_norm={grad_norm_value:.4f}")
+                # Check if we completed an accumulation cycle (optimizer step completed)
+                if micro_step % gradient_accumulation_steps == 0:
+                    optimizer_step += 1
 
-                    elapsed = time.time() - training_start_time
-                    tokens_per_sec = (step - start_step) * total_batch_size * max_length / elapsed if elapsed > 0 else 0
-                    steps_per_sec = (step - start_step) / elapsed if elapsed > 0 else 0
+                    # Compute averaged metrics over accumulation window
+                    avg_loss = accumulated_loss / gradient_accumulation_steps
+                    avg_accuracy = accumulated_accuracy / gradient_accumulation_steps
+                    avg_perplexity = accumulated_perplexity / gradient_accumulation_steps
+                    avg_grad_norm = accumulated_grad_norm / gradient_accumulation_steps
+                    avg_param_norm = accumulated_param_norm / gradient_accumulation_steps
+                    avg_update_ratio = accumulated_update_ratio / gradient_accumulation_steps
 
+                    # Logging (only on coordinator, using optimizer_step)
+                    if optimizer_step % log_every == 0 and is_coordinator():
+                        loss_value = avg_loss
+                        accuracy_value = avg_accuracy * 100
+                        perplexity_value = avg_perplexity
+                        grad_norm_value = avg_grad_norm
+                        param_norm_value = avg_param_norm
+                        update_ratio_value = avg_update_ratio
+
+                        lr_value = current_lr
+                        ln_lr_value = float(ln_lr_schedule(optimizer_step)) if ln_lr_schedule else lr_value
+                        n_masked = int(jnp.sum(batch["labels"] != -100))
+
+                        # Diagnostic metrics (from last micro-batch)
+                        logits_min = float(metrics["logits_min"])
+                        logits_max = float(metrics["logits_max"])
+                        logits_has_nan = bool(metrics["logits_has_nan"])
+                        logits_has_inf = bool(metrics["logits_has_inf"])
+                        grads_has_nan = bool(metrics["grads_has_nan"])
+
+                        # Print diagnostics for first 10 optimizer steps
+                        if optimizer_step < start_optimizer_step + 10:
+                            print(f"Step {optimizer_step}: loss={loss_value:.4f}, logits=[{logits_min:.2f}, {logits_max:.2f}], "
+                                  f"nan={logits_has_nan}, inf={logits_has_inf}, grad_nan={grads_has_nan}, grad_norm={grad_norm_value:.4f}")
+
+                        elapsed = time.time() - training_start_time
+                        # Tokens/sec based on micro_steps processed
+                        tokens_per_sec = (micro_step - start_step) * total_batch_size * max_length / elapsed if elapsed > 0 else 0
+                        optimizer_steps_per_sec = (optimizer_step - start_optimizer_step) / elapsed if elapsed > 0 else 0
+
+                        if pbar:
+                            pbar.set_postfix({
+                                "loss": f"{loss_value:.4f}",
+                                "acc": f"{accuracy_value:.1f}%",
+                                "ppl": f"{perplexity_value:.1f}",
+                                "lr": f"{lr_value:.2e}",
+                                "grad": f"{grad_norm_value:.2f}",
+                                "ratio": f"{update_ratio_value:.2e}",
+                                "tok/s": f"{tokens_per_sec:.0f}",
+                                "epoch": packed_dataloader.epoch,
+                            })
+
+                        if not args.no_wandb:
+                            wandb_log = {
+                                "train/loss": loss_value,
+                                "train/accuracy": accuracy_value,
+                                "train/perplexity": perplexity_value,
+                                "train/learning_rate": lr_value,
+                                "train/grad_norm": grad_norm_value,
+                                "train/param_norm": param_norm_value,
+                                "train/update_ratio": update_ratio_value,
+                                "train/n_masked_tokens": n_masked,
+                                "train/epoch": packed_dataloader.epoch,
+                                "train/effective_batch_size": effective_batch_size,
+                                "train/gradient_accumulation_steps": gradient_accumulation_steps,
+                                "train/micro_step": micro_step,
+                                "performance/tokens_per_sec": tokens_per_sec,
+                                "performance/optimizer_steps_per_sec": optimizer_steps_per_sec,
+                                "step": optimizer_step,
+                            }
+                            if ln_lr_schedule:
+                                wandb_log["train/layer_norm_lr"] = ln_lr_value
+                            wandb.log(wandb_log, step=optimizer_step)
+
+                    # Checkpointing (using micro_step for state, but keyed by optimizer_step)
+                    if optimizer_step > start_optimizer_step and optimizer_step % checkpoint_every == 0 and checkpoint_manager is not None:
+                        ckpt_state = prepare_state_for_checkpoint(state)
+                        checkpoint_manager.save(
+                            micro_step,  # Save micro_step for correct resume
+                            args=ocp.args.StandardSave(ckpt_state)
+                        )
+                        # Wait for checkpoint to complete before continuing
+                        checkpoint_manager.wait_until_finished()
+                        # Force garbage collection to release checkpoint references
+                        del ckpt_state
+                        gc.collect()
+                        if is_coordinator():
+                            print(f"\n✓ Checkpoint saved at optimizer_step {optimizer_step} (micro_step {micro_step})")
+
+                    # Reset accumulators for next accumulation window
+                    accumulated_loss = 0.0
+                    accumulated_accuracy = 0.0
+                    accumulated_perplexity = 0.0
+                    accumulated_grad_norm = 0.0
+                    accumulated_param_norm = 0.0
+                    accumulated_update_ratio = 0.0
+
+                    # Update progress bar (one step per optimizer step)
                     if pbar:
-                        pbar.set_postfix({
-                            "loss": f"{loss_value:.4f}",
-                            "acc": f"{accuracy_value:.1f}%",
-                            "ppl": f"{perplexity_value:.1f}",
-                            "lr": f"{lr_value:.2e}",
-                            "grad": f"{grad_norm_value:.2f}",
-                            "ratio": f"{update_ratio_value:.2e}",
-                            "tok/s": f"{tokens_per_sec:.0f}",
-                            "epoch": packed_dataloader.epoch,
-                        })
+                        pbar.update(1)
 
-                    if not args.no_wandb:
-                        wandb_log = {
-                            "train/loss": loss_value,
-                            "train/accuracy": accuracy_value,
-                            "train/perplexity": perplexity_value,
-                            "train/learning_rate": lr_value,
-                            "train/grad_norm": grad_norm_value,
-                            "train/param_norm": param_norm_value,
-                            "train/update_ratio": update_ratio_value,
-                            "train/n_masked_tokens": n_masked,
-                            "train/epoch": packed_dataloader.epoch,
-                            "performance/tokens_per_sec": tokens_per_sec,
-                            "performance/steps_per_sec": steps_per_sec,
-                            "step": step,
-                        }
-                        if ln_lr_schedule:
-                            wandb_log["train/layer_norm_lr"] = ln_lr_value
-                        wandb.log(wandb_log, step=step)
-
-                # Checkpointing
-                if step > start_step and step % checkpoint_every == 0 and checkpoint_manager is not None:
-                    ckpt_state = prepare_state_for_checkpoint(state)
-                    checkpoint_manager.save(
-                        step,
-                        args=ocp.args.StandardSave(ckpt_state)
-                    )
-                    # Wait for checkpoint to complete before continuing
-                    checkpoint_manager.wait_until_finished()
-                    # Force garbage collection to release checkpoint references
-                    # Without this, Python may not GC in time, causing OOM on next steps
-                    del ckpt_state
-                    gc.collect()
-                    if is_coordinator():
-                        print(f"\n✓ Checkpoint saved at step {step}")
-
-                step += 1
-                if pbar:
-                    pbar.update(1)
-
-                if step >= num_train_steps:
-                    break
+                    # Check termination (based on optimizer steps)
+                    if optimizer_step >= num_train_steps:
+                        break
         else:
-            # Original non-packed training loop
+            # Original non-packed training loop (with gradient accumulation support)
             for example in dataset:
                 # Skip examples when resuming (can't use dataset.skip() with split_dataset_by_node)
                 if skipped_examples < examples_to_skip:
@@ -1545,104 +1630,130 @@ def main(args):
                     batch = collator(batch_buffer, max_length=max_length)
                     batch_buffer = []
 
-                    # Training step - use per-layer metrics every 100 steps
-                    compute_per_layer = (step % 100 == 0)
-                    current_lr = float(lr_schedule(step))
-                    # Note: We pass the main LR to train_step, layer norm LR is handled internally by optimizer
+                    # Training step (with MultiSteps, optimizer accumulates gradients internally)
+                    compute_per_layer = (optimizer_step % 100 == 0) and (micro_step % gradient_accumulation_steps == 0)
+                    current_lr = float(lr_schedule(optimizer_step))
                     state, metrics, dropout_rng = train_step_jit(state, batch, dropout_rng, current_lr, compute_per_layer)
 
-                    # Logging (only on coordinator)
-                    if step % log_every == 0 and is_coordinator():
-                        # Extract metrics
-                        loss_value = float(metrics["loss"])
-                        accuracy_value = float(metrics["accuracy"]) * 100  # Convert to percentage
-                        perplexity_value = float(metrics["perplexity"])
-                        grad_norm_value = float(metrics["grad_norm"])
-                        param_norm_value = float(metrics["param_norm"])
-                        update_ratio_value = float(metrics["update_ratio"])
+                    # Accumulate metrics for averaging over accumulation window
+                    accumulated_loss += float(metrics["loss"])
+                    accumulated_accuracy += float(metrics["accuracy"])
+                    accumulated_perplexity += float(metrics["perplexity"])
+                    accumulated_grad_norm += float(metrics["grad_norm"])
+                    accumulated_param_norm += float(metrics["param_norm"])
+                    accumulated_update_ratio += float(metrics["update_ratio"])
 
-                        lr_value = current_lr  # Already computed above
-                        # Compute layer norm LR if different
-                        ln_lr_value = float(ln_lr_schedule(step)) if ln_lr_schedule else lr_value
-                        n_masked = int(jnp.sum(batch["labels"] != -100))
+                    micro_step += 1
 
-                        # Calculate throughput
-                        elapsed = time.time() - training_start_time
-                        tokens_per_sec = (step - start_step) * batch_size * max_length / elapsed if elapsed > 0 else 0
-                        samples_per_sec = tokens_per_sec / max_length
-                        steps_per_sec = (step - start_step) / elapsed if elapsed > 0 else 0
+                    # Check if we completed an accumulation cycle (optimizer step completed)
+                    if micro_step % gradient_accumulation_steps == 0:
+                        optimizer_step += 1
 
-                        # Update progress bar
+                        # Compute averaged metrics over accumulation window
+                        avg_loss = accumulated_loss / gradient_accumulation_steps
+                        avg_accuracy = accumulated_accuracy / gradient_accumulation_steps
+                        avg_perplexity = accumulated_perplexity / gradient_accumulation_steps
+                        avg_grad_norm = accumulated_grad_norm / gradient_accumulation_steps
+                        avg_param_norm = accumulated_param_norm / gradient_accumulation_steps
+                        avg_update_ratio = accumulated_update_ratio / gradient_accumulation_steps
+
+                        # Logging (only on coordinator, using optimizer_step)
+                        if optimizer_step % log_every == 0 and is_coordinator():
+                            loss_value = avg_loss
+                            accuracy_value = avg_accuracy * 100
+                            perplexity_value = avg_perplexity
+                            grad_norm_value = avg_grad_norm
+                            param_norm_value = avg_param_norm
+                            update_ratio_value = avg_update_ratio
+
+                            lr_value = current_lr
+                            ln_lr_value = float(ln_lr_schedule(optimizer_step)) if ln_lr_schedule else lr_value
+                            n_masked = int(jnp.sum(batch["labels"] != -100))
+
+                            # Calculate throughput
+                            elapsed = time.time() - training_start_time
+                            tokens_per_sec = (micro_step - start_step) * batch_size * max_length / elapsed if elapsed > 0 else 0
+                            samples_per_sec = tokens_per_sec / max_length
+                            optimizer_steps_per_sec = (optimizer_step - start_optimizer_step) / elapsed if elapsed > 0 else 0
+
+                            # Update progress bar
+                            if pbar:
+                                pbar.set_postfix({
+                                    "loss": f"{loss_value:.4f}",
+                                    "acc": f"{accuracy_value:.1f}%",
+                                    "ppl": f"{perplexity_value:.1f}",
+                                    "lr": f"{lr_value:.2e}",
+                                    "grad": f"{grad_norm_value:.2f}",
+                                    "ratio": f"{update_ratio_value:.2e}",
+                                })
+
+                            # Log to W&B (only on coordinator, already guarded)
+                            if not args.no_wandb:
+                                wandb_log = {
+                                    "train/loss": loss_value,
+                                    "train/accuracy": accuracy_value,
+                                    "train/perplexity": perplexity_value,
+                                    "train/learning_rate": lr_value,
+                                    "train/grad_norm": grad_norm_value,
+                                    "train/param_norm": param_norm_value,
+                                    "train/update_ratio": update_ratio_value,
+                                    "train/n_masked_tokens": n_masked,
+                                    "train/masking_percentage": n_masked / (batch_size * max_length) * 100,
+                                    "train/effective_batch_size": effective_batch_size,
+                                    "train/gradient_accumulation_steps": gradient_accumulation_steps,
+                                    "train/micro_step": micro_step,
+                                    "performance/tokens_per_sec": tokens_per_sec,
+                                    "performance/samples_per_sec": samples_per_sec,
+                                    "performance/optimizer_steps_per_sec": optimizer_steps_per_sec,
+                                    "step": optimizer_step,
+                                }
+
+                                # Add layer norm LR if different
+                                if ln_lr_schedule:
+                                    wandb_log["train/layer_norm_lr"] = ln_lr_value
+
+                                # Add per-layer gradient norms if available
+                                if "layer_grad_norms" in metrics:
+                                    for layer_name, grad_norm in metrics["layer_grad_norms"].items():
+                                        wandb_log[f"gradients/{layer_name}"] = float(grad_norm)
+
+                                wandb.log(wandb_log, step=optimizer_step)
+
+                            if optimizer_step % (log_every * 5) == 0:  # Print detailed stats occasionally
+                                print(f"\nStep {optimizer_step:4d} | Loss: {loss_value:.4f} | Acc: {accuracy_value:.1f}% | "
+                                      f"PPL: {perplexity_value:.1f} | LR: {lr_value:.2e} | "
+                                      f"Grad: {grad_norm_value:.2f} | Ratio: {update_ratio_value:.2e} | "
+                                      f"Tok/s: {tokens_per_sec:.0f}")
+
+                        # Checkpointing (using micro_step for state, keyed by optimizer_step)
+                        if optimizer_step > start_optimizer_step and optimizer_step % checkpoint_every == 0 and checkpoint_manager is not None:
+                            ckpt_state = prepare_state_for_checkpoint(state)
+                            checkpoint_manager.save(
+                                micro_step,  # Save micro_step for correct resume
+                                args=ocp.args.StandardSave(ckpt_state)
+                            )
+                            checkpoint_manager.wait_until_finished()
+                            del ckpt_state
+                            gc.collect()
+                            if is_coordinator():
+                                print(f"\n✓ Checkpoint saved at optimizer_step {optimizer_step} (micro_step {micro_step})")
+                                print(f"  Elapsed time: {(time.time() - training_start_time)/60:.1f} minutes")
+
+                        # Reset accumulators for next accumulation window
+                        accumulated_loss = 0.0
+                        accumulated_accuracy = 0.0
+                        accumulated_perplexity = 0.0
+                        accumulated_grad_norm = 0.0
+                        accumulated_param_norm = 0.0
+                        accumulated_update_ratio = 0.0
+
+                        # Update progress bar (one step per optimizer step)
                         if pbar:
-                            pbar.set_postfix({
-                                "loss": f"{loss_value:.4f}",
-                                "acc": f"{accuracy_value:.1f}%",
-                                "ppl": f"{perplexity_value:.1f}",
-                                "lr": f"{lr_value:.2e}",
-                                "grad": f"{grad_norm_value:.2f}",
-                                "ratio": f"{update_ratio_value:.2e}",
-                            })
+                            pbar.update(1)
 
-                        # Log to W&B (only on coordinator, already guarded)
-                        if not args.no_wandb:
-                            wandb_log = {
-                                "train/loss": loss_value,
-                                "train/accuracy": accuracy_value,
-                                "train/perplexity": perplexity_value,
-                                "train/learning_rate": lr_value,
-                                "train/grad_norm": grad_norm_value,
-                                "train/param_norm": param_norm_value,
-                                "train/update_ratio": update_ratio_value,
-                                "train/n_masked_tokens": n_masked,
-                                "train/masking_percentage": n_masked / (batch_size * max_length) * 100,
-                                "performance/tokens_per_sec": tokens_per_sec,
-                                "performance/samples_per_sec": samples_per_sec,
-                                "performance/steps_per_sec": steps_per_sec,
-                                "step": step,
-                            }
-
-                            # Add layer norm LR if different
-                            if ln_lr_schedule:
-                                wandb_log["train/layer_norm_lr"] = ln_lr_value
-
-                            # Add per-layer gradient norms if available
-                            if "layer_grad_norms" in metrics:
-                                for layer_name, grad_norm in metrics["layer_grad_norms"].items():
-                                    wandb_log[f"gradients/{layer_name}"] = float(grad_norm)
-
-                            wandb.log(wandb_log, step=step)
-
-                        if step % (log_every * 5) == 0:  # Print detailed stats occasionally
-                            print(f"\nStep {step:4d} | Loss: {loss_value:.4f} | Acc: {accuracy_value:.1f}% | "
-                                  f"PPL: {perplexity_value:.1f} | LR: {lr_value:.2e} | "
-                                  f"Grad: {grad_norm_value:.2f} | Ratio: {update_ratio_value:.2e} | "
-                                  f"Tok/s: {tokens_per_sec:.0f}")
-
-                    # Checkpointing
-                    # checkpoint_manager is None for non-coordinators with local storage
-                    if step > start_step and step % checkpoint_every == 0 and checkpoint_manager is not None:
-                        # Prepare state for multi-host checkpointing (converts step to global array)
-                        ckpt_state = prepare_state_for_checkpoint(state)
-                        checkpoint_manager.save(
-                            step,
-                            args=ocp.args.StandardSave(ckpt_state)
-                        )
-                        # Wait for async checkpoint to complete to release memory before continuing
-                        # This prevents OOM from holding checkpoint data + training data simultaneously
-                        checkpoint_manager.wait_until_finished()
-                        # Force garbage collection to release any lingering references
-                        del ckpt_state
-                        gc.collect()
-                        if is_coordinator():
-                            print(f"\n✓ Checkpoint saved at step {step}")
-                            print(f"  Elapsed time: {(time.time() - training_start_time)/60:.1f} minutes")
-
-                    step += 1
-                    if pbar:
-                        pbar.update(1)
-
-                    if step >= num_train_steps:
-                        break
+                        # Check termination (based on optimizer steps)
+                        if optimizer_step >= num_train_steps:
+                            break
 
     finally:
         # Close progress bar if it exists
@@ -1654,11 +1765,11 @@ def main(args):
         # Prepare state for multi-host checkpointing (converts step to global array)
         ckpt_state = prepare_state_for_checkpoint(state)
         checkpoint_manager.save(
-            step,
+            micro_step,  # Save micro_step for correct resume
             args=ocp.args.StandardSave(ckpt_state)
         )
         if is_coordinator():
-            print(f"\n✓ Final checkpoint saved at step {step}")
+            print(f"\n✓ Final checkpoint saved at optimizer_step {optimizer_step} (micro_step {micro_step})")
 
         # Wait for all async checkpoints to complete before exiting
         if is_coordinator():
@@ -1669,7 +1780,7 @@ def main(args):
 
     # Calculate final metrics for logging
     elapsed = time.time() - training_start_time
-    tokens_per_sec = (step - start_step) * batch_size * max_length / elapsed if elapsed > 0 else 0
+    tokens_per_sec = (micro_step - start_step) * batch_size * max_length / elapsed if elapsed > 0 else 0
 
     if is_coordinator():
         print("\n" + "=" * 70)
@@ -1678,7 +1789,8 @@ def main(args):
         print(f"Final loss: {float(metrics['loss']):.4f}")
         print(f"Final accuracy: {float(metrics['accuracy']) * 100:.1f}%")
         print(f"Final perplexity: {float(metrics['perplexity']):.1f}")
-        print(f"Total steps: {step}")
+        print(f"Total optimizer steps: {optimizer_step}")
+        print(f"Total micro steps: {micro_step}")
         print(f"Training time: {elapsed/60:.1f} minutes")
 
         if backend == 'tpu':
@@ -1691,7 +1803,10 @@ def main(args):
         wandb.summary["final_loss"] = float(metrics['loss'])
         wandb.summary["final_accuracy"] = float(metrics['accuracy']) * 100
         wandb.summary["final_perplexity"] = float(metrics['perplexity'])
-        wandb.summary["total_steps"] = step
+        wandb.summary["total_optimizer_steps"] = optimizer_step
+        wandb.summary["total_micro_steps"] = micro_step
+        wandb.summary["gradient_accumulation_steps"] = gradient_accumulation_steps
+        wandb.summary["effective_batch_size"] = effective_batch_size
         wandb.summary["training_time_minutes"] = elapsed / 60
         wandb.finish()
         print("\n✓ W&B run finished successfully")

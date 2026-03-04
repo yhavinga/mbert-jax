@@ -24,6 +24,7 @@ except ValueError:
 import jax.numpy as jnp
 import numpy as np
 import optax
+from optax import contrib as optax_contrib
 from flax import traverse_util
 from flax.training import train_state
 from datasets import load_dataset
@@ -142,7 +143,14 @@ def parse_args():
         "--weight-decay",
         type=float,
         default=0.01,
-        help="Weight decay (default: 0.01)"
+        help="Weight decay (default: 0.01 for AdamW, recommend 0.1 for Muon)"
+    )
+    parser.add_argument(
+        "--optimizer",
+        type=str,
+        choices=["adamw", "muon"],
+        default="adamw",
+        help="Optimizer to use (default: adamw). Muon uses less memory but needs weight_decay=0.1"
     )
     parser.add_argument(
         "--lr-schedule",
@@ -520,6 +528,7 @@ def create_train_state(
     layer_norm_lr_factor: float = 0.1,
     min_lr: float = 1e-7,
     gradient_accumulation_steps: int = 1,
+    optimizer_type: str = "adamw",
 ):
     """Create training state with proper optimizer.
 
@@ -528,11 +537,12 @@ def create_train_state(
         learning_rate: Peak learning rate
         num_train_steps: Total number of training steps (optimizer steps, not micro-steps)
         warmup_steps: Number of warmup steps (optimizer steps)
-        weight_decay: Weight decay coefficient
+        weight_decay: Weight decay coefficient (recommend 0.01 for AdamW, 0.1 for Muon)
         lr_schedule_type: Type of LR schedule ("inverse_sqrt", "linear", "cosine", "constant")
-        layer_norm_lr_factor: LR multiplier for layer norm parameters (e.g., 0.1 for 10x smaller)
+        layer_norm_lr_factor: LR multiplier for layer norm parameters (only for AdamW)
         min_lr: Minimum learning rate (prevents decay to zero)
         gradient_accumulation_steps: Number of micro-batches to accumulate before update
+        optimizer_type: "adamw" or "muon" (Muon uses less memory, good for large models)
     """
 
     # Create the selected learning rate schedule
@@ -642,8 +652,31 @@ def create_train_state(
             flat_mask[path] = not no_decay
 
         return traverse_util.unflatten_dict(flat_mask)
-    
-    # Create optimizer with optional separate learning rate for layer norms
+
+    # Create optimizer based on optimizer_type
+    if optimizer_type == "muon":
+        # Muon optimizer: uses Newton-Schulz orthogonalization for 2D params (weights)
+        # Automatically uses AdamW for non-2D params (biases, embeddings, layer norms)
+        # Uses less memory than AdamW (only stores momentum, not variance)
+        optimizer = optax.chain(
+            optax.clip_by_global_norm(1.0),  # Gradient clipping
+            optax_contrib.muon(
+                learning_rate=lr_schedule,
+                weight_decay=weight_decay,
+                # Muon-specific defaults
+                beta=0.95,  # Momentum
+                nesterov=True,
+                ns_steps=5,  # Newton-Schulz iterations
+            ),
+        )
+
+        # Wrap with MultiSteps for gradient accumulation
+        if gradient_accumulation_steps > 1:
+            optimizer = optax.MultiSteps(optimizer, every_k_schedule=gradient_accumulation_steps)
+
+        return optimizer, (lr_schedule, None)
+
+    # AdamW optimizer with optional separate learning rate for layer norms
     if layer_norm_lr_factor != 1.0:
         # Create schedule for layer norm parameters (scaled by factor)
         if callable(lr_schedule):
@@ -1058,6 +1091,7 @@ def main(args):
             "model_vocab_size": config.vocab_size,
 
             # Training config
+            "optimizer": args.optimizer,
             "per_device_batch_size": per_device_batch_size,
             "total_batch_size": total_batch_size,
             "gradient_accumulation_steps": gradient_accumulation_steps,
@@ -1143,15 +1177,20 @@ def main(args):
         print(f"  Parameters: {param_count:,} ({param_count/1e6:.1f}M)")
 
     # Create optimizer and training state
+    optimizer_type = args.optimizer
     if is_coordinator():
         print("\nCreating optimizer...")
+        print(f"  Optimizer: {optimizer_type.upper()}")
         print(f"  Learning rate: {learning_rate}")
         print(f"  LR schedule: {lr_schedule_type}")
         print(f"  Warmup steps: {warmup_steps}")
         print(f"  Min LR: {min_lr}")
         print(f"  Weight decay: {weight_decay}")
-        if layer_norm_lr_factor != 1.0:
+        if optimizer_type == "adamw" and layer_norm_lr_factor != 1.0:
             print(f"  Layer norm LR factor: {layer_norm_lr_factor} (LR = {learning_rate * layer_norm_lr_factor})")
+        if optimizer_type == "muon":
+            print(f"  Muon momentum (beta): 0.95")
+            print(f"  Muon Newton-Schulz steps: 5")
         if gradient_accumulation_steps > 1:
             print(f"  Gradient accumulation: {gradient_accumulation_steps} micro-batches per optimizer step")
 
@@ -1165,6 +1204,7 @@ def main(args):
         layer_norm_lr_factor=layer_norm_lr_factor,
         min_lr=min_lr,
         gradient_accumulation_steps=gradient_accumulation_steps,
+        optimizer_type=optimizer_type,
     )
 
     # Unpack schedules

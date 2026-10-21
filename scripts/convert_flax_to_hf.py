@@ -106,6 +106,7 @@ def save_tokenizer_with_mask(tokenizer_name: str, output_dir: Path, vocab_size: 
     tokenizer.save_pretrained(output_dir)
     print(f"✓ Saved tokenizer to {output_dir}")
     print(f"  Vocab size: {len(tokenizer)}, mask_token_id: {tokenizer.mask_token_id}")
+    return tokenizer
 
 
 def convert_flax_to_hf(input_dir: Path, output_dir: Path, tokenizer_override: str = None, verify: bool = True):
@@ -197,7 +198,6 @@ def convert_flax_to_hf(input_dir: Path, output_dir: Path, tokenizer_override: st
         "max_position_embeddings": config.get("max_position_embeddings", 8192),
         "initializer_range": 0.02,
         "norm_eps": 1e-5,
-        "pad_token_id": 0,
         "classifier_activation": "gelu",
         "classifier_dropout": 0.0,
         "attention_dropout": 0.0,
@@ -209,17 +209,28 @@ def convert_flax_to_hf(input_dir: Path, output_dir: Path, tokenizer_override: st
         "transformers_version": "4.48.0",
     }
 
+    # Save tokenizer (use override if provided, otherwise from config)
+    tokenizer_name = tokenizer_override or config.get("tokenizer_name")
+    if tokenizer_name:
+        tokenizer = save_tokenizer_with_mask(tokenizer_name, output_dir, hf_config["vocab_size"])
+        # Special token ids must come from the tokenizer used in training; if omitted, HF falls
+        # back to ModernBERT's defaults (50281/50282), which are outside our 32k vocab.
+        for name in ("pad", "bos", "eos"):
+            if getattr(tokenizer, f"{name}_token_id") is None:
+                raise ValueError(f"Tokenizer {tokenizer_name} has no {name}_token_id")
+        hf_config["pad_token_id"] = tokenizer.pad_token_id
+        hf_config["bos_token_id"] = tokenizer.bos_token_id
+        hf_config["eos_token_id"] = tokenizer.eos_token_id
+        hf_config["cls_token_id"] = tokenizer.bos_token_id
+        hf_config["sep_token_id"] = tokenizer.eos_token_id
+    else:
+        print("\nWARNING: No tokenizer specified. You must provide tokenizer separately, "
+              "and config.json has NO special token ids (pad/bos/eos/cls/sep) - set them manually.")
+
     config_path = output_dir / "config.json"
     with open(config_path, 'w') as f:
         json.dump(hf_config, f, indent=2)
     print(f"Saved config to {config_path}")
-
-    # Save tokenizer (use override if provided, otherwise from config)
-    tokenizer_name = tokenizer_override or config.get("tokenizer_name")
-    if tokenizer_name:
-        save_tokenizer_with_mask(tokenizer_name, output_dir, hf_config["vocab_size"])
-    else:
-        print("\nWARNING: No tokenizer specified. You must provide tokenizer separately.")
 
     # Verify if requested
     if verify:

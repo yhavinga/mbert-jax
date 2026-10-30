@@ -105,17 +105,17 @@ def test_per_layer_gradient_norms_cover_all_22_layers_without_mixing(tm, model_a
 
 
 def test_per_layer_norms_are_requested_on_a_step_that_logs(tm):
-    log_every = 10
+    every = 100
     for accumulation in (1, 3):
         requested = [
             optimizer_step
             for micro_step in range(1000 * accumulation)
             for optimizer_step in [micro_step // accumulation]
-            if tm.wants_per_layer_norms(optimizer_step, micro_step, accumulation, log_every)
+            if tm.wants_per_layer_norms(optimizer_step, micro_step, accumulation, every)
         ]
         assert requested == [99, 199, 299, 399, 499, 599, 699, 799, 899, 999]
         # The loop logs when optimizer_step + 1, after this micro-step, is a multiple of log_every
-        assert all((step + 1) % log_every == 0 for step in requested)
+        assert all((step + 1) % 10 == 0 for step in requested)
 
 
 def test_tracker_choice(tm):

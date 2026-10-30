@@ -661,6 +661,7 @@ def test_trackio_on_the_coordinator_with_per_chip_metrics_and_sync(tmp_path):
                              "--wandb-project", "proj", "--wandb-run-name", "r1", "--dataset-num-rows", "8000",
                              "--system-metrics-every", "5", "--tracking-sync-dir", str(sync_dir), "--tracking-sync-every", "1",
                              "--eval-file", str(eval_file), "--eval-every", "5", "--eval-batches", "2",
+                             "--per-layer-norms-every", "10",
                          ])
     assert "Exception in thread" not in logs[0], "a dead writer thread of Trackio loses the logs after it"
     _assert_identical_across_hosts_and_chips(results)

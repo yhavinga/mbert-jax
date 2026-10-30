@@ -2278,4 +2278,12 @@ def main(args):
 
 if __name__ == "__main__":
     args = parse_args()
-    main(args)
+    try:
+        main(args)
+    except BaseException:
+        traceback.print_exc()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        # Not a normal exit: atexit would call jax.distributed.shutdown(), whose barrier waits for
+        # peers that are stuck in a collective. Measured on the v4-32: still there after 10 minutes.
+        os._exit(1)

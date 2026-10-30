@@ -908,10 +908,15 @@ def create_checkpoint_manager(checkpoint_dir: str, checkpoint_every: int, max_to
     if wandb_run_id:
         metadata["wandb_run_id"] = wandb_run_id
 
+    # Orbax mkdirs <dir>/metadata and then requires it to exist, which fails on gs:// with the gcsfs
+    # backend (no TensorFlow): GCS has no empty directories. Nothing in this repo reads it back.
+    if is_gcs and is_coordinator():
+        print(f"  Not writing checkpoint root metadata on gs://: {metadata}")
+
     checkpoint_manager = ocp.CheckpointManager(
         checkpoint_dir,
         options=options,
-        metadata=metadata,
+        metadata=None if is_gcs else metadata,
     )
 
     return checkpoint_manager

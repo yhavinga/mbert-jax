@@ -130,6 +130,8 @@ class TrackerDatabaseSync(threading.Thread):
         from trackio.sqlite_storage import SQLiteStorage
 
         database = SQLiteStorage.get_project_db_path(self.project)
+        if not database.exists():  # Trackio creates it with the first log
+            return
         with tempfile.TemporaryDirectory() as directory:
             snapshot = Path(directory) / database.name
             source, target = sqlite3.connect(database), sqlite3.connect(snapshot)
@@ -1703,7 +1705,7 @@ def main(args):
 
     # Not on the TPU: it would wait for the running step, and the next batch can be prepared during that step
     cpu_device = jax.local_devices(backend="cpu")[0]
-    duty_sampler = start_duty_cycle_sampler(every_seconds=120)
+    duty_sampler = start_duty_cycle_sampler(every_seconds=60)
 
     # Create checkpoint manager for async checkpointing
     if is_coordinator():
@@ -1990,7 +1992,6 @@ def main(args):
                                 "performance/optimizer_steps_per_sec": optimizer_steps_per_sec,
                                 "performance/step_seconds": step_seconds,
                                 "performance/input_seconds_per_step": input_seconds_per_step,
-                                "step": optimizer_step,
                             }
                             if ln_lr_schedule:
                                 wandb_log["train/layer_norm_lr"] = ln_lr_value

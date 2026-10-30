@@ -3,6 +3,8 @@
 import os
 
 import numpy as np
+import json
+
 import pytest
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
@@ -54,6 +56,7 @@ def mock_callable_tokenizer():
     def _create(**kwargs):
         defaults = {
             "pad_token_id": 0,
+            "bos_token_id": 1,
             "eos_token_id": 2,
             "mask_token_id": 103,
             "vocab_size": 100,
@@ -75,9 +78,10 @@ def mock_callable_tokenizer():
 
 
 def test_tokenize_transform_adds_eos_token():
-    """TokenizeTransform should append EOS token only if doc wasn't truncated."""
+    """TokenizeTransform should start with BOS, and append EOS token only if doc wasn't truncated."""
     # This test uses a minimal callable tokenizer - keeping inline for clarity
     class MockTokenizer:
+        bos_token_id = 1
         eos_token_id = 2
 
         def __call__(self, text, truncation=False, max_length=None, return_tensors=None, add_special_tokens=False):
@@ -94,12 +98,15 @@ def test_tokenize_transform_adds_eos_token():
     result_short = transform.map(short_doc)
     assert result_short["input_ids"][-1] == MockTokenizer.eos_token_id, \
         "Short doc should have EOS token"
-    assert result_short["length"] == 3  # 2 words + 1 EOS
+    assert result_short["input_ids"][0] == MockTokenizer.bos_token_id, \
+        "Every doc should start with BOS"
+    assert result_short["length"] == 4  # 1 BOS + 2 words + 1 EOS
 
     # Case 2: Long document (truncated) - should NOT have EOS
-    long_doc = {"text": " ".join(["word"] * 20)}  # 20 tokens, will be truncated to 10
+    long_doc = {"text": " ".join(["word"] * 20)}  # 20 tokens, will be truncated to 9 + BOS
     result_long = transform.map(long_doc)
     assert result_long["length"] == max_length, f"Expected {max_length}, got {result_long['length']}"
+    assert result_long["input_ids"][0] == MockTokenizer.bos_token_id
     # EOS token id is 2, the hash of "word" is not 2, so check last token is NOT EOS
     assert result_long["input_ids"][-1] != MockTokenizer.eos_token_id, \
         "Truncated doc should NOT have EOS token"
@@ -458,3 +465,236 @@ def test_epoch_tracking_dataloader_restarts(mock_callable_tokenizer):
     print(f"✓ Epoch 2 restart: both epochs yielded {batch_count} batches")
 
 
+def _left_truncating_tokenizer():
+    """Real fast tokenizer with what matters of yhavinga/dutch-llama-tokenizer: <s>, </s>, truncation from the left."""
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from tokenizers.pre_tokenizers import Whitespace
+    from transformers import PreTrainedTokenizerFast
+
+    vocab = {token: i for i, token in enumerate(["<unk>", "<s>", "</s>", "<pad>", "<mask>"] + [f"w{i}" for i in range(95)])}
+    backend = Tokenizer(WordLevel(vocab, unk_token="<unk>"))
+    backend.pre_tokenizer = Whitespace()
+    return PreTrainedTokenizerFast(
+        tokenizer_object=backend, unk_token="<unk>", bos_token="<s>", eos_token="</s>", pad_token="<pad>",
+        mask_token="<mask>", truncation_side="left",
+    )
+
+
+def test_tokenize_transform_keeps_max_length_and_eos_rule():
+    tokenizer = _left_truncating_tokenizer()
+    transform = TokenizeTransform(tokenizer, max_length=8)
+    words = [f"w{i}" for i in range(20)]
+    ids = lambda n: tokenizer(" ".join(words[:n]), add_special_tokens=False)["input_ids"]  # noqa: E731
+
+    # Fits with both special tokens
+    assert transform.map({"text": " ".join(words[:6])})["input_ids"].tolist() == [1] + ids(6) + [2]
+    # Fits without </s>: indistinguishable from truncated, which gets no </s>
+    assert transform.map({"text": " ".join(words[:7])})["input_ids"].tolist() == [1] + ids(7)
+    # Truncated: the tokenizer's side decides what stays, <s> is in front and there is no </s>
+    long = transform.map({"text": " ".join(words)})
+    assert long["input_ids"].tolist() == [1] + ids(20)[-7:]
+    assert long["length"] == 8
+
+
+def test_tokenizer_without_bos_fails_with_a_message():
+    from src.mmbjax.training.packing import FLANTokenizeTransform
+
+    class NoBos:
+        bos_token_id = None
+        eos_token_id = 2
+
+    with pytest.raises(ValueError, match="no bos_token_id"):
+        TokenizeTransform(NoBos(), max_length=8)
+    with pytest.raises(ValueError, match="no bos_token_id"):
+        FLANTokenizeTransform(NoBos(), max_length=8)
+
+
+def test_flan_transform_starts_with_bos_within_max_length():
+    from src.mmbjax.training.packing import FLANTokenizeTransform
+
+    tokenizer = _left_truncating_tokenizer()
+    transform = FLANTokenizeTransform(tokenizer, max_length=8)
+    result = transform.map({"inputs": "w1 w2", "targets": "w3 w4"})["input_ids"].tolist()
+    inputs_ids, target_ids = (tokenizer(t, add_special_tokens=False)["input_ids"] for t in ("w1 w2", "w3 w4"))
+    assert result == [1] + inputs_ids + [2] + target_ids
+    words = " ".join(f"w{i}" for i in range(20))
+    result = transform.map({"inputs": words, "targets": words})["input_ids"].tolist()
+    assert len(result) == 8 and result[0] == 1 and result.count(2) == 1
+
+
+def _mask_tokens_with_python_loop(tokenizer, input_ids, mlm_probability):
+    """mask_tokens_packed as it was: the reference for the masking distribution."""
+    labels = input_ids.copy()
+    probability_matrix = np.full(input_ids.shape, mlm_probability)
+    special_tokens_mask = np.array([
+        [1 if tok in tokenizer.all_special_ids else 0 for tok in ids]
+        for ids in input_ids.tolist()
+    ])
+    probability_matrix[special_tokens_mask.astype(bool)] = 0.0
+    masked_indices = np.random.binomial(1, probability_matrix).astype(bool)
+    labels[~masked_indices] = -100
+    indices_replaced = np.random.binomial(1, np.full(labels.shape, 0.8)).astype(bool) & masked_indices
+    input_ids[indices_replaced] = tokenizer.mask_token_id
+    indices_random = np.random.binomial(1, np.full(labels.shape, 0.5)).astype(bool) & masked_indices & ~indices_replaced
+    random_words = np.random.randint(tokenizer.vocab_size, size=labels.shape, dtype=np.int32)
+    input_ids[indices_random] = random_words[indices_random]
+    return input_ids, labels
+
+
+def test_masking_is_unchanged_by_the_faster_special_token_mask(mock_tokenizer):
+    """Same seed, same bytes as the Python loop: the distribution can't have moved."""
+    tokenizer = mock_tokenizer(all_special_ids=[0, 1, 2, 103], vocab_size=1000, mask_token_id=103)
+    rng = np.random.RandomState(0)
+    input_ids = rng.randint(0, 1000, size=(64, 256)).astype(np.int32)
+    input_ids[:, 0] = 1
+    input_ids[:, 100] = 2
+    input_ids[:, 200:] = 0
+
+    np.random.seed(7)
+    expected_ids, expected_labels = _mask_tokens_with_python_loop(tokenizer, input_ids.copy(), 0.15)
+    np.random.seed(7)
+    collator = PackedMLMDataCollator(tokenizer, mlm_probability=0.15)
+    masked_ids, labels = collator.mask_tokens_packed(input_ids.copy(), np.zeros_like(input_ids))
+
+    assert np.array_equal(masked_ids, expected_ids)
+    assert np.array_equal(labels, expected_labels)
+    assert not np.any(labels[np.isin(input_ids, tokenizer.all_special_ids)] != -100)
+
+
+def _stream_of_numbered_documents(n, shard=0):
+    return ({"text": f"w{i % 95} " * (1 + i % 5), "doc": shard * 1000000 + i} for i in range(n))
+
+
+def test_source_stays_bounded_and_keeps_order_when_skipping():
+    from src.mmbjax.training import StreamingBufferDataSource
+
+    # What a resumed iterator does: straight to its index, keeping only the last items
+    source = StreamingBufferDataSource(_stream_of_numbered_documents(1000), max_buffer_size=8)
+    assert source[900]["doc"] == 900
+    assert len(source._buffer) <= 8
+    assert source[901]["doc"] == 901
+    assert source.stream_position == 902
+    with pytest.raises(IndexError, match="is gone"):
+        source[0]
+    # A normal read leaves nothing behind, and a later index may come first
+    source = StreamingBufferDataSource(_stream_of_numbered_documents(1000), max_buffer_size=8)
+    for index in [1, 0, 2, 20, 3, 4, 5]:
+        assert source[index]["doc"] == index
+    assert len(source._buffer) == 21 - 7
+    # The end of the stream is the end of the iterator, not a silent wrap to document 0
+    assert source[999]["doc"] == 999
+    with pytest.raises(StopIteration):
+        source[1000]
+
+
+def _batches_of_loader(loader, n):
+    iterator = iter(loader)
+    return iterator, [next(iterator) for _ in range(n)]
+
+
+def _real_pipeline_loader(monkeypatch, documents=400, **kwargs):
+    """The real EpochTrackingDataLoader on a real shuffled datasets.IterableDataset; only the download is fake."""
+    import datasets
+
+    from src.mmbjax.training import EpochTrackingDataLoader, packing
+
+    def generate(shards):
+        for shard in shards:
+            yield from _stream_of_numbered_documents(documents // 8, shard=shard)
+
+    fake = datasets.IterableDataset.from_generator(generate, gen_kwargs={"shards": list(range(8))})
+    monkeypatch.setattr(packing, "load_dataset", lambda *_a, **_k: fake)
+    return EpochTrackingDataLoader(
+        dataset_name="fake", tokenizer=_left_truncating_tokenizer(), max_length=16, batch_size=4,
+        shuffle_buffer_size=20, **kwargs,
+    )
+
+
+def test_loader_resumes_at_the_next_batch_on_the_real_pipeline(monkeypatch):
+    whole = _real_pipeline_loader(monkeypatch)
+    _, batches = _batches_of_loader(whole, 30)
+
+    first = _real_pipeline_loader(monkeypatch)
+    _, before = _batches_of_loader(first, 17)
+    state = json.loads(json.dumps(first.get_state(), default=int))
+
+    resumed = _real_pipeline_loader(monkeypatch)
+    resumed.set_state(state)
+    _, after = _batches_of_loader(resumed, 13)
+
+    for got, expected in zip(before + after, batches):
+        for key in expected:
+            assert np.array_equal(got[key], expected[key]), key
+
+
+def test_every_document_once_per_pass_across_a_resume(monkeypatch):
+    """Each document is one token sequence here, so what was trained on can be counted."""
+    import datasets
+
+    from src.mmbjax.training import EpochTrackingDataLoader, packing
+
+    documents = [{"text": f"w{i} w{(i * 7) % 95}"} for i in range(95)]
+    fake = datasets.IterableDataset.from_generator(lambda: iter(documents))
+    monkeypatch.setattr(packing, "load_dataset", lambda *_a, **_k: fake)
+
+    def loader():
+        return EpochTrackingDataLoader(
+            dataset_name="fake", tokenizer=_left_truncating_tokenizer(), max_length=8, batch_size=2,
+            shuffle_buffer_size=10, num_epochs=2,
+        )
+
+    def segments_of(batch):
+        found = []
+        for ids, positions in zip(batch["input_ids"], batch["input_ids_positions"]):
+            starts = [i for i, p in enumerate(positions) if p == 0 and ids[i] == 1]
+            for start, end in zip(starts, starts[1:] + [len(ids)]):
+                found.append(tuple(t for t in ids[start:end].tolist() if t != 3))
+        return found
+
+    first = loader()
+    iterator = iter(first)
+    seen = []
+    for _ in range(5):
+        seen += segments_of(next(iterator))
+    state = first.get_state()
+
+    resumed = loader()
+    resumed.set_state(state)
+    for batch in resumed:
+        if resumed.epoch > 0:
+            break
+        seen += segments_of(batch)
+
+    # Rows of the last, partial batch of a pass are dropped; none are repeated
+    assert len(seen) == len(set(seen)), "a document came twice within one pass"
+    assert len(seen) >= 95 - 2 * 4
+    assert resumed.epoch == 1
+
+
+def test_completed_pass_is_visible_and_the_next_one_starts(monkeypatch, capsys):
+    loader = _real_pipeline_loader(monkeypatch, documents=80)
+    iterator = iter(loader)
+    assert loader.epoch == 0
+    batches = 0
+    while loader.epoch == 0:
+        next(iterator)
+        batches += 1
+        assert batches < 500, "the pass never ended"
+    assert loader.documents_read >= 80
+    out = capsys.readouterr().out
+    assert "[EpochTrackingDataLoader] Completed epoch 1" in out
+    # Goes on with the next pass
+    next(iterator)
+    assert loader.epoch == 1
+
+
+def test_num_epochs_ends_the_loader_and_too_little_data_is_an_error(monkeypatch):
+    loader = _real_pipeline_loader(monkeypatch, documents=80, num_epochs=1)
+    assert sum(1 for _ in loader) > 0
+    assert loader.epoch == 1
+
+    short = _real_pipeline_loader(monkeypatch, documents=8)
+    short.batch_size = 64
+    with pytest.raises(RuntimeError, match="too few for one batch"):
+        next(iter(short))

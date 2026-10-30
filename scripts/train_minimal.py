@@ -12,7 +12,13 @@ import argparse
 import gc
 import os
 import json
+import re
+import sqlite3
+import subprocess
+import tempfile
+import threading
 import time
+import traceback
 from datetime import datetime
 import jax
 # Initialize distributed system for multi-host TPU (must be before other JAX calls)
@@ -27,14 +33,15 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 from optax import contrib as optax_contrib
+from etils import epath
 from flax import traverse_util
 from flax.training import train_state
+from jax.experimental import multihost_utils
 from datasets import load_dataset
 from transformers import AutoTokenizer
 from tqdm import tqdm
 from typing import Dict, List, Optional, Tuple, Any
 import orbax.checkpoint as ocp
-import wandb
 
 from mmbjax.configuration_mmbbert import MMBertConfig
 from mmbjax.heads.masked_lm import ModernBertForMaskedLM
@@ -47,6 +54,7 @@ from mmbjax.training import (
     HybridMaskingCollator,
     TokenizeTransform,
     create_packed_dataloader,
+    create_packed_dataset_streaming,
 )
 
 
@@ -85,6 +93,199 @@ def to_global(tree, sharding):
     return jax.make_array_from_process_local_data(sharding, jax.tree_util.tree_map(np.asarray, tree))
 
 
+def write_file(path, data):
+    """To a local path or gs://, where a directory needs no creating and mkdir fails with the gcsfs backend."""
+    path = epath.Path(path)
+    if not str(path).startswith("gs://"):
+        path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+
+
+def load_tracker(name):
+    """The module behind --tracker. Trackio follows wandb's init/log/finish, as in `import trackio as wandb`."""
+    if name == "trackio":
+        import trackio as wandb
+    elif name == "wandb":
+        import wandb
+    else:
+        return None
+    return wandb
+
+
+class TrackerDatabaseSync(threading.Thread):
+    """Copies Trackio's SQLite database to sync_dir, so progress can be read off the VM.
+
+    Trackio keeps one file per project, <TRACKIO_DIR>/<project>.db, in WAL mode. A plain copy of
+    that file can miss what is still in the WAL, so this copies through SQLite's backup API.
+    """
+
+    def __init__(self, project, sync_dir, every):
+        super().__init__(daemon=True)
+        self.project = project
+        self.sync_dir = sync_dir
+        self.every = every
+        self.stop_event = threading.Event()
+
+    def sync_once(self):
+        from trackio.sqlite_storage import SQLiteStorage
+
+        database = SQLiteStorage.get_project_db_path(self.project)
+        with tempfile.TemporaryDirectory() as directory:
+            snapshot = Path(directory) / database.name
+            source, target = sqlite3.connect(database), sqlite3.connect(snapshot)
+            source.backup(target)
+            source.close()
+            target.close()
+            write_file(epath.Path(self.sync_dir) / database.name, snapshot.read_bytes())
+
+    def run(self):
+        while not self.stop_event.wait(self.every):
+            try:
+                self.sync_once()
+            except Exception:
+                # Not worth losing a training run over; the next round tries again
+                print(f"Tracker database sync to {self.sync_dir} failed:", flush=True)
+                traceback.print_exc()
+
+    def finish(self):
+        self.stop_event.set()
+        self.join()
+        self.sync_once()
+
+
+class DutyCycleSampler(threading.Thread):
+    """Runs tpu-info in the background: it takes seconds, and a step must not wait for that."""
+
+    ROW = re.compile(r"\|\s*(\d+)\s*\|\s*[\d.]+ GiB / [\d.]+ GiB\s*\|\s*([\d.]+)%")
+
+    def __init__(self, command, every):
+        super().__init__(daemon=True)
+        self.command = command
+        self.every = every
+        self.latest = {}
+
+    def sample(self):
+        output = subprocess.run([self.command], capture_output=True, text=True, timeout=120).stdout
+        return {int(chip): float(duty) for chip, duty in self.ROW.findall(output)}
+
+    def run(self):
+        while True:
+            try:
+                self.latest = self.sample()
+            except Exception:
+                self.latest = {}
+                print(f"{self.command} failed on process {jax.process_index()}:", flush=True)
+                traceback.print_exc()
+            time.sleep(self.every)
+
+
+def start_duty_cycle_sampler(every_seconds):
+    """A running sampler, or None without tpu-info (CPU runs); the metric then reads -1."""
+    command = Path(sys.executable).with_name("tpu-info")
+    if not command.exists():
+        if is_coordinator():
+            print(f"  No {command}: duty cycle per chip will read -1")
+        return None
+    sampler = DutyCycleSampler(str(command), every_seconds)
+    sampler.start()
+    return sampler
+
+
+def gather_system_metrics(data_loader, duty_sampler, input_seconds_per_step, dataset_num_rows):
+    """Every chip of every host, gathered to all hosts. A collective: every host calls this at the same step.
+
+    Per-chip numbers are here because the bug that trained on one chip of sixteen looked fine
+    in everything else.
+    """
+    duty = duty_sampler.latest if duty_sampler is not None else {}
+    chips = []
+    for chip, device in enumerate(jax.local_devices()):
+        stats = device.memory_stats() or {}
+        chips.append([stats.get("bytes_in_use", -1), stats.get("peak_bytes_in_use", -1), duty.get(chip, -1)])
+    host = [data_loader.documents_read, data_loader.epoch, input_seconds_per_step]
+    gathered_chips = multihost_utils.process_allgather(np.array(chips, dtype=np.float32))
+    gathered_hosts = multihost_utils.process_allgather(np.array(host, dtype=np.float32))
+    gathered_chips = np.asarray(gathered_chips).reshape(jax.process_count(), -1, 3)
+    gathered_hosts = np.asarray(gathered_hosts).reshape(jax.process_count(), 3)
+
+    metrics = {}
+    for h, host_chips in enumerate(gathered_chips):
+        for c, (in_use, peak, duty_cycle) in enumerate(host_chips):
+            metrics[f"system/host{h}_chip{c}_bytes_in_use"] = float(in_use)
+            metrics[f"system/host{h}_chip{c}_peak_bytes_in_use"] = float(peak)
+            metrics[f"system/host{h}_chip{c}_duty_cycle"] = float(duty_cycle)
+    for h, (documents, epoch, seconds) in enumerate(gathered_hosts):
+        metrics[f"data/host{h}_documents_read"] = float(documents)
+        metrics[f"data/host{h}_passes_completed"] = float(epoch)
+        metrics[f"performance/host{h}_input_seconds_per_step"] = float(seconds)
+    if dataset_num_rows:
+        metrics["data/passes"] = float(gathered_hosts[:, 0].sum()) / dataset_num_rows
+    return metrics
+
+
+def data_state_path(checkpoint_dir, step, process_index):
+    """Next to the checkpoints, because Grain's state is per host and Orbax's save holds what all hosts share."""
+    return epath.Path(f"{str(checkpoint_dir).rstrip('/')}_data_state") / str(step) / f"process_{process_index}.json"
+
+
+def data_state_identity(args, rows_per_host):
+    """What must be the same for the saved indices to point at the same documents."""
+    return {
+        "dataset": args.dataset,
+        "dataset_config": args.dataset_config,
+        "datasets_config": args.datasets_config,
+        "process_count": jax.process_count(),
+        "rows_per_host": rows_per_host,
+        "max_length": args.max_length,
+        "tokenizer": args.tokenizer,
+        "shuffle_buffer_size": args.shuffle_buffer_size,
+    }
+
+
+def save_data_state(path, data_loader, identity, step):
+    write_file(path, json.dumps({"step": step, "identity": identity, "state": data_loader.get_state()}, default=int).encode())
+
+
+def restore_data_state(path, data_loader, identity, allow_restart):
+    """Put data_loader where the checkpoint left it; a resume that would repeat data must be asked for."""
+    if not path.exists():
+        if allow_restart:
+            print(f"No data state at {path}: this host reads its data from the start (--allow-data-restart)", flush=True)
+            return
+        raise RuntimeError(
+            f"No data state at {path}, so this resume would train on the same data again. "
+            "Pass --allow-data-restart if that is what you want."
+        )
+    saved = json.loads(path.read_text())
+    if saved["identity"] != identity:
+        raise RuntimeError(
+            f"Data state {path} is of another data setup, its indices would point at other documents: "
+            f"saved {saved['identity']}, this run {identity}"
+        )
+    data_loader.set_state(saved["state"])
+    print(f"Data state restored on process {jax.process_index()} at step {saved['step']}: {saved['state']}", flush=True)
+
+
+def load_eval_batches(path, tokenizer, collator, max_length, rows_per_host, n_batches):
+    """Held-out packed batches, built once: every evaluation and every run sees the same masks."""
+    import pyarrow.parquet as pq
+
+    def documents():
+        index = 0
+        for record_batch in pq.ParquetFile(path).iter_batches(batch_size=1024, columns=["text"]):
+            for text in record_batch.column("text").to_pylist():
+                if index % jax.process_count() == jax.process_index():
+                    yield {"text": text}
+                index += 1
+
+    packed = iter(create_packed_dataset_streaming(documents(), tokenizer=tokenizer, max_length=max_length, batch_size=rows_per_host))
+    np.random.seed(1234 + jax.process_index())
+    try:
+        return [collator(next(packed)) for _ in range(n_batches)]
+    except StopIteration:
+        raise ValueError(f"{path} has too few documents for {n_batches} eval batches of {rows_per_host} rows per host") from None
+
+
 def parse_args():
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
@@ -115,6 +316,12 @@ def parse_args():
         type=int,
         default=500,
         help="Maximum training steps (default: 500)"
+    )
+    parser.add_argument(
+        "--stop-at-step",
+        type=int,
+        default=None,
+        help="Stop after this optimizer step while the LR schedule still runs to --max-steps (default: run to --max-steps)"
     )
 
     # Additional training arguments
@@ -192,18 +399,49 @@ def parse_args():
         "--wandb-project",
         type=str,
         default="modernbert-mlm",
-        help="W&B project name (default: modernbert-mlm)"
+        help="Tracker project name (default: modernbert-mlm)"
     )
     parser.add_argument(
         "--wandb-run-name",
         type=str,
         default=None,
-        help="W&B run name (default: auto-generated)"
+        help="Tracker run name (default: auto-generated). With trackio a resume continues the run of this name"
     )
     parser.add_argument(
         "--no-wandb",
         action="store_true",
-        help="Disable W&B logging"
+        help="Same as --tracker none"
+    )
+    parser.add_argument(
+        "--tracker",
+        type=str,
+        choices=["wandb", "trackio", "none"],
+        default="trackio",
+        help="Experiment tracker, on the coordinator only (default: trackio, stored locally in TRACKIO_DIR)"
+    )
+    parser.add_argument(
+        "--tracking-sync-dir",
+        type=str,
+        default=None,
+        help="Copy Trackio's database here, e.g. gs://bucket/run/tracking (default: no copy)"
+    )
+    parser.add_argument(
+        "--tracking-sync-every",
+        type=int,
+        default=300,
+        help="Seconds between copies of Trackio's database (default: 300)"
+    )
+    parser.add_argument(
+        "--system-metrics-every",
+        type=int,
+        default=1000,
+        help="Optimizer steps between per-chip metrics; a step count because all hosts must gather at the same step (default: 1000)"
+    )
+    parser.add_argument(
+        "--dataset-num-rows",
+        type=int,
+        default=None,
+        help="Documents in the dataset, to log the fraction of a pass; streaming doesn't always know (default: only completed passes)"
     )
 
     # Mixed precision arguments
@@ -278,6 +516,29 @@ def parse_args():
         default=None,
         help="Number of epochs for packing mode (default: None = infinite, auto-restart on exhaustion)"
     )
+    parser.add_argument(
+        "--allow-data-restart",
+        action="store_true",
+        help="Packing mode: accept a resume from a checkpoint without data state; that host's data starts over"
+    )
+    parser.add_argument(
+        "--eval-file",
+        type=str,
+        default=None,
+        help="Local parquet file with held-out documents in a 'text' column (default: no evaluation)"
+    )
+    parser.add_argument(
+        "--eval-every",
+        type=int,
+        default=1000,
+        help="Optimizer steps between evaluations on --eval-file (default: 1000)"
+    )
+    parser.add_argument(
+        "--eval-batches",
+        type=int,
+        default=50,
+        help="Global batches in the held-out set (default: 50)"
+    )
     
     # Multi-dataset interleaving arguments
     parser.add_argument(
@@ -322,7 +583,12 @@ def parse_args():
         help="Masking mode: 'standard' for uniform 15%% masking, 'instruction_response' for 0%% instruction/25%% response (default: standard)"
     )
 
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.no_wandb:
+        args.tracker = "none"
+    if args.eval_file and not args.use_packing:
+        parser.error("--eval-file needs --use-packing")
+    return args
 
 
 class FlaxDataCollatorForLanguageModeling:
@@ -474,45 +740,28 @@ def compute_update_ratio(gradients, params, learning_rate):
 
 
 def compute_per_layer_gradient_norms(gradients):
-    """Compute gradient norms for each layer type."""
-    flat_grads = traverse_util.flatten_dict(gradients)
+    """Compute gradient norms for each layer type, from the module names in the parameter tree."""
+    squares = {}
 
-    layer_norms = {}
+    def add(name, grad):
+        squares[name] = squares.get(name, 0.0) + jnp.sum(jnp.square(grad))
 
-    # Embedding layer
-    embedding_grads = {k: v for k, v in flat_grads.items() if "embeddings" in str(k)}
-    if embedding_grads:
-        layer_norms["embeddings"] = jnp.sqrt(
-            sum([jnp.sum(jnp.square(g)) for g in embedding_grads.values()])
-        )
+    for path, grad in traverse_util.flatten_dict(gradients).items():
+        layer = next((part for part in path if re.fullmatch(r"layers_\d+", part)), None)
+        if layer is not None:
+            index = layer.removeprefix("layers_")
+            sublayer = "attention" if any(part.startswith("attention") for part in path) else "ffn"
+            add(f"encoder_{index}_{sublayer}", grad)
+        elif "embeddings" in path:
+            add("embeddings", grad)
+        elif "final_layer_norm" in path:
+            add("final_layer_norm", grad)
+        elif "prediction_head" in path or "decoder" in path:
+            add("lm_head", grad)
+        else:
+            add("other", grad)
 
-    # Encoder layers (attention and FFN)
-    for i in range(12):  # Assuming max 12 layers
-        layer_key = f"layer_{i}"
-        layer_grads = {k: v for k, v in flat_grads.items() if layer_key in str(k)}
-        if layer_grads:
-            # Attention sublayer
-            attn_grads = {k: v for k, v in layer_grads.items() if "attention" in str(k)}
-            if attn_grads:
-                layer_norms[f"encoder_{i}_attention"] = jnp.sqrt(
-                    sum([jnp.sum(jnp.square(g)) for g in attn_grads.values()])
-                )
-
-            # FFN sublayer
-            ffn_grads = {k: v for k, v in layer_grads.items() if "ffn" in str(k) or "intermediate" in str(k) or "output" in str(k)}
-            if ffn_grads:
-                layer_norms[f"encoder_{i}_ffn"] = jnp.sqrt(
-                    sum([jnp.sum(jnp.square(g)) for g in ffn_grads.values()])
-                )
-
-    # LM head
-    lm_head_grads = {k: v for k, v in flat_grads.items() if "lm_head" in str(k) or "predictions" in str(k)}
-    if lm_head_grads:
-        layer_norms["lm_head"] = jnp.sqrt(
-            sum([jnp.sum(jnp.square(g)) for g in lm_head_grads.values()])
-        )
-
-    return layer_norms
+    return {name: jnp.sqrt(square) for name, square in squares.items()}
 
 
 def create_train_state(
@@ -687,13 +936,12 @@ def create_train_state(
             )
 
         # Create label function to identify layer norm parameters
-        def label_fn(path):
-            """Label parameters as 'layer_norm' or 'other'."""
-            path_str = "/".join(path)
-            # Check if this is a layer norm parameter
-            if any(ln in path_str.lower() for ln in ["layer_norm", "layernorm", "ln", "norm.scale", "norm.bias"]):
-                return "layer_norm"
-            return "other"
+        def label_fn(params):
+            """Label each parameter 'layer_norm' or 'other' by its path: optax passes the whole tree."""
+            return traverse_util.path_aware_map(
+                lambda path, _: "layer_norm" if any(part == "norm" or part.endswith("_norm") for part in path) else "other",
+                params,
+            )
 
         # Create the multi-transform optimizer
         # First, we need the two different AdamW optimizers
@@ -743,6 +991,11 @@ def create_train_state(
             optimizer = optax.MultiSteps(optimizer, every_k_schedule=gradient_accumulation_steps)
 
         return optimizer, (lr_schedule, None)
+
+
+def wants_per_layer_norms(optimizer_step, micro_step, gradient_accumulation_steps, log_every):
+    """True for the micro-step whose metrics a log step reports, once in ten log steps."""
+    return (optimizer_step + 1) % (log_every * 10) == 0 and (micro_step + 1) % gradient_accumulation_steps == 0
 
 
 def train_step(state, batch, dropout_rng, learning_rate, compute_per_layer=False):
@@ -805,6 +1058,7 @@ def train_step(state, batch, dropout_rng, learning_rate, compute_per_layer=False
         "update_ratio": update_ratio,
         # Here because batch is a global array: the coordinator can't count it on its own
         "n_masked": jnp.sum(batch["labels"] != -100),
+        "n_tokens": jnp.sum(batch["attention_mask"]),
         # Diagnostics
         "logits_min": logits_min,
         "logits_max": logits_max,
@@ -1081,9 +1335,11 @@ def main(args):
             # For GCS, we'll check via checkpoint_manager later
             print("  Will check GCS for existing checkpoints...")
 
-    # Initialize W&B (only on coordinator)
-    if not args.no_wandb and is_coordinator():
-        print("\nInitializing W&B...")
+    # Initialize the tracker (only on coordinator); None on the other hosts and with --tracker none
+    wandb = load_tracker(args.tracker) if is_coordinator() else None
+    tracker_sync = None
+    if wandb is not None:
+        print(f"\nInitializing {args.tracker}...")
         wandb_config = {
             # Model config
             "model_layers": config.num_hidden_layers,
@@ -1114,6 +1370,9 @@ def main(args):
             # Dataset
             "dataset": args.dataset,
             "dataset_config": args.dataset_config,
+            "dataset_num_rows": args.dataset_num_rows,
+            "tokenizer": args.tokenizer,
+            "shuffle_buffer_size": args.shuffle_buffer_size,
 
             # Infrastructure
             "backend": backend,
@@ -1123,7 +1382,21 @@ def main(args):
         }
 
         # Initialize W&B - either resume existing run or create new one
-        if wandb_run_id and resuming_from_checkpoint:
+        if args.tracker == "trackio":
+            # Local storage only: no space_id, so no HF Space and no write token
+            run = wandb.init(
+                project=args.wandb_project,
+                name=args.wandb_run_name,
+                config=wandb_config,
+                resume="allow",
+                auto_log_gpu=False,
+            )
+            print(f"  ✓ Trackio run: {run.name}")
+            if args.tracking_sync_dir:
+                tracker_sync = TrackerDatabaseSync(args.wandb_project, args.tracking_sync_dir, args.tracking_sync_every)
+                tracker_sync.start()
+                print(f"  ✓ Database copied to {args.tracking_sync_dir} every {args.tracking_sync_every} s")
+        elif wandb_run_id and resuming_from_checkpoint:
             # Resume existing W&B run
             wandb.init(
                 project=args.wandb_project,
@@ -1145,7 +1418,7 @@ def main(args):
             print(f"  ✓ W&B run initialized: {wandb.run.name} (ID: {wandb_run_id})")
             print(f"  ✓ Project: {args.wandb_project}")
     elif is_coordinator():
-        print("\n✓ W&B logging disabled (--no-wandb)")
+        print("\n✓ Tracker disabled (--tracker none)")
 
     # Initialize model with dtype configuration
     if is_coordinator():
@@ -1392,6 +1665,46 @@ def main(args):
     # metrics must stay readable by float() on each host
     train_step_jit = jax.jit(train_step, static_argnums=(4,), out_shardings=replicated_sharding)
 
+    eval_batches = None
+    if args.eval_file:
+        if is_coordinator():
+            print(f"\nBuilding {args.eval_batches} held-out batches from {args.eval_file}...")
+        eval_batches = load_eval_batches(args.eval_file, tokenizer, collator, max_length, batch_size, args.eval_batches)
+
+        def eval_step(params, batch):
+            output = state.apply_fn(
+                {"params": params},
+                input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"],
+                position_ids=batch.get("position_ids"),
+                segment_ids=batch.get("segment_ids"),
+                deterministic=True,
+            )
+            logits = output.logits if hasattr(output, "logits") else output["logits"]
+            loss, accuracy, _ = compute_mlm_loss_and_accuracy(logits, batch["labels"])
+            n_masked = jnp.sum(batch["labels"] != -100)
+            return loss * n_masked, accuracy * n_masked, n_masked
+
+        eval_step_jit = jax.jit(eval_step, out_shardings=replicated_sharding)
+
+    def evaluate(step):
+        """Masked-token mean over the held-out set. All hosts run it, the coordinator reports it."""
+        totals = np.zeros(3)
+        for local_batch in eval_batches:
+            totals += [float(x) for x in eval_step_jit(state.params, to_global(local_batch, batch_sharding))]
+        if is_coordinator():
+            loss, accuracy, n_masked = totals[0] / totals[2], totals[1] / totals[2] * 100, int(totals[2])
+            print(f"EVAL step={step} loss={loss:.5f} accuracy={accuracy:.3f} perplexity={np.exp(loss):.4f} masked={n_masked}", flush=True)
+            if wandb is not None:
+                wandb.log({"eval/loss": loss, "eval/accuracy": accuracy, "eval/perplexity": float(np.exp(loss))}, step=step)
+
+    # Masking draws from NumPy's global RNG; seeded so runs differ by what they change only
+    np.random.seed(42 + process_idx)
+
+    # Not on the TPU: it would wait for the running step, and the next batch can be prepared during that step
+    cpu_device = jax.local_devices(backend="cpu")[0]
+    duty_sampler = start_duty_cycle_sampler(every_seconds=120)
+
     # Create checkpoint manager for async checkpointing
     if is_coordinator():
         print("\nInitializing checkpoint manager...")
@@ -1399,7 +1712,7 @@ def main(args):
         checkpoint_dir=checkpoint_dir,
         checkpoint_every=checkpoint_every,
         max_to_keep=3,
-        wandb_run_id=wandb_run_id if not args.no_wandb and is_coordinator() else None,
+        wandb_run_id=wandb_run_id if is_coordinator() else None,
     )
     if is_coordinator():
         print(f"  Checkpoint directory: {checkpoint_dir}")
@@ -1440,6 +1753,12 @@ def main(args):
         # Non-coordinator on multi-host with local storage
         if is_coordinator():
             print("\n✓ Starting fresh training")
+
+    # The other half of a packed checkpoint: where this host's data was, so it isn't trained on again
+    if args.use_packing:
+        data_identity = data_state_identity(args, batch_size)
+        if start_step > 0:
+            restore_data_state(data_state_path(checkpoint_dir, start_step, process_idx), packed_dataloader, data_identity, args.allow_data_restart)
 
     # Calculate examples to skip when resuming (only for non-packed)
     # Note: We can't use dataset.skip() because it doesn't work with split_dataset_by_node
@@ -1495,25 +1814,49 @@ def main(args):
     batch_buffer = []
     training_start_time = time.time()
     skipped_examples = 0
+    last_optimizer_step = num_train_steps if args.stop_at_step is None else min(args.stop_at_step, num_train_steps)
 
-    # Progress bar shows optimizer steps (not micro-steps)
-    pbar = tqdm(total=num_train_steps, desc="Training", initial=start_optimizer_step) if is_coordinator() else None
+    # Real tokens (padding excluded) and time to prepare batches, since the last time they were logged
+    window_metrics = []
+    pending_tokens = []
+    tokens_seen = 0
+    window_start_time = training_start_time
+    window_start_step = start_optimizer_step
+    input_seconds = 0.0
+    system_input_seconds = 0.0
+    system_window_start_step = start_optimizer_step
+
+    # Progress bar shows optimizer steps (not micro-steps); in a log file only every 30 s
+    pbar = tqdm(total=num_train_steps, desc="Training", initial=start_optimizer_step,
+                mininterval=0.1 if sys.stderr.isatty() else 30) if is_coordinator() else None
 
     try:
         if args.use_packing:
             # Grain returns pre-batched data
-            # Total micro-batches needed: (num_train_steps - start_optimizer_step) * gradient_accumulation_steps
-            total_micro_batches = (num_train_steps - start_optimizer_step) * gradient_accumulation_steps
+            # Total micro-batches needed: (last_optimizer_step - start_optimizer_step) * gradient_accumulation_steps
+            total_micro_batches = (last_optimizer_step - start_optimizer_step) * gradient_accumulation_steps
 
             for _ in range(total_micro_batches):
+                input_start_time = time.time()
+
                 # Get next packed batch from Grain
-                batch_raw = next(data_iter)
+                try:
+                    batch_raw = next(data_iter)
+                except StopIteration:
+                    # --num-epochs is over on this host. Every host must run every step: see the unpacked route below
+                    if process_count > 1:
+                        raise RuntimeError(
+                            f"Data of process {process_idx} ended after {args.num_epochs} epochs at optimizer_step "
+                            f"{optimizer_step} of {last_optimizer_step}; multi-host training cannot continue without this host."
+                        ) from None
+                    break
 
                 # Process batch through collator (applies MLM masking)
                 local_batch = collator(batch_raw)
 
                 # Convert to JAX arrays
                 batch = to_global(local_batch, batch_sharding)
+                input_seconds += time.time() - input_start_time
 
                 # Debug: Print batch info for first batch only
                 # Row contents come from local_batch: a global array can't be computed on by one host
@@ -1522,13 +1865,17 @@ def main(args):
                     pos_ids = local_batch["position_ids"]
                     labels = local_batch["labels"]
                     print("\n" + "="*60)
-                    print("PACKED BATCH DIAGNOSTICS (micro_step 0)")
+                    print(f"PACKED BATCH DIAGNOSTICS (micro_step {micro_step})")
                     print("="*60)
                     print(f"Batch shape: {batch['input_ids'].shape}")
+                    print(f"Input IDs row 0: {local_batch['input_ids'][0, :30]}... (first 30)")
                     print(f"Segment IDs row 0: {seg_ids[0, :30]}... (first 30)")
                     print(f"Position IDs row 0: {pos_ids[0, :30]}... (first 30)")
                     unique_segs = [len(set(int(x) for x in row)) for row in seg_ids]
                     print(f"Unique segments per row: {unique_segs}")
+                    segment_starts = (pos_ids == 0) & (seg_ids != -1)
+                    n_with_bos = int(np.sum(local_batch["input_ids"][segment_starts] == tokenizer.bos_token_id))
+                    print(f"Segments on this host starting with {tokenizer.bos_token}: {n_with_bos}/{int(segment_starts.sum())}")
                     n_masked = int(np.sum(labels != -100))
                     n_total = labels.size
                     print(f"Masked tokens on this host: {n_masked}/{n_total} ({100*n_masked/n_total:.1f}%)")
@@ -1539,22 +1886,20 @@ def main(args):
                     attn_mask = local_batch["attention_mask"]
                     n_attn_zeros = int(np.sum(attn_mask == 0))
                     print(f"Attention mask zeros (padding): {n_attn_zeros}/{attn_mask.size}")
-                    print("="*60 + "\n")
+                    print("="*60 + "\n", flush=True)
 
 
                 # Training step (with MultiSteps, optimizer accumulates gradients internally)
                 # LR is passed for update_ratio logging; actual LR is handled by optax schedule
-                compute_per_layer = (optimizer_step % 100 == 0) and (micro_step % gradient_accumulation_steps == 0)
-                current_lr = float(lr_schedule(optimizer_step))
+                compute_per_layer = wants_per_layer_norms(optimizer_step, micro_step, gradient_accumulation_steps, log_every)
+                with jax.default_device(cpu_device):
+                    current_lr = float(lr_schedule(optimizer_step))
                 state, metrics, dropout_rng = train_step_jit(state, batch, dropout_rng, current_lr, compute_per_layer)
 
-                # Accumulate metrics for averaging over accumulation window
-                accumulated_loss += float(metrics["loss"])
-                accumulated_accuracy += float(metrics["accuracy"])
-                accumulated_perplexity += float(metrics["perplexity"])
-                accumulated_grad_norm += float(metrics["grad_norm"])
-                accumulated_param_norm += float(metrics["param_norm"])
-                accumulated_update_ratio += float(metrics["update_ratio"])
+                # Kept as arrays until a log step: float() here would wait for the TPU, and the next
+                # batch can be prepared while this step runs
+                window_metrics.append(metrics)
+                pending_tokens.append(metrics["n_tokens"])
 
                 micro_step += 1
 
@@ -1562,25 +1907,29 @@ def main(args):
                 if micro_step % gradient_accumulation_steps == 0:
                     optimizer_step += 1
 
-                    # Compute averaged metrics over accumulation window
-                    avg_loss = accumulated_loss / gradient_accumulation_steps
-                    avg_accuracy = accumulated_accuracy / gradient_accumulation_steps
-                    avg_perplexity = accumulated_perplexity / gradient_accumulation_steps
-                    avg_grad_norm = accumulated_grad_norm / gradient_accumulation_steps
-                    avg_param_norm = accumulated_param_norm / gradient_accumulation_steps
-                    avg_update_ratio = accumulated_update_ratio / gradient_accumulation_steps
+                    if optimizer_step % log_every == 0:
+                        # On every host: the others would otherwise queue steps without limit
+                        jax.block_until_ready(metrics["loss"])
+                        window_tokens = sum(int(t) for t in pending_tokens)
+                        tokens_seen += window_tokens
+                        pending_tokens = []
 
                     # Logging (only on coordinator, using optimizer_step)
                     if optimizer_step % log_every == 0 and is_coordinator():
-                        loss_value = avg_loss
-                        accuracy_value = avg_accuracy * 100
-                        perplexity_value = avg_perplexity
-                        grad_norm_value = avg_grad_norm
-                        param_norm_value = avg_param_norm
-                        update_ratio_value = avg_update_ratio
+                        # Average over accumulation window
+                        def window_mean(name):
+                            return sum(float(m[name]) for m in window_metrics) / len(window_metrics)
+
+                        loss_value = window_mean("loss")
+                        accuracy_value = window_mean("accuracy") * 100
+                        perplexity_value = window_mean("perplexity")
+                        grad_norm_value = window_mean("grad_norm")
+                        param_norm_value = window_mean("param_norm")
+                        update_ratio_value = window_mean("update_ratio")
 
                         lr_value = current_lr
-                        ln_lr_value = float(ln_lr_schedule(optimizer_step)) if ln_lr_schedule else lr_value
+                        with jax.default_device(cpu_device):
+                            ln_lr_value = float(ln_lr_schedule(optimizer_step)) if ln_lr_schedule else lr_value
                         n_masked = int(metrics["n_masked"])
 
                         # Diagnostic metrics (from last micro-batch)
@@ -1595,10 +1944,15 @@ def main(args):
                             print(f"Step {optimizer_step}: loss={loss_value:.4f}, logits=[{logits_min:.2f}, {logits_max:.2f}], "
                                   f"nan={logits_has_nan}, inf={logits_has_inf}, grad_nan={grads_has_nan}, grad_norm={grad_norm_value:.4f}")
 
-                        elapsed = time.time() - training_start_time
-                        # Tokens/sec based on micro_steps processed
-                        tokens_per_sec = (micro_step - start_step) * total_batch_size * max_length / elapsed if elapsed > 0 else 0
-                        optimizer_steps_per_sec = (optimizer_step - start_optimizer_step) / elapsed if elapsed > 0 else 0
+                        # Since the previous log step, with padding excluded from the tokens
+                        now = time.time()
+                        window_seconds = now - window_start_time
+                        window_steps = optimizer_step - window_start_step
+                        tokens_per_sec = window_tokens / window_seconds
+                        step_seconds = window_seconds / window_steps
+                        input_seconds_per_step = input_seconds / window_steps
+                        optimizer_steps_per_sec = window_steps / window_seconds
+                        window_start_time, window_start_step = now, optimizer_step
 
                         if pbar:
                             pbar.set_postfix({
@@ -1610,9 +1964,15 @@ def main(args):
                                 "ratio": f"{update_ratio_value:.2e}",
                                 "tok/s": f"{tokens_per_sec:.0f}",
                                 "epoch": packed_dataloader.epoch,
-                            })
+                            }, refresh=False)
 
-                        if not args.no_wandb:
+                        if optimizer_step % (log_every * 5) == 0:  # Print detailed stats occasionally
+                            print(f"\nStep {optimizer_step:4d} | Loss: {loss_value:.4f} | Acc: {accuracy_value:.1f}% | "
+                                  f"PPL: {perplexity_value:.1f} | LR: {lr_value:.2e} | "
+                                  f"Grad: {grad_norm_value:.2f} | Ratio: {update_ratio_value:.2e} | "
+                                  f"Tok/s: {tokens_per_sec:.0f} | Step: {step_seconds:.3f}s | Input: {input_seconds_per_step:.3f}s", flush=True)
+
+                        if wandb is not None:
                             wandb_log = {
                                 "train/loss": loss_value,
                                 "train/accuracy": accuracy_value,
@@ -1628,14 +1988,44 @@ def main(args):
                                 "train/micro_step": micro_step,
                                 "performance/tokens_per_sec": tokens_per_sec,
                                 "performance/optimizer_steps_per_sec": optimizer_steps_per_sec,
+                                "performance/step_seconds": step_seconds,
+                                "performance/input_seconds_per_step": input_seconds_per_step,
                                 "step": optimizer_step,
                             }
                             if ln_lr_schedule:
                                 wandb_log["train/layer_norm_lr"] = ln_lr_value
+
+                            # Add per-layer gradient norms if available
+                            if "layer_grad_norms" in metrics:
+                                for layer_name, grad_norm in metrics["layer_grad_norms"].items():
+                                    wandb_log[f"gradients/{layer_name}"] = float(grad_norm)
+
                             wandb.log(wandb_log, step=optimizer_step)
+
+                    if optimizer_step % log_every == 0:
+                        system_input_seconds += input_seconds
+                        input_seconds = 0.0
+
+                    # Per-chip metrics (a collective: all hosts, at the same step)
+                    if optimizer_step % args.system_metrics_every == 0:
+                        system_input_seconds += input_seconds
+                        input_seconds = 0.0
+                        host_input_seconds = system_input_seconds / (optimizer_step - system_window_start_step)
+                        system_input_seconds = 0.0
+                        system_window_start_step = optimizer_step
+                        system_metrics = gather_system_metrics(packed_dataloader, duty_sampler, host_input_seconds, args.dataset_num_rows)
+                        if is_coordinator():
+                            print(f"SYSTEM step={optimizer_step} {json.dumps(system_metrics)}", flush=True)
+                            if wandb is not None:
+                                wandb.log(system_metrics, step=optimizer_step)
+
+                    if eval_batches is not None and optimizer_step % args.eval_every == 0:
+                        evaluate(optimizer_step)
 
                     # Checkpointing (using micro_step for state, but keyed by optimizer_step)
                     if optimizer_step > start_optimizer_step and optimizer_step % checkpoint_every == 0 and checkpoint_manager is not None:
+                        # Before the save: a checkpoint that exists has its data state
+                        save_data_state(data_state_path(checkpoint_dir, micro_step, process_idx), packed_dataloader, data_identity, micro_step)
                         checkpoint_manager.save(
                             micro_step,  # Save micro_step for correct resume
                             args=ocp.args.StandardSave(state)
@@ -1645,22 +2035,17 @@ def main(args):
                         # Force garbage collection to release checkpoint references
                         gc.collect()
                         if is_coordinator():
-                            print(f"\n✓ Checkpoint saved at optimizer_step {optimizer_step} (micro_step {micro_step})")
+                            print(f"\n✓ Checkpoint saved at optimizer_step {optimizer_step} (micro_step {micro_step})", flush=True)
 
-                    # Reset accumulators for next accumulation window
-                    accumulated_loss = 0.0
-                    accumulated_accuracy = 0.0
-                    accumulated_perplexity = 0.0
-                    accumulated_grad_norm = 0.0
-                    accumulated_param_norm = 0.0
-                    accumulated_update_ratio = 0.0
+                    # Reset for next accumulation window
+                    window_metrics = []
 
                     # Update progress bar (one step per optimizer step)
                     if pbar:
                         pbar.update(1)
 
                     # Check termination (based on optimizer steps)
-                    if optimizer_step >= num_train_steps:
+                    if optimizer_step >= last_optimizer_step:
                         break
         else:
             # Original non-packed training loop (with gradient accumulation support)
@@ -1684,7 +2069,7 @@ def main(args):
                         print(f"Batch shape: {batch['input_ids'].shape}")
 
                     # Training step (with MultiSteps, optimizer accumulates gradients internally)
-                    compute_per_layer = (optimizer_step % 100 == 0) and (micro_step % gradient_accumulation_steps == 0)
+                    compute_per_layer = wants_per_layer_norms(optimizer_step, micro_step, gradient_accumulation_steps, log_every)
                     current_lr = float(lr_schedule(optimizer_step))
                     state, metrics, dropout_rng = train_step_jit(state, batch, dropout_rng, current_lr, compute_per_layer)
 
@@ -1695,6 +2080,7 @@ def main(args):
                     accumulated_grad_norm += float(metrics["grad_norm"])
                     accumulated_param_norm += float(metrics["param_norm"])
                     accumulated_update_ratio += float(metrics["update_ratio"])
+                    tokens_seen += int(metrics["n_tokens"])
 
                     micro_step += 1
 
@@ -1725,8 +2111,8 @@ def main(args):
 
                             # Calculate throughput
                             elapsed = time.time() - training_start_time
-                            tokens_per_sec = (micro_step - start_step) * total_batch_size * max_length / elapsed if elapsed > 0 else 0
-                            samples_per_sec = tokens_per_sec / max_length
+                            tokens_per_sec = tokens_seen / elapsed if elapsed > 0 else 0
+                            samples_per_sec = (micro_step - start_step) * total_batch_size / elapsed if elapsed > 0 else 0
                             optimizer_steps_per_sec = (optimizer_step - start_optimizer_step) / elapsed if elapsed > 0 else 0
 
                             # Update progress bar
@@ -1740,8 +2126,8 @@ def main(args):
                                     "ratio": f"{update_ratio_value:.2e}",
                                 })
 
-                            # Log to W&B (only on coordinator, already guarded)
-                            if not args.no_wandb:
+                            # Log to the tracker (only on coordinator, already guarded)
+                            if wandb is not None:
                                 wandb_log = {
                                     "train/loss": loss_value,
                                     "train/accuracy": accuracy_value,
@@ -1803,15 +2189,15 @@ def main(args):
                             pbar.update(1)
 
                         # Check termination (based on optimizer steps)
-                        if optimizer_step >= num_train_steps:
+                        if optimizer_step >= last_optimizer_step:
                             break
 
             # Every host must run every step. The others now wait in a collective, and all hosts
             # abort when the shutdown barrier of this one times out (5 minutes, measured on CPU)
-            if process_count > 1 and optimizer_step < num_train_steps:
+            if process_count > 1 and optimizer_step < last_optimizer_step:
                 raise RuntimeError(
                     f"Dataset shard of process {process_idx} ran out at optimizer_step {optimizer_step} "
-                    f"of {num_train_steps}; multi-host training cannot continue without this host."
+                    f"of {last_optimizer_step}; multi-host training cannot continue without this host."
                 )
 
     finally:
@@ -1821,10 +2207,16 @@ def main(args):
 
     # Save final checkpoint (only if checkpoint_manager exists)
     if checkpoint_manager is not None:
-        checkpoint_manager.save(
-            micro_step,  # Save micro_step for correct resume
-            args=ocp.args.StandardSave(state)
-        )
+        # force: without it the manager skips a step that isn't a multiple of its interval, and this
+        # run would resume from the last multiple while the print below says otherwise
+        if checkpoint_manager.latest_step() != micro_step:
+            if args.use_packing:
+                save_data_state(data_state_path(checkpoint_dir, micro_step, process_idx), packed_dataloader, data_identity, micro_step)
+            checkpoint_manager.save(
+                micro_step,  # Save micro_step for correct resume
+                args=ocp.args.StandardSave(state),
+                force=True,
+            )
         if is_coordinator():
             print(f"\n✓ Final checkpoint saved at optimizer_step {optimizer_step} (micro_step {micro_step})")
 
@@ -1837,7 +2229,8 @@ def main(args):
 
     # Calculate final metrics for logging
     elapsed = time.time() - training_start_time
-    tokens_per_sec = (micro_step - start_step) * total_batch_size * max_length / elapsed if elapsed > 0 else 0
+    tokens_seen += sum(int(t) for t in pending_tokens)
+    tokens_per_sec = tokens_seen / elapsed if elapsed > 0 else 0
 
     if is_coordinator():
         print("\n" + "=" * 70)
@@ -1853,10 +2246,15 @@ def main(args):
         if backend == 'tpu':
             print(f"\nTPU Performance:")
             print(f"  Tokens/second: {tokens_per_sec:.0f}")
-            print(f"  Samples/second: {tokens_per_sec / max_length:.1f}")
+            print(f"  Samples/second: {(micro_step - start_step) * total_batch_size / elapsed:.1f}")
 
-    # Log final metrics to W&B (only on coordinator)
-    if not args.no_wandb and is_coordinator():
+    # Log final metrics to the tracker (only on coordinator)
+    if args.tracker == "trackio" and is_coordinator():
+        wandb.finish()
+        if tracker_sync is not None:
+            tracker_sync.finish()
+        print("\n✓ Trackio run finished successfully")
+    if args.tracker == "wandb" and is_coordinator():
         wandb.summary["final_loss"] = float(metrics['loss'])
         wandb.summary["final_accuracy"] = float(metrics['accuracy']) * 100
         wandb.summary["final_perplexity"] = float(metrics['perplexity'])

@@ -168,6 +168,9 @@ def worker_main(spec):
 
     ocp.CheckpointManager = LocalManager
 
+    real_data_state_path = tm.data_state_path
+    tm.data_state_path = lambda directory, step, process: real_data_state_path(str(directory).removeprefix("gs://"), step, process)
+
     if spec.get("legacy_numpy_save"):
         _save_numpy_state_like_before_the_fix(tm, ocp, ocp.args.StandardSave)
 
@@ -197,6 +200,10 @@ def worker_main(spec):
 
     class FixedPackedLoader:
         epoch = 0
+        documents_read = 0
+
+        def get_state(self):
+            return {}
 
         def __iter__(self):
             step = 0
@@ -216,6 +223,22 @@ def worker_main(spec):
 
         from mmbjax.training import packing
 
+        class RecordingCollator(tm.PackedMLMDataCollator):
+            """Keeps what the host read before masking, one line per batch, for a process that gets killed."""
+
+            batches = 0
+
+            def __call__(self, batch):
+                with open(output / f"raw_batches_{process_id}.txt", "a") as f:
+                    f.write(hashlib.sha256(np.asarray(batch["input_ids"]).tobytes()).hexdigest() + "\n")
+                type(self).batches += 1
+                if type(self).batches == spec.get("wait_to_be_killed_at_batch"):
+                    (output / f"ready_to_be_killed_{process_id}").touch()
+                    time.sleep(WORKER_TIMEOUT)
+                return super().__call__(batch)
+
+        tm.PackedMLMDataCollator = RecordingCollator
+
         def generate(shards):
             rng = np.random.RandomState(0)
             for shard in shards:
@@ -232,7 +255,7 @@ def worker_main(spec):
         "train_minimal.py",
         "--dataset", "fake",
         "--tokenizer", "fake",
-        "--no-wandb",
+        "--tracker", spec.get("tracker", "none"),
         "--compute-dtype", "float32",
         "--max-length", str(MAX_LENGTH),
         "--hidden-size", "16",
@@ -247,7 +270,7 @@ def worker_main(spec):
         "--checkpoint-every", str(spec.get("checkpoint_every", 1000)),
         "--checkpoint-dir", "gs://" + spec["checkpoint_dir"],
         "--gradient-accumulation-steps", str(spec.get("accumulation", 1)),
-    ] + (["--use-packing"] if spec["route"] == "packed" else [])
+    ] + (["--use-packing"] if spec["route"] == "packed" else []) + spec.get("extra_args", [])
     sys.argv = argv
 
     # to_global's first call receives the freshly initialized state: keep it to see that params move.
@@ -347,7 +370,7 @@ def _start(tmp_path, name, num_processes, devices_per_process, worker="worker_ma
         log = open(output / f"stdout_{process_id}.log", "w")
         procs.append((subprocess.Popen(
             [sys.executable, __file__, "--spec", json.dumps(full)],
-            stdout=log, stderr=subprocess.STDOUT, env=env), log))
+            stdout=log, stderr=subprocess.STDOUT, env={**env, "TRACKIO_DIR": str(output / f"trackio_{process_id}")}), log))
     return output, procs
 
 
@@ -520,11 +543,148 @@ def test_real_data_pipeline_unpacked(tmp_path):
 
 
 def test_real_data_pipeline_packed_on_a_short_dataset(tmp_path):
-    """Far fewer rows than the 8 steps need: StreamingBufferDataSource wraps, no host may fall out of step."""
-    results, _ = _run(tmp_path, "run", 2, 2, route="packed", data="real_pipeline", max_steps=8, per_device=2,
-                      rows_per_shard=3)
+    """Far fewer rows than the 8 steps need: the loader starts another pass, no host may fall out of step."""
+    results, logs = _run(tmp_path, "run", 2, 2, route="packed", data="real_pipeline", max_steps=8, per_device=2,
+                         rows_per_shard=3)
     _assert_identical_across_hosts_and_chips(results)
     assert results[0]["state_step"] == 8
+    # A pass that ends is in the log of each host
+    for process_id, log in enumerate(logs):
+        assert f"Completed epoch 1 (shard {process_id}/2)" in log
+
+
+def _raw_batches(tmp_path, name, process_id):
+    return (tmp_path / name / f"raw_batches_{process_id}.txt").read_text().split()
+
+
+def test_packed_resume_after_a_kill_continues_with_the_next_batch(tmp_path):
+    """Real sharding, shuffle, packing and Orbax; every host killed between two checkpoints."""
+    spec = dict(route="packed", data="real_pipeline", per_device=2, rows_per_shard=500, checkpoint_every=3)
+    _run(tmp_path, "whole", 2, 2, max_steps=8, checkpoint_dir=str(tmp_path / "ckpt_whole"), **spec)
+
+    ckpt = str(tmp_path / "ckpt")
+    # Killed while reading the data of the 5th step, after the checkpoint of step 3 and with step 4 trained
+    output, procs = _start(tmp_path, "killed", 2, 2, max_steps=8, checkpoint_dir=ckpt, wait_to_be_killed_at_batch=5, **spec)
+    try:
+        deadline = time.time() + WORKER_TIMEOUT
+        ready = [output / f"ready_to_be_killed_{i}" for i in range(2)]
+        while time.time() < deadline and not all(path.exists() for path in ready):
+            assert all(proc.poll() is None for proc, _ in procs), [(output / f"stdout_{i}.log").read_text()[-2000:] for i in range(2)]
+            time.sleep(0.2)
+    finally:
+        # Both at once: a worker that sees its peer gone aborts, and on macOS that opens a dialog
+        _kill_workers(procs)
+    assert all(path.exists() for path in ready)
+
+    resumed, logs = _run(tmp_path, "resumed", 2, 2, max_steps=8, checkpoint_dir=ckpt, **spec)
+    _assert_identical_across_hosts_and_chips(resumed)
+    assert resumed[0]["restored"]["step"] == 3
+    assert resumed[0]["state_step"] == 8
+    for process_id in range(2):
+        assert "Data state restored" in logs[process_id]
+        whole = _raw_batches(tmp_path, "whole", process_id)
+        assert _raw_batches(tmp_path, "killed", process_id) == whole[:5]
+        # The 4th batch again because step 4 wasn't in a checkpoint; from there on what the
+        # uninterrupted run read, byte for byte
+        assert _raw_batches(tmp_path, "resumed", process_id) == whole[3:8]
+        assert len(set(whole)) == 8, "this data must differ per batch or the comparison says nothing"
+
+
+def test_packed_resume_without_data_state_refuses_to_repeat_data(tmp_path):
+    ckpt = str(tmp_path / "ckpt")
+    spec = dict(route="packed", data="real_pipeline", per_device=2, rows_per_shard=500, checkpoint_every=2, checkpoint_dir=ckpt)
+    _run(tmp_path, "save", 2, 2, max_steps=2, **spec)
+    state_dir = Path(ckpt + "_data_state")
+    assert (state_dir / "2" / "process_1.json").exists()
+    (state_dir / "2" / "process_1.json").unlink()
+
+    output, procs = _start(tmp_path, "refused", 2, 2, max_steps=4, **spec)
+    try:
+        codes = _wait_for_workers(procs)
+    finally:
+        _kill_workers(procs)
+    assert codes[1] == 1
+    assert "this resume would train on the same data again" in (output / "stdout_1.log").read_text()
+
+    resumed, _ = _run(tmp_path, "allowed", 2, 2, max_steps=4, extra_args=["--allow-data-restart"], **spec)
+    assert resumed[0]["state_step"] == 4
+
+
+def test_stop_at_step_saves_there_for_a_resume_on_the_same_schedule(tmp_path):
+    ckpt = str(tmp_path / "ckpt")
+    spec = dict(route="packed", data="real_pipeline", per_device=2, rows_per_shard=500, max_steps=6, checkpoint_dir=ckpt)
+    stopped, _ = _run(tmp_path, "stopped", 2, 2, extra_args=["--stop-at-step", "3"], **spec)
+    assert stopped[0]["state_step"] == 3
+    # Step 3 is no multiple of --checkpoint-every; the save at the end happens anyway
+    resumed, _ = _run(tmp_path, "resumed", 2, 2, **spec)
+    assert resumed[0]["restored"]["step"] == 3
+    assert resumed[0]["state_step"] == 6
+
+
+def _write_eval_parquet(path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    rng = np.random.RandomState(1)
+    texts = [" ".join(f"w{w}" for w in rng.randint(0, VOCAB_WORDS, size=rng.randint(3, 11))) for _ in range(400)]
+    pq.write_table(pa.table({"text": texts}), path)
+
+
+def test_held_out_loss_is_logged_and_reproducible(tmp_path):
+    eval_file = tmp_path / "held_out.parquet"
+    _write_eval_parquet(eval_file)
+    spec = dict(route="packed", data="real_pipeline", per_device=2, rows_per_shard=500, max_steps=4,
+                extra_args=["--eval-file", str(eval_file), "--eval-every", "2", "--eval-batches", "5"])
+
+    def eval_lines(name):
+        _, logs = _run(tmp_path, name, 2, 2, **spec)
+        return [line for line in logs[0].splitlines() if line.startswith("EVAL")]
+
+    first = eval_lines("first")
+    assert len(first) == 2 and "step=2" in first[0] and "step=4" in first[1]
+    assert first[0] != first[1], "two evaluations of a model in training gave the same loss"
+    # Same data, same seeds, same masks: this is what a learning-rate comparison stands on
+    assert eval_lines("second") == first
+
+
+def test_trackio_on_the_coordinator_with_per_chip_metrics_and_sync(tmp_path):
+    import pytest
+
+    pytest.importorskip("trackio")
+    import sqlite3
+
+    sync_dir = tmp_path / "synced"
+    results, logs = _run(tmp_path, "run", 2, 2, route="packed", data="real_pipeline", max_steps=10, per_device=2,
+                         rows_per_shard=500, tracker="trackio", extra_args=[
+                             "--wandb-project", "proj", "--wandb-run-name", "r1", "--dataset-num-rows", "8000",
+                             "--system-metrics-every", "5", "--tracking-sync-dir", str(sync_dir), "--tracking-sync-every", "1",
+                         ])
+    _assert_identical_across_hosts_and_chips(results)
+    assert (tmp_path / "run" / "trackio_0" / "proj.db").exists()
+    assert not (tmp_path / "run" / "trackio_1" / "proj.db").exists(), "only the coordinator tracks"
+
+    rows = sqlite3.connect(sync_dir / "proj.db").execute("SELECT step, metrics FROM metrics").fetchall()
+    logged = {step: json.loads(metrics) for step, metrics in rows if "train/loss" in json.loads(metrics)}
+    system = {step: json.loads(metrics) for step, metrics in rows if "data/passes" in json.loads(metrics)}
+    assert sorted(system) == [5, 10]
+    # Every chip of every host, and the data position of every host
+    for host in range(2):
+        for chip in range(2):
+            assert f"system/host{host}_chip{chip}_bytes_in_use" in system[10]
+            assert f"system/host{host}_chip{chip}_duty_cycle" in system[10]
+        assert system[10][f"data/host{host}_documents_read"] > 0
+        assert system[10][f"performance/host{host}_input_seconds_per_step"] > 0
+    assert 0 < system[10]["data/passes"] < 1
+
+    # Real tokens: padding excluded, so fewer than rows x length per step
+    assert 0 < logged[10]["performance/tokens_per_sec"]
+    assert logged[10]["performance/step_seconds"] > 0
+    per_second_with_padding = 8 * MAX_LENGTH / logged[10]["performance/step_seconds"]
+    assert logged[10]["performance/tokens_per_sec"] < per_second_with_padding
+    # Per-layer norms reach the tracker on the packed route, and the logged step has them
+    assert "gradients/encoder_0_attention" in logged[10]
+    assert "gradients/encoder_1_ffn" in logged[10]
+    assert "gradients/lm_head" in logged[10]
 
 
 def test_exhausted_shard_stops_that_host_with_a_message(tmp_path):

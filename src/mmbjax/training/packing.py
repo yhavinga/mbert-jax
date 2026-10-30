@@ -23,6 +23,11 @@ except ImportError:
     grain_exp = None  # type: ignore
 
 
+# Items a source keeps for Grain's read threads (16, with a prefetch buffer of 500), and the
+# most it holds on to after a resume reads the stream up to its index
+SOURCE_BUFFER_ITEMS = 2048
+
+
 __all__ = [
     "TokenizeTransform",
     "FLANTokenizeTransform",
@@ -44,8 +49,13 @@ class StreamingBufferDataSource:
     from stream on-demand. This allows Grain's MapDataset.source() to work with
     streaming data while maintaining bounded memory usage.
     
-    The buffer grows as items are accessed, capped at max_buffer_size. For truly
-    infinite streams, use max_buffer_size to limit memory usage.
+    The pipeline reads every index once, in order give or take its prefetch threads, so with
+    max_buffer_size an item is dropped once read and memory stays bounded. A resumed iterator
+    starts far into the stream: the first index asked for reads the stream up to it, and of
+    what comes before it only the last max_buffer_size items are kept.
+    
+    Past the end of the stream __getitem__ raises StopIteration, which Grain's prefetch
+    passes on as the end of the iterator: the pass is over and the loader decides what next.
     
     Thread-safe: Grain's prefetch uses multiple threads, so we protect stream access.
     
@@ -60,69 +70,75 @@ class StreamingBufferDataSource:
         
         Args:
             stream: Any Python iterable (HF streaming dataset, generator, etc.)
-            max_buffer_size: Maximum items to buffer. None = buffer everything.
-                            For large datasets, set this to limit memory.
+            max_buffer_size: See above. Must exceed Grain's prefetch buffer, because a later
+                            index can arrive first. None = keep everything and allow reading
+                            an item again.
             stream_length: Expected number of items in stream. If None, assumes
                           very large (for streaming datasets). Used by Grain to
                           know when dataset is "exhausted".
         """
         import threading
         self._stream = iter(stream)
-        self._buffer = []
+        self._buffer = {}
         self._max_buffer_size = max_buffer_size
         self._exhausted = False
         self._stream_position = 0  # Track how far we've read
+        self._keep_from = None  # Items before this index are not wanted, set by the first request
         self._lock = threading.Lock()  # Thread-safety for Grain's prefetch
         # For streaming datasets with unknown length, use a very large number
         # so Grain doesn't stop early. 10B is enough for any pretraining run.
         self._stream_length = stream_length if stream_length is not None else 10_000_000_000
     
+    @property
+    def stream_position(self) -> int:
+        """Items read from the stream so far, including those still in prefetch."""
+        return self._stream_position
+    
     def _ensure_available(self, idx: int) -> None:
-        """Fetch from stream until idx is available. Thread-safe.
-        
-        Note: Buffer grows unbounded because Grain's shuffling requires random
-        access to all previously seen items. For large datasets, memory will grow
-        over time - this is required for the packing + shuffling pipeline.
-        """
+        """Fetch from stream until idx is available. Thread-safe."""
         with self._lock:
-            while idx >= len(self._buffer) and not self._exhausted:
+            if self._keep_from is None:
+                self._keep_from = 0 if self._max_buffer_size is None else idx - self._max_buffer_size
+            while idx >= self._stream_position and not self._exhausted:
                 try:
                     item = next(self._stream)
-                    self._stream_position += 1
-                    self._buffer.append(item)
                 except StopIteration:
                     self._exhausted = True
                     break
+                if self._stream_position >= self._keep_from:
+                    self._buffer[self._stream_position] = item
+                self._stream_position += 1
     
     def __len__(self) -> int:
         """Return expected stream length for Grain.
         
         For streaming datasets, returns a very large number so Grain keeps
         fetching. The actual data will be served via __getitem__ as long as
-        the stream has items.
+        the stream has items. It stays that number past the end of the stream:
+        Grain takes indices modulo this length, and a smaller one would wrap them.
         """
-        with self._lock:
-            if self._exhausted:
-                return len(self._buffer)
-            return self._stream_length
+        return self._stream_length
     
     def __getitem__(self, idx: int):
-        """Get item at index, fetching from stream if needed. Thread-safe.
-        
-        Handles race condition: if Grain's prefetch thread calls __len__ before
-        exhaustion (returns 10B) but __getitem__ is called after exhaustion,
-        we wrap the index to avoid IndexError. This effectively enables dataset
-        cycling for finite streams.
-        """
+        """Get item at index, fetching from stream if needed. Thread-safe."""
         self._ensure_available(idx)
         with self._lock:
-            if idx < len(self._buffer):
-                return self._buffer[idx]
-            # Stream exhausted and idx >= buffer size: wrap around for cycling
-            if self._exhausted and len(self._buffer) > 0:
-                wrapped_idx = idx % len(self._buffer)
-                return self._buffer[wrapped_idx]
-            raise IndexError(f'Index {idx} out of range (buffer size: {len(self._buffer)})')
+            if idx in self._buffer:
+                return self._buffer[idx] if self._max_buffer_size is None else self._buffer.pop(idx)
+            if self._exhausted and idx >= self._stream_position:
+                raise StopIteration
+            raise IndexError(
+                f'Index {idx} is gone: stream position {self._stream_position}, '
+                f'max_buffer_size {self._max_buffer_size}'
+            )
+
+
+def _require_bos_token(tokenizer) -> None:
+    if getattr(tokenizer, "bos_token_id", None) is None:
+        raise ValueError(
+            f"{type(tokenizer).__name__} has no bos_token_id: packed documents must start with "
+            "the token that inference puts first, and classifier_pooling=cls reads that token."
+        )
 
 
 def _stack_batch(batch: list) -> Dict[str, np.ndarray]:
@@ -144,20 +160,22 @@ class TokenizeTransform:
     """
 
     def __init__(self, tokenizer, max_length: int):
+        _require_bos_token(tokenizer)
         self.tokenizer = tokenizer
         self.max_length = max_length
 
     def map(self, element: Dict[str, Any]) -> Dict[str, Any]:
         """Tokenize a single text element."""
-        # Tokenize with truncation at max_length
+        # Tokenize with truncation at max_length, leaving room for <s>
         tokens = self.tokenizer(
             element["text"],
             truncation=True,
-            max_length=self.max_length,
+            max_length=self.max_length - 1,
             return_tensors=None,
             add_special_tokens=False,
         )
-        input_ids = tokens["input_ids"]
+        # The tokenizer puts <s> in front of text at inference, and classifier_pooling=cls reads it
+        input_ids = [self.tokenizer.bos_token_id] + tokens["input_ids"]
         
         # Only add EOS if the document wasn't truncated
         # If it was truncated, the text didn't actually end here - adding EOS would be misleading
@@ -176,10 +194,11 @@ class TokenizeTransform:
 class FLANTokenizeTransform:
     """Tokenize FLAN-format (inputs, targets) with separator for instruction-response masking.
 
-    Format: [inputs] </s> [targets] → 2 segments per example for differential masking.
+    Format: <s> [inputs] </s> [targets] → 2 segments per example for differential masking.
     """
 
     def __init__(self, tokenizer, max_length: int):
+        _require_bos_token(tokenizer)
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.sep_token_id = tokenizer.eos_token_id  # </s> token
@@ -192,11 +211,11 @@ class FLANTokenizeTransform:
         The dataset has 'inputs' (instruction) and 'targets' (response) fields.
         We concatenate them with EOS token as separator.
 
-        Note: We reserve 1 token for the separator, so inputs+targets must fit in max_length-1.
+        Note: We reserve 2 tokens for <s> and the separator, so inputs+targets must fit in max_length-2.
         """
         with self._lock:  # Thread-safe tokenization for fast tokenizers
-            # Reserve 1 token for the separator
-            max_tokens_per_part = (self.max_length - 1) // 2
+            # Reserve 2 tokens for <s> and the separator
+            max_tokens_per_part = (self.max_length - 2) // 2
 
             # Tokenize inputs (instruction)
             inputs = self.tokenizer(
@@ -208,7 +227,7 @@ class FLANTokenizeTransform:
             )["input_ids"]
 
             # Calculate remaining space for targets
-            remaining_space = self.max_length - len(inputs) - 1  # -1 for separator
+            remaining_space = self.max_length - len(inputs) - 2  # -2 for <s> and separator
 
             # Tokenize targets (response) with remaining space
             targets = self.tokenizer(
@@ -219,8 +238,8 @@ class FLANTokenizeTransform:
                 add_special_tokens=False,
             )["input_ids"]
 
-        # Concatenate: inputs + </s> + targets
-        input_ids = inputs + [self.sep_token_id] + targets
+        # Concatenate: <s> + inputs + </s> + targets
+        input_ids = [self.tokenizer.bos_token_id] + inputs + [self.sep_token_id] + targets
 
         return {
             "input_ids": np.array(input_ids, dtype=np.int32),
@@ -282,14 +301,7 @@ class PackedMLMDataCollator:
         probability_matrix = np.full(input_ids.shape, self.mlm_probability)
 
         # Don't mask special tokens (pad, bos, eos, cls, sep, mask)
-        special_tokens_mask = np.array([
-            [
-                1 if tok in self.tokenizer.all_special_ids else 0
-                for tok in ids
-            ]
-            for ids in input_ids.tolist()
-        ])
-        probability_matrix[special_tokens_mask.astype(bool)] = 0.0
+        probability_matrix[np.isin(input_ids, self.tokenizer.all_special_ids)] = 0.0
 
         # Sample positions to mask
         masked_indices = np.random.binomial(1, probability_matrix).astype(bool)
@@ -421,11 +433,7 @@ class InstructionResponseMaskingCollator:
                         probability_matrix[batch_idx, response_cols] = self.response_mask_prob
 
         # Don't mask special tokens (including </s> separator)
-        special_tokens_mask = np.array([
-            [1 if tok in self.tokenizer.all_special_ids else 0 for tok in ids]
-            for ids in input_ids.tolist()
-        ])
-        probability_matrix[special_tokens_mask.astype(bool)] = 0.0
+        probability_matrix[np.isin(input_ids, self.tokenizer.all_special_ids)] = 0.0
 
         # Sample and apply masking (80% MASK, 10% random, 10% original)
         masked_indices = np.random.binomial(1, probability_matrix).astype(bool)
@@ -556,11 +564,7 @@ class HybridMaskingCollator:
                         probability_matrix[batch_idx, response_cols] = self.response_mask_prob
 
         # Don't mask special tokens (including </s> separator)
-        special_tokens_mask = np.array([
-            [1 if tok in self.tokenizer.all_special_ids else 0 for tok in ids]
-            for ids in input_ids.tolist()
-        ])
-        probability_matrix[special_tokens_mask.astype(bool)] = 0.0
+        probability_matrix[np.isin(input_ids, self.tokenizer.all_special_ids)] = 0.0
 
         # Sample and apply masking (80% MASK, 10% random, 10% original)
         masked_indices = np.random.binomial(1, probability_matrix).astype(bool)
@@ -678,13 +682,10 @@ def create_packed_dataset_streaming(
     Uses StreamingBufferDataSource to lazily load from the stream while
     providing the RandomAccessDataSource interface that Grain requires.
 
-    Note: Buffer grows unbounded as items are accessed. For large datasets,
-    memory will grow over time. This is required because Grain's shuffling
-    needs random access to previously-seen items.
-
     Args:
         stream_dataset: Any Python iterable yielding dicts with "text" field
-            (for format="text") or "inputs"/"targets" fields (for format="inputs_targets")
+            (for format="text") or "inputs"/"targets" fields (for format="inputs_targets"),
+            or a StreamingBufferDataSource around one
         tokenizer: Tokenizer with eos_token_id
         max_length: Maximum sequence length for packing
         batch_size: Number of packing bins (sequences per batch)
@@ -699,8 +700,10 @@ def create_packed_dataset_streaming(
         )
 
     # Wrap stream as a lazy-loading RandomAccessDataSource
-    # No buffer limit - Grain needs random access to all items for shuffling
-    source = StreamingBufferDataSource(stream_dataset)
+    if isinstance(stream_dataset, StreamingBufferDataSource):
+        source = stream_dataset
+    else:
+        source = StreamingBufferDataSource(stream_dataset, max_buffer_size=SOURCE_BUFFER_ITEMS)
 
     # Create tokenizer transform based on dataset format
     if dataset_format == "inputs_targets":
@@ -723,7 +726,8 @@ def create_packed_dataset_streaming(
     )
 
     # Batch the packed sequences to get (batch_size, max_length) shaped tensors
-    batched_dataset = packed_dataset.batch(batch_size)
+    # drop_remainder: every host must hand in the same number of rows, also at the end of a pass
+    batched_dataset = packed_dataset.batch(batch_size, drop_remainder=True)
 
     return batched_dataset
 
@@ -810,6 +814,9 @@ class EpochTrackingDataLoader:
         self.stopping_strategy = stopping_strategy
         self.epoch = 0
         self._current_iter = None
+        self._source = None
+        self._documents_of_finished_epochs = 0
+        self._restore_state = None
     
     def _load_stream_dataset(self):
         """Load a fresh HuggingFace streaming dataset for one epoch."""
@@ -879,9 +886,9 @@ class EpochTrackingDataLoader:
             return self._create_multi_dataset_pipeline()
         else:
             # Single-dataset mode: use the specified format
-            stream_dataset = self._load_stream_dataset()
+            self._source = StreamingBufferDataSource(self._load_stream_dataset(), max_buffer_size=SOURCE_BUFFER_ITEMS)
             return create_packed_dataset_streaming(
-                stream_dataset,
+                self._source,
                 tokenizer=self.tokenizer,
                 max_length=self.max_length,
                 batch_size=self.batch_size,
@@ -935,7 +942,7 @@ class EpochTrackingDataLoader:
                 stream = stream.shuffle(seed=epoch_seed, buffer_size=self.shuffle_buffer_size)
 
             # Wrap as buffer source for Grain
-            source = StreamingBufferDataSource(stream)
+            source = StreamingBufferDataSource(stream, max_buffer_size=SOURCE_BUFFER_ITEMS)
 
             # Create appropriate tokenizer transform
             if dataset_format == "inputs_targets":
@@ -1019,8 +1026,8 @@ class EpochTrackingDataLoader:
 
         # Wrap interleaved iterator as a proper Grain data source
         # FirstFitPackIterDataset expects a Grain IterDataset, not a plain Python iterator
-        interleaved_source = StreamingBufferDataSource(iter(interleaved))
-        interleaved_map = grain.MapDataset.source(interleaved_source).map(lambda x: x)
+        self._source = StreamingBufferDataSource(iter(interleaved), max_buffer_size=SOURCE_BUFFER_ITEMS)
+        interleaved_map = grain.MapDataset.source(self._source).map(lambda x: x)
         interleaved_iter = interleaved_map.to_iter_dataset(
             read_options=grain.ReadOptions(num_threads=1, prefetch_buffer_size=0)
         )
@@ -1035,24 +1042,58 @@ class EpochTrackingDataLoader:
         )
 
         # Batch the packed sequences
-        batched_dataset = packed_dataset.batch(self.batch_size)
+        # drop_remainder: every host must hand in the same number of rows, also at the end of a pass
+        batched_dataset = packed_dataset.batch(self.batch_size, drop_remainder=True)
         return batched_dataset
     
+    @property
+    def documents_read(self) -> int:
+        """Documents this host read from the stream, over all epochs, including those in prefetch."""
+        position = self._source.stream_position if self._source is not None else 0
+        return self._documents_of_finished_epochs + position
+
+    def get_state(self) -> Dict[str, Any]:
+        """Where this host is: enough for a new loader to yield the very next batch.
+
+        Grain's state holds indices only, so it needs the same stream order again: the same
+        dataset, seed and number of hosts. On restore the stream is read up to that index.
+        """
+        return {
+            "epoch": self.epoch,
+            "pipeline": self._current_iter.get_state() if self._current_iter is not None else None,
+            "documents_of_finished_epochs": self._documents_of_finished_epochs,
+        }
+
+    def set_state(self, state: Dict[str, Any]) -> None:
+        """Continue from get_state(). Call before the first batch."""
+        self.epoch = state["epoch"]
+        self._documents_of_finished_epochs = state["documents_of_finished_epochs"]
+        self._restore_state = state["pipeline"]
+
     def __iter__(self):
         """Iterate through batches, auto-restarting on epoch boundaries."""
         while self.num_epochs is None or self.epoch < self.num_epochs:
-            pipeline = self._create_pipeline()
-            try:
-                for batch in pipeline:
-                    yield batch
-            except StopIteration:
-                pass  # Normal end of epoch
+            self._current_iter = iter(self._create_pipeline())
+            if self._restore_state is not None:
+                self._current_iter.set_state(self._restore_state)
+                self._restore_state = None
+            batches = 0
+            for batch in self._current_iter:
+                batches += 1
+                yield batch
+            if batches == 0:
+                raise RuntimeError(
+                    f"Epoch {self.epoch} of shard {self.shard_index}/{self.shard_count} has "
+                    f"{self.documents_read - self._documents_of_finished_epochs} documents, "
+                    f"too few for one batch of {self.batch_size} rows."
+                )
             
             # Epoch completed
+            self._documents_of_finished_epochs = self.documents_read
             self.epoch += 1
             print(f"[EpochTrackingDataLoader] Completed epoch {self.epoch} "
-                  f"(shard {self.shard_index}/{self.shard_count})")
+                  f"(shard {self.shard_index}/{self.shard_count}): "
+                  f"{self.documents_read:,} documents read so far", flush=True)
         
         # If num_epochs is set, we stop here
         print(f"[EpochTrackingDataLoader] Finished {self.num_epochs} epochs")
-

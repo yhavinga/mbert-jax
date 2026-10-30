@@ -654,11 +654,15 @@ def test_trackio_on_the_coordinator_with_per_chip_metrics_and_sync(tmp_path):
     import sqlite3
 
     sync_dir = tmp_path / "synced"
+    eval_file = tmp_path / "held_out.parquet"
+    _write_eval_parquet(eval_file)
     results, logs = _run(tmp_path, "run", 2, 2, route="packed", data="real_pipeline", max_steps=10, per_device=2,
                          rows_per_shard=500, tracker="trackio", extra_args=[
                              "--wandb-project", "proj", "--wandb-run-name", "r1", "--dataset-num-rows", "8000",
                              "--system-metrics-every", "5", "--tracking-sync-dir", str(sync_dir), "--tracking-sync-every", "1",
+                             "--eval-file", str(eval_file), "--eval-every", "5", "--eval-batches", "2",
                          ])
+    assert "Exception in thread" not in logs[0], "a dead writer thread of Trackio loses the logs after it"
     _assert_identical_across_hosts_and_chips(results)
     assert (tmp_path / "run" / "trackio_0" / "proj.db").exists()
     assert not (tmp_path / "run" / "trackio_1" / "proj.db").exists(), "only the coordinator tracks"
@@ -667,6 +671,8 @@ def test_trackio_on_the_coordinator_with_per_chip_metrics_and_sync(tmp_path):
     logged = {step: json.loads(metrics) for step, metrics in rows if "train/loss" in json.loads(metrics)}
     system = {step: json.loads(metrics) for step, metrics in rows if "data/passes" in json.loads(metrics)}
     assert sorted(system) == [5, 10]
+    # Logged after an evaluation, so these only arrive if its log didn't stop the writer
+    assert sorted(step for step, metrics in rows if "eval/loss" in json.loads(metrics)) == [5, 10]
     # Every chip of every host, and the data position of every host
     for host in range(2):
         for chip in range(2):
@@ -674,6 +680,7 @@ def test_trackio_on_the_coordinator_with_per_chip_metrics_and_sync(tmp_path):
             assert f"system/host{host}_chip{chip}_duty_cycle" in system[10]
         assert system[10][f"data/host{host}_documents_read"] > 0
         assert system[10][f"performance/host{host}_input_seconds_per_step"] > 0
+        assert system[10][f"system/host{host}_peak_rss_bytes"] > 0
     assert 0 < system[10]["data/passes"] < 1
 
     # Real tokens: padding excluded, so fewer than rows x length per step

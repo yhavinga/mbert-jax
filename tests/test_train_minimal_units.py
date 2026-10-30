@@ -124,3 +124,22 @@ def test_tracker_choice(tm):
     fake.__spec__ = importlib.machinery.ModuleSpec("trackio", None)
     sys.modules.setdefault("trackio", fake)
     assert tm.load_tracker("trackio") is sys.modules["trackio"]
+
+
+def test_duty_cycle_is_read_from_the_table_of_tpu_info(tm):
+    # Literal output on the second host of a v4-32, during a run: chips are numbered 4 to 7
+    output = """
+TPU Runtime Utilization
+
+| Chip | HBM Usage (GiB)       | Duty cycle |
+|------|-----------------------|------------|
+| 4    | 18.10 GiB / 30.75 GiB | 95.72%     |
+| 5    | 18.10 GiB / 30.75 GiB | 95.73%     |
+
+TensorCore Utilization
+
+| Core ID | TensorCore Utilization |
+|---------|------------------------|
+| 0       | N/A                    |
+"""
+    assert {int(chip): float(duty) for chip, duty in tm.DutyCycleSampler.ROW.findall(output)} == {4: 95.72, 5: 95.73}

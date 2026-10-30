@@ -13,6 +13,7 @@ import gc
 import os
 import json
 import re
+import resource
 import sqlite3
 import subprocess
 import tempfile
@@ -201,14 +202,16 @@ def gather_system_metrics(data_loader, duty_sampler, input_seconds_per_step, dat
     """
     duty = duty_sampler.latest if duty_sampler is not None else {}
     chips = []
-    for chip, device in enumerate(jax.local_devices()):
+    for device in jax.local_devices():
         stats = device.memory_stats() or {}
-        chips.append([stats.get("bytes_in_use", -1), stats.get("peak_bytes_in_use", -1), duty.get(chip, -1)])
-    host = [data_loader.documents_read, data_loader.epoch, input_seconds_per_step]
+        # tpu-info numbers the chips like device.id: 4 to 7 on the second host of a v4-32
+        chips.append([stats.get("bytes_in_use", -1), stats.get("peak_bytes_in_use", -1), duty.get(device.id, -1)])
+    peak_rss_bytes = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
+    host = [data_loader.documents_read, data_loader.epoch, input_seconds_per_step, peak_rss_bytes]
     gathered_chips = multihost_utils.process_allgather(np.array(chips, dtype=np.float32))
     gathered_hosts = multihost_utils.process_allgather(np.array(host, dtype=np.float32))
     gathered_chips = np.asarray(gathered_chips).reshape(jax.process_count(), -1, 3)
-    gathered_hosts = np.asarray(gathered_hosts).reshape(jax.process_count(), 3)
+    gathered_hosts = np.asarray(gathered_hosts).reshape(jax.process_count(), 4)
 
     metrics = {}
     for h, host_chips in enumerate(gathered_chips):
@@ -216,10 +219,11 @@ def gather_system_metrics(data_loader, duty_sampler, input_seconds_per_step, dat
             metrics[f"system/host{h}_chip{c}_bytes_in_use"] = float(in_use)
             metrics[f"system/host{h}_chip{c}_peak_bytes_in_use"] = float(peak)
             metrics[f"system/host{h}_chip{c}_duty_cycle"] = float(duty_cycle)
-    for h, (documents, epoch, seconds) in enumerate(gathered_hosts):
+    for h, (documents, epoch, seconds, peak_rss) in enumerate(gathered_hosts):
         metrics[f"data/host{h}_documents_read"] = float(documents)
         metrics[f"data/host{h}_passes_completed"] = float(epoch)
         metrics[f"performance/host{h}_input_seconds_per_step"] = float(seconds)
+        metrics[f"system/host{h}_peak_rss_bytes"] = float(peak_rss)
     if dataset_num_rows:
         metrics["data/passes"] = float(gathered_hosts[:, 0].sum()) / dataset_num_rows
     return metrics
@@ -1691,14 +1695,18 @@ def main(args):
 
     def evaluate(step):
         """Masked-token mean over the held-out set. All hosts run it, the coordinator reports it."""
-        totals = np.zeros(3)
+        loss_sum, correct, n_masked = 0.0, 0.0, 0
         for local_batch in eval_batches:
-            totals += [float(x) for x in eval_step_jit(state.params, to_global(local_batch, batch_sharding))]
+            batch_loss, batch_correct, batch_masked = eval_step_jit(state.params, to_global(local_batch, batch_sharding))
+            loss_sum += float(batch_loss)
+            correct += float(batch_correct)
+            n_masked += int(batch_masked)
         if is_coordinator():
-            loss, accuracy, n_masked = totals[0] / totals[2], totals[1] / totals[2] * 100, int(totals[2])
-            print(f"EVAL step={step} loss={loss:.5f} accuracy={accuracy:.3f} perplexity={np.exp(loss):.4f} masked={n_masked}", flush=True)
+            # Plain floats: a NumPy float kills Trackio's writer thread, and with it all later logs
+            loss, accuracy, perplexity = loss_sum / n_masked, correct / n_masked * 100, float(np.exp(loss_sum / n_masked))
+            print(f"EVAL step={step} loss={loss:.5f} accuracy={accuracy:.3f} perplexity={perplexity:.4f} masked={n_masked}", flush=True)
             if wandb is not None:
-                wandb.log({"eval/loss": loss, "eval/accuracy": accuracy, "eval/perplexity": float(np.exp(loss))}, step=step)
+                wandb.log({"eval/loss": loss, "eval/accuracy": accuracy, "eval/perplexity": perplexity}, step=step)
 
     # Masking draws from NumPy's global RNG; seeded so runs differ by what they change only
     np.random.seed(42 + process_idx)

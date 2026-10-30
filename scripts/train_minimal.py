@@ -234,9 +234,10 @@ def data_state_path(checkpoint_dir, step, process_index):
     return epath.Path(f"{str(checkpoint_dir).rstrip('/')}_data_state") / str(step) / f"process_{process_index}.json"
 
 
-def data_state_identity(args, rows_per_host):
+def data_state_identity(args, rows_per_host, data_files):
     """What must be the same for the saved indices to point at the same documents."""
     return {
+        "data_files": data_files,
         "dataset": args.dataset,
         "dataset_config": args.dataset_config,
         "datasets_config": args.datasets_config,
@@ -528,6 +529,13 @@ def parse_args():
         type=int,
         default=None,
         help="Number of epochs for packing mode (default: None = infinite, auto-restart on exhaustion)"
+    )
+    parser.add_argument(
+        "--data-files-list",
+        type=str,
+        default=None,
+        help="Packing mode: text file on each host with its own local parquet files, one per line. "
+             "Replaces streaming: on the v4-32 HF reads timed out up to 4 of the 5 retries that are fatal when exhausted"
     )
     parser.add_argument(
         "--allow-data-restart",
@@ -1644,6 +1652,10 @@ def main(args):
                 for cfg in dataset_configs:
                     print(f"    - {cfg['name']} ({cfg.get('config', 'default')}): weight={cfg.get('weight', 1.0)}")
 
+        data_files = Path(args.data_files_list).read_text().split() if args.data_files_list else None
+        if data_files and dataset_configs:
+            raise ValueError("--data-files-list replaces --dataset; it can't be combined with --datasets-config")
+
         packed_dataloader = create_packed_dataloader(
             dataset_name=args.dataset if not dataset_configs else None,
             dataset_config=args.dataset_config if not dataset_configs else None,
@@ -1658,6 +1670,7 @@ def main(args):
             dataset_configs=dataset_configs,
             shuffle_buffer_size=args.shuffle_buffer_size,
             stopping_strategy=args.stopping_strategy,
+            data_files=data_files,
         )
         if is_coordinator():
             print(f"  ✓ Packing enabled: documents will be packed into {max_length}-token sequences")
@@ -1775,7 +1788,7 @@ def main(args):
 
     # The other half of a packed checkpoint: where this host's data was, so it isn't trained on again
     if args.use_packing:
-        data_identity = data_state_identity(args, batch_size)
+        data_identity = data_state_identity(args, batch_size, data_files)
         if start_step > 0:
             restore_data_state(data_state_path(checkpoint_dir, start_step, process_idx), packed_dataloader, data_identity, args.allow_data_restart)
 

@@ -605,6 +605,8 @@ def create_packed_dataloader(
     stopping_strategy: str = "first_exhausted",
     # Dataset format parameter
     dataset_format: str = "text",
+    # This host's own parquet files on local disk, instead of streaming and sharding dataset_name
+    data_files: Optional[List[str]] = None,
 ):
     """Create Grain dataset iterator with sequence packing and epoch restart.
 
@@ -630,6 +632,7 @@ def create_packed_dataloader(
         shuffle_buffer_size: Buffer size for streaming shuffle
         stopping_strategy: "first_exhausted" or "all_exhausted"
         dataset_format: Dataset format - "text" or "inputs_targets" (single-dataset mode only)
+        data_files: Parquet files of this host (single-dataset mode only)
 
     Returns:
         EpochTrackingDataLoader with sequence packing and epoch tracking
@@ -667,6 +670,7 @@ def create_packed_dataloader(
         shuffle_buffer_size=shuffle_buffer_size,
         stopping_strategy=stopping_strategy,
         dataset_format=dataset_format,
+        data_files=data_files,
     )
 
 
@@ -765,6 +769,7 @@ class EpochTrackingDataLoader:
         stopping_strategy: str = "first_exhausted",
         # Dataset format parameter
         dataset_format: str = "text",
+        data_files: Optional[List[str]] = None,
     ):
         """Initialize the epoch-tracking data loader.
 
@@ -786,9 +791,12 @@ class EpochTrackingDataLoader:
             shuffle_buffer_size: Buffer size for streaming shuffle
             stopping_strategy: "first_exhausted" or "all_exhausted"
             dataset_format: Dataset format - "text" or "inputs_targets" (single-dataset mode)
+            data_files: Parquet files of this host, instead of streaming and sharding
+                dataset_name. Their order is shuffled with the seed, as a stream's files are.
         """
         # Determine mode
         self.multi_dataset_mode = dataset_configs is not None
+        self.data_files = data_files
 
         if self.multi_dataset_mode:
             self.dataset_configs = dataset_configs
@@ -833,6 +841,11 @@ class EpochTrackingDataLoader:
                 stopping_strategy=self.stopping_strategy,
             )
         
+        if self.data_files is not None:
+            # Already this host's part of the data: nothing to shard
+            stream_dataset = load_dataset("parquet", data_files=self.data_files, split="train", streaming=True)
+            return stream_dataset.shuffle(seed=epoch_seed, buffer_size=self.shuffle_buffer_size)
+
         # Single-dataset mode (original behavior)
         # reuse_cache_if_exists avoids timeout checking metadata for large datasets
         # token=True for gated datasets like CulturaX (use_auth_token is deprecated)

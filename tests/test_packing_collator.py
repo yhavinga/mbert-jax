@@ -698,3 +698,38 @@ def test_num_epochs_ends_the_loader_and_too_little_data_is_an_error(monkeypatch)
     short.batch_size = 64
     with pytest.raises(RuntimeError, match="too few for one batch"):
         next(iter(short))
+
+
+def test_loader_on_local_parquet_files_covers_them_and_resumes(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from src.mmbjax.training import EpochTrackingDataLoader
+
+    files = []
+    for part in range(3):
+        path = tmp_path / f"part{part}.parquet"
+        pq.write_table(pa.table({"text": [f"w{part} w{i % 95}" for i in range(40)]}), path)
+        files.append(str(path))
+
+    def loader():
+        # shard_count isn't used for local files: they are this host's part already
+        return EpochTrackingDataLoader(dataset_name="ignored", tokenizer=_left_truncating_tokenizer(), max_length=16,
+                                       batch_size=2, shard_index=1, shard_count=4, shuffle_buffer_size=10, data_files=files)
+
+    whole = loader()
+    iterator = iter(whole)
+    batches = [next(iterator) for _ in range(12)]
+    while whole.epoch == 0:
+        next(iterator)
+    assert 120 - 16 <= whole.documents_read - 0 and whole.epoch == 1
+
+    first = loader()
+    iterator = iter(first)
+    for _ in range(5):
+        next(iterator)
+    resumed = loader()
+    resumed.set_state(first.get_state())
+    iterator = iter(resumed)
+    for expected in batches[5:12]:
+        assert np.array_equal(next(iterator)["input_ids"], expected["input_ids"])

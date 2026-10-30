@@ -17,10 +17,12 @@ from datetime import datetime
 import jax
 # Initialize distributed system for multi-host TPU (must be before other JAX calls)
 # On TPU/Slurm/MPI: auto-detects config. On local: fails gracefully (single-host).
-try:
-    jax.distributed.initialize()
-except ValueError:
-    pass  # No coordinator available - running locally, single-host mode
+# A caller that set up the runtime itself (tests/test_multihost.py) must not be re-initialized.
+if not jax.distributed.is_initialized():
+    try:
+        jax.distributed.initialize()
+    except ValueError:
+        pass  # No coordinator available - running locally, single-host mode
 import jax.numpy as jnp
 import numpy as np
 import optax
@@ -64,28 +66,23 @@ def is_coordinator():
     return jax.process_index() == 0
 
 
-def prepare_state_for_checkpoint(state):
-    """Prepare TrainState for multi-host checkpointing.
+def create_shardings():
+    """Return (replicated, batch-split) shardings on a mesh over every device of every host."""
+    mesh = jax.sharding.Mesh(np.array(jax.devices()), ("batch",))
+    return (
+        jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec()),
+        jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("batch")),
+    )
 
-    In multi-host JAX, arrays from jit are host-local. For Orbax to serialize
-    them properly, we convert all arrays to NumPy arrays first.
 
-    This works because our arrays are replicated (same values on all devices),
-    so any host can provide the values. See: https://github.com/google/orbax/issues/844
+def to_global(tree, sharding):
+    """Build global arrays from this host's data.
+
+    With the replicated sharding every host must pass the same values (nothing checks
+    this); with the batch sharding each host passes its own rows, and the global batch
+    is the hosts' rows in process order.
     """
-    if jax.process_count() == 1:
-        return state  # Single-host doesn't need this
-
-    # Convert all JAX arrays to NumPy arrays for checkpointing
-    # This avoids the host-local array serialization issues
-    def to_numpy(x):
-        if isinstance(x, jax.Array):
-            return np.array(x)
-        return x
-
-    # Apply to all leaves in the state pytree
-    numpy_state = jax.tree_util.tree_map(to_numpy, state)
-    return numpy_state
+    return jax.make_array_from_process_local_data(sharding, jax.tree_util.tree_map(np.asarray, tree))
 
 
 def parse_args():
@@ -340,7 +337,7 @@ class FlaxDataCollatorForLanguageModeling:
         if tokenizer.mask_token is None:
             raise ValueError("Tokenizer must have a mask token for MLM")
     
-    def __call__(self, examples: List[Dict], max_length: int = 512) -> Dict[str, jnp.ndarray]:
+    def __call__(self, examples: List[Dict], max_length: int = 512) -> Dict[str, np.ndarray]:
         """Tokenize and mask a batch of examples."""
         # Extract texts
         texts = [ex["text"] if isinstance(ex, dict) else ex for ex in examples]
@@ -361,9 +358,9 @@ class FlaxDataCollatorForLanguageModeling:
         )
         
         return {
-            "input_ids": jnp.array(input_ids),
-            "attention_mask": jnp.array(batch["attention_mask"]),
-            "labels": jnp.array(labels),
+            "input_ids": input_ids,
+            "attention_mask": batch["attention_mask"],
+            "labels": labels,
         }
     
     def mask_tokens(
@@ -806,6 +803,8 @@ def train_step(state, batch, dropout_rng, learning_rate, compute_per_layer=False
         "grad_norm": grad_norm,
         "param_norm": param_norm,
         "update_ratio": update_ratio,
+        # Here because batch is a global array: the coordinator can't count it on its own
+        "n_masked": jnp.sum(batch["labels"] != -100),
         # Diagnostics
         "logits_min": logits_min,
         "logits_max": logits_max,
@@ -951,9 +950,9 @@ def main(args):
 
     # Display batch size information clearly (gradient accumulation info added later after extraction)
 
-    # Note: batch_size represents per-device batch size throughout the code
-    # JAX automatically handles data parallelism across devices internally
-    batch_size = per_device_batch_size
+    # Note: batch_size is the rows this host loads per micro-step; the hosts' rows together
+    # form the global batch of total_batch_size rows, split over all devices
+    batch_size = per_device_batch_size * jax.local_device_count()
 
     # Training hyperparameters from args
     max_length = args.max_length
@@ -1219,8 +1218,11 @@ def main(args):
         tx=optimizer,
     )
 
-    # Note: step counter sharding is handled automatically by Orbax during checkpoint restore
-    # No special handling needed here - TrainState.step is a Python int which works fine
+    # The same seed gives every host the same values, so these global arrays are consistent.
+    # Before the restore below, because Orbax restores into the shardings of this state.
+    replicated_sharding, batch_sharding = create_shardings()
+    state = to_global(state, replicated_sharding)
+    dropout_rng = to_global(dropout_rng, replicated_sharding)
 
     # Log weight decay assignment for verification (only when using same LR for all)
     if is_coordinator():
@@ -1271,6 +1273,9 @@ def main(args):
         else:
             print(f"\nUsing separate layer norm LR (factor={layer_norm_lr_factor}):")
             print("  Layer norms automatically have weight_decay=0")
+
+    # These still pin a host-local copy of the params to the first chip of each host
+    del variables, params
 
     # Create data collator
     if args.use_packing:
@@ -1351,7 +1356,7 @@ def main(args):
             dataset_config=args.dataset_config if not dataset_configs else None,
             tokenizer=tokenizer,
             max_length=max_length,
-            batch_size=batch_size,  # Per-device batch size (same as non-packed)
+            batch_size=batch_size,  # Rows per host (same as non-packed)
             num_workers=0,  # JAX compatible
             shard_index=jax.process_index(),
             shard_count=jax.process_count(),
@@ -1363,7 +1368,7 @@ def main(args):
         )
         if is_coordinator():
             print(f"  ✓ Packing enabled: documents will be packed into {max_length}-token sequences")
-            print(f"  ✓ Per-device batch size: {batch_size}")
+            print(f"  ✓ Rows per host: {batch_size}")
             epochs_str = "infinite" if args.num_epochs is None else str(args.num_epochs)
             print(f"  ✓ Epoch mode: {epochs_str} (auto-restart on exhaustion)")
         data_iter = iter(packed_dataloader)
@@ -1378,7 +1383,9 @@ def main(args):
     if is_coordinator():
         print("\nCompiling train_step...")
     # JIT compile with static argnums for compute_per_layer
-    train_step_jit = jax.jit(train_step, static_argnums=(4,))
+    # out_shardings: state must stay replicated for the checkpoints and the next step, and
+    # metrics must stay readable by float() on each host
+    train_step_jit = jax.jit(train_step, static_argnums=(4,), out_shardings=replicated_sharding)
 
     # Create checkpoint manager for async checkpointing
     if is_coordinator():
@@ -1498,16 +1505,17 @@ def main(args):
                 batch_raw = next(data_iter)
 
                 # Process batch through collator (applies MLM masking)
-                batch = collator(batch_raw)
+                local_batch = collator(batch_raw)
 
                 # Convert to JAX arrays
-                batch = {k: jnp.array(v) for k, v in batch.items()}
+                batch = to_global(local_batch, batch_sharding)
 
                 # Debug: Print batch info for first batch only
+                # Row contents come from local_batch: a global array can't be computed on by one host
                 if micro_step == start_step and is_coordinator():
-                    seg_ids = batch["segment_ids"]
-                    pos_ids = batch["position_ids"]
-                    labels = batch["labels"]
+                    seg_ids = local_batch["segment_ids"]
+                    pos_ids = local_batch["position_ids"]
+                    labels = local_batch["labels"]
                     print("\n" + "="*60)
                     print("PACKED BATCH DIAGNOSTICS (micro_step 0)")
                     print("="*60)
@@ -1516,15 +1524,15 @@ def main(args):
                     print(f"Position IDs row 0: {pos_ids[0, :30]}... (first 30)")
                     unique_segs = [len(set(int(x) for x in row)) for row in seg_ids]
                     print(f"Unique segments per row: {unique_segs}")
-                    n_masked = int(jnp.sum(labels != -100))
+                    n_masked = int(np.sum(labels != -100))
                     n_total = labels.size
-                    print(f"Masked tokens: {n_masked}/{n_total} ({100*n_masked/n_total:.1f}%)")
+                    print(f"Masked tokens on this host: {n_masked}/{n_total} ({100*n_masked/n_total:.1f}%)")
                     # Check for segment -1 (padding)
-                    n_padding = int(jnp.sum(seg_ids == -1))
+                    n_padding = int(np.sum(seg_ids == -1))
                     print(f"Padding tokens (segment=-1): {n_padding}/{seg_ids.size} ({100*n_padding/seg_ids.size:.1f}%)")
                     # Check attention_mask
-                    attn_mask = batch["attention_mask"]
-                    n_attn_zeros = int(jnp.sum(attn_mask == 0))
+                    attn_mask = local_batch["attention_mask"]
+                    n_attn_zeros = int(np.sum(attn_mask == 0))
                     print(f"Attention mask zeros (padding): {n_attn_zeros}/{attn_mask.size}")
                     print("="*60 + "\n")
 
@@ -1568,7 +1576,7 @@ def main(args):
 
                         lr_value = current_lr
                         ln_lr_value = float(ln_lr_schedule(optimizer_step)) if ln_lr_schedule else lr_value
-                        n_masked = int(jnp.sum(batch["labels"] != -100))
+                        n_masked = int(metrics["n_masked"])
 
                         # Diagnostic metrics (from last micro-batch)
                         logits_min = float(metrics["logits_min"])
@@ -1623,15 +1631,13 @@ def main(args):
 
                     # Checkpointing (using micro_step for state, but keyed by optimizer_step)
                     if optimizer_step > start_optimizer_step and optimizer_step % checkpoint_every == 0 and checkpoint_manager is not None:
-                        ckpt_state = prepare_state_for_checkpoint(state)
                         checkpoint_manager.save(
                             micro_step,  # Save micro_step for correct resume
-                            args=ocp.args.StandardSave(ckpt_state)
+                            args=ocp.args.StandardSave(state)
                         )
                         # Wait for checkpoint to complete before continuing
                         checkpoint_manager.wait_until_finished()
                         # Force garbage collection to release checkpoint references
-                        del ckpt_state
                         gc.collect()
                         if is_coordinator():
                             print(f"\n✓ Checkpoint saved at optimizer_step {optimizer_step} (micro_step {micro_step})")
@@ -1663,12 +1669,14 @@ def main(args):
 
                 batch_buffer.append(example)
 
-                # Collect examples until we have enough for one per-device batch
-                # JAX will automatically replicate this batch across all devices
+                # Collect examples until we have this host's rows of the global batch
                 if len(batch_buffer) >= batch_size:
-                    # Create batch - this will be replicated to all devices by JAX's pmap
-                    batch = collator(batch_buffer, max_length=max_length)
+                    # Create batch - split over all devices by to_global
+                    batch = to_global(collator(batch_buffer, max_length=max_length), batch_sharding)
                     batch_buffer = []
+
+                    if micro_step == start_step and is_coordinator():
+                        print(f"Batch shape: {batch['input_ids'].shape}")
 
                     # Training step (with MultiSteps, optimizer accumulates gradients internally)
                     compute_per_layer = (optimizer_step % 100 == 0) and (micro_step % gradient_accumulation_steps == 0)
@@ -1708,11 +1716,11 @@ def main(args):
 
                             lr_value = current_lr
                             ln_lr_value = float(ln_lr_schedule(optimizer_step)) if ln_lr_schedule else lr_value
-                            n_masked = int(jnp.sum(batch["labels"] != -100))
+                            n_masked = int(metrics["n_masked"])
 
                             # Calculate throughput
                             elapsed = time.time() - training_start_time
-                            tokens_per_sec = (micro_step - start_step) * batch_size * max_length / elapsed if elapsed > 0 else 0
+                            tokens_per_sec = (micro_step - start_step) * total_batch_size * max_length / elapsed if elapsed > 0 else 0
                             samples_per_sec = tokens_per_sec / max_length
                             optimizer_steps_per_sec = (optimizer_step - start_optimizer_step) / elapsed if elapsed > 0 else 0
 
@@ -1738,7 +1746,7 @@ def main(args):
                                     "train/param_norm": param_norm_value,
                                     "train/update_ratio": update_ratio_value,
                                     "train/n_masked_tokens": n_masked,
-                                    "train/masking_percentage": n_masked / (batch_size * max_length) * 100,
+                                    "train/masking_percentage": n_masked / (total_batch_size * max_length) * 100,
                                     "train/effective_batch_size": effective_batch_size,
                                     "train/gradient_accumulation_steps": gradient_accumulation_steps,
                                     "train/micro_step": micro_step,
@@ -1767,13 +1775,11 @@ def main(args):
 
                         # Checkpointing (using micro_step for state, keyed by optimizer_step)
                         if optimizer_step > start_optimizer_step and optimizer_step % checkpoint_every == 0 and checkpoint_manager is not None:
-                            ckpt_state = prepare_state_for_checkpoint(state)
                             checkpoint_manager.save(
                                 micro_step,  # Save micro_step for correct resume
-                                args=ocp.args.StandardSave(ckpt_state)
+                                args=ocp.args.StandardSave(state)
                             )
                             checkpoint_manager.wait_until_finished()
-                            del ckpt_state
                             gc.collect()
                             if is_coordinator():
                                 print(f"\n✓ Checkpoint saved at optimizer_step {optimizer_step} (micro_step {micro_step})")
@@ -1795,6 +1801,14 @@ def main(args):
                         if optimizer_step >= num_train_steps:
                             break
 
+            # Every host must run every step. The others now wait in a collective, and all hosts
+            # abort when the shutdown barrier of this one times out (5 minutes, measured on CPU)
+            if process_count > 1 and optimizer_step < num_train_steps:
+                raise RuntimeError(
+                    f"Dataset shard of process {process_idx} ran out at optimizer_step {optimizer_step} "
+                    f"of {num_train_steps}; multi-host training cannot continue without this host."
+                )
+
     finally:
         # Close progress bar if it exists
         if pbar:
@@ -1802,11 +1816,9 @@ def main(args):
 
     # Save final checkpoint (only if checkpoint_manager exists)
     if checkpoint_manager is not None:
-        # Prepare state for multi-host checkpointing (converts step to global array)
-        ckpt_state = prepare_state_for_checkpoint(state)
         checkpoint_manager.save(
             micro_step,  # Save micro_step for correct resume
-            args=ocp.args.StandardSave(ckpt_state)
+            args=ocp.args.StandardSave(state)
         )
         if is_coordinator():
             print(f"\n✓ Final checkpoint saved at optimizer_step {optimizer_step} (micro_step {micro_step})")
@@ -1820,7 +1832,7 @@ def main(args):
 
     # Calculate final metrics for logging
     elapsed = time.time() - training_start_time
-    tokens_per_sec = (micro_step - start_step) * batch_size * max_length / elapsed if elapsed > 0 else 0
+    tokens_per_sec = (micro_step - start_step) * total_batch_size * max_length / elapsed if elapsed > 0 else 0
 
     if is_coordinator():
         print("\n" + "=" * 70)
@@ -1856,6 +1868,8 @@ def main(args):
         print("✓ Training completed successfully!")
         print(f"✓ Checkpoints saved to: {checkpoint_dir}")
         print("\nTo continue training, simply run the script again!")
+
+    return state
 
 
 if __name__ == "__main__":

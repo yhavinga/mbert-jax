@@ -31,6 +31,10 @@ SOURCE_BUFFER_ITEMS = 2048
 # that come next, so without this the pieces of a long document would share a batch.
 PIECE_SHUFFLE_WINDOW = 5000
 
+# Batches kept ready by a thread of their own: 14 seconds of training on the 16-chip VM, more than
+# the 12 seconds a row group of parquet was measured to take to come off its disk
+BATCH_PREFETCH = 64
+
 
 __all__ = [
     "PIECE_SHUFFLE_WINDOW",
@@ -932,13 +936,18 @@ class EpochTrackingDataLoader:
             # Single-dataset mode: use the specified format
             source = StreamingBufferDataSource(self._load_stream_dataset(), max_buffer_size=SOURCE_BUFFER_ITEMS)
             self._document_sources = [source]
-            return create_packed_dataset_streaming(
-                source,
-                tokenizer=self.tokenizer,
-                max_length=self.max_length,
-                batch_size=self.batch_size,
-                dataset_format=self.dataset_format,
-                seed=self.base_seed + self.epoch,
+            # A window of pieces reads thousands of documents at once, measured at 2.3 seconds:
+            # in the training loop's thread that would cost 10% of the throughput
+            return grain_exp.ThreadPrefetchIterDataset(
+                create_packed_dataset_streaming(
+                    source,
+                    tokenizer=self.tokenizer,
+                    max_length=self.max_length,
+                    batch_size=self.batch_size,
+                    dataset_format=self.dataset_format,
+                    seed=self.base_seed + self.epoch,
+                ),
+                prefetch_buffer_size=BATCH_PREFETCH,
             )
 
     def _create_multi_dataset_pipeline(self):

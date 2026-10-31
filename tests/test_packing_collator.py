@@ -65,7 +65,8 @@ def mock_callable_tokenizer():
         defaults.update(kwargs)
 
         class MockTokenizer:
-            def __call__(self, text, truncation=False, max_length=None, return_tensors=None, add_special_tokens=False):
+            def __call__(self, text, truncation=False, max_length=None, return_tensors=None, add_special_tokens=False,
+                         split_special_tokens=False):
                 words = text.split()[:max_length] if max_length else text.split()
                 return {"input_ids": [hash(w) % self.vocab_size for w in words]}
 
@@ -84,7 +85,8 @@ def test_tokenize_transform_adds_eos_token():
         bos_token_id = 1
         eos_token_id = 2
 
-        def __call__(self, text, truncation=False, max_length=None, return_tensors=None, add_special_tokens=False):
+        def __call__(self, text, truncation=False, max_length=None, return_tensors=None, add_special_tokens=False,
+                     split_special_tokens=False):
             words = text.split()
             if max_length and truncation:
                 words = words[:max_length]
@@ -509,6 +511,69 @@ def test_pieces_hold_the_document_exactly_within_the_limits(n, max_length):
     # No waste: every piece but the last two is full, and only a document without tokens has an empty piece
     assert all(len(piece) == max_length for piece in pieces[:-2])
     assert n == 0 or len(pieces[-1]) >= 3
+
+
+def _tokenizer_with_the_pieces_of_special_tokens():
+    """Special tokens as in yhavinga/dutch-llama-tokenizer, and a vocabulary that can spell them as text."""
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from tokenizers.pre_tokenizers import Whitespace
+    from transformers import PreTrainedTokenizerFast
+
+    words = ["<", "</", ">", "s", "pad", "unk", "mask", "a", "b"]
+    vocab = {token: i for i, token in enumerate(["<unk>", "<s>", "</s>", "<pad>", "<mask>"] + words)}
+    backend = Tokenizer(WordLevel(vocab, unk_token="<unk>"))
+    backend.pre_tokenizer = Whitespace()
+    return PreTrainedTokenizerFast(
+        tokenizer_object=backend, unk_token="<unk>", bos_token="<s>", eos_token="</s>", pad_token="<pad>",
+        mask_token="<mask>", truncation_side="left",
+    )
+
+
+LITERAL_SPECIAL_TOKENS = "a <s> b </s> a <pad> b <unk> a <mask> b"
+
+
+def test_literal_special_tokens_in_a_document_are_text():
+    tokenizer = _tokenizer_with_the_pieces_of_special_tokens()
+    specials = set(tokenizer.all_special_ids)
+    assert specials == {0, 1, 2, 3, 4}
+    # Without the option the strings do become those tokens, or this test says nothing
+    assert specials <= set(tokenizer(LITERAL_SPECIAL_TOKENS, add_special_tokens=False)["input_ids"]) | {0}
+
+    for max_length in (6, 1024):
+        pieces = [p["input_ids"].tolist() for p in TokenizeTransform(tokenizer, max_length).map({"text": LITERAL_SPECIAL_TOKENS})]
+        # The real ones the packer needs are there, each in its place
+        assert all(piece[0] == 1 for piece in pieces)
+        assert pieces[-1][-1] == 2
+        inner = [t for piece in pieces[:-1] for t in piece[1:]] + pieces[-1][1:-1]
+        assert not specials & set(inner), inner
+        assert len(inner) == 6 + 3 + 3 + 3 + 3 + 3
+
+
+def test_literal_special_tokens_in_flan_documents_are_text():
+    from src.mmbjax.training.packing import FLANTokenizeTransform
+
+    tokenizer = _tokenizer_with_the_pieces_of_special_tokens()
+    ids = FLANTokenizeTransform(tokenizer, 64).map({"inputs": "a <s> </s>", "targets": "b <pad> <mask> <unk>"})["input_ids"].tolist()
+    assert ids[0] == 1
+    assert ids.count(1) == 1 and ids.count(2) == 1, "only the <s> and the separator it adds"
+    assert not {0, 3, 4} & set(ids)
+
+
+def test_literal_special_tokens_through_the_packed_pipeline():
+    """The route of training and of the held-out batches."""
+    from src.mmbjax.training import create_packed_dataset_streaming
+
+    tokenizer = _tokenizer_with_the_pieces_of_special_tokens()
+    documents = [{"text": LITERAL_SPECIAL_TOKENS} for _ in range(8)]
+    batch = next(iter(create_packed_dataset_streaming(documents, tokenizer=tokenizer, max_length=8, batch_size=4)))
+    for ids, positions in zip(batch["input_ids"], batch["input_ids_positions"]):
+        padding = (ids == 3) & (positions == 0)
+        assert not padding[:1].any()
+        real = ids[~padding]
+        assert not (real == 3).any() and not (real == 0).any() and not (real == 4).any()
+        # <s> is at the start of each segment and nowhere else
+        assert np.array_equal(real == 1, positions[~padding] == 0)
 
 
 def test_too_short_max_length_is_an_error():

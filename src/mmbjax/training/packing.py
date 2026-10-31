@@ -206,6 +206,7 @@ class TokenizeTransform:
             truncation=False,
             return_tensors=None,
             add_special_tokens=False,
+            split_special_tokens=True,  # A literal <s> in a document is text, not token id 1
         )["input_ids"]
 
     def map(self, element: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -253,6 +254,7 @@ class FLANTokenizeTransform:
                 max_length=max_tokens_per_part,
                 return_tensors=None,
                 add_special_tokens=False,
+                split_special_tokens=True,  # A literal </s> mustn't pass for the separator
             )["input_ids"]
 
             # Calculate remaining space for targets
@@ -265,6 +267,7 @@ class FLANTokenizeTransform:
                 max_length=remaining_space,
                 return_tensors=None,
                 add_special_tokens=False,
+                split_special_tokens=True,
             )["input_ids"]
 
         # Concatenate: <s> + inputs + </s> + targets

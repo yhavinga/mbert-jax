@@ -248,6 +248,7 @@ def data_state_identity(args, rows_per_host, data_files):
         "max_length": args.max_length,
         "long_documents": "split_into_pieces",
         "piece_shuffle_window": PIECE_SHUFFLE_WINDOW,
+        "special_tokens_in_text": "split",
         "tokenizer": args.tokenizer,
         "shuffle_buffer_size": args.shuffle_buffer_size,
     }
@@ -1289,7 +1290,8 @@ def main(args):
     # Load tokenizer BEFORE model config (to determine vocab_size)
     if is_coordinator():
         print("\nLoading tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
+    # On every route: a special token's string in a document is text, not that token
+    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, split_special_tokens=True)
 
     # Ensure mask token exists (required for MLM)
     if tokenizer.mask_token is None:

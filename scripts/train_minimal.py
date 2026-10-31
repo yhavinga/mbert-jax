@@ -268,6 +268,14 @@ def restore_data_state(path, data_loader, identity, allow_restart):
             "Pass --allow-data-restart if that is what you want."
         )
     saved = json.loads(path.read_text())
+    if saved["identity"] != identity and identity["data_files"]:
+        # A reboot can give a host another process index, and its data files stay with the host
+        for other in sorted(path.parent.glob("process_*.json")):
+            candidate = json.loads(other.read_text())
+            if candidate["identity"] == identity:
+                print(f"Process {jax.process_index()} continues the data state {other}, of the same data files", flush=True)
+                path, saved = other, candidate
+                break
     if saved["identity"] != identity:
         raise RuntimeError(
             f"Data state {path} is of another data setup, its indices would point at other documents: "

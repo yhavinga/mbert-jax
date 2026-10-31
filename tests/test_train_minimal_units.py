@@ -168,3 +168,24 @@ def test_resume_with_another_split_setup_is_refused(tm, tmp_path):
     tm.save_data_state(path, loader, old, 25000)
     with pytest.raises(RuntimeError, match="another data setup"):
         tm.restore_data_state(path, loader, identity, allow_restart=True)
+
+
+def test_host_finds_its_data_state_after_a_reboot_changed_the_process_indices(tm, tmp_path):
+    args = types.SimpleNamespace(
+        dataset="d", dataset_config="c", datasets_config=None, max_length=1024, tokenizer="t", shuffle_buffer_size=10,
+    )
+    identity = {host: tm.data_state_identity(args, 32, [f"{host}.parquet"]) for host in ("a", "b")}
+    directory = tm.epath.Path(tmp_path)
+    for index, host in enumerate(("a", "b")):
+        loader = mock.Mock(get_state=mock.Mock(return_value={"epoch": 0, "of": host}))
+        tm.save_data_state(directory / f"process_{index}.json", loader, identity[host], 25000)
+
+    # Host b is process 0 now
+    loader = mock.Mock()
+    tm.restore_data_state(directory / "process_0.json", loader, identity["b"], allow_restart=False)
+    loader.set_state.assert_called_once_with({"epoch": 0, "of": "b"})
+
+    # Files no state was saved for: refused
+    stranger = tm.data_state_identity(args, 32, ["c.parquet"])
+    with pytest.raises(RuntimeError, match="another data setup"):
+        tm.restore_data_state(directory / "process_0.json", loader, stranger, allow_restart=False)

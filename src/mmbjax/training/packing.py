@@ -31,9 +31,10 @@ SOURCE_BUFFER_ITEMS = 2048
 # that come next, so without this the pieces of a long document would share a batch.
 PIECE_SHUFFLE_WINDOW = 5000
 
-# Batches kept ready by a thread of their own: 14 seconds of training on the 16-chip VM, more than
-# the 12 seconds a row group of parquet was measured to take to come off its disk
-BATCH_PREFETCH = 64
+# Batches kept ready by a thread of their own, 54 seconds of training on the 16-chip VM. Reading a part
+# of the parquet that isn't in the page cache held the pipeline up for 12 seconds in a measurement,
+# and 256 batches take only 100 MB.
+BATCH_PREFETCH = 256
 
 
 __all__ = [

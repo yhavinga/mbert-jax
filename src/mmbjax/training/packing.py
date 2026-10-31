@@ -27,8 +27,14 @@ except ImportError:
 # most it holds on to after a resume reads the stream up to its index
 SOURCE_BUFFER_ITEMS = 2048
 
+# Pieces in the window that shuffles them before packing. Packing fills one batch from the elements
+# that come next, so without this the pieces of a long document would share a batch.
+PIECE_SHUFFLE_WINDOW = 5000
+
 
 __all__ = [
+    "PIECE_SHUFFLE_WINDOW",
+    "split_into_pieces",
     "TokenizeTransform",
     "FLANTokenizeTransform",
     "PackedMLMDataCollator",
@@ -152,43 +158,61 @@ def _stack_batch(batch: list) -> Dict[str, np.ndarray]:
     }
 
 
-class TokenizeTransform:
-    """Tokenize text for sequence packing (variable length).
+def split_into_pieces(token_ids: List[int], max_length: int, bos_token_id: int, eos_token_id: int) -> List[List[int]]:
+    """A document's tokens, in order, in pieces of at most max_length tokens including specials.
 
-    Note: This class extends grain.MapTransform when Grain is available.
-    We use composition over inheritance to avoid import issues.
+    Every piece starts with <s>, because inference puts it first and classifier_pooling=cls reads
+    it. Only the piece with the real end of the document ends with </s>. A last piece always has a
+    token besides its specials: </s> alone carries nothing to learn from.
+    """
+    if max_length < 3:
+        raise ValueError(f"max_length {max_length} has no room for <s>, a token and </s>")
+    pieces = []
+    start = 0
+    room = max_length - 1
+    while len(token_ids) - start > room - 1:
+        # With exactly `room` tokens left, </s> wouldn't fit behind them: one of them moves on with it
+        end = start + min(room, len(token_ids) - start - 1)
+        pieces.append([bos_token_id] + token_ids[start:end])
+        start = end
+    pieces.append([bos_token_id] + token_ids[start:] + [eos_token_id])
+    return pieces
+
+
+class TokenizeTransform:
+    """Tokenize text for sequence packing: a document becomes one or more pieces (variable length).
+
+    map() does the work and belongs in Grain's read threads, as a long document takes long to
+    tokenize. flat_map() then hands out its pieces one by one, and with a parent's checkpointable
+    index plus the position in the document Grain can resume in the middle of a document.
     """
 
     def __init__(self, tokenizer, max_length: int):
         _require_bos_token(tokenizer)
         self.tokenizer = tokenizer
         self.max_length = max_length
+        # A fast tokenizer drops a truncation setting on its first call, which mustn't happen with
+        # read threads already using it.
+        self._tokenize("")
 
-    def map(self, element: Dict[str, Any]) -> Dict[str, Any]:
-        """Tokenize a single text element."""
-        # Tokenize with truncation at max_length, leaving room for <s>
-        tokens = self.tokenizer(
-            element["text"],
-            truncation=True,
-            max_length=self.max_length - 1,
+    def _tokenize(self, text: str) -> List[int]:
+        return self.tokenizer(
+            text,
+            truncation=False,
             return_tensors=None,
             add_special_tokens=False,
+        )["input_ids"]
+
+    def map(self, element: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """The pieces of a single text element."""
+        pieces = split_into_pieces(
+            self._tokenize(element["text"]), self.max_length, self.tokenizer.bos_token_id, self.tokenizer.eos_token_id
         )
-        # The tokenizer puts <s> in front of text at inference, and classifier_pooling=cls reads it
-        input_ids = [self.tokenizer.bos_token_id] + tokens["input_ids"]
-        
-        # Only add EOS if the document wasn't truncated
-        # If it was truncated, the text didn't actually end here - adding EOS would be misleading
-        # Grain's packing still works correctly: segment boundaries are tracked separately
-        was_truncated = len(input_ids) >= self.max_length
-        if not was_truncated:
-            input_ids = input_ids + [self.tokenizer.eos_token_id]
-        
         # Grain's FirstFitPackIterDataset requires numpy arrays, not Python lists
-        return {
-            "input_ids": np.array(input_ids, dtype=np.int32),
-            "length": len(input_ids),
-        }
+        return [{"input_ids": np.array(piece, dtype=np.int32), "length": len(piece)} for piece in pieces]
+
+    def flat_map(self, pieces: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        return pieces
 
 
 class FLANTokenizeTransform:
@@ -680,6 +704,7 @@ def create_packed_dataset_streaming(
     max_length: int,
     batch_size: int,
     dataset_format: str = "text",
+    seed: int = 0,
 ):
     """Create a packed IterDataset from a streaming dataset.
 
@@ -694,6 +719,7 @@ def create_packed_dataset_streaming(
         max_length: Maximum sequence length for packing
         batch_size: Number of packing bins (sequences per batch)
         dataset_format: "text" for standard text datasets, "inputs_targets" for FLAN-style
+        seed: Seed of the window that shuffles pieces before packing (format "text")
 
     Returns:
         IterDataset that yields packed batches
@@ -715,9 +741,13 @@ def create_packed_dataset_streaming(
     else:  # Default to "text" format
         tokenize = TokenizeTransform(tokenizer, max_length)
 
-    # Build Grain pipeline: source -> tokenize -> to_iter -> pack -> batch
+    # Build Grain pipeline: source -> tokenize -> to_iter -> (pieces -> shuffle) -> pack -> batch
     map_dataset = grain.MapDataset.source(source).map(tokenize.map)
     iter_dataset = map_dataset.to_iter_dataset()
+    if isinstance(tokenize, TokenizeTransform):
+        iter_dataset = grain_exp.WindowShuffleIterDataset(
+            grain_exp.FlatMapIterDataset(iter_dataset, tokenize), window_size=PIECE_SHUFFLE_WINDOW, seed=seed
+        )
 
     # Apply packing - FirstFitPackIterDataset yields one packed sequence at a time
     # num_packing_bins controls parallel packing efficiency, not output batch size
@@ -822,8 +852,9 @@ class EpochTrackingDataLoader:
         self.stopping_strategy = stopping_strategy
         self.epoch = 0
         self._current_iter = None
-        self._source = None
+        self._document_sources = []
         self._documents_of_finished_epochs = 0
+        self._pieces_read = 0
         self._restore_state = None
     
     def _load_stream_dataset(self):
@@ -899,13 +930,15 @@ class EpochTrackingDataLoader:
             return self._create_multi_dataset_pipeline()
         else:
             # Single-dataset mode: use the specified format
-            self._source = StreamingBufferDataSource(self._load_stream_dataset(), max_buffer_size=SOURCE_BUFFER_ITEMS)
+            source = StreamingBufferDataSource(self._load_stream_dataset(), max_buffer_size=SOURCE_BUFFER_ITEMS)
+            self._document_sources = [source]
             return create_packed_dataset_streaming(
-                self._source,
+                source,
                 tokenizer=self.tokenizer,
                 max_length=self.max_length,
                 batch_size=self.batch_size,
                 dataset_format=self.dataset_format,
+                seed=self.base_seed + self.epoch,
             )
 
     def _create_multi_dataset_pipeline(self):
@@ -919,6 +952,7 @@ class EpochTrackingDataLoader:
         # Load and tokenize each dataset separately
         tokenized_streams = []
         weights = []
+        self._document_sources = []
 
         for cfg in self.dataset_configs:
             # Get dataset format (default to "text")
@@ -956,6 +990,7 @@ class EpochTrackingDataLoader:
 
             # Wrap as buffer source for Grain
             source = StreamingBufferDataSource(stream, max_buffer_size=SOURCE_BUFFER_ITEMS)
+            self._document_sources.append(source)
 
             # Create appropriate tokenizer transform
             if dataset_format == "inputs_targets":
@@ -970,6 +1005,8 @@ class EpochTrackingDataLoader:
             iter_dataset = map_dataset.to_iter_dataset(
                 read_options=grain.ReadOptions(num_threads=1, prefetch_buffer_size=0)
             )
+            if isinstance(tokenize, TokenizeTransform):
+                iter_dataset = grain_exp.FlatMapIterDataset(iter_dataset, tokenize)
 
             tokenized_streams.append(iter_dataset)
             weights.append(cfg.get("weight", 1.0))
@@ -1039,10 +1076,14 @@ class EpochTrackingDataLoader:
 
         # Wrap interleaved iterator as a proper Grain data source
         # FirstFitPackIterDataset expects a Grain IterDataset, not a plain Python iterator
-        self._source = StreamingBufferDataSource(iter(interleaved), max_buffer_size=SOURCE_BUFFER_ITEMS)
-        interleaved_map = grain.MapDataset.source(self._source).map(lambda x: x)
-        interleaved_iter = interleaved_map.to_iter_dataset(
-            read_options=grain.ReadOptions(num_threads=1, prefetch_buffer_size=0)
+        interleaved_source = StreamingBufferDataSource(iter(interleaved), max_buffer_size=SOURCE_BUFFER_ITEMS)
+        interleaved_map = grain.MapDataset.source(interleaved_source).map(lambda x: x)
+        interleaved_iter = grain_exp.WindowShuffleIterDataset(
+            interleaved_map.to_iter_dataset(
+                read_options=grain.ReadOptions(num_threads=1, prefetch_buffer_size=0)
+            ),
+            window_size=PIECE_SHUFFLE_WINDOW,
+            seed=epoch_seed,
         )
 
         # Apply packing to the interleaved tokenized stream
@@ -1062,8 +1103,12 @@ class EpochTrackingDataLoader:
     @property
     def documents_read(self) -> int:
         """Documents this host read from the stream, over all epochs, including those in prefetch."""
-        position = self._source.stream_position if self._source is not None else 0
-        return self._documents_of_finished_epochs + position
+        return self._documents_of_finished_epochs + sum(source.stream_position for source in self._document_sources)
+
+    @property
+    def pieces_read(self) -> int:
+        """Segments this host handed to training, over all epochs: the pieces of its documents."""
+        return self._pieces_read
 
     def get_state(self) -> Dict[str, Any]:
         """Where this host is: enough for a new loader to yield the very next batch.
@@ -1075,12 +1120,14 @@ class EpochTrackingDataLoader:
             "epoch": self.epoch,
             "pipeline": self._current_iter.get_state() if self._current_iter is not None else None,
             "documents_of_finished_epochs": self._documents_of_finished_epochs,
+            "pieces_read": self._pieces_read,
         }
 
     def set_state(self, state: Dict[str, Any]) -> None:
         """Continue from get_state(). Call before the first batch."""
         self.epoch = state["epoch"]
         self._documents_of_finished_epochs = state["documents_of_finished_epochs"]
+        self._pieces_read = state["pieces_read"]
         self._restore_state = state["pipeline"]
 
     def __iter__(self):
@@ -1093,6 +1140,10 @@ class EpochTrackingDataLoader:
             batches = 0
             for batch in self._current_iter:
                 batches += 1
+                # Padding has position 0 too
+                self._pieces_read += int(np.count_nonzero(
+                    (batch["input_ids_positions"] == 0) & (batch["input_ids"] != self.tokenizer.pad_token_id)
+                ))
                 yield batch
             if batches == 0:
                 raise RuntimeError(
@@ -1103,10 +1154,12 @@ class EpochTrackingDataLoader:
             
             # Epoch completed
             self._documents_of_finished_epochs = self.documents_read
+            self._document_sources = []  # Counted now; left in place they would count twice
             self.epoch += 1
             print(f"[EpochTrackingDataLoader] Completed epoch {self.epoch} "
                   f"(shard {self.shard_index}/{self.shard_count}): "
-                  f"{self.documents_read:,} documents read so far", flush=True)
+                  f"{self.documents_read:,} documents read so far, "
+                  f"{self.pieces_read:,} pieces handed to training", flush=True)
         
         # If num_epochs is set, we stop here
         print(f"[EpochTrackingDataLoader] Finished {self.num_epochs} epochs")

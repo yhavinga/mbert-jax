@@ -143,3 +143,28 @@ TensorCore Utilization
 | 0       | N/A                    |
 """
     assert {int(chip): float(duty) for chip, duty in tm.DutyCycleSampler.ROW.findall(output)} == {4: 95.72, 5: 95.73}
+
+
+def test_resume_with_another_split_setup_is_refused(tm, tmp_path):
+    args = types.SimpleNamespace(
+        dataset="d", dataset_config="c", datasets_config=None, max_length=1024, tokenizer="t", shuffle_buffer_size=10,
+    )
+    identity = tm.data_state_identity(args, 32, ["a.parquet"])
+    assert identity["long_documents"] == "split_into_pieces"
+    assert identity["piece_shuffle_window"] == tm.PIECE_SHUFFLE_WINDOW
+
+    path = tm.epath.Path(tmp_path) / "state.json"
+    loader = mock.Mock(get_state=mock.Mock(return_value={"epoch": 0}))
+    tm.save_data_state(path, loader, identity, 25000)
+
+    tm.restore_data_state(path, loader, identity, allow_restart=False)
+    loader.set_state.assert_called_once_with({"epoch": 0})
+
+    for key, value in [("piece_shuffle_window", identity["piece_shuffle_window"] + 1), ("long_documents", "truncated")]:
+        with pytest.raises(RuntimeError, match="another data setup"):
+            tm.restore_data_state(path, loader, {**identity, key: value}, allow_restart=False)
+    # A data state from before the split: refused as well, also with --allow-data-restart
+    old = {k: v for k, v in identity.items() if k not in ("long_documents", "piece_shuffle_window")}
+    tm.save_data_state(path, loader, old, 25000)
+    with pytest.raises(RuntimeError, match="another data setup"):
+        tm.restore_data_state(path, loader, identity, allow_restart=True)

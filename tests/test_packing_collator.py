@@ -78,7 +78,7 @@ def mock_callable_tokenizer():
 
 
 def test_tokenize_transform_adds_eos_token():
-    """TokenizeTransform should start with BOS, and append EOS token only if doc wasn't truncated."""
+    """Every piece starts with BOS; only the piece with the end of the document has EOS."""
     # This test uses a minimal callable tokenizer - keeping inline for clarity
     class MockTokenizer:
         bos_token_id = 1
@@ -88,28 +88,23 @@ def test_tokenize_transform_adds_eos_token():
             words = text.split()
             if max_length and truncation:
                 words = words[:max_length]
-            return {"input_ids": [hash(w) % 1000 for w in words]}
+            return {"input_ids": [hash(w) % 1000 + 10 for w in words]}
 
     max_length = 10
     transform = TokenizeTransform(MockTokenizer(), max_length=max_length)
 
-    # Case 1: Short document (not truncated) - should have EOS
-    short_doc = {"text": "Hello world"}  # 2 tokens
-    result_short = transform.map(short_doc)
-    assert result_short["input_ids"][-1] == MockTokenizer.eos_token_id, \
-        "Short doc should have EOS token"
-    assert result_short["input_ids"][0] == MockTokenizer.bos_token_id, \
-        "Every doc should start with BOS"
-    assert result_short["length"] == 4  # 1 BOS + 2 words + 1 EOS
+    # Case 1: Short document - one piece, with EOS
+    pieces = transform.map({"text": "Hello world"})  # 2 tokens
+    assert len(pieces) == 1
+    assert pieces[0]["input_ids"][-1] == MockTokenizer.eos_token_id, "Short doc should have EOS token"
+    assert pieces[0]["input_ids"][0] == MockTokenizer.bos_token_id, "Every doc should start with BOS"
+    assert pieces[0]["length"] == 4  # 1 BOS + 2 words + 1 EOS
 
-    # Case 2: Long document (truncated) - should NOT have EOS
-    long_doc = {"text": " ".join(["word"] * 20)}  # 20 tokens, will be truncated to 9 + BOS
-    result_long = transform.map(long_doc)
-    assert result_long["length"] == max_length, f"Expected {max_length}, got {result_long['length']}"
-    assert result_long["input_ids"][0] == MockTokenizer.bos_token_id
-    # EOS token id is 2, the hash of "word" is not 2, so check last token is NOT EOS
-    assert result_long["input_ids"][-1] != MockTokenizer.eos_token_id, \
-        "Truncated doc should NOT have EOS token"
+    # Case 2: Long document - pieces of 9 tokens + BOS, and EOS on the last only
+    pieces = transform.map({"text": " ".join(["word"] * 20)})
+    assert [piece["length"] for piece in pieces] == [10, 10, 4]
+    assert all(piece["input_ids"][0] == MockTokenizer.bos_token_id for piece in pieces)
+    assert [piece["input_ids"][-1] == MockTokenizer.eos_token_id for piece in pieces] == [False, False, True]
 
 
 def test_packed_mlm_collator_preserves_segments(mock_tokenizer):
@@ -371,7 +366,7 @@ def test_streaming_buffer_data_source(mock_callable_tokenizer):
 
     # Build Grain pipeline
     map_ds = grain.MapDataset.source(source).map(tokenize.map)
-    iter_ds = map_ds.to_iter_dataset()
+    iter_ds = grain_exp.FlatMapIterDataset(map_ds.to_iter_dataset(), tokenize)
     packed_ds = grain_exp.FirstFitPackIterDataset(
         parent=iter_ds,
         length_struct={"input_ids": max_length},
@@ -486,15 +481,69 @@ def test_tokenize_transform_keeps_max_length_and_eos_rule():
     transform = TokenizeTransform(tokenizer, max_length=8)
     words = [f"w{i}" for i in range(20)]
     ids = lambda n: tokenizer(" ".join(words[:n]), add_special_tokens=False)["input_ids"]  # noqa: E731
+    pieces = lambda n: [p["input_ids"].tolist() for p in transform.map({"text": " ".join(words[:n])})]  # noqa: E731
 
     # Fits with both special tokens
-    assert transform.map({"text": " ".join(words[:6])})["input_ids"].tolist() == [1] + ids(6) + [2]
-    # Fits without </s>: indistinguishable from truncated, which gets no </s>
-    assert transform.map({"text": " ".join(words[:7])})["input_ids"].tolist() == [1] + ids(7)
-    # Truncated: the tokenizer's side decides what stays, <s> is in front and there is no </s>
-    long = transform.map({"text": " ".join(words)})
-    assert long["input_ids"].tolist() == [1] + ids(20)[-7:]
-    assert long["length"] == 8
+    assert pieces(6) == [[1] + ids(6) + [2]]
+    # Fits without </s>: this is the end of the document, so </s> takes a last token along to a new piece
+    assert pieces(7) == [[1] + ids(6), [1] + ids(7)[6:] + [2]]
+    # Longer: all of it, from the start. The tokenizer's truncation side has no say.
+    assert pieces(20) == [[1] + ids(7), [1] + ids(14)[7:], [1] + ids(20)[14:] + [2]]
+    assert all(p["length"] == 8 for p in transform.map({"text": " ".join(words)})[:2])
+
+
+@pytest.mark.parametrize("n", [0, 1, 2, 7, 8, 9, 10, 15, 16, 17, 18, 19, 26, 27, 28, 29, 5000])
+@pytest.mark.parametrize("max_length", [3, 4, 10])
+def test_pieces_hold_the_document_exactly_within_the_limits(n, max_length):
+    from src.mmbjax.training.packing import split_into_pieces
+
+    tokens = list(range(100, 100 + n))
+    pieces = split_into_pieces(tokens, max_length, 1, 2)
+
+    assert all(2 <= len(piece) <= max_length for piece in pieces)
+    assert all(piece[0] == 1 for piece in pieces)
+    # The real end has the only </s>
+    assert [piece[-1] == 2 for piece in pieces] == [False] * (len(pieces) - 1) + [True]
+    rebuilt = [t for piece in pieces[:-1] for t in piece[1:]] + pieces[-1][1:-1]
+    assert rebuilt == tokens
+    # No waste: every piece but the last two is full, and only a document without tokens has an empty piece
+    assert all(len(piece) == max_length for piece in pieces[:-2])
+    assert n == 0 or len(pieces[-1]) >= 3
+
+
+def test_too_short_max_length_is_an_error():
+    from src.mmbjax.training.packing import split_into_pieces
+
+    with pytest.raises(ValueError, match="no room"):
+        split_into_pieces([5], 2, 1, 2)
+
+
+def test_document_far_longer_than_the_limit_is_kept_whole():
+    tokenizer = _left_truncating_tokenizer()
+    transform = TokenizeTransform(tokenizer, max_length=16)
+    text = " ".join(f"w{i % 95}" for i in range(100_000))
+    pieces = [p["input_ids"].tolist() for p in transform.map({"text": text})]
+
+    assert sum(len(piece) - 1 for piece in pieces) - 1 == 100_000
+    assert [t for piece in pieces for t in piece if t not in (1, 2)] == tokenizer(text, add_special_tokens=False)["input_ids"]
+    assert pieces[0][1] == tokenizer("w0", add_special_tokens=False)["input_ids"][0], "starts at the start of the document"
+
+
+def test_truncation_settings_of_the_tokenizer_do_not_change_the_pieces():
+    text = " ".join(f"w{i % 95}" for i in range(200))
+
+    def pieces_with(side, preset_truncation=False):
+        tokenizer = _left_truncating_tokenizer()
+        tokenizer.truncation_side = side
+        if preset_truncation:
+            tokenizer.backend_tokenizer.enable_truncation(5, direction=side)
+        return [p["input_ids"].tolist() for p in TokenizeTransform(tokenizer, max_length=16).map({"text": text})]
+
+    left = pieces_with("left")
+    assert left == pieces_with("right")
+    assert left == pieces_with("left", preset_truncation=True)
+    assert left == pieces_with("right", preset_truncation=True)
+    assert len(left) == 14
 
 
 def test_tokenizer_without_bos_fails_with_a_message():
@@ -698,6 +747,143 @@ def test_num_epochs_ends_the_loader_and_too_little_data_is_an_error(monkeypatch)
     short.batch_size = 64
     with pytest.raises(RuntimeError, match="too few for one batch"):
         next(iter(short))
+
+
+def _segments(batch):
+    """The packed segments of a batch as token tuples, as the training step gets them apart."""
+    found = []
+    for ids, positions in zip(batch["input_ids"], batch["input_ids_positions"]):
+        starts = [i for i, p in enumerate(positions) if p == 0 and ids[i] == 1]
+        for start, end in zip(starts, starts[1:] + [len(ids)]):
+            found.append(tuple(t for t in ids[start:end].tolist() if t != 3))
+    return found
+
+
+def _long_documents_loader(monkeypatch, documents, window=None, **kwargs):
+    """The real loader on a real shuffled datasets.IterableDataset of documents of all lengths; only the download is fake."""
+    import datasets
+
+    from src.mmbjax.training import EpochTrackingDataLoader, packing
+
+    fake = datasets.IterableDataset.from_generator(lambda: iter(documents))
+    monkeypatch.setattr(packing, "load_dataset", lambda *_a, **_k: fake)
+    if window is not None:
+        monkeypatch.setattr(packing, "PIECE_SHUFFLE_WINDOW", window)
+    return EpochTrackingDataLoader(
+        dataset_name="fake", tokenizer=_left_truncating_tokenizer(), max_length=16, batch_size=4,
+        shuffle_buffer_size=7, **kwargs,
+    )
+
+
+def _documents_of_all_lengths(n=60):
+    """Random words, of 1 to 90 tokens: a piece of some length tells its document."""
+    rng = np.random.RandomState(0)
+    return [
+        {"text": " ".join(f"w{w}" for w in rng.randint(0, 95, size=int(rng.choice([1, 3, 14, 15, 16, 30, 31, 90]))))}
+        for _ in range(n)
+    ]
+
+
+def _pieces_expected(documents):
+    transform = TokenizeTransform(_left_truncating_tokenizer(), max_length=16)
+    return [tuple(p["input_ids"].tolist()) for document in documents for p in transform.map(document)]
+
+
+@pytest.mark.parametrize("window", [1, 6, 5000])
+def test_resume_in_the_middle_of_a_document_loses_and_repeats_no_piece(monkeypatch, window):
+    documents = _documents_of_all_lengths()
+    transform = TokenizeTransform(_left_truncating_tokenizer(), max_length=16)
+    # Full pieces only: those can't be the same by chance
+    document_of_piece = {
+        tuple(p["input_ids"].tolist()): i
+        for i, document in enumerate(documents) for p in transform.map(document) if p["length"] == 16
+    }
+    assert len(document_of_piece) > 20, "the documents must split or this says nothing"
+
+    whole = _long_documents_loader(monkeypatch, documents, window=window, num_epochs=1)
+    all_batches = list(whole)
+
+    documents_cut_by_a_kill = 0
+    for kill_at in range(1, len(all_batches), 3):
+        first = _long_documents_loader(monkeypatch, documents, window=window, num_epochs=1)
+        iterator = iter(first)
+        trained = [next(iterator) for _ in range(kill_at)]
+        state = json.loads(json.dumps(first.get_state(), default=int))
+        iterator.close()
+
+        resumed = _long_documents_loader(monkeypatch, documents, window=window, num_epochs=1)
+        resumed.set_state(state)
+        rest = list(resumed)
+
+        for got, wanted in zip(trained + rest, all_batches):
+            for key in wanted:
+                assert np.array_equal(got[key], wanted[key]), (kill_at, key)
+        assert len(trained) + len(rest) == len(all_batches)
+        assert resumed.pieces_read == whole.pieces_read
+
+        documents_before = {document_of_piece.get(seg) for batch in trained for seg in _segments(batch)} - {None}
+        documents_after = {document_of_piece.get(seg) for batch in rest for seg in _segments(batch)} - {None}
+        documents_cut_by_a_kill += len(documents_before & documents_after)
+    assert documents_cut_by_a_kill > 0, "no kill fell in the middle of a document"
+
+
+def test_every_piece_once_per_pass_and_the_counters_are_right(monkeypatch):
+    from collections import Counter
+
+    documents = _documents_of_all_lengths()
+    expected = _pieces_expected(documents)
+
+    loader = _long_documents_loader(monkeypatch, documents, num_epochs=1)
+    seen = []
+    for batch in loader:
+        seen += _segments(batch)
+    assert len(seen) == loader.pieces_read
+    # Only rows of the last, partial batch are dropped, nothing comes twice
+    missing = Counter(expected) - Counter(seen)
+    assert not Counter(seen) - Counter(expected)
+    assert sum(missing.values()) <= 4 * 16
+
+    # Documents stay documents and a pass stays a pass, however many pieces they make
+    assert loader.documents_read == len(documents)
+    assert loader.epoch == 1
+    assert loader.pieces_read > loader.documents_read
+
+
+def test_pieces_of_a_document_are_spread_over_batches(monkeypatch):
+    """One document of 500 pieces among short ones: without a window it takes over whole batches."""
+    long_document = {"text": " ".join(f"w{i % 95}" for i in range(500 * 15))}
+    documents = [{"text": f"w{i % 95} w{(i + 1) % 95}"} for i in range(2000)] + [long_document]
+
+    def most_in_one_batch(window):
+        loader = _long_documents_loader(monkeypatch, documents, window=window, num_epochs=1)
+        return max(sum(len(segment) >= 15 for segment in _segments(batch)) for batch in loader)
+
+    assert most_in_one_batch(1) == 4
+    assert most_in_one_batch(5000) < 4
+
+
+def test_multi_dataset_route_splits_too_and_counts_documents(monkeypatch):
+    import datasets
+
+    from src.mmbjax.training import EpochTrackingDataLoader, packing
+
+    text_documents = _documents_of_all_lengths()
+    flan_documents = [{"inputs": "w1 w2", "targets": "w3 w4"} for _ in range(30)]
+    streams = {"text": text_documents, "flan": flan_documents}
+    monkeypatch.setattr(
+        packing, "load_dataset",
+        lambda name, *_a, **_k: datasets.IterableDataset.from_generator(lambda: iter(streams[name])),
+    )
+    loader = EpochTrackingDataLoader(
+        dataset_configs=[{"name": "text"}, {"name": "flan", "format": "inputs_targets"}],
+        tokenizer=_left_truncating_tokenizer(), max_length=16, batch_size=4, shuffle_buffer_size=7,
+        stopping_strategy="all_exhausted", num_epochs=1,
+    )
+    seen = [segment for batch in loader for segment in _segments(batch)]
+
+    assert set(seen) <= set(_pieces_expected(text_documents)) | {(1, 6, 7, 2, 8, 9)}
+    assert len(seen) == loader.pieces_read
+    assert loader.documents_read == len(text_documents) + len(flan_documents)
 
 
 def test_loader_on_local_parquet_files_covers_them_and_resumes(tmp_path):

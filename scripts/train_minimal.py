@@ -50,6 +50,7 @@ from mmbjax.heads.masked_lm import ModernBertForMaskedLM
 # Grain for sequence packing (optional, requires --use-packing)
 from mmbjax.training import (
     GRAIN_AVAILABLE,
+    PIECE_SHUFFLE_WINDOW,
     PackedMLMDataCollator,
     InstructionResponseMaskingCollator,
     HybridMaskingCollator,
@@ -207,11 +208,11 @@ def gather_system_metrics(data_loader, duty_sampler, input_seconds_per_step, dat
         # tpu-info numbers the chips like device.id: 4 to 7 on the second host of a v4-32
         chips.append([stats.get("bytes_in_use", -1), stats.get("peak_bytes_in_use", -1), duty.get(device.id, -1)])
     peak_rss_bytes = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
-    host = [data_loader.documents_read, data_loader.epoch, input_seconds_per_step, peak_rss_bytes]
+    host = [data_loader.documents_read, data_loader.epoch, input_seconds_per_step, peak_rss_bytes, data_loader.pieces_read]
     gathered_chips = multihost_utils.process_allgather(np.array(chips, dtype=np.float32))
     gathered_hosts = multihost_utils.process_allgather(np.array(host, dtype=np.float32))
     gathered_chips = np.asarray(gathered_chips).reshape(jax.process_count(), -1, 3)
-    gathered_hosts = np.asarray(gathered_hosts).reshape(jax.process_count(), 4)
+    gathered_hosts = np.asarray(gathered_hosts).reshape(jax.process_count(), 5)
 
     metrics = {}
     for h, host_chips in enumerate(gathered_chips):
@@ -219,8 +220,9 @@ def gather_system_metrics(data_loader, duty_sampler, input_seconds_per_step, dat
             metrics[f"system/host{h}_chip{c}_bytes_in_use"] = float(in_use)
             metrics[f"system/host{h}_chip{c}_peak_bytes_in_use"] = float(peak)
             metrics[f"system/host{h}_chip{c}_duty_cycle"] = float(duty_cycle)
-    for h, (documents, epoch, seconds, peak_rss) in enumerate(gathered_hosts):
+    for h, (documents, epoch, seconds, peak_rss, pieces) in enumerate(gathered_hosts):
         metrics[f"data/host{h}_documents_read"] = float(documents)
+        metrics[f"data/host{h}_pieces_read"] = float(pieces)
         metrics[f"data/host{h}_passes_completed"] = float(epoch)
         metrics[f"performance/host{h}_input_seconds_per_step"] = float(seconds)
         metrics[f"system/host{h}_peak_rss_bytes"] = float(peak_rss)
@@ -244,6 +246,8 @@ def data_state_identity(args, rows_per_host, data_files):
         "process_count": jax.process_count(),
         "rows_per_host": rows_per_host,
         "max_length": args.max_length,
+        "long_documents": "split_into_pieces",
+        "piece_shuffle_window": PIECE_SHUFFLE_WINDOW,
         "tokenizer": args.tokenizer,
         "shuffle_buffer_size": args.shuffle_buffer_size,
     }

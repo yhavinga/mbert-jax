@@ -201,6 +201,7 @@ def worker_main(spec):
     class FixedPackedLoader:
         epoch = 0
         documents_read = 0
+        pieces_read = 0
 
         def get_state(self):
             return {}
@@ -243,7 +244,7 @@ def worker_main(spec):
             rng = np.random.RandomState(0)
             for shard in shards:
                 for i in range(spec["rows_per_shard"]):
-                    words = rng.randint(0, VOCAB_WORDS, size=rng.randint(3, 11))
+                    words = rng.randint(0, VOCAB_WORDS, size=rng.randint(3, spec.get("longest_document", 10) + 1))
                     yield {"text": " ".join(f"w{w}" for w in words), "row": shard * 100000 + i}
 
         fake = datasets.IterableDataset.from_generator(generate, gen_kwargs={"shards": list(range(8))})
@@ -590,6 +591,40 @@ def test_packed_resume_after_a_kill_continues_with_the_next_batch(tmp_path):
         assert len(set(whole)) == 8, "this data must differ per batch or the comparison says nothing"
 
 
+def test_split_documents_resume_after_a_kill_with_the_next_batch(tmp_path):
+    """As above with documents up to 12 times --max-length: the kill falls in the middle of documents."""
+    spec = dict(route="packed", data="real_pipeline", per_device=2, rows_per_shard=500, checkpoint_every=3,
+                longest_document=12 * MAX_LENGTH)
+    whole_results, _ = _run(tmp_path, "whole", 2, 2, max_steps=8, checkpoint_dir=str(tmp_path / "ckpt_whole"), **spec)
+    _assert_identical_across_hosts_and_chips(whole_results)
+
+    ckpt = str(tmp_path / "ckpt")
+    output, procs = _start(tmp_path, "killed", 2, 2, max_steps=8, checkpoint_dir=ckpt, wait_to_be_killed_at_batch=5, **spec)
+    try:
+        deadline = time.time() + WORKER_TIMEOUT
+        ready = [output / f"ready_to_be_killed_{i}" for i in range(2)]
+        while time.time() < deadline and not all(path.exists() for path in ready):
+            assert all(proc.poll() is None for proc, _ in procs), [(output / f"stdout_{i}.log").read_text()[-2000:] for i in range(2)]
+            time.sleep(0.2)
+    finally:
+        _kill_workers(procs)
+    assert all(path.exists() for path in ready)
+
+    resumed, logs = _run(tmp_path, "resumed", 2, 2, max_steps=8, checkpoint_dir=ckpt, **spec)
+    _assert_identical_across_hosts_and_chips(resumed)
+    assert resumed[0]["restored"]["step"] == 3
+    for process_id in range(2):
+        assert "Data state restored" in logs[process_id]
+        whole = _raw_batches(tmp_path, "whole", process_id)
+        assert _raw_batches(tmp_path, "killed", process_id) == whole[:5]
+        assert _raw_batches(tmp_path, "resumed", process_id) == whole[3:8]
+        assert len(set(whole)) == 8
+
+    saved = json.loads((Path(ckpt + "_data_state") / "6" / "process_0.json").read_text())
+    assert saved["identity"]["long_documents"] == "split_into_pieces"
+    assert saved["state"]["pieces_read"] > 0
+
+
 def test_packed_resume_without_data_state_refuses_to_repeat_data(tmp_path):
     ckpt = str(tmp_path / "ckpt")
     spec = dict(route="packed", data="real_pipeline", per_device=2, rows_per_shard=500, checkpoint_every=2, checkpoint_dir=ckpt)
@@ -680,6 +715,7 @@ def test_trackio_on_the_coordinator_with_per_chip_metrics_and_sync(tmp_path):
             assert f"system/host{host}_chip{chip}_bytes_in_use" in system[10]
             assert f"system/host{host}_chip{chip}_duty_cycle" in system[10]
         assert system[10][f"data/host{host}_documents_read"] > 0
+        assert system[10][f"data/host{host}_pieces_read"] > 0
         assert system[10][f"performance/host{host}_input_seconds_per_step"] > 0
         assert system[10][f"system/host{host}_peak_rss_bytes"] > 0
     assert 0 < system[10]["data/passes"] < 1

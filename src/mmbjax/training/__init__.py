@@ -6,6 +6,7 @@ ModernBERT models, including sequence packing with Google's Grain library.
 
 from .packing import (
     GRAIN_AVAILABLE,
+    PIECE_SHUFFLE_WINDOW,
     EpochTrackingDataLoader,
     HybridMaskingCollator,
     InstructionResponseMaskingCollator,
@@ -18,6 +19,7 @@ from .packing import (
 
 __all__ = [
     "GRAIN_AVAILABLE",
+    "PIECE_SHUFFLE_WINDOW",
     "EpochTrackingDataLoader",
     "HybridMaskingCollator",
     "InstructionResponseMaskingCollator",

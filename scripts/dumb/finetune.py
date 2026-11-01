@@ -256,6 +256,8 @@ def main():
     parser.add_argument("--max-length", type=int, default=512, help="Max sequence length")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     args = parser.parse_args()
+    # The epoch shuffles below draw from NumPy, and two checkpoints should see the same order
+    np.random.seed(args.seed)
 
     print(f"Fine-tuning on task: {args.task}")
     print(f"Checkpoint: {args.checkpoint}")

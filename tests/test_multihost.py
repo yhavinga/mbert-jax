@@ -274,6 +274,16 @@ def worker_main(spec):
     ] + (["--use-packing"] if spec["route"] == "packed" else []) + spec.get("extra_args", [])
     sys.argv = argv
 
+    real_load_eval_batches = tm.load_eval_batches
+
+    def load_eval_batches_recording(*args):
+        batches = real_load_eval_batches(*args)
+        (output / f"eval_batches_{process_id}.txt").write_text("".join(
+            hashlib.sha256(b"".join(batch[key].tobytes() for key in sorted(batch))).hexdigest() + "\n" for batch in batches))
+        return batches
+
+    tm.load_eval_batches = load_eval_batches_recording
+
     # to_global's first call receives the freshly initialized state: keep it to see that params move.
     real_to_global = tm.to_global
 
@@ -680,6 +690,59 @@ def test_held_out_loss_is_logged_and_reproducible(tmp_path):
     assert first[0] != first[1], "two evaluations of a model in training gave the same loss"
     # Same data, same seeds, same masks: this is what a learning-rate comparison stands on
     assert eval_lines("second") == first
+
+
+def test_masking_modes_train_on_another_mask_and_are_measured_on_the_same(tmp_path):
+    import pytest
+
+    eval_file = tmp_path / "held_out.parquet"
+    _write_eval_parquet(eval_file)
+    spec = dict(route="packed", data="real_pipeline", per_device=2, rows_per_shard=500, max_steps=4)
+
+    def run(masking):
+        results, logs = _run(tmp_path, masking, 2, 2, extra_args=[
+            "--masking", masking, "--eval-file", str(eval_file), "--eval-every", "4", "--eval-batches", "5", "--system-metrics-every", "2",
+        ], **spec)
+        _assert_identical_across_hosts_and_chips(results)
+        assert results[0]["state_step"] == 4
+        return logs, [(tmp_path / masking / f"eval_batches_{i}.txt").read_text() for i in range(2)]
+
+    logs_default, eval_default = run("uniform15")
+    assert "MASKING" not in logs_default[0]
+    masked = [line for line in logs_default[0].splitlines() if line.startswith("EVAL")][0].rsplit("masked=")[1]
+    for masking in ("uniform30", "mix"):
+        logs, eval_batches = run(masking)
+        assert eval_batches == eval_default, masking
+        assert len(eval_batches[0].split()) == 5 and eval_batches[0] != eval_batches[1]
+        line = [line for line in logs[0].splitlines() if line.startswith("EVAL")][0]
+        assert line.rsplit("masked=")[1] == masked
+        assert line != [line for line in logs_default[0].splitlines() if line.startswith("EVAL")][0], "training saw the same masks"
+        # The share per denoiser is logged by the coordinator, at the system metrics
+        assert ("MASKING step=2" in logs[0]) == (masking == "mix")
+        assert ("MASKING step=4" in logs[0]) == (masking == "mix")
+    stats = json.loads([line for line in logs[0].splitlines() if line.startswith("MASKING step=4")][0].split(" ", 2)[2])
+    assert len(stats) == 8
+    assert sum(s["masked_share"] for s in stats.values()) == pytest.approx(1.0)
+
+
+def test_resume_in_another_masking_mode_is_refused(tmp_path):
+    ckpt = str(tmp_path / "ckpt")
+    spec = dict(route="packed", data="real_pipeline", per_device=2, rows_per_shard=500, checkpoint_every=2, checkpoint_dir=ckpt)
+    _run(tmp_path, "save", 2, 2, max_steps=2, extra_args=["--masking", "mix"], **spec)
+
+    for masking in ("uniform15", "uniform30"):
+        output, procs = _start(tmp_path, f"refused_{masking}", 2, 2, max_steps=4, extra_args=["--masking", masking], **spec)
+        try:
+            codes = _wait_for_workers(procs)
+        finally:
+            _kill_workers(procs)
+        assert 1 in codes, codes
+        logs = "".join((output / f"stdout_{i}.log").read_text() for i in range(2))
+        assert "is of another data setup" in logs
+
+    resumed, logs = _run(tmp_path, "same", 2, 2, max_steps=4, extra_args=["--masking", "mix"], **spec)
+    assert resumed[0]["state_step"] == 4
+    assert "Data state restored" in logs[0]
 
 
 def test_trackio_on_the_coordinator_with_per_chip_metrics_and_sync(tmp_path):

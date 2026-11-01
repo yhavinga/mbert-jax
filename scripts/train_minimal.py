@@ -52,6 +52,7 @@ from mmbjax.training import (
     GRAIN_AVAILABLE,
     PIECE_SHUFFLE_WINDOW,
     PackedMLMDataCollator,
+    MixedDenoiserCollator,
     InstructionResponseMaskingCollator,
     HybridMaskingCollator,
     TokenizeTransform,
@@ -236,9 +237,9 @@ def data_state_path(checkpoint_dir, step, process_index):
     return epath.Path(f"{str(checkpoint_dir).rstrip('/')}_data_state") / str(step) / f"process_{process_index}.json"
 
 
-def data_state_identity(args, rows_per_host, data_files):
-    """What must be the same for the saved indices to point at the same documents."""
-    return {
+def data_state_identity(args, rows_per_host, data_files, masking="uniform15"):
+    """What must be the same for the saved indices to point at the same documents, and for a run to stay one experiment."""
+    identity = {
         "data_files": data_files,
         "dataset": args.dataset,
         "dataset_config": args.dataset_config,
@@ -252,6 +253,10 @@ def data_state_identity(args, rows_per_host, data_files):
         "tokenizer": args.tokenizer,
         "shuffle_buffer_size": args.shuffle_buffer_size,
     }
+    # Only when it isn't the default: data states saved before --masking existed have no such key
+    if masking != "uniform15":
+        identity["masking"] = masking
+    return identity
 
 
 def save_data_state(path, data_loader, identity, step):
@@ -284,6 +289,18 @@ def restore_data_state(path, data_loader, identity, allow_restart):
         )
     data_loader.set_state(saved["state"])
     print(f"Data state restored on process {jax.process_index()} at step {saved['step']}: {saved['state']}", flush=True)
+
+
+def create_masking_collator(masking, tokenizer):
+    """The training collator of --masking, for packed plain-text data."""
+    if masking == "mix":
+        return MixedDenoiserCollator(tokenizer)
+    return PackedMLMDataCollator(tokenizer=tokenizer, mlm_probability={"uniform15": 0.15, "uniform30": 0.30}[masking])
+
+
+def create_eval_collator(masking, train_collator, tokenizer):
+    """Held-out masks are those of 15% single tokens in every mode, or EVAL lines couldn't be compared across modes."""
+    return train_collator if masking == "uniform15" else PackedMLMDataCollator(tokenizer=tokenizer, mlm_probability=0.15)
 
 
 def load_eval_batches(path, tokenizer, collator, max_length, rows_per_host, n_batches):
@@ -616,12 +633,24 @@ def parse_args():
         default="standard",
         help="Masking mode: 'standard' for uniform 15%% masking, 'instruction_response' for 0%% instruction/25%% response (default: standard)"
     )
+    parser.add_argument(
+        "--masking",
+        type=str,
+        choices=["uniform15", "uniform30", "mix"],
+        default="uniform15",
+        help="Masking of training batches: single tokens at 15%% or 30%%, or 'mix' for one of 8 denoisers per packed segment; "
+             "--eval-file always gets 15%% single tokens (default: uniform15)"
+    )
 
     args = parser.parse_args()
     if args.no_wandb:
         args.tracker = "none"
     if args.eval_file and not args.use_packing:
         parser.error("--eval-file needs --use-packing")
+    if args.masking != "uniform15" and (
+        not args.use_packing or args.dataset_format != "text" or args.masking_mode != "standard" or args.datasets_config
+    ):
+        parser.error(f"--masking {args.masking} needs --use-packing on one plain-text dataset, with --masking-mode standard")
     if args.per_layer_norms_every % args.log_every != 0:
         parser.error("--per-layer-norms-every must be a multiple of --log-every: other steps aren't logged")
     return args
@@ -1401,7 +1430,8 @@ def main(args):
             "layer_norm_lr_factor": layer_norm_lr_factor,
             "min_lr": min_lr,
             "weight_decay": weight_decay,
-            "mlm_probability": 0.15,
+            "mlm_probability": {"uniform15": 0.15, "uniform30": 0.30, "mix": None}[args.masking],
+            "masking": args.masking,
             "gradient_clipping": 1.0,
 
             # Dataset
@@ -1640,10 +1670,7 @@ def main(args):
                 print("  - Response tokens: 25% masking")
         else:
             # Standard single dataset
-            collator = PackedMLMDataCollator(
-                tokenizer=tokenizer,
-                mlm_probability=0.15,
-            )
+            collator = create_masking_collator(args.masking, tokenizer)
     else:
         collator = FlaxDataCollatorForLanguageModeling(
             tokenizer=tokenizer,
@@ -1711,7 +1738,8 @@ def main(args):
     if args.eval_file:
         if is_coordinator():
             print(f"\nBuilding {args.eval_batches} held-out batches from {args.eval_file}...")
-        eval_batches = load_eval_batches(args.eval_file, tokenizer, collator, max_length, batch_size, args.eval_batches)
+        eval_collator = create_eval_collator(args.masking, collator, tokenizer)
+        eval_batches = load_eval_batches(args.eval_file, tokenizer, eval_collator, max_length, batch_size, args.eval_batches)
 
         def eval_step(params, batch):
             output = state.apply_fn(
@@ -1802,7 +1830,7 @@ def main(args):
 
     # The other half of a packed checkpoint: where this host's data was, so it isn't trained on again
     if args.use_packing:
-        data_identity = data_state_identity(args, batch_size, data_files)
+        data_identity = data_state_identity(args, batch_size, data_files, args.masking)
         if start_step > 0:
             restore_data_state(data_state_path(checkpoint_dir, start_step, process_idx), packed_dataloader, data_identity, args.allow_data_restart)
 
@@ -2063,6 +2091,11 @@ def main(args):
                             print(f"SYSTEM step={optimizer_step} {json.dumps(system_metrics)}", flush=True)
                             if wandb is not None:
                                 wandb.log(system_metrics, step=optimizer_step)
+                            if args.masking == "mix":
+                                denoiser_stats = collator.denoiser_stats()
+                                print(f"MASKING step={optimizer_step} {json.dumps(denoiser_stats)}", flush=True)
+                                if wandb is not None:
+                                    wandb.log({f"masking/{name}_{key}": value for name, stats in denoiser_stats.items() for key, value in stats.items()}, step=optimizer_step)
 
                     if eval_batches is not None and optimizer_step % args.eval_every == 0:
                         evaluate(optimizer_step)

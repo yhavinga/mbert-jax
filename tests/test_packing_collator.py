@@ -15,7 +15,7 @@ import jax.random as jr
 
 from src.mmbjax.configuration_mmbbert import MMBertConfig
 from src.mmbjax.heads.masked_lm import ModernBertForMaskedLM
-from src.mmbjax.training import PackedMLMDataCollator, TokenizeTransform
+from src.mmbjax.training import DENOISER_NAMES, MixedDenoiserCollator, PackedMLMDataCollator, TokenizeTransform
 
 
 @pytest.fixture
@@ -984,3 +984,272 @@ def test_loader_on_local_parquet_files_covers_them_and_resumes(tmp_path):
     iterator = iter(resumed)
     for expected in batches[5:12]:
         assert np.array_equal(next(iterator)["input_ids"], expected["input_ids"])
+
+
+# --------------------------------------------------------------------------- --masking
+
+GOLDEN_UNIFORM15 = "8b98bdaf1f5ac53837e87b468f5a3a9d0a66783539e87ec3e8e26cc7c687b687"
+GOLDEN_UNIFORM15_NEXT_DRAW = 1395185717
+
+
+def _masking_tokenizer(mock_tokenizer):
+    return mock_tokenizer(pad_token_id=0, bos_token_id=1, eos_token_id=2, mask_token_id=3,
+                          all_special_ids=[0, 1, 2, 3], vocab_size=1000)
+
+
+def _packed_batch(rows=16, length=256, seed=0, longest=120):
+    """What Grain's packing hands the collator: <s> tokens </s> per document, with padding in segment 0 at position 0."""
+    rng = np.random.RandomState(seed)
+    input_ids = np.zeros((rows, length), dtype=np.int32)
+    segment_ids = np.zeros((rows, length), dtype=np.int32)
+    positions = np.zeros((rows, length), dtype=np.int32)
+    for row in range(rows):
+        at, segment = 0, 0
+        while True:
+            n = rng.randint(1, longest)
+            if at + n + 2 > length:
+                break
+            input_ids[row, at:at + n + 2] = np.r_[1, rng.randint(10, 1000, size=n), 2]
+            segment_ids[row, at:at + n + 2] = segment
+            positions[row, at:at + n + 2] = np.arange(n + 2)
+            at += n + 2
+            segment += 1
+    return {"input_ids": input_ids, "input_ids_segment_ids": segment_ids, "input_ids_positions": positions}
+
+
+def _documents_of_row(batch, row):
+    """(start, end) of each document in a row of a raw batch."""
+    ids = batch["input_ids"][row]
+    starts = np.flatnonzero(ids == 1)
+    ends = np.flatnonzero(ids == 2) + 1
+    return list(zip(starts.tolist(), ends.tolist()))
+
+
+def _digest(collated):
+    import hashlib
+
+    digest = hashlib.sha256()
+    for key in sorted(collated):
+        digest.update(key.encode())
+        digest.update(collated[key].dtype.str.encode())
+        digest.update(collated[key].tobytes())
+    return digest.hexdigest()
+
+
+def test_uniform15_collates_to_the_bytes_of_the_collator_before_the_flag(mock_tokenizer):
+    """The digest was computed with packing.py of cabf5d4, the code of the running long run."""
+    np.random.seed(42)
+    collator = PackedMLMDataCollator(_masking_tokenizer(mock_tokenizer), mlm_probability=0.15)
+    batches = [collator(_packed_batch(seed=seed)) for seed in range(3)]
+    assert _digest({f"{i}{key}": batch[key] for i, batch in enumerate(batches) for key in batch}) == GOLDEN_UNIFORM15
+    # And the RNG stands where it stood, for all that comes after
+    assert np.random.randint(2**31) == GOLDEN_UNIFORM15_NEXT_DRAW
+
+
+@pytest.mark.parametrize("denoiser", [i for i, name in enumerate(DENOISER_NAMES) if name.startswith("span")])
+def test_span_denoiser_masks_its_rate_in_separate_spans_around_its_mean(denoiser):
+    mean, rate = [(int(name.split("_")[1][2:]), int(name.split("_")[2][1:]) / 100) for name in [DENOISER_NAMES[denoiser]]][0]
+    np.random.seed(denoiser)
+    n = 2000
+    spans, masked = [], 0
+    for _ in range(200):
+        chosen = MixedDenoiserCollator._draw_masked(denoiser, n)
+        assert len(set(chosen.tolist())) == len(chosen) and chosen.min() >= 0 and chosen.max() < n
+        assert np.all(np.diff(chosen) > 0)
+        assert abs(len(chosen) - rate * n) <= 1
+        masked += len(chosen)
+        breaks = np.flatnonzero(np.diff(chosen) > 1) + 1
+        spans += [len(span) for span in np.split(chosen, breaks)]
+    assert masked / (200 * n) == pytest.approx(rate, abs=0.002)
+    # The last span of a segment is cut to the budget, which pulls the mean down a little
+    assert 0.8 * mean < np.mean(spans) < 1.1 * mean
+    assert min(spans) >= 1
+
+
+@pytest.mark.parametrize("n", [1, 2, 3, 5, 9, 17, 40, 63])
+def test_a_short_segment_caps_the_span_and_keeps_the_rate(n):
+    for denoiser, name in enumerate(DENOISER_NAMES):
+        if not name.startswith("span"):
+            continue
+        rate = int(name.split("_")[2][1:]) / 100
+        np.random.seed(n)
+        sizes = [len(MixedDenoiserCollator._draw_masked(denoiser, n)) for _ in range(2000)]
+        assert max(sizes) <= rate * n + 1
+        assert np.mean(sizes) == pytest.approx(rate * n, abs=0.05 * max(rate * n, 1))
+        assert max(sizes) < n or n == 1, "a whole segment masked leaves nothing to predict from"
+
+
+def test_no_maskable_tokens_is_no_error():
+    for denoiser in range(len(DENOISER_NAMES)):
+        assert len(MixedDenoiserCollator._draw_masked(denoiser, 0)) == 0
+
+
+def test_short_prefix_masks_one_block_of_1_to_16_at_a_uniform_cut():
+    prefix = DENOISER_NAMES.index("short_prefix")
+    np.random.seed(0)
+    draws = [MixedDenoiserCollator._draw_masked(prefix, 100) for _ in range(20000)]
+    assert all(np.all(np.diff(chosen) == 1) for chosen in draws)
+    # Blocks at the end of the segment are cut short, the others are 1 to 16 with equal chance
+    far_from_the_end = [len(chosen) for chosen in draws if chosen[0] < 100 - 16]
+    assert set(far_from_the_end) == set(range(1, 17))
+    assert np.mean(far_from_the_end) == pytest.approx(8.5, abs=0.1)
+    assert np.mean([chosen[0] for chosen in draws]) == pytest.approx(49.5, abs=1)
+    assert {chosen[0] for chosen in draws} == set(range(100))
+    assert all(chosen[-1] < 100 for chosen in draws)
+
+
+def test_mix_draws_are_fixed_by_the_seed(mock_tokenizer):
+    tokenizer = _masking_tokenizer(mock_tokenizer)
+
+    def run(seed):
+        np.random.seed(seed)
+        collator = MixedDenoiserCollator(tokenizer)
+        return [_digest(collator(_packed_batch(seed=i))) for i in range(3)], collator.segments.tolist()
+
+    assert run(1) == run(1)
+    assert run(1)[0] != run(2)[0]
+
+
+def test_mix_gives_each_denoiser_an_equal_chance_and_logs_its_share(mock_tokenizer):
+    np.random.seed(5)
+    collator = MixedDenoiserCollator(_masking_tokenizer(mock_tokenizer))
+    for seed in range(100):
+        collator(_packed_batch(seed=seed))
+    assert collator.segments.sum() > 5000
+    assert np.all(np.abs(collator.segments / collator.segments.sum() - 1 / 8) < 0.02)
+
+    stats = collator.denoiser_stats()
+    assert set(stats) == set(DENOISER_NAMES) and len(stats) == 8
+    assert sum(s["masked_share"] for s in stats.values()) == pytest.approx(1.0)
+    assert stats["single_r15"]["masked_rate"] == pytest.approx(0.15, abs=0.01)
+    for name, s in stats.items():
+        if name.startswith("span"):
+            assert s["masked_rate"] == pytest.approx(int(name.split("_")[2][1:]) / 100, abs=0.02), name
+    # What makes this mix top-heavy: r=0.5 on 3 of 8 segments gives most of the masked tokens, so most of a mean loss
+    high = sum(s["masked_share"] for name, s in stats.items() if name.endswith("_r50"))
+    assert high > 0.6
+    assert stats["short_prefix"]["hidden_tokens"] > 0
+
+
+def test_mix_never_masks_specials_and_keeps_the_80_10_10(mock_tokenizer):
+    np.random.seed(11)
+    collator = MixedDenoiserCollator(_masking_tokenizer(mock_tokenizer))
+    outcome = {"mask": 0, "kept": 0, "random": 0}
+    for seed in range(60):
+        raw = _packed_batch(seed=seed)
+        batch = collator(raw)
+        original = raw["input_ids"]
+        assert np.all(batch["labels"][np.isin(original, [0, 1, 2, 3])] == -100)
+        # Specials stay what they are, unless a short prefix hid them
+        special = np.isin(original, [0, 1, 2])
+        assert np.all((batch["input_ids"][special] == original[special]) | (batch["attention_mask"][special] == 0))
+        assert np.all(batch["input_ids"][original == 1] == 1), "<s> is before any masked block, so never hidden"
+        masked = batch["labels"] != -100
+        assert np.all(batch["labels"][masked] == original[masked])
+        outcome["mask"] += int(np.sum(batch["input_ids"][masked] == 3))
+        outcome["kept"] += int(np.sum(batch["input_ids"][masked] == original[masked]))
+        outcome["random"] += int(np.sum((batch["input_ids"][masked] != 3) & (batch["input_ids"][masked] != original[masked])))
+    total = sum(outcome.values())
+    assert outcome["mask"] / total == pytest.approx(0.8, abs=0.01)
+    assert outcome["kept"] / total == pytest.approx(0.1, abs=0.01)
+    assert outcome["random"] / total == pytest.approx(0.1, abs=0.01)
+
+
+def _short_prefix_only(monkeypatch):
+    """Every segment gets the short prefix; what happens to the RNG doesn't change."""
+    real_randint = np.random.randint
+    prefix = DENOISER_NAMES.index("short_prefix")
+
+    def randint(low, high=None, **kwargs):
+        value = real_randint(low, high, **kwargs)
+        return prefix if low == len(DENOISER_NAMES) and high is None and not kwargs else value
+
+    monkeypatch.setattr(np.random, "randint", randint)
+
+
+def test_short_prefix_leaves_nothing_behind_its_block_in_the_batch(mock_tokenizer, monkeypatch):
+    _short_prefix_only(monkeypatch)
+    np.random.seed(3)
+    collator = MixedDenoiserCollator(_masking_tokenizer(mock_tokenizer))
+    raw = _packed_batch(seed=4)
+    batch = collator(raw)
+    hidden_somewhere = False
+    for row in range(raw["input_ids"].shape[0]):
+        for start, end in _documents_of_row(raw, row):
+            masked = np.flatnonzero(batch["labels"][row, start:end] != -100)
+            assert len(masked) >= 1 and 1 <= len(masked) <= 16
+            assert np.all(np.diff(masked) == 1)
+            last = start + masked[-1]
+            # Up to the block: the document as it was
+            assert np.array_equal(batch["input_ids"][row, start:start + masked[0]], raw["input_ids"][row, start:start + masked[0]])
+            assert np.all(batch["segment_ids"][row, start:last + 1] == raw["input_ids_segment_ids"][row, start])
+            assert np.all(batch["attention_mask"][row, start:last + 1] == 1)
+            assert np.array_equal(batch["position_ids"][row, start:last + 1], raw["input_ids_positions"][row, start:last + 1])
+            # Behind it: the same as padding, in every array, and no target
+            assert np.all(batch["input_ids"][row, last + 1:end] == 0)
+            assert np.all(batch["attention_mask"][row, last + 1:end] == 0)
+            assert np.all(batch["segment_ids"][row, last + 1:end] == -1)
+            assert np.all(batch["position_ids"][row, last + 1:end] == 0)
+            assert np.all(batch["labels"][row, last + 1:end] == -100)
+            hidden_somewhere |= last + 1 < end - 1
+    assert hidden_somewhere
+
+
+def test_other_tokens_behind_the_prefix_make_the_same_batch(mock_tokenizer, monkeypatch):
+    """Behind the block the collator's output can't depend on the document, so the model can't either."""
+    _short_prefix_only(monkeypatch)
+    tokenizer = _masking_tokenizer(mock_tokenizer)
+    raw = _packed_batch(seed=4)
+    np.random.seed(3)
+    first = MixedDenoiserCollator(tokenizer)(raw)
+
+    other = {key: value.copy() for key, value in raw.items()}
+    changed = (first["attention_mask"] == 0) & (raw["input_ids"] >= 10)
+    assert changed.sum() > 100
+    other["input_ids"][changed] = 10 + (other["input_ids"][changed] + 7) % 900
+    np.random.seed(3)
+    second = MixedDenoiserCollator(tokenizer)(other)
+    assert _digest(first) == _digest(second)
+
+
+def test_model_sees_nothing_of_the_tokens_behind_the_prefix():
+    """On the model itself, with local and global layers: hidden positions take any token id, without effect on any other position."""
+    config = MMBertConfig(
+        vocab_size=64, hidden_size=16, intermediate_size=32, num_hidden_layers=4, num_attention_heads=2,
+        max_position_embeddings=64, local_attention=8, global_attn_every_n_layers=2, pad_token_id=0,
+    )
+    model = ModernBertForMaskedLM(config)
+    # Two documents; the first is cut behind its masked block at position 9, the second is padding-free up to 24
+    input_ids = jnp.array([[1, 5, 6, 7, 8, 9, 10, 3, 3, 3, 11, 12, 13, 14, 15, 2, 1, 21, 22, 23, 24, 25, 26, 2, 0, 0]], dtype=jnp.int32)
+    segment_ids = jnp.array([[0] * 16 + [1] * 8 + [-1] * 2], dtype=jnp.int32)
+    position_ids = jnp.array([list(range(16)) + list(range(8)) + [0, 0]], dtype=jnp.int32)
+    attention_mask = jnp.array([[1] * 24 + [0, 0]], dtype=jnp.int32)
+    hidden_from, hidden_to = 10, 16
+
+    variables = model.init(jr.PRNGKey(0), input_ids=input_ids, attention_mask=attention_mask, deterministic=True)
+
+    def logits(ids, mask, segments, positions):
+        return np.asarray(model.apply(variables, input_ids=ids, attention_mask=mask, segment_ids=segments,
+                                      position_ids=positions, deterministic=True).logits)
+
+    hidden_mask = attention_mask.at[0, hidden_from:hidden_to].set(0)
+    hidden_segments = segment_ids.at[0, hidden_from:hidden_to].set(-1)
+    hidden_positions = position_ids.at[0, hidden_from:hidden_to].set(0)
+    base = logits(input_ids, hidden_mask, hidden_segments, hidden_positions)
+    other_ids = input_ids.at[0, hidden_from:hidden_to].set(jnp.array([40, 41, 42, 43, 44, 45]))
+    other = logits(other_ids, hidden_mask, hidden_segments, hidden_positions)
+
+    seen = np.r_[0:hidden_from, hidden_to:24]
+    assert np.array_equal(base[0, seen], other[0, seen])
+    assert np.all(np.isfinite(base[0, seen]))
+    # A position of a hidden token can't reach them either
+    moved = logits(input_ids, hidden_mask, hidden_segments, hidden_positions.at[0, hidden_from:hidden_to].set(50))
+    assert np.array_equal(base[0, seen], moved[0, seen])
+
+    # Negative controls: each of the two arrays hides them on its own, and with neither the same tokens do show
+    only_mask = logits(other_ids, hidden_mask, segment_ids, position_ids), logits(input_ids, hidden_mask, segment_ids, position_ids)
+    assert np.array_equal(only_mask[0][0, seen], only_mask[1][0, seen])
+    only_segments = logits(other_ids, attention_mask, hidden_segments, position_ids), logits(input_ids, attention_mask, hidden_segments, position_ids)
+    assert np.array_equal(only_segments[0][0, seen], only_segments[1][0, seen])
+    visible = logits(other_ids, attention_mask, segment_ids, position_ids), logits(input_ids, attention_mask, segment_ids, position_ids)
+    assert not np.array_equal(visible[0][0, :hidden_from], visible[1][0, :hidden_from])

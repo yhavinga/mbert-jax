@@ -36,6 +36,13 @@ PIECE_SHUFFLE_WINDOW = 5000
 # and 256 batches take only 100 MB.
 BATCH_PREFETCH = 256
 
+# The span denoisers of Table 1 of UL2 (Tay et al. 2022, arXiv:2205.05131): (mean span length, corruption rate)
+SPAN_DENOISERS = ((3, 0.15), (8, 0.15), (3, 0.5), (8, 0.5), (64, 0.15), (64, 0.5))
+# UL2 says "a normal distribution with mean of µ" and no spread. A share of µ keeps µ=3 and µ=64 apart.
+SPAN_LENGTH_STD_OVER_MEAN = 0.25
+PREFIX_MAX_MASKED = 16
+DENOISER_NAMES = ("single_r15", *(f"span_mu{mean}_r{round(rate * 100)}" for mean, rate in SPAN_DENOISERS), "short_prefix")
+
 
 __all__ = [
     "PIECE_SHUFFLE_WINDOW",
@@ -43,6 +50,8 @@ __all__ = [
     "TokenizeTransform",
     "FLANTokenizeTransform",
     "PackedMLMDataCollator",
+    "MixedDenoiserCollator",
+    "DENOISER_NAMES",
     "InstructionResponseMaskingCollator",
     "HybridMaskingCollator",
     "StreamingBufferDataSource",
@@ -339,26 +348,133 @@ class PackedMLMDataCollator:
         masked_indices = np.random.binomial(1, probability_matrix).astype(bool)
         labels[~masked_indices] = -100
 
-        # 80% MASK, 10% random, 10% original
+        self._replace_masked_tokens(input_ids, masked_indices)
+
+        return input_ids, labels
+
+    def _replace_masked_tokens(self, input_ids: np.ndarray, masked_indices: np.ndarray) -> None:
+        """80% MASK, 10% random, 10% original."""
         indices_replaced = (
-            np.random.binomial(1, np.full(labels.shape, 0.8)).astype(bool)
+            np.random.binomial(1, np.full(input_ids.shape, 0.8)).astype(bool)
             & masked_indices
         )
         input_ids[indices_replaced] = self.tokenizer.mask_token_id
 
         indices_random = (
-            np.random.binomial(1, np.full(labels.shape, 0.5)).astype(bool)
+            np.random.binomial(1, np.full(input_ids.shape, 0.5)).astype(bool)
             & masked_indices
             & ~indices_replaced
         )
         random_words = np.random.randint(
             self.tokenizer.vocab_size,
-            size=labels.shape,
+            size=input_ids.shape,
             dtype=np.int32
         )
         input_ids[indices_random] = random_words[indices_random]
 
-        return input_ids, labels
+
+class MixedDenoiserCollator(PackedMLMDataCollator):
+    """Each packed segment gets one of 8 denoisers, with equal chance: DENOISER_NAMES.
+
+    All draws come from NumPy's global RNG, as in the parent, so a seed fixes them. The short prefix
+    leaves the tokens behind its masked block out by turning them into padding, in every array the
+    model reads: the batch then holds nothing of them, whatever the attention does.
+    """
+
+    def __init__(self, tokenizer):
+        super().__init__(tokenizer, mlm_probability=0.15)
+        self.segments = np.zeros(len(DENOISER_NAMES), dtype=np.int64)
+        self.maskable_tokens = np.zeros(len(DENOISER_NAMES), dtype=np.int64)
+        self.masked_tokens = np.zeros(len(DENOISER_NAMES), dtype=np.int64)
+        self.hidden_tokens = np.zeros(len(DENOISER_NAMES), dtype=np.int64)
+
+    def __call__(self, batch: Dict[str, Any]) -> Dict[str, np.ndarray]:
+        input_ids = np.array(batch["input_ids"])
+        segment_ids = np.array(batch["input_ids_segment_ids"])
+        positions = np.array(batch["input_ids_positions"])
+
+        # See the parent: padding comes with segment_id 0, which a real document also has
+        is_padding = (input_ids == self.tokenizer.pad_token_id)
+        segment_ids = np.where(is_padding, -1, segment_ids)
+
+        maskable = ~np.isin(input_ids, self.tokenizer.all_special_ids)
+        masked_indices = np.zeros(input_ids.shape, dtype=bool)
+        hidden = np.zeros(input_ids.shape, dtype=bool)
+        for row in range(input_ids.shape[0]):
+            boundaries = np.flatnonzero(segment_ids[row, 1:] != segment_ids[row, :-1]) + 1
+            for start, end in zip(np.r_[0, boundaries], np.r_[boundaries, input_ids.shape[1]]):
+                if segment_ids[row, start] == -1:
+                    continue
+                candidates = start + np.flatnonzero(maskable[row, start:end])
+                denoiser = np.random.randint(len(DENOISER_NAMES))
+                chosen = candidates[self._draw_masked(denoiser, len(candidates))]
+                masked_indices[row, chosen] = True
+                if DENOISER_NAMES[denoiser] == "short_prefix" and len(chosen):
+                    hidden[row, chosen[-1] + 1:end] = True
+                    self.hidden_tokens[denoiser] += end - chosen[-1] - 1
+                self.segments[denoiser] += 1
+                self.maskable_tokens[denoiser] += len(candidates)
+                self.masked_tokens[denoiser] += len(chosen)
+
+        labels = np.where(masked_indices, input_ids, -100)
+        input_ids[hidden] = self.tokenizer.pad_token_id
+        segment_ids[hidden] = -1
+        positions[hidden] = 0
+        self._replace_masked_tokens(input_ids, masked_indices)
+        attention_mask = np.where(is_padding | hidden, 0, 1).astype(np.int32)
+
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+            "position_ids": positions,
+            "segment_ids": segment_ids,
+        }
+
+    @staticmethod
+    def _draw_masked(denoiser: int, n: int) -> np.ndarray:
+        """Which of a segment's n maskable tokens this denoiser masks, as ascending indices."""
+        name = DENOISER_NAMES[denoiser]
+        if name == "single_r15":
+            return np.flatnonzero(np.random.binomial(1, 0.15, size=n))
+        if name == "short_prefix":
+            if n == 0:
+                return np.arange(0)
+            cut = np.random.randint(n)
+            k = np.random.randint(1, PREFIX_MAX_MASKED + 1)
+            return np.arange(cut, min(cut + k, n))
+
+        mean, rate = SPAN_DENOISERS[denoiser - 1]
+        # Rounded at random, or the short segments would all land on the same side of the rate
+        budget = int(rate * n + np.random.random())
+        if budget == 0:
+            return np.arange(0)
+        # At least 1 token each, so this many draws always reach the budget
+        lengths = np.maximum(np.rint(np.random.normal(mean, SPAN_LENGTH_STD_OVER_MEAN * mean, size=budget)).astype(int), 1)
+        ends = np.cumsum(lengths)
+        spans = int(np.searchsorted(ends, budget)) + 1
+        # The cap for a short segment: a span stops at the rate's budget, so µ=64 can't blank a segment of 40
+        lengths = lengths[:spans]
+        lengths[-1] = budget - (ends[spans - 2] if spans > 1 else 0)
+        # Spans keep an unmasked token between them, or two neighbours would be one longer span. That
+        # token is always there: budget <= rate * n + 1, with rate <= 0.5 and every span at least 1 long.
+        room = n - budget - (spans - 1)
+        gaps = np.sort(np.random.randint(0, room + 1, size=spans)) + np.arange(spans)
+        starts = gaps + np.r_[0, np.cumsum(lengths)[:-1]]
+        return np.concatenate([np.arange(start, start + length) for start, length in zip(starts, lengths)])
+
+    def denoiser_stats(self) -> Dict[str, Dict[str, float]]:
+        """Per denoiser since the start of this process, on this host."""
+        total_masked = max(int(self.masked_tokens.sum()), 1)
+        return {
+            name: {
+                "segments": int(self.segments[i]),
+                "masked_share": float(self.masked_tokens[i]) / total_masked,
+                "masked_rate": float(self.masked_tokens[i]) / max(int(self.maskable_tokens[i]), 1),
+                "hidden_tokens": int(self.hidden_tokens[i]),
+            }
+            for i, name in enumerate(DENOISER_NAMES)
+        }
 
 
 class InstructionResponseMaskingCollator:

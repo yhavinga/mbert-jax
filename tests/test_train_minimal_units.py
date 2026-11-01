@@ -189,3 +189,121 @@ def test_host_finds_its_data_state_after_a_reboot_changed_the_process_indices(tm
     stranger = tm.data_state_identity(args, 32, ["c.parquet"])
     with pytest.raises(RuntimeError, match="another data setup"):
         tm.restore_data_state(directory / "process_0.json", loader, stranger, allow_restart=False)
+
+
+def _masking_args(tm, *flags):
+    with mock.patch.object(sys, "argv", ["train_minimal.py", *flags]):
+        return tm.parse_args()
+
+
+def test_masking_default_keeps_the_route_and_the_data_state_of_the_long_run(tm, tmp_path):
+    args = _masking_args(tm, "--use-packing", "--dataset", "uonlp/CulturaX", "--dataset-config", "nl", "--max-length", "1024",
+                         "--tokenizer", "yhavinga/dutch-llama-tokenizer")
+    assert args.masking == "uniform15"
+    identity = tm.data_state_identity(args, 32, ["/home/yeb/culturax_nl/nl/nl_part_00038.parquet"], args.masking)
+    # The identity in gs://.../culturax-nl-230m-chunk1024/ckpt_data_state/355000/process_0.json, data files cut short
+    assert identity == {
+        "data_files": ["/home/yeb/culturax_nl/nl/nl_part_00038.parquet"],
+        "dataset": "uonlp/CulturaX",
+        "dataset_config": "nl",
+        "datasets_config": None,
+        "process_count": 1,
+        "rows_per_host": 32,
+        "max_length": 1024,
+        "long_documents": "split_into_pieces",
+        "piece_shuffle_window": 5000,
+        "special_tokens_in_text": "split",
+        "tokenizer": "yhavinga/dutch-llama-tokenizer",
+        "shuffle_buffer_size": 10000,
+    }
+    path = tm.epath.Path(tmp_path) / "state.json"
+    # A state saved before the flag existed: the same bytes as a state saved now
+    path.write_text(tm.json.dumps({"step": 355000, "identity": identity, "state": {"epoch": 0}}))
+    loader = mock.Mock()
+    tm.restore_data_state(path, loader, identity, allow_restart=False)
+    loader.set_state.assert_called_once_with({"epoch": 0})
+
+
+@pytest.mark.parametrize("saved,resumed", [
+    ("uniform15", "uniform30"), ("uniform15", "mix"), ("uniform30", "uniform15"), ("uniform30", "mix"), ("mix", "uniform15"), ("mix", "uniform30"),
+])
+def test_resume_across_masking_modes_is_refused(tm, tmp_path, saved, resumed):
+    args = types.SimpleNamespace(
+        dataset="d", dataset_config="c", datasets_config=None, max_length=1024, tokenizer="t", shuffle_buffer_size=10,
+    )
+    path = tm.epath.Path(tmp_path) / "state.json"
+    loader = mock.Mock(get_state=mock.Mock(return_value={"epoch": 0}))
+    tm.save_data_state(path, loader, tm.data_state_identity(args, 32, None, saved), 5000)
+    tm.restore_data_state(path, loader, tm.data_state_identity(args, 32, None, saved), allow_restart=False)
+    # Also with data files, where restore_data_state looks for another host's state, and with --allow-data-restart
+    for files, allow in [(None, False), (["a.parquet"], False), (None, True)]:
+        tm.save_data_state(path, loader, tm.data_state_identity(args, 32, files, saved), 5000)
+        with pytest.raises(RuntimeError, match="another data setup"):
+            tm.restore_data_state(path, loader, tm.data_state_identity(args, 32, files, resumed), allow_restart=allow)
+
+
+def test_masking_flag_refuses_routes_that_would_ignore_it(tm):
+    for flags in (["--masking", "mix"], ["--masking", "uniform30"],
+                  ["--masking", "mix", "--use-packing", "--masking-mode", "instruction_response"],
+                  ["--masking", "mix", "--use-packing", "--dataset-format", "inputs_targets"],
+                  ["--masking", "uniform30", "--use-packing", "--datasets-config", "c.json"]):
+        with pytest.raises(SystemExit):
+            _masking_args(tm, *flags)
+    assert _masking_args(tm, "--masking", "mix", "--use-packing").masking == "mix"
+    # The older flag that starts with the same word still works, in full
+    assert _masking_args(tm).masking_mode == "standard"
+
+
+def _eval_tokenizer():
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from tokenizers.pre_tokenizers import Whitespace
+    from transformers import PreTrainedTokenizerFast
+
+    specials = ["<pad>", "<unk>", "<s>", "</s>", "<mask>"]
+    vocab = {token: i for i, token in enumerate(specials + [f"w{i}" for i in range(200)])}
+    backend = Tokenizer(WordLevel(vocab, unk_token="<unk>"))
+    backend.pre_tokenizer = Whitespace()
+    return PreTrainedTokenizerFast(tokenizer_object=backend, pad_token="<pad>", unk_token="<unk>", bos_token="<s>",
+                                   eos_token="</s>", mask_token="<mask>")
+
+
+def test_eval_batches_are_the_same_15_percent_masks_in_every_mode(tm, tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    rng = np.random.RandomState(0)
+    path = tmp_path / "held_out.parquet"
+    pq.write_table(pa.table({"text": [" ".join(f"w{w}" for w in rng.randint(0, 200, size=rng.randint(3, 60))) for _ in range(600)]}), path)
+    tokenizer = _eval_tokenizer()
+
+    batches = {}
+    for seed, masking in enumerate(("uniform15", "uniform30", "mix")):
+        # What main() does before training; another RNG state here mustn't matter either
+        np.random.seed(seed)
+        train_collator = tm.create_masking_collator(masking, tokenizer)
+        eval_collator = tm.create_eval_collator(masking, train_collator, tokenizer)
+        assert type(eval_collator) is tm.PackedMLMDataCollator and eval_collator.mlm_probability == 0.15
+        batches[masking] = tm.load_eval_batches(str(path), tokenizer, eval_collator, 64, 4, 5)
+
+    for masking in ("uniform30", "mix"):
+        for ours, theirs in zip(batches[masking], batches["uniform15"], strict=True):
+            assert ours.keys() == theirs.keys()
+            for key in ours:
+                assert np.array_equal(ours[key], theirs[key]), (masking, key)
+
+    labels = np.stack([batch["labels"] for batch in batches["mix"]])
+    real = np.stack([batch["attention_mask"] for batch in batches["mix"]]).sum()
+    assert 0.08 < np.sum(labels != -100) / real < 0.2
+
+
+def test_uniform30_masks_twice_as_much_with_the_same_handling(tm):
+    tokenizer = _eval_tokenizer()
+    collator = tm.create_masking_collator("uniform30", tokenizer)
+    assert type(collator) is tm.PackedMLMDataCollator
+    input_ids = np.random.RandomState(0).randint(5, 200, size=(64, 256)).astype(np.int32)
+    np.random.seed(0)
+    batch = collator({"input_ids": input_ids, "input_ids_segment_ids": np.zeros_like(input_ids), "input_ids_positions": np.zeros_like(input_ids)})
+    masked = batch["labels"] != -100
+    assert masked.mean() == pytest.approx(0.30, abs=0.01)
+    assert np.mean(batch["input_ids"][masked] == tokenizer.mask_token_id) == pytest.approx(0.8, abs=0.02)

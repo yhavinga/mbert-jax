@@ -81,6 +81,7 @@ def create_model_and_state(
     num_labels: int,
     learning_rate: float,
     rng: jax.Array,
+    gradient_accumulation_steps: int = 1,
 ) -> tuple[ModernBertForSequenceClassification, TrainState]:
     """Create model and training state with pretrained weights."""
     # Update config for classification
@@ -110,6 +111,8 @@ def create_model_and_state(
 
     # Create optimizer
     optimizer = optax.adamw(learning_rate=learning_rate, weight_decay=0.01)
+    if gradient_accumulation_steps > 1:
+        optimizer = optax.MultiSteps(optimizer, every_k_schedule=gradient_accumulation_steps)
 
     state = TrainState.create(
         apply_fn=model.apply,
@@ -213,8 +216,12 @@ def _eval_step(
 p_eval_step = jax.pmap(_eval_step, axis_name="batch")
 
 
-def evaluate(state: TrainState, dataset, collate, batch_size: int) -> dict:
-    """Evaluate model on dataset using pmap."""
+def evaluate(state: TrainState, dataset, collate, batch_size: int, examples_multiple_of: int = 1) -> dict:
+    """Evaluate model on dataset using pmap, on the largest number of examples that is a multiple of examples_multiple_of.
+
+    That number decides which examples count: a run with the update of an earlier one in smaller batches
+    must be measured on the same examples, as incomplete batches are skipped.
+    """
     total_loss = 0.0
     total_correct = 0
     total_samples = 0
@@ -223,7 +230,7 @@ def evaluate(state: TrainState, dataset, collate, batch_size: int) -> dict:
     effective_batch_size = (batch_size // NUM_DEVICES) * NUM_DEVICES
 
     # Create batches
-    indices = list(range(len(dataset)))
+    indices = list(range(len(dataset) // examples_multiple_of * examples_multiple_of))
     for i in range(0, len(indices), effective_batch_size):
         batch_indices = indices[i : i + effective_batch_size]
         # Skip incomplete batches at the end
@@ -252,6 +259,10 @@ def main():
     parser.add_argument("--output", type=str, required=True, help="Output directory for fine-tuned model")
     parser.add_argument("--epochs", type=int, default=3, help="Number of training epochs")
     parser.add_argument("--batch-size", type=int, default=32, help="Per-device batch size")
+    parser.add_argument(
+        "--gradient-accumulation-steps", type=int, default=1,
+        help="Micro-batches per update, for an update of the same size on a chip too small to hold it (default: 1)",
+    )
     parser.add_argument("--learning-rate", type=float, default=2e-5, help="Learning rate")
     parser.add_argument("--max-length", type=int, default=512, help="Max sequence length")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
@@ -285,6 +296,7 @@ def main():
         num_labels=task_config["num_labels"],
         learning_rate=args.learning_rate,
         rng=rng,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
     )
 
     # Replicate state across devices for pmap
@@ -295,6 +307,7 @@ def main():
 
     # Total batch size across all devices
     total_batch_size = args.batch_size * NUM_DEVICES
+    update_size = total_batch_size * args.gradient_accumulation_steps
 
     # Training loop
     best_val_accuracy = 0.0
@@ -339,7 +352,7 @@ def main():
         print(f"Train Loss: {epoch_loss / num_batches:.4f}, Train Accuracy: {train_accuracy:.4f}")
 
         # Validation
-        val_metrics = evaluate(state, dataset["validation"], collate, total_batch_size)
+        val_metrics = evaluate(state, dataset["validation"], collate, total_batch_size, update_size)
         print(f"Val Loss: {val_metrics['loss']:.4f}, Val Accuracy: {val_metrics['accuracy']:.4f}")
 
         # Save best model
@@ -347,10 +360,9 @@ def main():
             best_val_accuracy = val_metrics["accuracy"]
             print(f"New best! Saving checkpoint...")
 
-            # Unreplicate state to save single copy of params
-            unreplicated_state = jax_utils.unreplicate(state)
+            # Off the chip right away: a variable holding the unreplicated state keeps a copy of it on the first chip
             with open(output_path / "params.pkl", "wb") as f:
-                pickle.dump(unreplicated_state.params, f)
+                pickle.dump(jax.device_get(jax_utils.unreplicate(state.params)), f)
 
             # Save config with num_labels
             config_dict = config.to_dict()
@@ -360,7 +372,7 @@ def main():
 
     # Final evaluation on test set
     print("\nEvaluating on test set...")
-    test_metrics = evaluate(state, dataset["test"], collate, total_batch_size)
+    test_metrics = evaluate(state, dataset["test"], collate, total_batch_size, update_size)
     print(f"Test Loss: {test_metrics['loss']:.4f}, Test Accuracy: {test_metrics['accuracy']:.4f}")
 
     # Save results
@@ -374,6 +386,7 @@ def main():
         "learning_rate": args.learning_rate,
         "batch_size": args.batch_size,
         "total_batch_size": total_batch_size,
+        "gradient_accumulation_steps": args.gradient_accumulation_steps,
         "num_devices": NUM_DEVICES,
     }
     with open(output_path / "results.json", "w") as f:

@@ -47,7 +47,11 @@ def load_orbax_checkpoint(checkpoint_path: Path):
     else:
         restore_path = checkpoint_path
 
-    raw = checkpointer.restore(restore_path)
+    # As NumPy: global arrays of a multi-host run have a sharding over devices that aren't here
+    restore_args = jax.tree_util.tree_map(
+        lambda _: ocp.RestoreArgs(restore_type=np.ndarray), dict(checkpointer.metadata(restore_path).item_metadata)
+    )
+    raw = checkpointer.restore(restore_path, args=ocp.args.PyTreeRestore(restore_args=restore_args))
 
     # Navigate checkpoint structure to find params
     if isinstance(raw, dict):

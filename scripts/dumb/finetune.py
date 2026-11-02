@@ -124,13 +124,19 @@ def create_model_and_state(
     return model, state
 
 
-def collate_fn(batch: list[dict], pad_token_id: int, max_length: int) -> dict:
-    """Collate batch with padding."""
+def collate_fn(batch: list[dict], pad_token_id: int, max_length: int, pad_to_multiple_of: int = 1) -> dict:
+    """Collate batch with padding.
+
+    pad_to_multiple_of rounds the padded length up (never past max_length). The padding is masked
+    and the classifier reads <s>, so this changes no result; it only bounds the number of shapes,
+    each of which compiles the step again.
+    """
     input_ids = [ex["input_ids"][:max_length] for ex in batch]
     labels = [ex["label"] for ex in batch]
 
     # Pad to max length in batch
     max_len = max(len(ids) for ids in input_ids)
+    max_len = min(-(-max_len // pad_to_multiple_of) * pad_to_multiple_of, max_length)
     padded_ids = []
     attention_masks = []
 
@@ -265,6 +271,11 @@ def main():
     )
     parser.add_argument("--learning-rate", type=float, default=2e-5, help="Learning rate")
     parser.add_argument("--max-length", type=int, default=512, help="Max sequence length")
+    parser.add_argument(
+        "--pad-to-multiple-of", type=int, default=1,
+        help="Round each batch's padded length up to a multiple of this: at --max-length 2048 nearly every batch has "
+             "another length, and each length compiles the step again (default: 1, the longest example)",
+    )
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     args = parser.parse_args()
     # The epoch shuffles below draw from NumPy, and two checkpoints should see the same order
@@ -303,7 +314,8 @@ def main():
     state = jax_utils.replicate(state)
 
     # Collate function
-    collate = partial(collate_fn, pad_token_id=tokenizer.pad_token_id, max_length=args.max_length)
+    collate = partial(collate_fn, pad_token_id=tokenizer.pad_token_id, max_length=args.max_length,
+                      pad_to_multiple_of=args.pad_to_multiple_of)
 
     # Total batch size across all devices
     total_batch_size = args.batch_size * NUM_DEVICES
@@ -350,6 +362,9 @@ def main():
 
         train_accuracy = epoch_correct / len(train_indices)
         print(f"Train Loss: {epoch_loss / num_batches:.4f}, Train Accuracy: {train_accuracy:.4f}")
+        # Whether a longer --max-length still fits next to the per-device batch
+        peaks = [(device.memory_stats() or {}).get("peak_bytes_in_use", -1) / 2**30 for device in jax.local_devices()]
+        print(f"Peak memory per device: {' '.join(f'{peak:.2f}' for peak in peaks)} GiB")
 
         # Validation
         val_metrics = evaluate(state, dataset["validation"], collate, total_batch_size, update_size)
@@ -388,6 +403,8 @@ def main():
         "total_batch_size": total_batch_size,
         "gradient_accumulation_steps": args.gradient_accumulation_steps,
         "num_devices": NUM_DEVICES,
+        "max_length": args.max_length,
+        "pad_to_multiple_of": args.pad_to_multiple_of,
     }
     with open(output_path / "results.json", "w") as f:
         json.dump(results, f, indent=2)

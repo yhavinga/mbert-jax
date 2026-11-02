@@ -206,6 +206,10 @@ def worker_main(spec):
         def get_state(self):
             return {}
 
+        def accounting(self):
+            return {"documents_read": 0, "documents_completed": 0, "pieces_read": 0, "tokens_read": 0, "epoch": 0,
+                    "counted_from_start": True}
+
         def __iter__(self):
             step = 0
             while True:
@@ -232,6 +236,14 @@ def worker_main(spec):
             def __call__(self, batch):
                 with open(output / f"raw_batches_{process_id}.txt", "a") as f:
                     f.write(hashlib.sha256(np.asarray(batch["input_ids"]).tobytes()).hexdigest() + "\n")
+                ids = np.asarray(batch["input_ids"])
+                real = ids != self.tokenizer.pad_token_id
+                with open(output / f"raw_counts_{process_id}.txt", "a") as f:
+                    f.write(json.dumps({
+                        "tokens": int(real.sum()),
+                        "documents_completed": int((ids == self.tokenizer.eos_token_id).sum()),
+                        "pieces": int(((np.asarray(batch["input_ids_positions"]) == 0) & real).sum()),
+                    }) + "\n")
                 type(self).batches += 1
                 if type(self).batches == spec.get("wait_to_be_killed_at_batch"):
                     (output / f"ready_to_be_killed_{process_id}").touch()
@@ -761,6 +773,17 @@ def test_resume_in_another_masking_mode_is_refused(tmp_path):
     assert "Data state restored" in logs[0]
 
 
+def _data_line(log):
+    """The DATA line the coordinator prints at the end of a packed run."""
+    lines = [line for line in log.splitlines() if line.startswith("DATA step=")]
+    assert len(lines) == 1, lines
+    return json.loads(lines[0].split(" ", 2)[2])
+
+
+def _raw_counts(tmp_path, name, process_id):
+    return [json.loads(line) for line in (tmp_path / name / f"raw_counts_{process_id}.txt").read_text().splitlines()]
+
+
 def test_init_from_takes_the_parameters_only_with_a_fresh_optimizer_step_and_data(tmp_path):
     spec = dict(route="packed", data="real_pipeline", per_device=2, rows_per_shard=500, checkpoint_every=6,
                 longest_document=3 * MAX_LENGTH)
@@ -829,6 +852,34 @@ def test_init_from_refuses_what_is_not_a_checkpoint_of_this_model(tmp_path):
         # Both hosts check; the first to fail ends the wait, the other may still be on its way
         assert 1 in codes and 0 not in codes, (name, codes)
         assert message in "".join((output / f"stdout_{i}.log").read_text() for i in range(2)), name
+
+
+def test_data_accounting_counts_what_training_got_and_survives_a_resume(tmp_path):
+    """Documents up to 3 times --max-length: more pieces than documents, and pieces cut across a resume."""
+    spec = dict(route="packed", data="real_pipeline", per_device=2, rows_per_shard=500, checkpoint_every=100, max_steps=6,
+                longest_document=3 * MAX_LENGTH)
+    _, whole_logs = _run(tmp_path, "whole", 2, 2, checkpoint_dir=str(tmp_path / "ckpt_whole"), **spec)
+    whole = _data_line(whole_logs[0])
+    for process_id in range(2):
+        counts = _raw_counts(tmp_path, "whole", process_id)
+        assert len(counts) == 6
+        host = whole["hosts"][f"host{process_id}"]
+        # Exactly the batches the collator got, with prefetch left out
+        assert host["tokens_read"] == sum(c["tokens"] for c in counts)
+        assert host["documents_completed"] == sum(c["documents_completed"] for c in counts)
+        assert host["pieces_read"] == sum(c["pieces"] for c in counts)
+        assert host["counted_from_start"]
+        assert 0 < host["documents_completed"] < host["pieces_read"], "no document was split, so this tests nothing"
+        assert host["documents_read"] >= host["documents_completed"]
+    assert whole["total"]["tokens_read"] == sum(host["tokens_read"] for host in whole["hosts"].values())
+
+    ckpt = str(tmp_path / "ckpt")
+    _run(tmp_path, "stopped", 2, 2, checkpoint_dir=ckpt, extra_args=["--stop-at-step", "3"], **spec)
+    _, resumed_logs = _run(tmp_path, "resumed", 2, 2, checkpoint_dir=ckpt, **spec)
+    resumed = _data_line(resumed_logs[0])
+    for host in ("host0", "host1"):
+        for name in ("tokens_read", "documents_completed", "pieces_read"):
+            assert resumed["hosts"][host][name] == whole["hosts"][host][name], (host, name)
 
 
 def test_trackio_on_the_coordinator_with_per_chip_metrics_and_sync(tmp_path):

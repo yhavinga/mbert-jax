@@ -979,6 +979,10 @@ class EpochTrackingDataLoader:
         self._document_sources = []
         self._documents_of_finished_epochs = 0
         self._pieces_read = 0
+        self._tokens_read = 0
+        self._documents_completed = 0
+        # False after a resume from a data state saved before these two counts existed
+        self._counted_from_start = True
         self._restore_state = None
     
     def _load_stream_dataset(self):
@@ -1239,6 +1243,31 @@ class EpochTrackingDataLoader:
         """Segments this host handed to training, over all epochs: the pieces of its documents."""
         return self._pieces_read
 
+    @property
+    def tokens_read(self) -> int:
+        """Tokens other than padding this host handed to training, <s> and </s> included."""
+        return self._tokens_read
+
+    @property
+    def documents_completed(self) -> int:
+        """Documents whose last piece this host handed to training: only that piece has </s>.
+
+        Unlike documents_read this leaves out what still waits in prefetch, so it is what
+        training consumed.
+        """
+        return self._documents_completed
+
+    def accounting(self) -> Dict[str, Any]:
+        """What this host handed to training since the start of the run."""
+        return {
+            "documents_read": self.documents_read,
+            "documents_completed": self._documents_completed,
+            "pieces_read": self._pieces_read,
+            "tokens_read": self._tokens_read,
+            "epoch": self.epoch,
+            "counted_from_start": self._counted_from_start,
+        }
+
     def get_state(self) -> Dict[str, Any]:
         """Where this host is: enough for a new loader to yield the very next batch.
 
@@ -1250,6 +1279,9 @@ class EpochTrackingDataLoader:
             "pipeline": self._current_iter.get_state() if self._current_iter is not None else None,
             "documents_of_finished_epochs": self._documents_of_finished_epochs,
             "pieces_read": self._pieces_read,
+            "tokens_read": self._tokens_read,
+            "documents_completed": self._documents_completed,
+            "counted_from_start": self._counted_from_start,
         }
 
     def set_state(self, state: Dict[str, Any]) -> None:
@@ -1257,6 +1289,15 @@ class EpochTrackingDataLoader:
         self.epoch = state["epoch"]
         self._documents_of_finished_epochs = state["documents_of_finished_epochs"]
         self._pieces_read = state["pieces_read"]
+        if "tokens_read" in state:
+            self._tokens_read = state["tokens_read"]
+            self._documents_completed = state["documents_completed"]
+            self._counted_from_start = state["counted_from_start"]
+        else:
+            # Saved before these counts: they start here, and accounting() says so
+            self._counted_from_start = False
+            print("[EpochTrackingDataLoader] data state has no tokens_read or documents_completed: "
+                  "those count from this resume on, counted_from_start=False", flush=True)
         self._restore_state = state["pipeline"]
 
     def __iter__(self):
@@ -1269,10 +1310,12 @@ class EpochTrackingDataLoader:
             batches = 0
             for batch in self._current_iter:
                 batches += 1
+                real = batch["input_ids"] != self.tokenizer.pad_token_id
                 # Padding has position 0 too
-                self._pieces_read += int(np.count_nonzero(
-                    (batch["input_ids_positions"] == 0) & (batch["input_ids"] != self.tokenizer.pad_token_id)
-                ))
+                self._pieces_read += int(np.count_nonzero((batch["input_ids_positions"] == 0) & real))
+                self._tokens_read += int(np.count_nonzero(real))
+                # A literal </s> in a text is tokenized as text (split_special_tokens), so this id ends a document
+                self._documents_completed += int(np.count_nonzero(batch["input_ids"] == self.tokenizer.eos_token_id))
                 yield batch
             if batches == 0:
                 raise RuntimeError(

@@ -321,6 +321,24 @@ def load_params_of_run(step_dir, target_params):
     return restored["params"]
 
 
+def log_data_accounting(data_loader, optimizer_step):
+    """What each host handed to training in this run, gathered on every host. A collective: all hosts call it."""
+    names = ["documents_read", "documents_completed", "pieces_read", "tokens_read", "epoch"]
+    mine = data_loader.accounting()
+    # Two int32 words per count: without x64 JAX gathers int64 as int32, and tokens pass 2**31 in long runs
+    words = np.array([[mine[name] >> 31, mine[name] & (2**31 - 1)] for name in names] + [[0, int(mine["counted_from_start"])]], dtype=np.int32)
+    gathered = np.asarray(multihost_utils.process_allgather(words)).reshape(jax.process_count(), len(names) + 1, 2).astype(np.int64)
+    hosts = {
+        f"host{h}": {**{name: int(gathered[h, i, 0] << 31 | gathered[h, i, 1]) for i, name in enumerate(names)},
+                     "counted_from_start": bool(gathered[h, -1, 1])}
+        for h in range(jax.process_count())
+    }
+    if is_coordinator():
+        totals = {name: sum(host[name] for host in hosts.values()) for name in names if name != "epoch"}
+        print(f"DATA step={optimizer_step} {json.dumps({'hosts': hosts, 'total': totals})}", flush=True)
+    return hosts
+
+
 def create_masking_collator(masking, tokenizer):
     """The training collator of --masking, for packed plain-text data."""
     if masking == "mix":
@@ -2344,6 +2362,10 @@ def main(args):
         checkpoint_manager.wait_until_finished()
         if is_coordinator():
             print("✓ All checkpoints saved successfully")
+
+    # Over the whole run, resumes included: two runs on the same stream can be held against each other
+    if args.use_packing:
+        log_data_accounting(packed_dataloader, optimizer_step)
 
     # Calculate final metrics for logging
     elapsed = time.time() - training_start_time

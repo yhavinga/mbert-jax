@@ -10,10 +10,11 @@ last host than on the first, segments of 1,000 rows 0.08%, as striding row by ro
   plan   Where the lengths parquets of scripts/count_tokens.py (branch token-counts; one row per document,
          its token count in `text`) are: rows and tokens per source file, and documents and tokens per share,
          to experiments/corpus-runs/<corpus>_plan.json. The stage step reads that plan from the checkout.
-  stage  On a worker: each source file of the plan's revision is downloaded from the Hugging Face repo,
-         checked against the plan's row count, and this host's rows are written as one parquet file with
-         the column `text`; then the download is deleted. Then the list --data-files-list reads. A file
-         already staged with the planned rows is kept, so a second start continues.
+  stage  On a worker: each source file of the plan's revision is downloaded from the Hugging Face repo (into
+         --download-dir, /dev/shm on a TPU VM, as the boot disk writes 27 MB/s), checked against the plan's
+         row count, and this host's rows are written as one parquet file with the column `text`; then the
+         download is deleted. Then the list --data-files-list reads. A file already staged with the planned
+         rows is kept, so a second start continues.
 
   python scripts/stage_share.py plan --corpus fineweb2 --lengths ~/tc/fineweb2/lengths
   python scripts/stage_share.py stage --corpus fineweb2 --rank 0 --out ~/fineweb2_nl --list ~/fineweb2_nl_files.txt
@@ -45,6 +46,9 @@ CORPORA = {
 SEGMENT_ROWS = 1000
 # Rows per written row group: the trainer's parquet stream reads one row group at a time
 ROWS_PER_GROUP = 50_000
+# The boot disk of a v4 worker writes 27 MB/s: level 9 writes 0.81 of what Arrow's default (level 1, the size
+# of FineWeb-2's own text column) does, at 75 MB/s of text per process
+ZSTD_LEVEL = 9
 
 
 def share_ranges(rows: list[int], hosts: int, segment: int = SEGMENT_ROWS) -> list[list[list[tuple[int, int]]]]:
@@ -201,7 +205,8 @@ def _json_gz_rows(local: Path, rows: int, ranges: list[tuple[int, int]], writer)
         raise ValueError(f"{local} has {row} rows, the plan {rows}")
 
 
-def stage_file(corpus: str, path: str, rows: int, ranges: list[tuple[int, int]], out: str) -> tuple[str, int, int, float]:
+def stage_file(corpus: str, path: str, rows: int, ranges: list[tuple[int, int]], out: str,
+               download_dir: str) -> tuple[str, int, int, float]:
     """One source file's part of a share, written under a temporary name first. Returns (out, rows, bytes, seconds)."""
     import pyarrow as pa
     import pyarrow.parquet as pq
@@ -213,12 +218,13 @@ def stage_file(corpus: str, path: str, rows: int, ranges: list[tuple[int, int]],
     t = time.time()
     if not (target.exists() and pq.ParquetFile(target).metadata.num_rows == wanted):
         partial = target.with_name(target.name + ".partial")
-        download = target.with_name(target.name + ".download")
+        download = Path(download_dir) / (target.name + ".download")
         partial.unlink(missing_ok=True)
         shutil.rmtree(download, ignore_errors=True)
         try:
             local = Path(hf_hub_download(spec["repo"], path, repo_type="dataset", revision=spec["revision"], local_dir=download))
-            writer = pq.ParquetWriter(partial, pa.schema([("text", pa.string())]), compression="zstd")
+            writer = pq.ParquetWriter(partial, pa.schema([("text", pa.string())]), compression="zstd",
+                                      compression_level=ZSTD_LEVEL)
             (_parquet_rows if path.endswith(".parquet") else _json_gz_rows)(local, rows, ranges, writer)
             writer.close()
         finally:
@@ -243,8 +249,10 @@ def cmd_stage(args) -> None:
         raise ValueError(f"the split gives rank {args.rank} another number of documents than the plan's {planned}")
     out_dir = Path(args.out).expanduser()
     out_dir.mkdir(parents=True, exist_ok=True)
-    jobs = [(args.corpus, f["path"], f["rows"], file_ranges, str(out_dir / share_file_name(f["path"], args.rank, hosts)))
-            for f, file_ranges in zip(plan["files"], mine)]
+    download_dir = Path(args.download_dir).expanduser() if args.download_dir else out_dir
+    download_dir.mkdir(parents=True, exist_ok=True)
+    jobs = [(args.corpus, f["path"], f["rows"], file_ranges, str(out_dir / share_file_name(f["path"], args.rank, hosts)),
+             str(download_dir)) for f, file_ranges in zip(plan["files"], mine)]
     print(f"rank {args.rank} of {hosts}: {len(jobs)} files, {planned['documents']:,} documents, "
           f"{planned['tokens']:,} tokens planned, {args.workers} files at a time", flush=True)
     t = time.time()
@@ -255,7 +263,7 @@ def cmd_stage(args) -> None:
             path, n, nbytes, seconds = future.result()
             done += 1
             print(f"[{done}/{len(jobs)}] {Path(path).name}: {n:,} rows, {nbytes / 1e9:.2f} GB, {seconds:.0f} s", flush=True)
-    paths = [job[-1] for job in jobs]
+    paths = [job[4] for job in jobs]
     documents = sum(pq.ParquetFile(p).metadata.num_rows for p in paths)
     nbytes = sum(Path(p).stat().st_size for p in paths)
     if documents != planned["documents"]:
@@ -282,6 +290,9 @@ def main(argv=None) -> None:
     s.add_argument("--out", required=True, help="directory of the share's parquet files")
     s.add_argument("--list", required=True, help="file to write the share's paths to, for --data-files-list")
     s.add_argument("--workers", type=int, default=6, help="source files downloaded at a time; each needs its size on disk")
+    s.add_argument("--download-dir", default=None,
+                   help="where a source file waits while its rows are taken, e.g. /dev/shm: then the disk only writes "
+                        "the share (default: --out)")
     s.set_defaults(func=cmd_stage)
     args = parser.parse_args(argv)
     args.func(args)

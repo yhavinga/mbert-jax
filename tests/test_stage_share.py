@@ -144,7 +144,8 @@ def test_staged_shares_hold_every_document_once_in_the_file_order(tmp_path, monk
         # One file at a time in this process: the fake download is patched here only
         monkeypatch.setattr(stage_share.cf, "ProcessPoolExecutor", stage_share.cf.ThreadPoolExecutor)
         stage_share.main(["stage", "--corpus", corpus, "--rank", str(rank), "--out", str(tmp_path / f"w{rank}"),
-                          "--list", str(tmp_path / f"w{rank}.txt"), "--workers", "1"])
+                          "--list", str(tmp_path / f"w{rank}.txt"), "--workers", "1", "--download-dir", str(tmp_path / "shm")])
+        assert not list((tmp_path / "shm").iterdir()), "a download was left behind"
         listed = (tmp_path / f"w{rank}.txt").read_text().split()
         assert [Path(p).name for p in listed] == [f"{n}-w{rank}of4.parquet" for n in ("a", "b", "c")]
         assert pq.read_schema(listed[0]).names == ["text"]

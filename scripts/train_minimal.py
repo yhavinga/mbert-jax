@@ -291,6 +291,36 @@ def restore_data_state(path, data_loader, identity, allow_restart):
     print(f"Data state restored on process {jax.process_index()} at step {saved['step']}: {saved['state']}", flush=True)
 
 
+def load_params_of_run(step_dir, target_params):
+    """The parameters saved in step_dir by another run, in the shapes, dtypes and shardings of target_params.
+
+    Only the parameters are read: that run's optimizer state and step stay behind. All hosts call this, as
+    they do the restore of a resume, and each gets the arrays in target_params' (replicated) sharding.
+    """
+    item_dir = epath.Path(step_dir) / "default"
+    if not item_dir.exists():
+        raise FileNotFoundError(f"--init-from {step_dir}: no {item_dir}, so this is no step directory of an Orbax checkpoint")
+    if str(step_dir).startswith("gs://") and not (epath.Path(step_dir) / "commit_success.txt").exists():
+        # On GCS Orbax marks a finished save with this file; without it the save may have been cut off
+        raise FileNotFoundError(f"--init-from {step_dir}: no commit_success.txt, the save of this checkpoint did not finish")
+    checkpointer = ocp.PyTreeCheckpointer()
+    saved = checkpointer.metadata(item_dir).item_metadata
+    if "params" not in saved:
+        raise ValueError(f"--init-from {step_dir}: no 'params' in the checkpoint, only {sorted(saved)}")
+    saved_shapes = {path: (tuple(leaf.shape), np.dtype(leaf.dtype)) for path, leaf in traverse_util.flatten_dict(dict(saved["params"])).items()}
+    target_shapes = {path: (tuple(leaf.shape), np.dtype(leaf.dtype)) for path, leaf in traverse_util.flatten_dict(target_params).items()}
+    if saved_shapes != target_shapes:
+        # partial_restore would skip saved parameters this model lacks: that must not pass unnoticed
+        differ = sorted((path for path in saved_shapes.keys() | target_shapes.keys() if saved_shapes.get(path) != target_shapes.get(path)), key=str)
+        examples = "; ".join(f"{'/'.join(path)}: saved {saved_shapes.get(path)}, model {target_shapes.get(path)}" for path in differ[:3])
+        raise ValueError(f"--init-from {step_dir}: the saved parameters are not those of this model, {len(differ)} differ, e.g. {examples}")
+    item = {"params": target_params}
+    restored = checkpointer.restore(item_dir, args=ocp.args.PyTreeRestore(
+        item=item, restore_args=ocp.checkpoint_utils.construct_restore_args(item), partial_restore=True,
+    ))
+    return restored["params"]
+
+
 def create_masking_collator(masking, tokenizer):
     """The training collator of --masking, for packed plain-text data."""
     if masking == "mix":
@@ -429,6 +459,14 @@ def parse_args():
         type=str,
         default="checkpoints",
         help="Directory to save checkpoints (default: checkpoints)"
+    )
+    parser.add_argument(
+        "--init-from",
+        type=str,
+        default=None,
+        help="Step directory of another run's checkpoint, e.g. gs://bucket/run/ckpt/653000: start from its parameters "
+             "only, with a fresh optimizer, step 0 and fresh data. A checkpoint in --checkpoint-dir wins: then this "
+             "run resumes from its own (default: random initialization)"
     )
 
     # W&B arguments
@@ -1432,6 +1470,7 @@ def main(args):
             "weight_decay": weight_decay,
             "mlm_probability": {"uniform15": 0.15, "uniform30": 0.30, "mix": None}[args.masking],
             "masking": args.masking,
+            "init_from": args.init_from,
             "gradient_clipping": 1.0,
 
             # Dataset
@@ -1802,31 +1841,32 @@ def main(args):
     # For multi-host with local storage: checkpoint_manager is None on non-coordinators
     # They start fresh (no resume support without shared storage)
     start_step = 0
+    latest_step = checkpoint_manager.latest_step() if checkpoint_manager is not None else None
 
-    if checkpoint_manager is not None:
-        latest_step = checkpoint_manager.latest_step()
-
-        if latest_step is not None:
-            # Restore from latest checkpoint
-            if is_coordinator():
-                print(f"\nRestoring checkpoint from step {latest_step}...")
-            state = checkpoint_manager.restore(
-                latest_step,
-                args=ocp.args.StandardRestore(state)
-            )
-            if is_coordinator():
-                print(f"✓ Restored checkpoint from step {latest_step}")
-
-            start_step = latest_step
-            if is_coordinator():
-                print(f"✓ Resumed from step {start_step}")
-        else:
-            if is_coordinator():
-                print("\n✓ Starting fresh training")
-    else:
-        # Non-coordinator on multi-host with local storage
+    if latest_step is not None:
+        # Restore from latest checkpoint
         if is_coordinator():
-            print("\n✓ Starting fresh training")
+            print(f"\nRestoring checkpoint from step {latest_step}...")
+        state = checkpoint_manager.restore(
+            latest_step,
+            args=ocp.args.StandardRestore(state)
+        )
+        if is_coordinator():
+            print(f"✓ Restored checkpoint from step {latest_step}")
+
+        start_step = latest_step
+        if is_coordinator():
+            print(f"✓ Resumed from step {start_step}")
+            if args.init_from:
+                print(f"  --init-from {args.init_from} not used: this run resumes from its own checkpoint")
+    elif args.init_from:
+        if is_coordinator():
+            print(f"\nLoading the parameters of {args.init_from} (--init-from)...")
+        state = state.replace(params=load_params_of_run(args.init_from, state.params))
+        if is_coordinator():
+            print(f"✓ Parameters of {args.init_from}; optimizer, step 0 and data start fresh")
+    elif is_coordinator():
+        print("\n✓ Starting fresh training")
 
     # The other half of a packed checkpoint: where this host's data was, so it isn't trained on again
     if args.use_packing:

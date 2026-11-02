@@ -295,6 +295,18 @@ def worker_main(spec):
 
     tm.to_global = to_global_recording
 
+    real_load_params_of_run = tm.load_params_of_run
+
+    def load_params_of_run_recording(step_dir, target_params):
+        loaded = real_load_params_of_run(step_dir, target_params)
+        record["init_from"] = {
+            "digests": _digest_per_device(loaded),
+            "replicated": all(leaf.is_fully_replicated for leaf in jax.tree_util.tree_leaves(loaded)),
+        }
+        return loaded
+
+    tm.load_params_of_run = load_params_of_run_recording
+
     state = tm.main(tm.parse_args())
 
     np.savez(output / f"params_{process_id}.npz", **_flat_numpy(state.params))
@@ -309,6 +321,10 @@ def worker_main(spec):
         "state_step": int(state.step),
         "first_rows": record["first_rows"],
         "restored": record["restored"],
+        "init_from": record.get("init_from"),
+        # The step counts in the optimizer state: a fresh optimizer counts from 0
+        "optimizer_counts": sorted({int(leaf) for leaf in jax.tree_util.tree_leaves(state.opt_state)
+                                    if np.ndim(leaf) == 0 and np.issubdtype(leaf.dtype, np.integer)}),
     }))
 
 
@@ -743,6 +759,76 @@ def test_resume_in_another_masking_mode_is_refused(tmp_path):
     resumed, logs = _run(tmp_path, "same", 2, 2, max_steps=4, extra_args=["--masking", "mix"], **spec)
     assert resumed[0]["state_step"] == 4
     assert "Data state restored" in logs[0]
+
+
+def test_init_from_takes_the_parameters_only_with_a_fresh_optimizer_step_and_data(tmp_path):
+    spec = dict(route="packed", data="real_pipeline", per_device=2, rows_per_shard=500, checkpoint_every=6,
+                longest_document=3 * MAX_LENGTH)
+    # 12 steps: far enough from the random start that a phase run from there is told apart below
+    base, _ = _run(tmp_path, "base", 2, 2, max_steps=12, checkpoint_dir=str(tmp_path / "ckpt_base"), **spec)
+    phase, logs = _run(tmp_path, "phase", 2, 2, max_steps=3, checkpoint_dir=str(tmp_path / "ckpt_phase"),
+                       extra_args=["--init-from", str(tmp_path / "ckpt_base" / "12")], **spec)
+    base_digest = next(iter(base[0]["digests"].values()))
+    for result in phase:
+        # Every chip of every host got the bytes the other run saved last
+        assert result["init_from"]["replicated"]
+        assert set(result["init_from"]["digests"].values()) == {base_digest}
+        assert result["restored"] is None
+        assert result["state_step"] == 3
+        assert result["optimizer_counts"] == [3], "the optimizer state of the other run came along"
+    _assert_identical_across_hosts_and_chips(phase)
+    assert "optimizer, step 0 and data start fresh" in logs[0]
+    for process_id in range(2):
+        # The data stream from its start again, not where the other run stopped
+        assert _raw_batches(tmp_path, "phase", process_id) == _raw_batches(tmp_path, "base", process_id)[:3]
+    # It trained on from the loaded parameters: 3 steps (the first two at lr 0) move them less than the
+    # 12 steps of the other run moved its random start, which this run's own random start equals
+    final, loaded, random = _params(tmp_path, "phase"), _params(tmp_path, "base"), _params(tmp_path, "phase", kind="init")
+    assert _max_abs_diff(final, loaded) < 0.5 * _max_abs_diff(loaded, random)
+    assert _max_abs_diff(final, loaded) > 100 * PARAM_ABS_TOL
+
+
+def test_a_resume_of_the_run_itself_wins_over_init_from(tmp_path):
+    spec = dict(route="packed", data="real_pipeline", per_device=2, rows_per_shard=500, checkpoint_every=2, max_steps=4)
+    _run(tmp_path, "base", 2, 2, checkpoint_dir=str(tmp_path / "ckpt_base"), **spec)
+    init = ["--init-from", str(tmp_path / "ckpt_base" / "4")]
+    ckpt = str(tmp_path / "ckpt_phase")
+    whole, _ = _run(tmp_path, "whole", 2, 2, checkpoint_dir=str(tmp_path / "ckpt_whole"), extra_args=init, **spec)
+    stopped, _ = _run(tmp_path, "stopped", 2, 2, checkpoint_dir=ckpt, extra_args=init + ["--stop-at-step", "2"], **spec)
+    assert stopped[0]["init_from"] is not None and stopped[0]["state_step"] == 2
+
+    resumed, logs = _run(tmp_path, "resumed", 2, 2, checkpoint_dir=ckpt, extra_args=init, **spec)
+    stopped_digest = next(iter(stopped[0]["digests"].values()))
+    for process_id, result in enumerate(resumed):
+        assert result["init_from"] is None, "the parameters of --init-from replaced those of the run's own checkpoint"
+        assert result["restored"]["step"] == 2
+        assert set(result["restored"]["digests"].values()) == {stopped_digest}
+        assert result["state_step"] == 4
+        # The optimizer state of its own checkpoint, not a fresh one
+        assert result["optimizer_counts"] == [4]
+        assert "Data state restored" in logs[process_id]
+        assert _raw_batches(tmp_path, "resumed", process_id) == _raw_batches(tmp_path, "whole", process_id)[2:4]
+    assert f"--init-from {init[1]} not used: this run resumes from its own checkpoint" in logs[0]
+    _assert_identical_across_hosts_and_chips(resumed)
+
+
+def test_init_from_refuses_what_is_not_a_checkpoint_of_this_model(tmp_path):
+    spec = dict(route="packed", data="real_pipeline", per_device=2, rows_per_shard=500, checkpoint_every=2, max_steps=2)
+    _run(tmp_path, "base", 2, 2, checkpoint_dir=str(tmp_path / "ckpt_base"), **spec)
+    cases = {
+        "wider": (["--init-from", str(tmp_path / "ckpt_base" / "2"), "--intermediate-size", "48"],
+                  "the saved parameters are not those of this model"),
+        "missing": (["--init-from", str(tmp_path / "ckpt_base" / "3")], "so this is no step directory of an Orbax checkpoint"),
+    }
+    for name, (extra_args, message) in cases.items():
+        output, procs = _start(tmp_path, name, 2, 2, checkpoint_dir=str(tmp_path / f"ckpt_{name}"), extra_args=extra_args, **spec)
+        try:
+            codes = _wait_for_workers(procs)
+        finally:
+            _kill_workers(procs)
+        # Both hosts check; the first to fail ends the wait, the other may still be on its way
+        assert 1 in codes and 0 not in codes, (name, codes)
+        assert message in "".join((output / f"stdout_{i}.log").read_text() for i in range(2)), name
 
 
 def test_trackio_on_the_coordinator_with_per_chip_metrics_and_sync(tmp_path):

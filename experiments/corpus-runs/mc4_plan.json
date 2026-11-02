@@ -1,0 +1,5155 @@
+{
+ "corpus": "mc4",
+ "repo": "yhavinga/mc4_nl_cleaned",
+ "config": "full",
+ "revision": "187180b617793d6415c93fd2f950e34f8bf3e199",
+ "hosts": 4,
+ "segment_rows": 1000,
+ "documents": 64545895,
+ "tokens": 36490323233,
+ "tokens_note": "without <s> and </s>, of yhavinga/dutch-llama-tokenizer as the trainer tokenizes (count_tokens.py)",
+ "shares": [
+  {
+   "rank": 0,
+   "documents": 16136474,
+   "tokens": 9123844185
+  },
+  {
+   "rank": 1,
+   "documents": 16136474,
+   "tokens": 9119933509
+  },
+  {
+   "rank": 2,
+   "documents": 16136474,
+   "tokens": 9117220608
+  },
+  {
+   "rank": 3,
+   "documents": 16136473,
+   "tokens": 9129324931
+  }
+ ],
+ "files": [
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00000-of-01024.json.gz",
+   "rows": 62981,
+   "tokens": 35426935
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00001-of-01024.json.gz",
+   "rows": 62969,
+   "tokens": 35660256
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00002-of-01024.json.gz",
+   "rows": 63066,
+   "tokens": 35285966
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00003-of-01024.json.gz",
+   "rows": 63404,
+   "tokens": 35675349
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00004-of-01024.json.gz",
+   "rows": 62903,
+   "tokens": 35835636
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00005-of-01024.json.gz",
+   "rows": 63265,
+   "tokens": 35897252
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00006-of-01024.json.gz",
+   "rows": 63258,
+   "tokens": 35709080
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00007-of-01024.json.gz",
+   "rows": 63045,
+   "tokens": 35587416
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00008-of-01024.json.gz",
+   "rows": 63206,
+   "tokens": 36072785
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00009-of-01024.json.gz",
+   "rows": 63106,
+   "tokens": 35453706
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00010-of-01024.json.gz",
+   "rows": 62939,
+   "tokens": 35492163
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00011-of-01024.json.gz",
+   "rows": 62920,
+   "tokens": 35889143
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00012-of-01024.json.gz",
+   "rows": 63311,
+   "tokens": 35784689
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00013-of-01024.json.gz",
+   "rows": 63078,
+   "tokens": 35637441
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00014-of-01024.json.gz",
+   "rows": 63014,
+   "tokens": 35360096
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00015-of-01024.json.gz",
+   "rows": 62923,
+   "tokens": 35425509
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00016-of-01024.json.gz",
+   "rows": 63063,
+   "tokens": 35719528
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00017-of-01024.json.gz",
+   "rows": 63105,
+   "tokens": 35827431
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00018-of-01024.json.gz",
+   "rows": 62755,
+   "tokens": 35560628
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00019-of-01024.json.gz",
+   "rows": 63177,
+   "tokens": 35645411
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00020-of-01024.json.gz",
+   "rows": 63108,
+   "tokens": 35653970
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00021-of-01024.json.gz",
+   "rows": 63386,
+   "tokens": 35890851
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00022-of-01024.json.gz",
+   "rows": 63015,
+   "tokens": 35324810
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00023-of-01024.json.gz",
+   "rows": 63249,
+   "tokens": 35666489
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00024-of-01024.json.gz",
+   "rows": 62896,
+   "tokens": 35446000
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00025-of-01024.json.gz",
+   "rows": 62816,
+   "tokens": 35384031
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00026-of-01024.json.gz",
+   "rows": 63317,
+   "tokens": 35570425
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00027-of-01024.json.gz",
+   "rows": 63100,
+   "tokens": 35797616
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00028-of-01024.json.gz",
+   "rows": 63077,
+   "tokens": 35935884
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00029-of-01024.json.gz",
+   "rows": 62934,
+   "tokens": 35802102
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00030-of-01024.json.gz",
+   "rows": 63019,
+   "tokens": 35579098
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00031-of-01024.json.gz",
+   "rows": 63183,
+   "tokens": 36000564
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00032-of-01024.json.gz",
+   "rows": 63013,
+   "tokens": 35648430
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00033-of-01024.json.gz",
+   "rows": 63266,
+   "tokens": 36045778
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00034-of-01024.json.gz",
+   "rows": 63078,
+   "tokens": 36150873
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00035-of-01024.json.gz",
+   "rows": 63238,
+   "tokens": 36012117
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00036-of-01024.json.gz",
+   "rows": 62978,
+   "tokens": 35931257
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00037-of-01024.json.gz",
+   "rows": 63082,
+   "tokens": 35594022
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00038-of-01024.json.gz",
+   "rows": 62966,
+   "tokens": 35822580
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00039-of-01024.json.gz",
+   "rows": 63220,
+   "tokens": 36012704
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00040-of-01024.json.gz",
+   "rows": 63187,
+   "tokens": 35571756
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00041-of-01024.json.gz",
+   "rows": 63047,
+   "tokens": 35658613
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00042-of-01024.json.gz",
+   "rows": 62916,
+   "tokens": 35313613
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00043-of-01024.json.gz",
+   "rows": 63104,
+   "tokens": 35742467
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00044-of-01024.json.gz",
+   "rows": 62790,
+   "tokens": 35521752
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00045-of-01024.json.gz",
+   "rows": 62952,
+   "tokens": 35624396
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00046-of-01024.json.gz",
+   "rows": 63190,
+   "tokens": 35854905
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00047-of-01024.json.gz",
+   "rows": 63094,
+   "tokens": 35619515
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00048-of-01024.json.gz",
+   "rows": 63262,
+   "tokens": 35391276
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00049-of-01024.json.gz",
+   "rows": 62870,
+   "tokens": 35687772
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00050-of-01024.json.gz",
+   "rows": 62764,
+   "tokens": 35462813
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00051-of-01024.json.gz",
+   "rows": 63012,
+   "tokens": 35377215
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00052-of-01024.json.gz",
+   "rows": 62838,
+   "tokens": 35397936
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00053-of-01024.json.gz",
+   "rows": 63166,
+   "tokens": 35188372
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00054-of-01024.json.gz",
+   "rows": 62973,
+   "tokens": 35542750
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00055-of-01024.json.gz",
+   "rows": 62821,
+   "tokens": 35622025
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00056-of-01024.json.gz",
+   "rows": 62872,
+   "tokens": 35522422
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00057-of-01024.json.gz",
+   "rows": 62877,
+   "tokens": 35222234
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00058-of-01024.json.gz",
+   "rows": 63047,
+   "tokens": 36032155
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00059-of-01024.json.gz",
+   "rows": 63012,
+   "tokens": 35373296
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00060-of-01024.json.gz",
+   "rows": 62969,
+   "tokens": 35390477
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00061-of-01024.json.gz",
+   "rows": 62978,
+   "tokens": 35741810
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00062-of-01024.json.gz",
+   "rows": 62762,
+   "tokens": 35802918
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00063-of-01024.json.gz",
+   "rows": 62682,
+   "tokens": 35284435
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00064-of-01024.json.gz",
+   "rows": 62970,
+   "tokens": 35666963
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00065-of-01024.json.gz",
+   "rows": 63259,
+   "tokens": 35682595
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00066-of-01024.json.gz",
+   "rows": 63306,
+   "tokens": 36062686
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00067-of-01024.json.gz",
+   "rows": 63056,
+   "tokens": 35436461
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00068-of-01024.json.gz",
+   "rows": 62836,
+   "tokens": 35537780
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00069-of-01024.json.gz",
+   "rows": 63271,
+   "tokens": 35832896
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00070-of-01024.json.gz",
+   "rows": 63266,
+   "tokens": 35904594
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00071-of-01024.json.gz",
+   "rows": 63250,
+   "tokens": 35628228
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00072-of-01024.json.gz",
+   "rows": 63139,
+   "tokens": 36063770
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00073-of-01024.json.gz",
+   "rows": 62973,
+   "tokens": 35487215
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00074-of-01024.json.gz",
+   "rows": 62863,
+   "tokens": 35539652
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00075-of-01024.json.gz",
+   "rows": 62779,
+   "tokens": 35438021
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00076-of-01024.json.gz",
+   "rows": 63060,
+   "tokens": 35704692
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00077-of-01024.json.gz",
+   "rows": 63212,
+   "tokens": 35645669
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00078-of-01024.json.gz",
+   "rows": 63330,
+   "tokens": 35654648
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00079-of-01024.json.gz",
+   "rows": 62995,
+   "tokens": 35758090
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00080-of-01024.json.gz",
+   "rows": 62999,
+   "tokens": 35485721
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00081-of-01024.json.gz",
+   "rows": 63001,
+   "tokens": 35764071
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00082-of-01024.json.gz",
+   "rows": 62856,
+   "tokens": 35286776
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00083-of-01024.json.gz",
+   "rows": 63136,
+   "tokens": 35516436
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00084-of-01024.json.gz",
+   "rows": 63148,
+   "tokens": 35861844
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00085-of-01024.json.gz",
+   "rows": 62843,
+   "tokens": 35408111
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00086-of-01024.json.gz",
+   "rows": 63209,
+   "tokens": 35604199
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00087-of-01024.json.gz",
+   "rows": 62973,
+   "tokens": 35643376
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00088-of-01024.json.gz",
+   "rows": 63224,
+   "tokens": 35509103
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00089-of-01024.json.gz",
+   "rows": 63266,
+   "tokens": 35654518
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00090-of-01024.json.gz",
+   "rows": 62904,
+   "tokens": 35195510
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00091-of-01024.json.gz",
+   "rows": 62902,
+   "tokens": 35310785
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00092-of-01024.json.gz",
+   "rows": 62685,
+   "tokens": 35141459
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00093-of-01024.json.gz",
+   "rows": 63010,
+   "tokens": 35708960
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00094-of-01024.json.gz",
+   "rows": 62977,
+   "tokens": 35562606
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00095-of-01024.json.gz",
+   "rows": 62960,
+   "tokens": 35940441
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00096-of-01024.json.gz",
+   "rows": 62869,
+   "tokens": 35406958
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00097-of-01024.json.gz",
+   "rows": 62811,
+   "tokens": 35323073
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00098-of-01024.json.gz",
+   "rows": 63037,
+   "tokens": 35640786
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00099-of-01024.json.gz",
+   "rows": 62904,
+   "tokens": 36068767
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00100-of-01024.json.gz",
+   "rows": 63080,
+   "tokens": 35866953
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00101-of-01024.json.gz",
+   "rows": 62971,
+   "tokens": 35738362
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00102-of-01024.json.gz",
+   "rows": 63455,
+   "tokens": 35733939
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00103-of-01024.json.gz",
+   "rows": 62954,
+   "tokens": 35747084
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00104-of-01024.json.gz",
+   "rows": 62893,
+   "tokens": 35632123
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00105-of-01024.json.gz",
+   "rows": 62946,
+   "tokens": 35749688
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00106-of-01024.json.gz",
+   "rows": 63072,
+   "tokens": 35657541
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00107-of-01024.json.gz",
+   "rows": 62918,
+   "tokens": 35921916
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00108-of-01024.json.gz",
+   "rows": 63230,
+   "tokens": 36018927
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00109-of-01024.json.gz",
+   "rows": 63177,
+   "tokens": 35622038
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00110-of-01024.json.gz",
+   "rows": 63064,
+   "tokens": 35810445
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00111-of-01024.json.gz",
+   "rows": 63034,
+   "tokens": 35647517
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00112-of-01024.json.gz",
+   "rows": 63040,
+   "tokens": 35795499
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00113-of-01024.json.gz",
+   "rows": 62994,
+   "tokens": 35235296
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00114-of-01024.json.gz",
+   "rows": 63075,
+   "tokens": 35783486
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00115-of-01024.json.gz",
+   "rows": 62901,
+   "tokens": 35344632
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00116-of-01024.json.gz",
+   "rows": 62993,
+   "tokens": 35816987
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00117-of-01024.json.gz",
+   "rows": 62923,
+   "tokens": 35925921
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00118-of-01024.json.gz",
+   "rows": 62991,
+   "tokens": 35634314
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00119-of-01024.json.gz",
+   "rows": 63006,
+   "tokens": 35846954
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00120-of-01024.json.gz",
+   "rows": 62904,
+   "tokens": 35349341
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00121-of-01024.json.gz",
+   "rows": 63032,
+   "tokens": 35805925
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00122-of-01024.json.gz",
+   "rows": 63011,
+   "tokens": 35462190
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00123-of-01024.json.gz",
+   "rows": 63043,
+   "tokens": 35324032
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00124-of-01024.json.gz",
+   "rows": 63050,
+   "tokens": 35708583
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00125-of-01024.json.gz",
+   "rows": 63155,
+   "tokens": 35868104
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00126-of-01024.json.gz",
+   "rows": 62751,
+   "tokens": 35265909
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00127-of-01024.json.gz",
+   "rows": 62889,
+   "tokens": 35750333
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00128-of-01024.json.gz",
+   "rows": 63168,
+   "tokens": 35302137
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00129-of-01024.json.gz",
+   "rows": 63260,
+   "tokens": 35910420
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00130-of-01024.json.gz",
+   "rows": 63251,
+   "tokens": 36044891
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00131-of-01024.json.gz",
+   "rows": 63025,
+   "tokens": 35677831
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00132-of-01024.json.gz",
+   "rows": 63175,
+   "tokens": 35655327
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00133-of-01024.json.gz",
+   "rows": 63139,
+   "tokens": 35449065
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00134-of-01024.json.gz",
+   "rows": 63017,
+   "tokens": 35816602
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00135-of-01024.json.gz",
+   "rows": 63248,
+   "tokens": 36252008
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00136-of-01024.json.gz",
+   "rows": 63005,
+   "tokens": 35765230
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00137-of-01024.json.gz",
+   "rows": 63116,
+   "tokens": 35540435
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00138-of-01024.json.gz",
+   "rows": 63133,
+   "tokens": 35565004
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00139-of-01024.json.gz",
+   "rows": 63031,
+   "tokens": 35935866
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00140-of-01024.json.gz",
+   "rows": 63010,
+   "tokens": 35417054
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00141-of-01024.json.gz",
+   "rows": 63151,
+   "tokens": 35254814
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00142-of-01024.json.gz",
+   "rows": 63098,
+   "tokens": 36116156
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00143-of-01024.json.gz",
+   "rows": 63058,
+   "tokens": 35438075
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00144-of-01024.json.gz",
+   "rows": 63084,
+   "tokens": 35649471
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00145-of-01024.json.gz",
+   "rows": 63232,
+   "tokens": 35595197
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00146-of-01024.json.gz",
+   "rows": 62997,
+   "tokens": 35505314
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00147-of-01024.json.gz",
+   "rows": 62806,
+   "tokens": 35586646
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00148-of-01024.json.gz",
+   "rows": 62761,
+   "tokens": 35583080
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00149-of-01024.json.gz",
+   "rows": 62839,
+   "tokens": 35669615
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00150-of-01024.json.gz",
+   "rows": 63287,
+   "tokens": 35955103
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00151-of-01024.json.gz",
+   "rows": 62956,
+   "tokens": 35467552
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00152-of-01024.json.gz",
+   "rows": 62978,
+   "tokens": 35541005
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00153-of-01024.json.gz",
+   "rows": 62856,
+   "tokens": 35606226
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00154-of-01024.json.gz",
+   "rows": 62921,
+   "tokens": 35542407
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00155-of-01024.json.gz",
+   "rows": 63121,
+   "tokens": 35615278
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00156-of-01024.json.gz",
+   "rows": 62863,
+   "tokens": 35657573
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00157-of-01024.json.gz",
+   "rows": 63185,
+   "tokens": 35380036
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00158-of-01024.json.gz",
+   "rows": 62983,
+   "tokens": 35655093
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00159-of-01024.json.gz",
+   "rows": 62824,
+   "tokens": 35340316
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00160-of-01024.json.gz",
+   "rows": 63003,
+   "tokens": 35407342
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00161-of-01024.json.gz",
+   "rows": 62996,
+   "tokens": 35849669
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00162-of-01024.json.gz",
+   "rows": 62743,
+   "tokens": 35511589
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00163-of-01024.json.gz",
+   "rows": 63052,
+   "tokens": 35567773
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00164-of-01024.json.gz",
+   "rows": 63207,
+   "tokens": 35543293
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00165-of-01024.json.gz",
+   "rows": 62792,
+   "tokens": 35744393
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00166-of-01024.json.gz",
+   "rows": 63091,
+   "tokens": 35472205
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00167-of-01024.json.gz",
+   "rows": 62740,
+   "tokens": 35323527
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00168-of-01024.json.gz",
+   "rows": 62798,
+   "tokens": 35505508
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00169-of-01024.json.gz",
+   "rows": 63160,
+   "tokens": 35920398
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00170-of-01024.json.gz",
+   "rows": 63137,
+   "tokens": 35882907
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00171-of-01024.json.gz",
+   "rows": 63026,
+   "tokens": 35716271
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00172-of-01024.json.gz",
+   "rows": 63324,
+   "tokens": 35989266
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00173-of-01024.json.gz",
+   "rows": 62718,
+   "tokens": 35619993
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00174-of-01024.json.gz",
+   "rows": 62999,
+   "tokens": 35953114
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00175-of-01024.json.gz",
+   "rows": 63079,
+   "tokens": 35592984
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00176-of-01024.json.gz",
+   "rows": 63140,
+   "tokens": 35593251
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00177-of-01024.json.gz",
+   "rows": 62935,
+   "tokens": 35466844
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00178-of-01024.json.gz",
+   "rows": 63349,
+   "tokens": 35896764
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00179-of-01024.json.gz",
+   "rows": 63073,
+   "tokens": 35431217
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00180-of-01024.json.gz",
+   "rows": 63272,
+   "tokens": 35849572
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00181-of-01024.json.gz",
+   "rows": 62881,
+   "tokens": 35262574
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00182-of-01024.json.gz",
+   "rows": 62945,
+   "tokens": 35817773
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00183-of-01024.json.gz",
+   "rows": 63343,
+   "tokens": 36048511
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00184-of-01024.json.gz",
+   "rows": 63218,
+   "tokens": 35778481
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00185-of-01024.json.gz",
+   "rows": 62932,
+   "tokens": 35790723
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00186-of-01024.json.gz",
+   "rows": 63226,
+   "tokens": 35617315
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00187-of-01024.json.gz",
+   "rows": 63015,
+   "tokens": 35536688
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00188-of-01024.json.gz",
+   "rows": 62983,
+   "tokens": 35974696
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00189-of-01024.json.gz",
+   "rows": 62912,
+   "tokens": 35499763
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00190-of-01024.json.gz",
+   "rows": 63157,
+   "tokens": 35429937
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00191-of-01024.json.gz",
+   "rows": 63069,
+   "tokens": 35584551
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00192-of-01024.json.gz",
+   "rows": 63117,
+   "tokens": 35639249
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00193-of-01024.json.gz",
+   "rows": 62955,
+   "tokens": 35338309
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00194-of-01024.json.gz",
+   "rows": 63068,
+   "tokens": 35721827
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00195-of-01024.json.gz",
+   "rows": 63033,
+   "tokens": 35718171
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00196-of-01024.json.gz",
+   "rows": 63041,
+   "tokens": 35229535
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00197-of-01024.json.gz",
+   "rows": 62993,
+   "tokens": 35353405
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00198-of-01024.json.gz",
+   "rows": 63047,
+   "tokens": 35523769
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00199-of-01024.json.gz",
+   "rows": 62961,
+   "tokens": 35550335
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00200-of-01024.json.gz",
+   "rows": 63196,
+   "tokens": 35894216
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00201-of-01024.json.gz",
+   "rows": 62916,
+   "tokens": 35711947
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00202-of-01024.json.gz",
+   "rows": 63129,
+   "tokens": 35977055
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00203-of-01024.json.gz",
+   "rows": 63245,
+   "tokens": 35776567
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00204-of-01024.json.gz",
+   "rows": 63067,
+   "tokens": 35692792
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00205-of-01024.json.gz",
+   "rows": 63003,
+   "tokens": 35897468
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00206-of-01024.json.gz",
+   "rows": 63133,
+   "tokens": 35952700
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00207-of-01024.json.gz",
+   "rows": 63184,
+   "tokens": 36224571
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00208-of-01024.json.gz",
+   "rows": 62962,
+   "tokens": 35492941
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00209-of-01024.json.gz",
+   "rows": 63107,
+   "tokens": 35377320
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00210-of-01024.json.gz",
+   "rows": 62900,
+   "tokens": 35613051
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00211-of-01024.json.gz",
+   "rows": 63089,
+   "tokens": 35648196
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00212-of-01024.json.gz",
+   "rows": 62990,
+   "tokens": 35698864
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00213-of-01024.json.gz",
+   "rows": 62930,
+   "tokens": 35594829
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00214-of-01024.json.gz",
+   "rows": 63100,
+   "tokens": 35702708
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00215-of-01024.json.gz",
+   "rows": 62963,
+   "tokens": 35275652
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00216-of-01024.json.gz",
+   "rows": 63128,
+   "tokens": 35686726
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00217-of-01024.json.gz",
+   "rows": 62985,
+   "tokens": 35928554
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00218-of-01024.json.gz",
+   "rows": 63182,
+   "tokens": 35666448
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00219-of-01024.json.gz",
+   "rows": 63061,
+   "tokens": 35728397
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00220-of-01024.json.gz",
+   "rows": 63104,
+   "tokens": 35515083
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00221-of-01024.json.gz",
+   "rows": 62884,
+   "tokens": 35391999
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00222-of-01024.json.gz",
+   "rows": 62734,
+   "tokens": 35299059
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00223-of-01024.json.gz",
+   "rows": 62845,
+   "tokens": 35699365
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00224-of-01024.json.gz",
+   "rows": 63140,
+   "tokens": 35660044
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00225-of-01024.json.gz",
+   "rows": 63193,
+   "tokens": 35611634
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00226-of-01024.json.gz",
+   "rows": 62901,
+   "tokens": 35117353
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00227-of-01024.json.gz",
+   "rows": 62912,
+   "tokens": 35545273
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00228-of-01024.json.gz",
+   "rows": 63203,
+   "tokens": 35747258
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00229-of-01024.json.gz",
+   "rows": 63130,
+   "tokens": 35723854
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00230-of-01024.json.gz",
+   "rows": 63089,
+   "tokens": 35353831
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00231-of-01024.json.gz",
+   "rows": 63035,
+   "tokens": 35669399
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00232-of-01024.json.gz",
+   "rows": 62953,
+   "tokens": 35646675
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00233-of-01024.json.gz",
+   "rows": 63269,
+   "tokens": 35775357
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00234-of-01024.json.gz",
+   "rows": 63112,
+   "tokens": 35341865
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00235-of-01024.json.gz",
+   "rows": 62973,
+   "tokens": 35545101
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00236-of-01024.json.gz",
+   "rows": 63125,
+   "tokens": 35523787
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00237-of-01024.json.gz",
+   "rows": 62981,
+   "tokens": 35369366
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00238-of-01024.json.gz",
+   "rows": 63011,
+   "tokens": 35533527
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00239-of-01024.json.gz",
+   "rows": 63050,
+   "tokens": 35472579
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00240-of-01024.json.gz",
+   "rows": 62948,
+   "tokens": 35638246
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00241-of-01024.json.gz",
+   "rows": 63026,
+   "tokens": 35800502
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00242-of-01024.json.gz",
+   "rows": 63095,
+   "tokens": 35333089
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00243-of-01024.json.gz",
+   "rows": 63166,
+   "tokens": 35655586
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00244-of-01024.json.gz",
+   "rows": 62694,
+   "tokens": 35973772
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00245-of-01024.json.gz",
+   "rows": 62888,
+   "tokens": 35525386
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00246-of-01024.json.gz",
+   "rows": 63003,
+   "tokens": 35261140
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00247-of-01024.json.gz",
+   "rows": 63158,
+   "tokens": 35940487
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00248-of-01024.json.gz",
+   "rows": 62950,
+   "tokens": 35376265
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00249-of-01024.json.gz",
+   "rows": 63168,
+   "tokens": 35548605
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00250-of-01024.json.gz",
+   "rows": 63063,
+   "tokens": 35714142
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00251-of-01024.json.gz",
+   "rows": 63127,
+   "tokens": 35810352
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00252-of-01024.json.gz",
+   "rows": 63157,
+   "tokens": 35490622
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00253-of-01024.json.gz",
+   "rows": 63011,
+   "tokens": 35828378
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00254-of-01024.json.gz",
+   "rows": 63093,
+   "tokens": 35522986
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00255-of-01024.json.gz",
+   "rows": 62898,
+   "tokens": 35311730
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00256-of-01024.json.gz",
+   "rows": 63045,
+   "tokens": 35484578
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00257-of-01024.json.gz",
+   "rows": 62870,
+   "tokens": 35953611
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00258-of-01024.json.gz",
+   "rows": 63095,
+   "tokens": 35576360
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00259-of-01024.json.gz",
+   "rows": 62975,
+   "tokens": 35531801
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00260-of-01024.json.gz",
+   "rows": 63036,
+   "tokens": 35761901
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00261-of-01024.json.gz",
+   "rows": 63207,
+   "tokens": 35961583
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00262-of-01024.json.gz",
+   "rows": 63018,
+   "tokens": 35337450
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00263-of-01024.json.gz",
+   "rows": 62892,
+   "tokens": 35291529
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00264-of-01024.json.gz",
+   "rows": 62763,
+   "tokens": 35295038
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00265-of-01024.json.gz",
+   "rows": 63036,
+   "tokens": 36188774
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00266-of-01024.json.gz",
+   "rows": 62948,
+   "tokens": 35592278
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00267-of-01024.json.gz",
+   "rows": 63030,
+   "tokens": 35535880
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00268-of-01024.json.gz",
+   "rows": 63239,
+   "tokens": 35735250
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00269-of-01024.json.gz",
+   "rows": 62883,
+   "tokens": 35509105
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00270-of-01024.json.gz",
+   "rows": 63063,
+   "tokens": 35417257
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00271-of-01024.json.gz",
+   "rows": 62863,
+   "tokens": 35468397
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00272-of-01024.json.gz",
+   "rows": 63034,
+   "tokens": 35560727
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00273-of-01024.json.gz",
+   "rows": 63214,
+   "tokens": 35368350
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00274-of-01024.json.gz",
+   "rows": 63163,
+   "tokens": 35505063
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00275-of-01024.json.gz",
+   "rows": 63097,
+   "tokens": 35940119
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00276-of-01024.json.gz",
+   "rows": 63105,
+   "tokens": 35607745
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00277-of-01024.json.gz",
+   "rows": 62840,
+   "tokens": 35829522
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00278-of-01024.json.gz",
+   "rows": 62915,
+   "tokens": 35261037
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00279-of-01024.json.gz",
+   "rows": 63288,
+   "tokens": 35858096
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00280-of-01024.json.gz",
+   "rows": 63130,
+   "tokens": 35602387
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00281-of-01024.json.gz",
+   "rows": 62931,
+   "tokens": 35833410
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00282-of-01024.json.gz",
+   "rows": 63159,
+   "tokens": 35963099
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00283-of-01024.json.gz",
+   "rows": 62997,
+   "tokens": 35619515
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00284-of-01024.json.gz",
+   "rows": 63019,
+   "tokens": 35421692
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00285-of-01024.json.gz",
+   "rows": 63290,
+   "tokens": 35702535
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00286-of-01024.json.gz",
+   "rows": 63126,
+   "tokens": 35701846
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00287-of-01024.json.gz",
+   "rows": 63142,
+   "tokens": 35584263
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00288-of-01024.json.gz",
+   "rows": 62999,
+   "tokens": 35588152
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00289-of-01024.json.gz",
+   "rows": 63076,
+   "tokens": 35778398
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00290-of-01024.json.gz",
+   "rows": 62927,
+   "tokens": 35452980
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00291-of-01024.json.gz",
+   "rows": 63219,
+   "tokens": 35819900
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00292-of-01024.json.gz",
+   "rows": 63181,
+   "tokens": 35920027
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00293-of-01024.json.gz",
+   "rows": 62877,
+   "tokens": 35887374
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00294-of-01024.json.gz",
+   "rows": 62887,
+   "tokens": 35493422
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00295-of-01024.json.gz",
+   "rows": 62889,
+   "tokens": 35275906
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00296-of-01024.json.gz",
+   "rows": 63134,
+   "tokens": 35663105
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00297-of-01024.json.gz",
+   "rows": 63035,
+   "tokens": 35649678
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00298-of-01024.json.gz",
+   "rows": 63115,
+   "tokens": 35935364
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00299-of-01024.json.gz",
+   "rows": 62971,
+   "tokens": 35891790
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00300-of-01024.json.gz",
+   "rows": 63138,
+   "tokens": 35433877
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00301-of-01024.json.gz",
+   "rows": 62877,
+   "tokens": 35531979
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00302-of-01024.json.gz",
+   "rows": 63273,
+   "tokens": 35598003
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00303-of-01024.json.gz",
+   "rows": 62988,
+   "tokens": 35600365
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00304-of-01024.json.gz",
+   "rows": 63051,
+   "tokens": 35578181
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00305-of-01024.json.gz",
+   "rows": 63061,
+   "tokens": 35949919
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00306-of-01024.json.gz",
+   "rows": 62891,
+   "tokens": 35358085
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00307-of-01024.json.gz",
+   "rows": 63251,
+   "tokens": 35757364
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00308-of-01024.json.gz",
+   "rows": 63132,
+   "tokens": 35841427
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00309-of-01024.json.gz",
+   "rows": 62866,
+   "tokens": 35174596
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00310-of-01024.json.gz",
+   "rows": 62967,
+   "tokens": 35728834
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00311-of-01024.json.gz",
+   "rows": 63141,
+   "tokens": 35672349
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00312-of-01024.json.gz",
+   "rows": 63065,
+   "tokens": 35399710
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00313-of-01024.json.gz",
+   "rows": 63112,
+   "tokens": 36000318
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00314-of-01024.json.gz",
+   "rows": 63212,
+   "tokens": 35612892
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00315-of-01024.json.gz",
+   "rows": 62996,
+   "tokens": 35391535
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00316-of-01024.json.gz",
+   "rows": 62934,
+   "tokens": 35590672
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00317-of-01024.json.gz",
+   "rows": 63005,
+   "tokens": 35685223
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00318-of-01024.json.gz",
+   "rows": 63376,
+   "tokens": 35954102
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00319-of-01024.json.gz",
+   "rows": 62998,
+   "tokens": 35937528
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00320-of-01024.json.gz",
+   "rows": 62934,
+   "tokens": 35408274
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00321-of-01024.json.gz",
+   "rows": 62987,
+   "tokens": 35760038
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00322-of-01024.json.gz",
+   "rows": 62827,
+   "tokens": 35614653
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00323-of-01024.json.gz",
+   "rows": 63115,
+   "tokens": 35634137
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00324-of-01024.json.gz",
+   "rows": 63003,
+   "tokens": 35634713
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00325-of-01024.json.gz",
+   "rows": 62909,
+   "tokens": 35740105
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00326-of-01024.json.gz",
+   "rows": 63040,
+   "tokens": 35606482
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00327-of-01024.json.gz",
+   "rows": 62848,
+   "tokens": 35334444
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00328-of-01024.json.gz",
+   "rows": 62864,
+   "tokens": 35832339
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00329-of-01024.json.gz",
+   "rows": 62977,
+   "tokens": 35646726
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00330-of-01024.json.gz",
+   "rows": 62945,
+   "tokens": 35464092
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00331-of-01024.json.gz",
+   "rows": 63150,
+   "tokens": 35484386
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00332-of-01024.json.gz",
+   "rows": 62977,
+   "tokens": 35405008
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00333-of-01024.json.gz",
+   "rows": 62731,
+   "tokens": 35579466
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00334-of-01024.json.gz",
+   "rows": 63046,
+   "tokens": 35713352
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00335-of-01024.json.gz",
+   "rows": 63250,
+   "tokens": 35644182
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00336-of-01024.json.gz",
+   "rows": 62921,
+   "tokens": 35340926
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00337-of-01024.json.gz",
+   "rows": 63019,
+   "tokens": 35271820
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00338-of-01024.json.gz",
+   "rows": 63230,
+   "tokens": 35909447
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00339-of-01024.json.gz",
+   "rows": 63087,
+   "tokens": 35355360
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00340-of-01024.json.gz",
+   "rows": 63021,
+   "tokens": 35536339
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00341-of-01024.json.gz",
+   "rows": 63102,
+   "tokens": 35421557
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00342-of-01024.json.gz",
+   "rows": 63060,
+   "tokens": 35743238
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00343-of-01024.json.gz",
+   "rows": 63259,
+   "tokens": 35564689
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00344-of-01024.json.gz",
+   "rows": 62958,
+   "tokens": 35629332
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00345-of-01024.json.gz",
+   "rows": 63031,
+   "tokens": 35884958
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00346-of-01024.json.gz",
+   "rows": 62986,
+   "tokens": 35432739
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00347-of-01024.json.gz",
+   "rows": 62959,
+   "tokens": 35235802
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00348-of-01024.json.gz",
+   "rows": 63066,
+   "tokens": 35483597
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00349-of-01024.json.gz",
+   "rows": 62868,
+   "tokens": 35635208
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00350-of-01024.json.gz",
+   "rows": 62973,
+   "tokens": 35657804
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00351-of-01024.json.gz",
+   "rows": 62992,
+   "tokens": 35552749
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00352-of-01024.json.gz",
+   "rows": 62908,
+   "tokens": 35328842
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00353-of-01024.json.gz",
+   "rows": 63255,
+   "tokens": 36018237
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00354-of-01024.json.gz",
+   "rows": 63114,
+   "tokens": 35609103
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00355-of-01024.json.gz",
+   "rows": 62882,
+   "tokens": 35860729
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00356-of-01024.json.gz",
+   "rows": 62950,
+   "tokens": 35492649
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00357-of-01024.json.gz",
+   "rows": 62832,
+   "tokens": 35466168
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00358-of-01024.json.gz",
+   "rows": 62962,
+   "tokens": 35532158
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00359-of-01024.json.gz",
+   "rows": 63193,
+   "tokens": 35820829
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00360-of-01024.json.gz",
+   "rows": 62911,
+   "tokens": 35598960
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00361-of-01024.json.gz",
+   "rows": 63055,
+   "tokens": 35745488
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00362-of-01024.json.gz",
+   "rows": 63177,
+   "tokens": 35730530
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00363-of-01024.json.gz",
+   "rows": 63326,
+   "tokens": 35577645
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00364-of-01024.json.gz",
+   "rows": 62924,
+   "tokens": 35512534
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00365-of-01024.json.gz",
+   "rows": 63119,
+   "tokens": 35776249
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00366-of-01024.json.gz",
+   "rows": 62903,
+   "tokens": 35443531
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00367-of-01024.json.gz",
+   "rows": 62976,
+   "tokens": 35807412
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00368-of-01024.json.gz",
+   "rows": 62826,
+   "tokens": 35582215
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00369-of-01024.json.gz",
+   "rows": 62732,
+   "tokens": 35809990
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00370-of-01024.json.gz",
+   "rows": 62908,
+   "tokens": 35584570
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00371-of-01024.json.gz",
+   "rows": 62914,
+   "tokens": 35568124
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00372-of-01024.json.gz",
+   "rows": 63180,
+   "tokens": 35835121
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00373-of-01024.json.gz",
+   "rows": 63102,
+   "tokens": 35614906
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00374-of-01024.json.gz",
+   "rows": 63128,
+   "tokens": 35682306
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00375-of-01024.json.gz",
+   "rows": 62994,
+   "tokens": 35976718
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00376-of-01024.json.gz",
+   "rows": 63013,
+   "tokens": 35521569
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00377-of-01024.json.gz",
+   "rows": 63069,
+   "tokens": 35592577
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00378-of-01024.json.gz",
+   "rows": 62961,
+   "tokens": 35799831
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00379-of-01024.json.gz",
+   "rows": 62817,
+   "tokens": 35631960
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00380-of-01024.json.gz",
+   "rows": 63101,
+   "tokens": 35807508
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00381-of-01024.json.gz",
+   "rows": 62892,
+   "tokens": 35586782
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00382-of-01024.json.gz",
+   "rows": 63009,
+   "tokens": 35770294
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00383-of-01024.json.gz",
+   "rows": 62785,
+   "tokens": 35641726
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00384-of-01024.json.gz",
+   "rows": 63339,
+   "tokens": 35671568
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00385-of-01024.json.gz",
+   "rows": 63109,
+   "tokens": 35500823
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00386-of-01024.json.gz",
+   "rows": 63221,
+   "tokens": 35868099
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00387-of-01024.json.gz",
+   "rows": 63037,
+   "tokens": 35773267
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00388-of-01024.json.gz",
+   "rows": 63092,
+   "tokens": 35663885
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00389-of-01024.json.gz",
+   "rows": 63189,
+   "tokens": 35855218
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00390-of-01024.json.gz",
+   "rows": 63022,
+   "tokens": 35419063
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00391-of-01024.json.gz",
+   "rows": 63135,
+   "tokens": 35806262
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00392-of-01024.json.gz",
+   "rows": 62888,
+   "tokens": 35242980
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00393-of-01024.json.gz",
+   "rows": 63062,
+   "tokens": 35385634
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00394-of-01024.json.gz",
+   "rows": 62863,
+   "tokens": 35632721
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00395-of-01024.json.gz",
+   "rows": 62984,
+   "tokens": 35574986
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00396-of-01024.json.gz",
+   "rows": 63122,
+   "tokens": 35608373
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00397-of-01024.json.gz",
+   "rows": 63072,
+   "tokens": 35695842
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00398-of-01024.json.gz",
+   "rows": 62903,
+   "tokens": 35779074
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00399-of-01024.json.gz",
+   "rows": 63094,
+   "tokens": 35628458
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00400-of-01024.json.gz",
+   "rows": 62973,
+   "tokens": 35466947
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00401-of-01024.json.gz",
+   "rows": 63032,
+   "tokens": 35736607
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00402-of-01024.json.gz",
+   "rows": 62982,
+   "tokens": 35635871
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00403-of-01024.json.gz",
+   "rows": 63075,
+   "tokens": 35633740
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00404-of-01024.json.gz",
+   "rows": 63081,
+   "tokens": 35857792
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00405-of-01024.json.gz",
+   "rows": 62991,
+   "tokens": 35754708
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00406-of-01024.json.gz",
+   "rows": 63073,
+   "tokens": 35947139
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00407-of-01024.json.gz",
+   "rows": 63241,
+   "tokens": 36181436
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00408-of-01024.json.gz",
+   "rows": 62979,
+   "tokens": 35968339
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00409-of-01024.json.gz",
+   "rows": 62909,
+   "tokens": 35393232
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00410-of-01024.json.gz",
+   "rows": 63001,
+   "tokens": 35865527
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00411-of-01024.json.gz",
+   "rows": 62853,
+   "tokens": 35540312
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00412-of-01024.json.gz",
+   "rows": 63107,
+   "tokens": 35437007
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00413-of-01024.json.gz",
+   "rows": 63155,
+   "tokens": 35241363
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00414-of-01024.json.gz",
+   "rows": 63132,
+   "tokens": 35677595
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00415-of-01024.json.gz",
+   "rows": 62966,
+   "tokens": 36012204
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00416-of-01024.json.gz",
+   "rows": 63215,
+   "tokens": 35791684
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00417-of-01024.json.gz",
+   "rows": 63159,
+   "tokens": 35838480
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00418-of-01024.json.gz",
+   "rows": 62963,
+   "tokens": 35869268
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00419-of-01024.json.gz",
+   "rows": 63059,
+   "tokens": 35771021
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00420-of-01024.json.gz",
+   "rows": 63065,
+   "tokens": 36144222
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00421-of-01024.json.gz",
+   "rows": 62985,
+   "tokens": 35424305
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00422-of-01024.json.gz",
+   "rows": 62898,
+   "tokens": 35304279
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00423-of-01024.json.gz",
+   "rows": 62735,
+   "tokens": 35541691
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00424-of-01024.json.gz",
+   "rows": 63304,
+   "tokens": 35606702
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00425-of-01024.json.gz",
+   "rows": 62930,
+   "tokens": 35689439
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00426-of-01024.json.gz",
+   "rows": 63133,
+   "tokens": 35739287
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00427-of-01024.json.gz",
+   "rows": 62938,
+   "tokens": 35629585
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00428-of-01024.json.gz",
+   "rows": 62899,
+   "tokens": 35500014
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00429-of-01024.json.gz",
+   "rows": 63101,
+   "tokens": 35764630
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00430-of-01024.json.gz",
+   "rows": 63295,
+   "tokens": 35519329
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00431-of-01024.json.gz",
+   "rows": 63160,
+   "tokens": 35814871
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00432-of-01024.json.gz",
+   "rows": 63121,
+   "tokens": 35486485
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00433-of-01024.json.gz",
+   "rows": 63199,
+   "tokens": 35699676
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00434-of-01024.json.gz",
+   "rows": 63150,
+   "tokens": 35736013
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00435-of-01024.json.gz",
+   "rows": 63246,
+   "tokens": 35567272
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00436-of-01024.json.gz",
+   "rows": 63170,
+   "tokens": 35918089
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00437-of-01024.json.gz",
+   "rows": 62749,
+   "tokens": 35412251
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00438-of-01024.json.gz",
+   "rows": 63343,
+   "tokens": 36113522
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00439-of-01024.json.gz",
+   "rows": 62884,
+   "tokens": 35518174
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00440-of-01024.json.gz",
+   "rows": 62838,
+   "tokens": 35646348
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00441-of-01024.json.gz",
+   "rows": 62690,
+   "tokens": 35590008
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00442-of-01024.json.gz",
+   "rows": 63051,
+   "tokens": 35490859
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00443-of-01024.json.gz",
+   "rows": 63290,
+   "tokens": 35890671
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00444-of-01024.json.gz",
+   "rows": 63106,
+   "tokens": 35682414
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00445-of-01024.json.gz",
+   "rows": 63052,
+   "tokens": 35131035
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00446-of-01024.json.gz",
+   "rows": 62934,
+   "tokens": 35576687
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00447-of-01024.json.gz",
+   "rows": 62972,
+   "tokens": 35694219
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00448-of-01024.json.gz",
+   "rows": 63314,
+   "tokens": 35964061
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00449-of-01024.json.gz",
+   "rows": 63050,
+   "tokens": 35512853
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00450-of-01024.json.gz",
+   "rows": 62677,
+   "tokens": 35325823
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00451-of-01024.json.gz",
+   "rows": 63240,
+   "tokens": 35687762
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00452-of-01024.json.gz",
+   "rows": 63219,
+   "tokens": 35776085
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00453-of-01024.json.gz",
+   "rows": 63060,
+   "tokens": 35724224
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00454-of-01024.json.gz",
+   "rows": 63109,
+   "tokens": 35438723
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00455-of-01024.json.gz",
+   "rows": 63114,
+   "tokens": 35627201
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00456-of-01024.json.gz",
+   "rows": 63007,
+   "tokens": 35456817
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00457-of-01024.json.gz",
+   "rows": 63069,
+   "tokens": 35963253
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00458-of-01024.json.gz",
+   "rows": 63054,
+   "tokens": 35950557
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00459-of-01024.json.gz",
+   "rows": 63224,
+   "tokens": 35694138
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00460-of-01024.json.gz",
+   "rows": 62934,
+   "tokens": 35688896
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00461-of-01024.json.gz",
+   "rows": 63054,
+   "tokens": 35768007
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00462-of-01024.json.gz",
+   "rows": 63126,
+   "tokens": 36073957
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00463-of-01024.json.gz",
+   "rows": 62869,
+   "tokens": 35627528
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00464-of-01024.json.gz",
+   "rows": 63085,
+   "tokens": 35660156
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00465-of-01024.json.gz",
+   "rows": 63084,
+   "tokens": 35272689
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00466-of-01024.json.gz",
+   "rows": 62646,
+   "tokens": 35640891
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00467-of-01024.json.gz",
+   "rows": 63086,
+   "tokens": 35687347
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00468-of-01024.json.gz",
+   "rows": 63133,
+   "tokens": 36068587
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00469-of-01024.json.gz",
+   "rows": 63266,
+   "tokens": 35852669
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00470-of-01024.json.gz",
+   "rows": 63079,
+   "tokens": 35644429
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00471-of-01024.json.gz",
+   "rows": 63357,
+   "tokens": 36197059
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00472-of-01024.json.gz",
+   "rows": 63194,
+   "tokens": 35902741
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00473-of-01024.json.gz",
+   "rows": 63270,
+   "tokens": 36109071
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00474-of-01024.json.gz",
+   "rows": 62846,
+   "tokens": 35500427
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00475-of-01024.json.gz",
+   "rows": 63215,
+   "tokens": 35808119
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00476-of-01024.json.gz",
+   "rows": 62922,
+   "tokens": 35230969
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00477-of-01024.json.gz",
+   "rows": 63137,
+   "tokens": 35954232
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00478-of-01024.json.gz",
+   "rows": 63247,
+   "tokens": 35974218
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00479-of-01024.json.gz",
+   "rows": 63147,
+   "tokens": 35642874
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00480-of-01024.json.gz",
+   "rows": 62840,
+   "tokens": 35388543
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00481-of-01024.json.gz",
+   "rows": 63004,
+   "tokens": 35633811
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00482-of-01024.json.gz",
+   "rows": 62802,
+   "tokens": 35688817
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00483-of-01024.json.gz",
+   "rows": 62976,
+   "tokens": 35412322
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00484-of-01024.json.gz",
+   "rows": 63018,
+   "tokens": 35249618
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00485-of-01024.json.gz",
+   "rows": 63025,
+   "tokens": 35493831
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00486-of-01024.json.gz",
+   "rows": 63149,
+   "tokens": 35733406
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00487-of-01024.json.gz",
+   "rows": 63094,
+   "tokens": 35614384
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00488-of-01024.json.gz",
+   "rows": 63108,
+   "tokens": 35346504
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00489-of-01024.json.gz",
+   "rows": 63007,
+   "tokens": 35234560
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00490-of-01024.json.gz",
+   "rows": 62904,
+   "tokens": 35876209
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00491-of-01024.json.gz",
+   "rows": 62821,
+   "tokens": 35265461
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00492-of-01024.json.gz",
+   "rows": 63058,
+   "tokens": 35681862
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00493-of-01024.json.gz",
+   "rows": 62933,
+   "tokens": 35377484
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00494-of-01024.json.gz",
+   "rows": 63289,
+   "tokens": 35547508
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00495-of-01024.json.gz",
+   "rows": 62856,
+   "tokens": 35514588
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00496-of-01024.json.gz",
+   "rows": 62980,
+   "tokens": 35483139
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00497-of-01024.json.gz",
+   "rows": 62710,
+   "tokens": 35489405
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00498-of-01024.json.gz",
+   "rows": 63133,
+   "tokens": 35520233
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00499-of-01024.json.gz",
+   "rows": 62756,
+   "tokens": 35451271
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00500-of-01024.json.gz",
+   "rows": 62947,
+   "tokens": 35660367
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00501-of-01024.json.gz",
+   "rows": 63033,
+   "tokens": 35801752
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00502-of-01024.json.gz",
+   "rows": 62732,
+   "tokens": 35106207
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00503-of-01024.json.gz",
+   "rows": 63075,
+   "tokens": 35564696
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00504-of-01024.json.gz",
+   "rows": 63128,
+   "tokens": 35888401
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00505-of-01024.json.gz",
+   "rows": 62866,
+   "tokens": 35450833
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00506-of-01024.json.gz",
+   "rows": 63059,
+   "tokens": 35861407
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00507-of-01024.json.gz",
+   "rows": 63054,
+   "tokens": 35592441
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00508-of-01024.json.gz",
+   "rows": 63163,
+   "tokens": 35600246
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00509-of-01024.json.gz",
+   "rows": 62773,
+   "tokens": 35377938
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00510-of-01024.json.gz",
+   "rows": 63068,
+   "tokens": 35697187
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00511-of-01024.json.gz",
+   "rows": 62782,
+   "tokens": 35664705
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00512-of-01024.json.gz",
+   "rows": 63350,
+   "tokens": 35678863
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00513-of-01024.json.gz",
+   "rows": 62981,
+   "tokens": 35880018
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00514-of-01024.json.gz",
+   "rows": 63018,
+   "tokens": 35710759
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00515-of-01024.json.gz",
+   "rows": 62995,
+   "tokens": 35490302
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00516-of-01024.json.gz",
+   "rows": 63166,
+   "tokens": 35426936
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00517-of-01024.json.gz",
+   "rows": 63101,
+   "tokens": 35672210
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00518-of-01024.json.gz",
+   "rows": 63085,
+   "tokens": 35487237
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00519-of-01024.json.gz",
+   "rows": 63108,
+   "tokens": 35627407
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00520-of-01024.json.gz",
+   "rows": 62972,
+   "tokens": 35657243
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00521-of-01024.json.gz",
+   "rows": 63078,
+   "tokens": 36031015
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00522-of-01024.json.gz",
+   "rows": 63228,
+   "tokens": 36082546
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00523-of-01024.json.gz",
+   "rows": 63061,
+   "tokens": 35531545
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00524-of-01024.json.gz",
+   "rows": 63143,
+   "tokens": 35589070
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00525-of-01024.json.gz",
+   "rows": 63071,
+   "tokens": 35200431
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00526-of-01024.json.gz",
+   "rows": 63229,
+   "tokens": 36043964
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00527-of-01024.json.gz",
+   "rows": 63063,
+   "tokens": 35653397
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00528-of-01024.json.gz",
+   "rows": 63059,
+   "tokens": 35606528
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00529-of-01024.json.gz",
+   "rows": 62889,
+   "tokens": 35403805
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00530-of-01024.json.gz",
+   "rows": 63072,
+   "tokens": 35863593
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00531-of-01024.json.gz",
+   "rows": 63105,
+   "tokens": 35667584
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00532-of-01024.json.gz",
+   "rows": 62938,
+   "tokens": 35314848
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00533-of-01024.json.gz",
+   "rows": 63172,
+   "tokens": 35742335
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00534-of-01024.json.gz",
+   "rows": 62915,
+   "tokens": 35721275
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00535-of-01024.json.gz",
+   "rows": 63132,
+   "tokens": 35521033
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00536-of-01024.json.gz",
+   "rows": 63104,
+   "tokens": 35413823
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00537-of-01024.json.gz",
+   "rows": 63017,
+   "tokens": 35480044
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00538-of-01024.json.gz",
+   "rows": 63336,
+   "tokens": 35897563
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00539-of-01024.json.gz",
+   "rows": 62680,
+   "tokens": 35441445
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00540-of-01024.json.gz",
+   "rows": 63012,
+   "tokens": 35550527
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00541-of-01024.json.gz",
+   "rows": 62998,
+   "tokens": 35834799
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00542-of-01024.json.gz",
+   "rows": 63227,
+   "tokens": 35999330
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00543-of-01024.json.gz",
+   "rows": 63199,
+   "tokens": 35788348
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00544-of-01024.json.gz",
+   "rows": 63138,
+   "tokens": 35634856
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00545-of-01024.json.gz",
+   "rows": 63124,
+   "tokens": 35868947
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00546-of-01024.json.gz",
+   "rows": 63137,
+   "tokens": 35911849
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00547-of-01024.json.gz",
+   "rows": 62859,
+   "tokens": 35369332
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00548-of-01024.json.gz",
+   "rows": 62980,
+   "tokens": 35868109
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00549-of-01024.json.gz",
+   "rows": 62987,
+   "tokens": 35539339
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00550-of-01024.json.gz",
+   "rows": 62956,
+   "tokens": 35530989
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00551-of-01024.json.gz",
+   "rows": 62828,
+   "tokens": 35690463
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00552-of-01024.json.gz",
+   "rows": 63163,
+   "tokens": 35478009
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00553-of-01024.json.gz",
+   "rows": 63125,
+   "tokens": 35646676
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00554-of-01024.json.gz",
+   "rows": 63209,
+   "tokens": 35596179
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00555-of-01024.json.gz",
+   "rows": 62974,
+   "tokens": 35497140
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00556-of-01024.json.gz",
+   "rows": 63055,
+   "tokens": 35657052
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00557-of-01024.json.gz",
+   "rows": 62847,
+   "tokens": 35593825
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00558-of-01024.json.gz",
+   "rows": 63055,
+   "tokens": 35628478
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00559-of-01024.json.gz",
+   "rows": 63027,
+   "tokens": 35346400
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00560-of-01024.json.gz",
+   "rows": 63085,
+   "tokens": 35459202
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00561-of-01024.json.gz",
+   "rows": 62859,
+   "tokens": 35612388
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00562-of-01024.json.gz",
+   "rows": 63037,
+   "tokens": 35502135
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00563-of-01024.json.gz",
+   "rows": 63100,
+   "tokens": 35578720
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00564-of-01024.json.gz",
+   "rows": 63280,
+   "tokens": 35511320
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00565-of-01024.json.gz",
+   "rows": 62962,
+   "tokens": 35662249
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00566-of-01024.json.gz",
+   "rows": 63047,
+   "tokens": 35564643
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00567-of-01024.json.gz",
+   "rows": 63125,
+   "tokens": 35825307
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00568-of-01024.json.gz",
+   "rows": 62970,
+   "tokens": 35758605
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00569-of-01024.json.gz",
+   "rows": 63063,
+   "tokens": 35701884
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00570-of-01024.json.gz",
+   "rows": 62902,
+   "tokens": 35750560
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00571-of-01024.json.gz",
+   "rows": 63219,
+   "tokens": 35444995
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00572-of-01024.json.gz",
+   "rows": 63046,
+   "tokens": 35448323
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00573-of-01024.json.gz",
+   "rows": 62908,
+   "tokens": 35553696
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00574-of-01024.json.gz",
+   "rows": 62922,
+   "tokens": 35290915
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00575-of-01024.json.gz",
+   "rows": 62948,
+   "tokens": 35613303
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00576-of-01024.json.gz",
+   "rows": 62831,
+   "tokens": 35436755
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00577-of-01024.json.gz",
+   "rows": 62987,
+   "tokens": 35643582
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00578-of-01024.json.gz",
+   "rows": 62896,
+   "tokens": 35495208
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00579-of-01024.json.gz",
+   "rows": 62807,
+   "tokens": 35328291
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00580-of-01024.json.gz",
+   "rows": 62928,
+   "tokens": 35234613
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00581-of-01024.json.gz",
+   "rows": 62795,
+   "tokens": 35722428
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00582-of-01024.json.gz",
+   "rows": 62958,
+   "tokens": 35953018
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00583-of-01024.json.gz",
+   "rows": 63164,
+   "tokens": 36201649
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00584-of-01024.json.gz",
+   "rows": 62980,
+   "tokens": 35654498
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00585-of-01024.json.gz",
+   "rows": 63201,
+   "tokens": 35430634
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00586-of-01024.json.gz",
+   "rows": 62866,
+   "tokens": 35793614
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00587-of-01024.json.gz",
+   "rows": 63165,
+   "tokens": 35506206
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00588-of-01024.json.gz",
+   "rows": 63053,
+   "tokens": 35337431
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00589-of-01024.json.gz",
+   "rows": 63117,
+   "tokens": 35553986
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00590-of-01024.json.gz",
+   "rows": 63058,
+   "tokens": 35664738
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00591-of-01024.json.gz",
+   "rows": 63022,
+   "tokens": 35709112
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00592-of-01024.json.gz",
+   "rows": 62896,
+   "tokens": 35773852
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00593-of-01024.json.gz",
+   "rows": 62774,
+   "tokens": 35277872
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00594-of-01024.json.gz",
+   "rows": 62978,
+   "tokens": 35829487
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00595-of-01024.json.gz",
+   "rows": 62902,
+   "tokens": 35185629
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00596-of-01024.json.gz",
+   "rows": 63185,
+   "tokens": 35364734
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00597-of-01024.json.gz",
+   "rows": 63199,
+   "tokens": 35530469
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00598-of-01024.json.gz",
+   "rows": 62791,
+   "tokens": 35394436
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00599-of-01024.json.gz",
+   "rows": 62896,
+   "tokens": 35582788
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00600-of-01024.json.gz",
+   "rows": 62892,
+   "tokens": 35429740
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00601-of-01024.json.gz",
+   "rows": 63349,
+   "tokens": 35672321
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00602-of-01024.json.gz",
+   "rows": 63428,
+   "tokens": 36267747
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00603-of-01024.json.gz",
+   "rows": 62881,
+   "tokens": 35591805
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00604-of-01024.json.gz",
+   "rows": 63224,
+   "tokens": 35894441
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00605-of-01024.json.gz",
+   "rows": 63306,
+   "tokens": 35726983
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00606-of-01024.json.gz",
+   "rows": 62820,
+   "tokens": 35544582
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00607-of-01024.json.gz",
+   "rows": 62999,
+   "tokens": 35551344
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00608-of-01024.json.gz",
+   "rows": 63381,
+   "tokens": 35647800
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00609-of-01024.json.gz",
+   "rows": 63122,
+   "tokens": 35433587
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00610-of-01024.json.gz",
+   "rows": 63092,
+   "tokens": 35769045
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00611-of-01024.json.gz",
+   "rows": 63196,
+   "tokens": 35753158
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00612-of-01024.json.gz",
+   "rows": 62796,
+   "tokens": 35309175
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00613-of-01024.json.gz",
+   "rows": 62857,
+   "tokens": 35756931
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00614-of-01024.json.gz",
+   "rows": 63167,
+   "tokens": 35455934
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00615-of-01024.json.gz",
+   "rows": 62795,
+   "tokens": 35962507
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00616-of-01024.json.gz",
+   "rows": 63005,
+   "tokens": 35905286
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00617-of-01024.json.gz",
+   "rows": 63086,
+   "tokens": 35401008
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00618-of-01024.json.gz",
+   "rows": 62823,
+   "tokens": 35319198
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00619-of-01024.json.gz",
+   "rows": 63225,
+   "tokens": 35658532
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00620-of-01024.json.gz",
+   "rows": 62923,
+   "tokens": 35686627
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00621-of-01024.json.gz",
+   "rows": 63163,
+   "tokens": 35393197
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00622-of-01024.json.gz",
+   "rows": 63044,
+   "tokens": 35757187
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00623-of-01024.json.gz",
+   "rows": 63300,
+   "tokens": 35804399
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00624-of-01024.json.gz",
+   "rows": 63073,
+   "tokens": 35601728
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00625-of-01024.json.gz",
+   "rows": 62958,
+   "tokens": 35451640
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00626-of-01024.json.gz",
+   "rows": 63158,
+   "tokens": 35965467
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00627-of-01024.json.gz",
+   "rows": 63101,
+   "tokens": 35727182
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00628-of-01024.json.gz",
+   "rows": 63086,
+   "tokens": 35577587
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00629-of-01024.json.gz",
+   "rows": 62921,
+   "tokens": 35504344
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00630-of-01024.json.gz",
+   "rows": 63068,
+   "tokens": 35744730
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00631-of-01024.json.gz",
+   "rows": 62910,
+   "tokens": 35637745
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00632-of-01024.json.gz",
+   "rows": 62989,
+   "tokens": 35650064
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00633-of-01024.json.gz",
+   "rows": 62843,
+   "tokens": 35800588
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00634-of-01024.json.gz",
+   "rows": 63250,
+   "tokens": 36039173
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00635-of-01024.json.gz",
+   "rows": 63100,
+   "tokens": 35599606
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00636-of-01024.json.gz",
+   "rows": 62994,
+   "tokens": 35476687
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00637-of-01024.json.gz",
+   "rows": 63367,
+   "tokens": 35791465
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00638-of-01024.json.gz",
+   "rows": 63033,
+   "tokens": 35747904
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00639-of-01024.json.gz",
+   "rows": 63182,
+   "tokens": 35929366
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00640-of-01024.json.gz",
+   "rows": 62950,
+   "tokens": 35270377
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00641-of-01024.json.gz",
+   "rows": 63095,
+   "tokens": 35861081
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00642-of-01024.json.gz",
+   "rows": 63173,
+   "tokens": 35758359
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00643-of-01024.json.gz",
+   "rows": 63187,
+   "tokens": 35676126
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00644-of-01024.json.gz",
+   "rows": 62976,
+   "tokens": 35657500
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00645-of-01024.json.gz",
+   "rows": 62945,
+   "tokens": 35522907
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00646-of-01024.json.gz",
+   "rows": 62936,
+   "tokens": 35608575
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00647-of-01024.json.gz",
+   "rows": 63241,
+   "tokens": 35840071
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00648-of-01024.json.gz",
+   "rows": 63099,
+   "tokens": 35463969
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00649-of-01024.json.gz",
+   "rows": 62796,
+   "tokens": 35804797
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00650-of-01024.json.gz",
+   "rows": 63047,
+   "tokens": 35411567
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00651-of-01024.json.gz",
+   "rows": 63148,
+   "tokens": 35543596
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00652-of-01024.json.gz",
+   "rows": 63046,
+   "tokens": 35405358
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00653-of-01024.json.gz",
+   "rows": 63030,
+   "tokens": 35756834
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00654-of-01024.json.gz",
+   "rows": 62913,
+   "tokens": 35682732
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00655-of-01024.json.gz",
+   "rows": 62931,
+   "tokens": 35712468
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00656-of-01024.json.gz",
+   "rows": 63103,
+   "tokens": 35625715
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00657-of-01024.json.gz",
+   "rows": 63007,
+   "tokens": 35757301
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00658-of-01024.json.gz",
+   "rows": 62928,
+   "tokens": 35611906
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00659-of-01024.json.gz",
+   "rows": 63170,
+   "tokens": 35951964
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00660-of-01024.json.gz",
+   "rows": 63065,
+   "tokens": 35798681
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00661-of-01024.json.gz",
+   "rows": 63008,
+   "tokens": 35553641
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00662-of-01024.json.gz",
+   "rows": 63211,
+   "tokens": 35740371
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00663-of-01024.json.gz",
+   "rows": 62982,
+   "tokens": 35296292
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00664-of-01024.json.gz",
+   "rows": 63039,
+   "tokens": 35702281
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00665-of-01024.json.gz",
+   "rows": 63089,
+   "tokens": 35675481
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00666-of-01024.json.gz",
+   "rows": 63054,
+   "tokens": 35431548
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00667-of-01024.json.gz",
+   "rows": 62952,
+   "tokens": 35528114
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00668-of-01024.json.gz",
+   "rows": 63058,
+   "tokens": 35619852
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00669-of-01024.json.gz",
+   "rows": 63007,
+   "tokens": 35601827
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00670-of-01024.json.gz",
+   "rows": 63055,
+   "tokens": 35757267
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00671-of-01024.json.gz",
+   "rows": 63141,
+   "tokens": 35675070
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00672-of-01024.json.gz",
+   "rows": 63061,
+   "tokens": 35647968
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00673-of-01024.json.gz",
+   "rows": 62904,
+   "tokens": 35448597
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00674-of-01024.json.gz",
+   "rows": 63241,
+   "tokens": 35749639
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00675-of-01024.json.gz",
+   "rows": 63129,
+   "tokens": 35607808
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00676-of-01024.json.gz",
+   "rows": 62997,
+   "tokens": 35825805
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00677-of-01024.json.gz",
+   "rows": 63181,
+   "tokens": 35731152
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00678-of-01024.json.gz",
+   "rows": 63145,
+   "tokens": 35632563
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00679-of-01024.json.gz",
+   "rows": 63152,
+   "tokens": 35385988
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00680-of-01024.json.gz",
+   "rows": 62896,
+   "tokens": 35155812
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00681-of-01024.json.gz",
+   "rows": 62875,
+   "tokens": 35419537
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00682-of-01024.json.gz",
+   "rows": 63049,
+   "tokens": 35664091
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00683-of-01024.json.gz",
+   "rows": 63171,
+   "tokens": 35246028
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00684-of-01024.json.gz",
+   "rows": 63050,
+   "tokens": 35534241
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00685-of-01024.json.gz",
+   "rows": 62980,
+   "tokens": 35322067
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00686-of-01024.json.gz",
+   "rows": 62884,
+   "tokens": 35494431
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00687-of-01024.json.gz",
+   "rows": 62903,
+   "tokens": 35578568
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00688-of-01024.json.gz",
+   "rows": 62893,
+   "tokens": 35605099
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00689-of-01024.json.gz",
+   "rows": 63100,
+   "tokens": 35733300
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00690-of-01024.json.gz",
+   "rows": 62831,
+   "tokens": 35442413
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00691-of-01024.json.gz",
+   "rows": 63018,
+   "tokens": 35399095
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00692-of-01024.json.gz",
+   "rows": 63145,
+   "tokens": 35594949
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00693-of-01024.json.gz",
+   "rows": 63042,
+   "tokens": 35554009
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00694-of-01024.json.gz",
+   "rows": 63116,
+   "tokens": 36170993
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00695-of-01024.json.gz",
+   "rows": 63200,
+   "tokens": 35561311
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00696-of-01024.json.gz",
+   "rows": 63013,
+   "tokens": 35628560
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00697-of-01024.json.gz",
+   "rows": 62902,
+   "tokens": 35495612
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00698-of-01024.json.gz",
+   "rows": 63145,
+   "tokens": 35885387
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00699-of-01024.json.gz",
+   "rows": 62908,
+   "tokens": 35585494
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00700-of-01024.json.gz",
+   "rows": 63244,
+   "tokens": 35593860
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00701-of-01024.json.gz",
+   "rows": 63206,
+   "tokens": 35716806
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00702-of-01024.json.gz",
+   "rows": 62943,
+   "tokens": 35748670
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00703-of-01024.json.gz",
+   "rows": 62924,
+   "tokens": 35745384
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00704-of-01024.json.gz",
+   "rows": 63105,
+   "tokens": 35797627
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00705-of-01024.json.gz",
+   "rows": 63120,
+   "tokens": 35475696
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00706-of-01024.json.gz",
+   "rows": 62935,
+   "tokens": 35671053
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00707-of-01024.json.gz",
+   "rows": 63023,
+   "tokens": 35921056
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00708-of-01024.json.gz",
+   "rows": 63299,
+   "tokens": 35534604
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00709-of-01024.json.gz",
+   "rows": 63244,
+   "tokens": 35485410
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00710-of-01024.json.gz",
+   "rows": 63011,
+   "tokens": 35492273
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00711-of-01024.json.gz",
+   "rows": 62950,
+   "tokens": 35647080
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00712-of-01024.json.gz",
+   "rows": 63174,
+   "tokens": 35731537
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00713-of-01024.json.gz",
+   "rows": 63107,
+   "tokens": 35478234
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00714-of-01024.json.gz",
+   "rows": 63033,
+   "tokens": 35360677
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00715-of-01024.json.gz",
+   "rows": 63198,
+   "tokens": 36281105
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00716-of-01024.json.gz",
+   "rows": 63126,
+   "tokens": 35491668
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00717-of-01024.json.gz",
+   "rows": 63140,
+   "tokens": 35773239
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00718-of-01024.json.gz",
+   "rows": 62998,
+   "tokens": 35401435
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00719-of-01024.json.gz",
+   "rows": 63092,
+   "tokens": 35756808
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00720-of-01024.json.gz",
+   "rows": 63170,
+   "tokens": 35693972
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00721-of-01024.json.gz",
+   "rows": 63334,
+   "tokens": 35999508
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00722-of-01024.json.gz",
+   "rows": 63125,
+   "tokens": 36136371
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00723-of-01024.json.gz",
+   "rows": 62958,
+   "tokens": 35961302
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00724-of-01024.json.gz",
+   "rows": 63095,
+   "tokens": 35682656
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00725-of-01024.json.gz",
+   "rows": 63041,
+   "tokens": 35547539
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00726-of-01024.json.gz",
+   "rows": 63016,
+   "tokens": 35586566
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00727-of-01024.json.gz",
+   "rows": 62946,
+   "tokens": 35704095
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00728-of-01024.json.gz",
+   "rows": 63097,
+   "tokens": 35709303
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00729-of-01024.json.gz",
+   "rows": 62926,
+   "tokens": 35696610
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00730-of-01024.json.gz",
+   "rows": 63080,
+   "tokens": 35647438
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00731-of-01024.json.gz",
+   "rows": 62823,
+   "tokens": 35469157
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00732-of-01024.json.gz",
+   "rows": 63040,
+   "tokens": 35644065
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00733-of-01024.json.gz",
+   "rows": 62891,
+   "tokens": 35603931
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00734-of-01024.json.gz",
+   "rows": 63039,
+   "tokens": 35394675
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00735-of-01024.json.gz",
+   "rows": 63170,
+   "tokens": 35610925
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00736-of-01024.json.gz",
+   "rows": 62801,
+   "tokens": 35455854
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00737-of-01024.json.gz",
+   "rows": 62958,
+   "tokens": 35341939
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00738-of-01024.json.gz",
+   "rows": 63036,
+   "tokens": 35623262
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00739-of-01024.json.gz",
+   "rows": 62837,
+   "tokens": 35430215
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00740-of-01024.json.gz",
+   "rows": 62912,
+   "tokens": 35610171
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00741-of-01024.json.gz",
+   "rows": 62958,
+   "tokens": 35805312
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00742-of-01024.json.gz",
+   "rows": 63001,
+   "tokens": 35346877
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00743-of-01024.json.gz",
+   "rows": 63053,
+   "tokens": 35747166
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00744-of-01024.json.gz",
+   "rows": 63117,
+   "tokens": 35592317
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00745-of-01024.json.gz",
+   "rows": 63012,
+   "tokens": 35725113
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00746-of-01024.json.gz",
+   "rows": 63274,
+   "tokens": 35894288
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00747-of-01024.json.gz",
+   "rows": 63035,
+   "tokens": 35741672
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00748-of-01024.json.gz",
+   "rows": 63083,
+   "tokens": 35785106
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00749-of-01024.json.gz",
+   "rows": 62961,
+   "tokens": 35800644
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00750-of-01024.json.gz",
+   "rows": 63104,
+   "tokens": 35491857
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00751-of-01024.json.gz",
+   "rows": 62746,
+   "tokens": 35327546
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00752-of-01024.json.gz",
+   "rows": 62949,
+   "tokens": 35522392
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00753-of-01024.json.gz",
+   "rows": 63048,
+   "tokens": 35638577
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00754-of-01024.json.gz",
+   "rows": 63147,
+   "tokens": 35630776
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00755-of-01024.json.gz",
+   "rows": 63205,
+   "tokens": 35639997
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00756-of-01024.json.gz",
+   "rows": 62870,
+   "tokens": 35515497
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00757-of-01024.json.gz",
+   "rows": 62936,
+   "tokens": 35576788
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00758-of-01024.json.gz",
+   "rows": 62856,
+   "tokens": 35776345
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00759-of-01024.json.gz",
+   "rows": 62997,
+   "tokens": 35640269
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00760-of-01024.json.gz",
+   "rows": 63047,
+   "tokens": 35893910
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00761-of-01024.json.gz",
+   "rows": 63018,
+   "tokens": 35739700
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00762-of-01024.json.gz",
+   "rows": 63069,
+   "tokens": 35743987
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00763-of-01024.json.gz",
+   "rows": 62784,
+   "tokens": 35532607
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00764-of-01024.json.gz",
+   "rows": 63061,
+   "tokens": 35361100
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00765-of-01024.json.gz",
+   "rows": 63039,
+   "tokens": 35485040
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00766-of-01024.json.gz",
+   "rows": 63226,
+   "tokens": 35560368
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00767-of-01024.json.gz",
+   "rows": 62886,
+   "tokens": 35521546
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00768-of-01024.json.gz",
+   "rows": 62866,
+   "tokens": 35294943
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00769-of-01024.json.gz",
+   "rows": 62889,
+   "tokens": 35489839
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00770-of-01024.json.gz",
+   "rows": 62804,
+   "tokens": 35629923
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00771-of-01024.json.gz",
+   "rows": 63022,
+   "tokens": 35725566
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00772-of-01024.json.gz",
+   "rows": 62882,
+   "tokens": 35317697
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00773-of-01024.json.gz",
+   "rows": 63223,
+   "tokens": 35696805
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00774-of-01024.json.gz",
+   "rows": 63159,
+   "tokens": 35642291
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00775-of-01024.json.gz",
+   "rows": 62815,
+   "tokens": 35286772
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00776-of-01024.json.gz",
+   "rows": 63040,
+   "tokens": 35413592
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00777-of-01024.json.gz",
+   "rows": 63049,
+   "tokens": 35683453
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00778-of-01024.json.gz",
+   "rows": 62882,
+   "tokens": 35610708
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00779-of-01024.json.gz",
+   "rows": 63096,
+   "tokens": 35506274
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00780-of-01024.json.gz",
+   "rows": 62848,
+   "tokens": 35665772
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00781-of-01024.json.gz",
+   "rows": 62977,
+   "tokens": 35402403
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00782-of-01024.json.gz",
+   "rows": 62957,
+   "tokens": 35953715
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00783-of-01024.json.gz",
+   "rows": 63088,
+   "tokens": 35696604
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00784-of-01024.json.gz",
+   "rows": 63131,
+   "tokens": 35627659
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00785-of-01024.json.gz",
+   "rows": 63261,
+   "tokens": 35500551
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00786-of-01024.json.gz",
+   "rows": 62821,
+   "tokens": 35687445
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00787-of-01024.json.gz",
+   "rows": 63175,
+   "tokens": 35975067
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00788-of-01024.json.gz",
+   "rows": 63173,
+   "tokens": 35594610
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00789-of-01024.json.gz",
+   "rows": 62970,
+   "tokens": 35723789
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00790-of-01024.json.gz",
+   "rows": 62887,
+   "tokens": 35364087
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00791-of-01024.json.gz",
+   "rows": 63011,
+   "tokens": 35877415
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00792-of-01024.json.gz",
+   "rows": 62871,
+   "tokens": 35969019
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00793-of-01024.json.gz",
+   "rows": 63097,
+   "tokens": 35517810
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00794-of-01024.json.gz",
+   "rows": 63020,
+   "tokens": 35473706
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00795-of-01024.json.gz",
+   "rows": 63287,
+   "tokens": 35849622
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00796-of-01024.json.gz",
+   "rows": 62893,
+   "tokens": 35718354
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00797-of-01024.json.gz",
+   "rows": 63055,
+   "tokens": 35697058
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00798-of-01024.json.gz",
+   "rows": 63037,
+   "tokens": 35556684
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00799-of-01024.json.gz",
+   "rows": 63122,
+   "tokens": 35630387
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00800-of-01024.json.gz",
+   "rows": 62991,
+   "tokens": 35509028
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00801-of-01024.json.gz",
+   "rows": 63156,
+   "tokens": 35764738
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00802-of-01024.json.gz",
+   "rows": 63236,
+   "tokens": 35462406
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00803-of-01024.json.gz",
+   "rows": 62738,
+   "tokens": 35546070
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00804-of-01024.json.gz",
+   "rows": 62801,
+   "tokens": 35591245
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00805-of-01024.json.gz",
+   "rows": 62978,
+   "tokens": 35691781
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00806-of-01024.json.gz",
+   "rows": 63231,
+   "tokens": 35392701
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00807-of-01024.json.gz",
+   "rows": 63196,
+   "tokens": 35963960
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00808-of-01024.json.gz",
+   "rows": 62902,
+   "tokens": 35470484
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00809-of-01024.json.gz",
+   "rows": 63050,
+   "tokens": 35731040
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00810-of-01024.json.gz",
+   "rows": 62862,
+   "tokens": 35378913
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00811-of-01024.json.gz",
+   "rows": 62998,
+   "tokens": 35939284
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00812-of-01024.json.gz",
+   "rows": 62867,
+   "tokens": 35586010
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00813-of-01024.json.gz",
+   "rows": 63303,
+   "tokens": 35842640
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00814-of-01024.json.gz",
+   "rows": 62881,
+   "tokens": 35561987
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00815-of-01024.json.gz",
+   "rows": 62992,
+   "tokens": 35486784
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00816-of-01024.json.gz",
+   "rows": 62996,
+   "tokens": 35722998
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00817-of-01024.json.gz",
+   "rows": 62870,
+   "tokens": 35454653
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00818-of-01024.json.gz",
+   "rows": 63155,
+   "tokens": 35698677
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00819-of-01024.json.gz",
+   "rows": 62846,
+   "tokens": 35603059
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00820-of-01024.json.gz",
+   "rows": 63143,
+   "tokens": 35520246
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00821-of-01024.json.gz",
+   "rows": 62825,
+   "tokens": 35326731
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00822-of-01024.json.gz",
+   "rows": 63122,
+   "tokens": 35604266
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00823-of-01024.json.gz",
+   "rows": 63068,
+   "tokens": 35507010
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00824-of-01024.json.gz",
+   "rows": 62799,
+   "tokens": 35376682
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00825-of-01024.json.gz",
+   "rows": 63117,
+   "tokens": 35382500
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00826-of-01024.json.gz",
+   "rows": 62983,
+   "tokens": 35344019
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00827-of-01024.json.gz",
+   "rows": 63127,
+   "tokens": 35748767
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00828-of-01024.json.gz",
+   "rows": 63051,
+   "tokens": 35688135
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00829-of-01024.json.gz",
+   "rows": 63199,
+   "tokens": 35694883
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00830-of-01024.json.gz",
+   "rows": 63090,
+   "tokens": 35740114
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00831-of-01024.json.gz",
+   "rows": 62975,
+   "tokens": 35517076
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00832-of-01024.json.gz",
+   "rows": 62716,
+   "tokens": 35749112
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00833-of-01024.json.gz",
+   "rows": 62875,
+   "tokens": 35253696
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00834-of-01024.json.gz",
+   "rows": 63088,
+   "tokens": 35669535
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00835-of-01024.json.gz",
+   "rows": 62823,
+   "tokens": 35381346
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00836-of-01024.json.gz",
+   "rows": 62899,
+   "tokens": 35228597
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00837-of-01024.json.gz",
+   "rows": 62727,
+   "tokens": 35059963
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00838-of-01024.json.gz",
+   "rows": 63359,
+   "tokens": 36336737
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00839-of-01024.json.gz",
+   "rows": 62924,
+   "tokens": 35174474
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00840-of-01024.json.gz",
+   "rows": 63205,
+   "tokens": 35951571
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00841-of-01024.json.gz",
+   "rows": 62907,
+   "tokens": 35376275
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00842-of-01024.json.gz",
+   "rows": 63072,
+   "tokens": 35675294
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00843-of-01024.json.gz",
+   "rows": 62765,
+   "tokens": 35745788
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00844-of-01024.json.gz",
+   "rows": 63004,
+   "tokens": 35688031
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00845-of-01024.json.gz",
+   "rows": 63020,
+   "tokens": 35743786
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00846-of-01024.json.gz",
+   "rows": 63158,
+   "tokens": 35637499
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00847-of-01024.json.gz",
+   "rows": 63197,
+   "tokens": 35648144
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00848-of-01024.json.gz",
+   "rows": 62962,
+   "tokens": 35792781
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00849-of-01024.json.gz",
+   "rows": 63153,
+   "tokens": 35674894
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00850-of-01024.json.gz",
+   "rows": 62854,
+   "tokens": 35767045
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00851-of-01024.json.gz",
+   "rows": 63023,
+   "tokens": 35407987
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00852-of-01024.json.gz",
+   "rows": 63126,
+   "tokens": 35520816
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00853-of-01024.json.gz",
+   "rows": 62866,
+   "tokens": 35432655
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00854-of-01024.json.gz",
+   "rows": 62867,
+   "tokens": 36116314
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00855-of-01024.json.gz",
+   "rows": 62936,
+   "tokens": 35360767
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00856-of-01024.json.gz",
+   "rows": 63085,
+   "tokens": 35775246
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00857-of-01024.json.gz",
+   "rows": 62890,
+   "tokens": 35737201
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00858-of-01024.json.gz",
+   "rows": 63196,
+   "tokens": 35980347
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00859-of-01024.json.gz",
+   "rows": 63351,
+   "tokens": 35503228
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00860-of-01024.json.gz",
+   "rows": 63276,
+   "tokens": 36077847
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00861-of-01024.json.gz",
+   "rows": 63039,
+   "tokens": 35743537
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00862-of-01024.json.gz",
+   "rows": 63073,
+   "tokens": 35895972
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00863-of-01024.json.gz",
+   "rows": 62991,
+   "tokens": 35274271
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00864-of-01024.json.gz",
+   "rows": 63001,
+   "tokens": 35679878
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00865-of-01024.json.gz",
+   "rows": 62960,
+   "tokens": 35668821
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00866-of-01024.json.gz",
+   "rows": 62909,
+   "tokens": 35758909
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00867-of-01024.json.gz",
+   "rows": 63050,
+   "tokens": 35950693
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00868-of-01024.json.gz",
+   "rows": 62851,
+   "tokens": 35533876
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00869-of-01024.json.gz",
+   "rows": 63254,
+   "tokens": 35651444
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00870-of-01024.json.gz",
+   "rows": 63280,
+   "tokens": 35747432
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00871-of-01024.json.gz",
+   "rows": 63343,
+   "tokens": 35816257
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00872-of-01024.json.gz",
+   "rows": 63034,
+   "tokens": 35503243
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00873-of-01024.json.gz",
+   "rows": 63131,
+   "tokens": 35583412
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00874-of-01024.json.gz",
+   "rows": 63046,
+   "tokens": 35346311
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00875-of-01024.json.gz",
+   "rows": 63131,
+   "tokens": 35711234
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00876-of-01024.json.gz",
+   "rows": 62704,
+   "tokens": 35267102
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00877-of-01024.json.gz",
+   "rows": 62962,
+   "tokens": 35545896
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00878-of-01024.json.gz",
+   "rows": 63158,
+   "tokens": 35778004
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00879-of-01024.json.gz",
+   "rows": 63056,
+   "tokens": 35457944
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00880-of-01024.json.gz",
+   "rows": 62702,
+   "tokens": 35547275
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00881-of-01024.json.gz",
+   "rows": 62974,
+   "tokens": 35448482
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00882-of-01024.json.gz",
+   "rows": 63202,
+   "tokens": 36059896
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00883-of-01024.json.gz",
+   "rows": 63068,
+   "tokens": 35711215
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00884-of-01024.json.gz",
+   "rows": 63172,
+   "tokens": 35759976
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00885-of-01024.json.gz",
+   "rows": 63166,
+   "tokens": 35835235
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00886-of-01024.json.gz",
+   "rows": 63120,
+   "tokens": 35365053
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00887-of-01024.json.gz",
+   "rows": 63135,
+   "tokens": 35680787
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00888-of-01024.json.gz",
+   "rows": 63017,
+   "tokens": 35638313
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00889-of-01024.json.gz",
+   "rows": 62977,
+   "tokens": 35920133
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00890-of-01024.json.gz",
+   "rows": 63041,
+   "tokens": 35615164
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00891-of-01024.json.gz",
+   "rows": 63013,
+   "tokens": 35405703
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00892-of-01024.json.gz",
+   "rows": 62967,
+   "tokens": 35506212
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00893-of-01024.json.gz",
+   "rows": 62829,
+   "tokens": 35638873
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00894-of-01024.json.gz",
+   "rows": 63274,
+   "tokens": 35489571
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00895-of-01024.json.gz",
+   "rows": 62958,
+   "tokens": 35667747
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00896-of-01024.json.gz",
+   "rows": 63049,
+   "tokens": 35952325
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00897-of-01024.json.gz",
+   "rows": 63096,
+   "tokens": 35914084
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00898-of-01024.json.gz",
+   "rows": 62903,
+   "tokens": 35176743
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00899-of-01024.json.gz",
+   "rows": 63270,
+   "tokens": 35462241
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00900-of-01024.json.gz",
+   "rows": 63089,
+   "tokens": 35475557
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00901-of-01024.json.gz",
+   "rows": 63035,
+   "tokens": 35820328
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00902-of-01024.json.gz",
+   "rows": 63256,
+   "tokens": 35635219
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00903-of-01024.json.gz",
+   "rows": 63024,
+   "tokens": 35736371
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00904-of-01024.json.gz",
+   "rows": 63203,
+   "tokens": 35519798
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00905-of-01024.json.gz",
+   "rows": 62948,
+   "tokens": 35314753
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00906-of-01024.json.gz",
+   "rows": 63134,
+   "tokens": 35647048
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00907-of-01024.json.gz",
+   "rows": 62915,
+   "tokens": 35612004
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00908-of-01024.json.gz",
+   "rows": 63017,
+   "tokens": 35740752
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00909-of-01024.json.gz",
+   "rows": 63206,
+   "tokens": 36085605
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00910-of-01024.json.gz",
+   "rows": 62751,
+   "tokens": 35639606
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00911-of-01024.json.gz",
+   "rows": 63188,
+   "tokens": 35844742
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00912-of-01024.json.gz",
+   "rows": 62961,
+   "tokens": 35568037
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00913-of-01024.json.gz",
+   "rows": 63037,
+   "tokens": 35762918
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00914-of-01024.json.gz",
+   "rows": 63016,
+   "tokens": 35779204
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00915-of-01024.json.gz",
+   "rows": 63021,
+   "tokens": 35692448
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00916-of-01024.json.gz",
+   "rows": 62980,
+   "tokens": 35985353
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00917-of-01024.json.gz",
+   "rows": 62977,
+   "tokens": 35368427
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00918-of-01024.json.gz",
+   "rows": 62914,
+   "tokens": 35851766
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00919-of-01024.json.gz",
+   "rows": 63187,
+   "tokens": 35778417
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00920-of-01024.json.gz",
+   "rows": 62827,
+   "tokens": 35532454
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00921-of-01024.json.gz",
+   "rows": 62745,
+   "tokens": 35532357
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00922-of-01024.json.gz",
+   "rows": 62931,
+   "tokens": 35631961
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00923-of-01024.json.gz",
+   "rows": 62850,
+   "tokens": 35538325
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00924-of-01024.json.gz",
+   "rows": 62796,
+   "tokens": 35673697
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00925-of-01024.json.gz",
+   "rows": 63213,
+   "tokens": 35886595
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00926-of-01024.json.gz",
+   "rows": 62807,
+   "tokens": 35593261
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00927-of-01024.json.gz",
+   "rows": 63110,
+   "tokens": 35805198
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00928-of-01024.json.gz",
+   "rows": 63041,
+   "tokens": 35403321
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00929-of-01024.json.gz",
+   "rows": 62960,
+   "tokens": 35607601
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00930-of-01024.json.gz",
+   "rows": 63120,
+   "tokens": 35700012
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00931-of-01024.json.gz",
+   "rows": 62769,
+   "tokens": 35257381
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00932-of-01024.json.gz",
+   "rows": 62599,
+   "tokens": 35421250
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00933-of-01024.json.gz",
+   "rows": 62984,
+   "tokens": 35785491
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00934-of-01024.json.gz",
+   "rows": 63126,
+   "tokens": 35961015
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00935-of-01024.json.gz",
+   "rows": 62882,
+   "tokens": 35578050
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00936-of-01024.json.gz",
+   "rows": 63033,
+   "tokens": 35978796
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00937-of-01024.json.gz",
+   "rows": 62866,
+   "tokens": 35633924
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00938-of-01024.json.gz",
+   "rows": 62959,
+   "tokens": 35600135
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00939-of-01024.json.gz",
+   "rows": 62751,
+   "tokens": 35463623
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00940-of-01024.json.gz",
+   "rows": 62944,
+   "tokens": 35441045
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00941-of-01024.json.gz",
+   "rows": 63151,
+   "tokens": 35811784
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00942-of-01024.json.gz",
+   "rows": 63113,
+   "tokens": 35690108
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00943-of-01024.json.gz",
+   "rows": 63024,
+   "tokens": 36004148
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00944-of-01024.json.gz",
+   "rows": 62595,
+   "tokens": 35538802
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00945-of-01024.json.gz",
+   "rows": 63169,
+   "tokens": 36165597
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00946-of-01024.json.gz",
+   "rows": 63312,
+   "tokens": 35550669
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00947-of-01024.json.gz",
+   "rows": 62915,
+   "tokens": 35980505
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00948-of-01024.json.gz",
+   "rows": 63240,
+   "tokens": 36015322
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00949-of-01024.json.gz",
+   "rows": 62978,
+   "tokens": 35808624
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00950-of-01024.json.gz",
+   "rows": 62978,
+   "tokens": 35443006
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00951-of-01024.json.gz",
+   "rows": 62947,
+   "tokens": 35306734
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00952-of-01024.json.gz",
+   "rows": 63094,
+   "tokens": 35873380
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00953-of-01024.json.gz",
+   "rows": 63058,
+   "tokens": 35566709
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00954-of-01024.json.gz",
+   "rows": 62931,
+   "tokens": 35596423
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00955-of-01024.json.gz",
+   "rows": 63096,
+   "tokens": 35898630
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00956-of-01024.json.gz",
+   "rows": 63191,
+   "tokens": 35885125
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00957-of-01024.json.gz",
+   "rows": 62943,
+   "tokens": 35856631
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00958-of-01024.json.gz",
+   "rows": 62944,
+   "tokens": 35705281
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00959-of-01024.json.gz",
+   "rows": 62921,
+   "tokens": 35740766
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00960-of-01024.json.gz",
+   "rows": 63217,
+   "tokens": 35636546
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00961-of-01024.json.gz",
+   "rows": 63054,
+   "tokens": 35594975
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00962-of-01024.json.gz",
+   "rows": 63167,
+   "tokens": 35743772
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00963-of-01024.json.gz",
+   "rows": 62869,
+   "tokens": 35511192
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00964-of-01024.json.gz",
+   "rows": 62895,
+   "tokens": 35411330
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00965-of-01024.json.gz",
+   "rows": 63015,
+   "tokens": 35394587
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00966-of-01024.json.gz",
+   "rows": 63047,
+   "tokens": 35647652
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00967-of-01024.json.gz",
+   "rows": 62720,
+   "tokens": 35613211
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00968-of-01024.json.gz",
+   "rows": 62832,
+   "tokens": 35691244
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00969-of-01024.json.gz",
+   "rows": 62915,
+   "tokens": 35668925
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00970-of-01024.json.gz",
+   "rows": 63103,
+   "tokens": 35573983
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00971-of-01024.json.gz",
+   "rows": 62969,
+   "tokens": 35736226
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00972-of-01024.json.gz",
+   "rows": 63053,
+   "tokens": 35684376
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00973-of-01024.json.gz",
+   "rows": 62971,
+   "tokens": 35458968
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00974-of-01024.json.gz",
+   "rows": 63057,
+   "tokens": 35557815
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00975-of-01024.json.gz",
+   "rows": 63009,
+   "tokens": 35802239
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00976-of-01024.json.gz",
+   "rows": 62923,
+   "tokens": 35473691
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00977-of-01024.json.gz",
+   "rows": 62972,
+   "tokens": 35601287
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00978-of-01024.json.gz",
+   "rows": 62969,
+   "tokens": 35977439
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00979-of-01024.json.gz",
+   "rows": 63267,
+   "tokens": 35551469
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00980-of-01024.json.gz",
+   "rows": 62957,
+   "tokens": 35522801
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00981-of-01024.json.gz",
+   "rows": 63389,
+   "tokens": 36001791
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00982-of-01024.json.gz",
+   "rows": 63006,
+   "tokens": 35396536
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00983-of-01024.json.gz",
+   "rows": 63219,
+   "tokens": 35563112
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00984-of-01024.json.gz",
+   "rows": 63137,
+   "tokens": 35725803
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00985-of-01024.json.gz",
+   "rows": 63152,
+   "tokens": 36038554
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00986-of-01024.json.gz",
+   "rows": 62990,
+   "tokens": 35673810
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00987-of-01024.json.gz",
+   "rows": 63125,
+   "tokens": 35852888
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00988-of-01024.json.gz",
+   "rows": 62971,
+   "tokens": 35250098
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00989-of-01024.json.gz",
+   "rows": 63224,
+   "tokens": 35691214
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00990-of-01024.json.gz",
+   "rows": 62923,
+   "tokens": 35910218
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00991-of-01024.json.gz",
+   "rows": 63178,
+   "tokens": 35570290
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00992-of-01024.json.gz",
+   "rows": 63051,
+   "tokens": 35309025
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00993-of-01024.json.gz",
+   "rows": 62979,
+   "tokens": 35688043
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00994-of-01024.json.gz",
+   "rows": 63414,
+   "tokens": 35984531
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00995-of-01024.json.gz",
+   "rows": 62930,
+   "tokens": 35267073
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00996-of-01024.json.gz",
+   "rows": 63001,
+   "tokens": 35647487
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00997-of-01024.json.gz",
+   "rows": 63026,
+   "tokens": 35838582
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00998-of-01024.json.gz",
+   "rows": 62901,
+   "tokens": 35644655
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-00999-of-01024.json.gz",
+   "rows": 62849,
+   "tokens": 35905357
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-01000-of-01024.json.gz",
+   "rows": 63166,
+   "tokens": 35313745
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-01001-of-01024.json.gz",
+   "rows": 63102,
+   "tokens": 35861155
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-01002-of-01024.json.gz",
+   "rows": 62950,
+   "tokens": 35314506
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-01003-of-01024.json.gz",
+   "rows": 63082,
+   "tokens": 35574300
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-01004-of-01024.json.gz",
+   "rows": 63299,
+   "tokens": 35926484
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-01005-of-01024.json.gz",
+   "rows": 62702,
+   "tokens": 35396200
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-01006-of-01024.json.gz",
+   "rows": 62882,
+   "tokens": 35532729
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-01007-of-01024.json.gz",
+   "rows": 62995,
+   "tokens": 35659992
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-01008-of-01024.json.gz",
+   "rows": 63074,
+   "tokens": 35835721
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-01009-of-01024.json.gz",
+   "rows": 62880,
+   "tokens": 35523071
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-01010-of-01024.json.gz",
+   "rows": 63076,
+   "tokens": 35271252
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-01011-of-01024.json.gz",
+   "rows": 62995,
+   "tokens": 35456464
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-01012-of-01024.json.gz",
+   "rows": 63003,
+   "tokens": 35756339
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-01013-of-01024.json.gz",
+   "rows": 62690,
+   "tokens": 35359273
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-01014-of-01024.json.gz",
+   "rows": 62979,
+   "tokens": 35779779
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-01015-of-01024.json.gz",
+   "rows": 62684,
+   "tokens": 35337206
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-01016-of-01024.json.gz",
+   "rows": 63172,
+   "tokens": 36106857
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-01017-of-01024.json.gz",
+   "rows": 62836,
+   "tokens": 35492756
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-01018-of-01024.json.gz",
+   "rows": 63112,
+   "tokens": 35672874
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-01019-of-01024.json.gz",
+   "rows": 63030,
+   "tokens": 35519482
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-01020-of-01024.json.gz",
+   "rows": 63126,
+   "tokens": 35510829
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-01021-of-01024.json.gz",
+   "rows": 63233,
+   "tokens": 35523786
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-01022-of-01024.json.gz",
+   "rows": 63170,
+   "tokens": 35719827
+  },
+  {
+   "path": "mc4_nl_cleaned/train/c4-nl-cleaned.tfrecord-01023-of-01024.json.gz",
+   "rows": 63179,
+   "tokens": 35399668
+  }
+ ]
+}

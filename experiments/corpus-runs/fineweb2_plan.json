@@ -1,0 +1,260 @@
+{
+ "corpus": "fineweb2",
+ "repo": "HuggingFaceFW/fineweb-2",
+ "config": "nld_Latn",
+ "revision": "af9c13333eb981300149d5ca60a8e9d659b276b9",
+ "hosts": 4,
+ "segment_rows": 1000,
+ "documents": 147301270,
+ "tokens": 103344958426,
+ "tokens_note": "without <s> and </s>, of yhavinga/dutch-llama-tokenizer as the trainer tokenizes (count_tokens.py)",
+ "shares": [
+  {
+   "rank": 0,
+   "documents": 36825318,
+   "tokens": 25845959633
+  },
+  {
+   "rank": 1,
+   "documents": 36825318,
+   "tokens": 25841348570
+  },
+  {
+   "rank": 2,
+   "documents": 36825317,
+   "tokens": 25832926080
+  },
+  {
+   "rank": 3,
+   "documents": 36825317,
+   "tokens": 25824724143
+  }
+ ],
+ "files": [
+  {
+   "path": "data/nld_Latn/train/000_00000.parquet",
+   "rows": 4004000,
+   "tokens": 2577832271
+  },
+  {
+   "path": "data/nld_Latn/train/000_00001.parquet",
+   "rows": 4000000,
+   "tokens": 2578833066
+  },
+  {
+   "path": "data/nld_Latn/train/000_00002.parquet",
+   "rows": 4012000,
+   "tokens": 2577523931
+  },
+  {
+   "path": "data/nld_Latn/train/000_00003.parquet",
+   "rows": 4010000,
+   "tokens": 2577112029
+  },
+  {
+   "path": "data/nld_Latn/train/000_00004.parquet",
+   "rows": 4003000,
+   "tokens": 2577764481
+  },
+  {
+   "path": "data/nld_Latn/train/000_00005.parquet",
+   "rows": 3999000,
+   "tokens": 2580376937
+  },
+  {
+   "path": "data/nld_Latn/train/000_00006.parquet",
+   "rows": 3997000,
+   "tokens": 2580372880
+  },
+  {
+   "path": "data/nld_Latn/train/000_00007.parquet",
+   "rows": 4002000,
+   "tokens": 2578678406
+  },
+  {
+   "path": "data/nld_Latn/train/000_00008.parquet",
+   "rows": 3994000,
+   "tokens": 2579916826
+  },
+  {
+   "path": "data/nld_Latn/train/001_00000.parquet",
+   "rows": 3911000,
+   "tokens": 2600021941
+  },
+  {
+   "path": "data/nld_Latn/train/001_00001.parquet",
+   "rows": 3915000,
+   "tokens": 2599582040
+  },
+  {
+   "path": "data/nld_Latn/train/001_00002.parquet",
+   "rows": 3904000,
+   "tokens": 2601437708
+  },
+  {
+   "path": "data/nld_Latn/train/001_00003.parquet",
+   "rows": 3900000,
+   "tokens": 2602399010
+  },
+  {
+   "path": "data/nld_Latn/train/001_00004.parquet",
+   "rows": 3902000,
+   "tokens": 2602211543
+  },
+  {
+   "path": "data/nld_Latn/train/001_00005.parquet",
+   "rows": 3904000,
+   "tokens": 2602798098
+  },
+  {
+   "path": "data/nld_Latn/train/001_00006.parquet",
+   "rows": 3898000,
+   "tokens": 2602989964
+  },
+  {
+   "path": "data/nld_Latn/train/001_00007.parquet",
+   "rows": 3903000,
+   "tokens": 2602583691
+  },
+  {
+   "path": "data/nld_Latn/train/001_00008.parquet",
+   "rows": 3911000,
+   "tokens": 2602012679
+  },
+  {
+   "path": "data/nld_Latn/train/002_00000.parquet",
+   "rows": 3765000,
+   "tokens": 2634366308
+  },
+  {
+   "path": "data/nld_Latn/train/002_00001.parquet",
+   "rows": 3745000,
+   "tokens": 2637061609
+  },
+  {
+   "path": "data/nld_Latn/train/002_00002.parquet",
+   "rows": 3748000,
+   "tokens": 2637552118
+  },
+  {
+   "path": "data/nld_Latn/train/002_00003.parquet",
+   "rows": 3751000,
+   "tokens": 2638004858
+  },
+  {
+   "path": "data/nld_Latn/train/002_00004.parquet",
+   "rows": 3741000,
+   "tokens": 2640537549
+  },
+  {
+   "path": "data/nld_Latn/train/002_00005.parquet",
+   "rows": 3736000,
+   "tokens": 2640397513
+  },
+  {
+   "path": "data/nld_Latn/train/002_00006.parquet",
+   "rows": 3733000,
+   "tokens": 2641766921
+  },
+  {
+   "path": "data/nld_Latn/train/002_00007.parquet",
+   "rows": 3725000,
+   "tokens": 2644190830
+  },
+  {
+   "path": "data/nld_Latn/train/002_00008.parquet",
+   "rows": 3725000,
+   "tokens": 2643844073
+  },
+  {
+   "path": "data/nld_Latn/train/003_00000.parquet",
+   "rows": 3536000,
+   "tokens": 2686420932
+  },
+  {
+   "path": "data/nld_Latn/train/003_00001.parquet",
+   "rows": 3534000,
+   "tokens": 2687648784
+  },
+  {
+   "path": "data/nld_Latn/train/003_00002.parquet",
+   "rows": 3532000,
+   "tokens": 2689362775
+  },
+  {
+   "path": "data/nld_Latn/train/003_00003.parquet",
+   "rows": 3523000,
+   "tokens": 2691067322
+  },
+  {
+   "path": "data/nld_Latn/train/003_00004.parquet",
+   "rows": 3525000,
+   "tokens": 2691045496
+  },
+  {
+   "path": "data/nld_Latn/train/003_00005.parquet",
+   "rows": 3511000,
+   "tokens": 2693834852
+  },
+  {
+   "path": "data/nld_Latn/train/003_00006.parquet",
+   "rows": 3520000,
+   "tokens": 2693900987
+  },
+  {
+   "path": "data/nld_Latn/train/003_00007.parquet",
+   "rows": 3508000,
+   "tokens": 2695133017
+  },
+  {
+   "path": "data/nld_Latn/train/003_00008.parquet",
+   "rows": 3497000,
+   "tokens": 2698321827
+  },
+  {
+   "path": "data/nld_Latn/train/004_00000.parquet",
+   "rows": 1559103,
+   "tokens": 1261378327
+  },
+  {
+   "path": "data/nld_Latn/train/004_00001.parquet",
+   "rows": 1426604,
+   "tokens": 1152968628
+  },
+  {
+   "path": "data/nld_Latn/train/004_00002.parquet",
+   "rows": 1328240,
+   "tokens": 1072034657
+  },
+  {
+   "path": "data/nld_Latn/train/004_00003.parquet",
+   "rows": 1235243,
+   "tokens": 1006502744
+  },
+  {
+   "path": "data/nld_Latn/train/004_00004.parquet",
+   "rows": 1179913,
+   "tokens": 957595437
+  },
+  {
+   "path": "data/nld_Latn/train/004_00005.parquet",
+   "rows": 1123118,
+   "tokens": 905781460
+  },
+  {
+   "path": "data/nld_Latn/train/004_00006.parquet",
+   "rows": 1040706,
+   "tokens": 847949897
+  },
+  {
+   "path": "data/nld_Latn/train/004_00007.parquet",
+   "rows": 976177,
+   "tokens": 792085731
+  },
+  {
+   "path": "data/nld_Latn/train/004_00008.parquet",
+   "rows": 908166,
+   "tokens": 739756273
+  }
+ ]
+}

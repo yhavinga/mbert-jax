@@ -1,0 +1,81 @@
+# The corpus runs: fineweb2-nl-230m-chunk1024-mix on mbert-corpus and mc4-nl-230m-chunk1024-mix on a v4-32 (mbert-mix,
+# after its mix run), each the command of culturax-nl-230m-chunk1024-mix (start_mix.sh in
+# gs://t5-dutch-english-usc2/mbert/masking/scripts, without its --stop-at-step) with another corpus; and DUMB of the mix
+# run's checkpoint at 300,000 on a spot v6e-8. From /Users/yeb/Developer/yhavinga/hammond.
+# Code: branch corpus-runs of github.com/yhavinga/mbert-jax at COMMIT. Scripts: $B (copies of experiments/corpus-runs/).
+# One thing at a time on a TPU: every start script refuses while a trainer, an eval or a fine-tune runs.
+COMMIT=0d92db49330c8ee5c003e0d2c5f0bb9f4424663a
+B=gs://t5-dutch-english-usc2/mbert/corpus-runs/scripts
+
+# Held-out loss: ~/heldout.parquet is the long run's, the first 40,000 documents of CulturaX nl_part_00097 (md5 checked by
+# every setup). FineWeb-2 and mC4 are crawls of the same web as CulturaX, so its documents may be in their training text:
+# in these two runs its EVAL loss is a monitor of training, not a held-out measure, and is not comparable to that of the
+# CulturaX runs as one.
+#
+# Checkpoints: the trainer keeps the last 3 (every 5,000 steps, ~20 minutes at 0.233 s per step). A step wanted for DUMB
+# must be copied to ckpt_keep/ within an hour, as for the mix run: gsutil -m cp -r $R/ckpt/<STEP> $R/ckpt_keep/
+
+######## FineWeb-2 nl on mbert-corpus (v4-32, us-central2-b, 4 workers)
+R=gs://t5-dutch-english-usc2/mbert/fineweb2-nl-230m-chunk1024-mix
+
+# 1. HF token through stdin, on each worker, before any Hugging Face download (the setup refuses to start without it)
+for w in 0 1 2 3; do gcloud compute tpus tpu-vm ssh mbert-corpus --zone us-central2-b --worker=$w --quiet --command='mkdir -p ~/.cache/huggingface; umask 077; cat > ~/.cache/huggingface/token' < ~/.cache/huggingface/token; done
+
+# 2. Setup, detached: code at COMMIT, venv, held-out file, this host's share. Measured on mbert-corpus on 2-3 Nov: 45 files, 36,825,317
+# or 36,825,318 documents and 37.3 GB per host (the 4 sum to 147,301,270); 20 minutes of staging per host, 41 on a host
+# slowed by an interrupted first attempt (the boot disk writes ~27 MB/s); afterwards 46-47 GB used, ~50 GB free.
+# Done on mbert-corpus at faee7bd, whose trainer is that of COMMIT: run it again only to record COMMIT on the VMs.
+# A second run keeps what is staged (then it takes a minute or two, e.g. to check out a new COMMIT).
+# Ready when each ~/setup_fineweb2.log ends in EXIT 0; the shares: gsutil cat gs://t5-dutch-english-usc2/mbert/corpus-runs/shares/fineweb2-w*.json
+gcloud compute tpus tpu-vm ssh mbert-corpus --zone us-central2-b --worker=all --quiet --command="gsutil -q cp $B/setup_fineweb2.sh ~/ && (COMMIT=$COMMIT setsid nohup bash -c 'bash ~/setup_fineweb2.sh > ~/setup_fineweb2.log 2>&1; echo EXIT \$? >> ~/setup_fineweb2.log' > /dev/null 2>&1 < /dev/null &)" < /dev/null
+
+# 3. Start. After a preemption or maintenance event the same command resumes from the last checkpoint (and data state).
+# 653,000 steps of ~0.233 s: ~42 hours. 0.785 of a pass over FineWeb-2 nl, so no host comes to the end of its share.
+gcloud compute tpus tpu-vm ssh mbert-corpus --zone us-central2-b --worker=all --quiet --command='bash ~/start_fineweb2.sh' < /dev/null
+# Progress: gsutil cat $R/logs/w<N>.log | grep -ao "^Step.*\|EVAL step=.*" | tail   (process_0 may be any worker: the one
+# with Step lines; an EVAL line follows the progress bar on its line)
+# Per host what training got: grep -a "^DATA" in that log at the end; ~/logs/fineweb2-nl-230m-chunk1024-mix.exit has EXIT 0.
+# Smoke test of these scripts on mbert-corpus (3 Nov, 00:01-00:11, outputs deleted): start_fineweb2.sh with STOP_AT=60,
+# CHECKPOINT_EVERY=30, EVAL_EVERY=30, then again with STOP_AT=100: EXIT 0 on all 4 workers both times, every host restored
+# its own data state at 60, 0.210 s per step at step 50 (input 0.018 s), EVAL loss 9.444 / 8.590 / 7.735 at 30 / 60 / 90.
+
+######## DUMB of the mix run at 300,000 on a spot v6e-8 (us-east1-d), when ckpt_keep/300000 exists
+# The protocol of gs://t5-dutch-english-usc2/mbert/masking/dumb (DBRD and SICK-NL at 512, seeds 42 43 44, 4 chips per
+# fine-tune), two fine-tunes at a time on chips 0-3 and 4-7; results named as those of mix-100000:
+# gs://t5-dutch-english-usc2/mbert/masking/dumb/mix-300000--{dbrd,sicknl}--seed{42,43,44}.json (and logs/). The long run's
+# 300000--*.json are not touched, and a job with a result is skipped. The earlier rounds ran on a v4-8, this on v6e chips.
+# Across regions per start: 0.92 GB of params (read in place with --params-only, the optimizer state stays behind), the
+# 68 MB held-out file, scripts and results. After a preemption: create the VM again and repeat 2 to 4; done jobs are skipped.
+gsutil -q stat gs://t5-dutch-english-usc2/mbert/culturax-nl-230m-chunk1024-mix/ckpt_keep/300000/commit_success.txt && echo ready
+# 1. The VM, only through the guard of tpu.py (spot)
+HAMMOND_BUCKET=t5-dutch-english-use1 .venv/bin/python training/tpu.py up --accelerator v6e-8 --zone us-east1-d --name mbert-dumb-mix --wait
+# 2. HF token through stdin
+gcloud compute tpus tpu-vm ssh mbert-dumb-mix --zone us-east1-d --worker=0 --quiet --command='mkdir -p ~/.cache/huggingface; umask 077; cat > ~/.cache/huggingface/token' < ~/.cache/huggingface/token
+# 3. Setup, conversion, held-out check and the 6 fine-tunes, detached. Estimate, not measured on a v6e: ~5 minutes
+# of setup, 1 of conversion, then 3 fine-tunes per queue; mix-100000's took 3.5 minutes per DBRD and 2 per SICK-NL on a v4-8.
+gcloud compute tpus tpu-vm ssh mbert-dumb-mix --zone us-east1-d --worker=0 --quiet --command="gsutil -q cp $B/dumb_mix_v6e.sh ~/ && COMMIT=$COMMIT bash ~/dumb_mix_v6e.sh 300000" < /dev/null
+# Progress: gsutil ls gs://t5-dutch-english-usc2/mbert/masking/dumb/mix-300000--*.json | wc -l   (6 when done); on the VM
+# ~/logs/dumb_mix-300000.log, per queue ~/logs/dumb_mix-300000_w{0,1}.log; at the end logs/dumb_mix-300000_v6e.{log,exit}.
+# If ~/logs/dumb_mix-300000_w1.log says "preflight failed" (chips 4-7 not a TPU of their own next to 0-3), queue 0 still
+# runs its 3 jobs; when ~/logs/dumb_mix-300000.exit exists, the rest one after the other on chips 0-3 (done jobs are skipped):
+gcloud compute tpus tpu-vm ssh mbert-dumb-mix --zone us-east1-d --worker=0 --quiet --command="QUEUES=1 COMMIT=$COMMIT bash ~/dumb_mix_v6e.sh 300000" < /dev/null
+# 4. Delete the VM and its queued resource, and check
+.venv/bin/python training/tpu.py down --name mbert-dumb-mix --zone us-east1-d && .venv/bin/python training/tpu.py status
+
+######## mC4 nl cleaned on mbert-mix (v4-32, us-central2-b, 4 workers), after its mix run
+# The setup leaves ~/mbert-jax (the mix run's code), ~/culturax_nl (its share, ~52 GB) and ~/culturax_nl_files.txt alone:
+# code and venv in ~/mbert-corpus, the share in ~/mc4_nl (~13 GB per host, estimated from one file staged on the Mac: 12.75 MB per file and host per host; with ~2 GB of venv it fits in the ~37 GB
+# free next to CulturaX). It can run while the mix run trains (16 downloads at a time into /dev/shm, the disk writes the
+# share only); start_mc4.sh refuses while a trainer runs.
+R4=gs://t5-dutch-english-usc2/mbert/mc4-nl-230m-chunk1024-mix
+# 1. HF token through stdin, on each worker (again, if it is there already: the setup refuses to start without it)
+for w in 0 1 2 3; do gcloud compute tpus tpu-vm ssh mbert-mix --zone us-central2-b --worker=$w --quiet --command='mkdir -p ~/.cache/huggingface; umask 077; cat > ~/.cache/huggingface/token' < ~/.cache/huggingface/token; done
+# 2. Setup, detached. Ready when each ~/setup_mc4.log ends in EXIT 0; the shares: gsutil cat gs://t5-dutch-english-usc2/mbert/corpus-runs/shares/mc4-w*.json
+gcloud compute tpus tpu-vm ssh mbert-mix --zone us-central2-b --worker=all --quiet --command="gsutil -q cp $B/setup_mc4.sh ~/ && (COMMIT=$COMMIT setsid nohup bash -c 'bash ~/setup_mc4.sh > ~/setup_mc4.log 2>&1; echo EXIT \$? >> ~/setup_mc4.log' > /dev/null 2>&1 < /dev/null &)" < /dev/null
+# 3. Start, when ~/logs/culturax-nl-230m-chunk1024-mix.exit says EXIT 0 on all workers (and whatever else is to run on
+# mbert-mix first, e.g. the 2048 phase, is done). 2.21 passes over mC4 nl: each host starts its next pass on its own when
+# its share runs out (seed 42 + pass for the order of its files, the shuffle buffer and the window of pieces), at other
+# steps than the others, which is safe (tests/test_multihost.py, test_shares_of_other_sizes_...). A resume in any pass
+# continues with the next batch, also from a checkpoint on the last batch of a pass (fixed in 65fa609).
+gcloud compute tpus tpu-vm ssh mbert-mix --zone us-central2-b --worker=all --quiet --command='bash ~/start_mc4.sh' < /dev/null
+# Progress: gsutil cat $R4/logs/w<N>.log | grep -ao "^Step.*\|EVAL step=.*\|Completed epoch.*" | tail

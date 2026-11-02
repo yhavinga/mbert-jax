@@ -45,3 +45,24 @@ def test_padding_to_a_multiple_gives_the_same_logits_and_loss():
     rounded_logits, rounded_loss = run(rounded)
     np.testing.assert_allclose(rounded_logits, tight_logits, rtol=1e-5, atol=1e-6)
     assert abs(rounded_loss - tight_loss) < 1e-6
+
+
+def test_memory_probe_runs_the_worst_case_and_says_it_fits(tmp_path):
+    import json
+    import os
+    import pickle
+    import subprocess
+
+    config = MMBertConfig(vocab_size=64, hidden_size=32, intermediate_size=32, num_hidden_layers=3, num_attention_heads=2,
+                          max_position_embeddings=256, global_attn_every_n_layers=3, pad_token_id=0)
+    model = ModernBertForSequenceClassification(config)
+    params = model.init(jax.random.PRNGKey(0), jnp.ones((1, 8), dtype=jnp.int32), deterministic=True)["params"]
+    # The layout of a converted checkpoint: the masked-LM tree, whose model and prediction head the fine-tune takes
+    (tmp_path / "params.pkl").write_bytes(pickle.dumps({"model": jax.device_get(params["model"]), "prediction_head": jax.device_get(params["head"])}))
+    (tmp_path / "config.json").write_text(json.dumps({**config.to_dict(), "tokenizer_name": "unused"}))
+    script = Path(__file__).resolve().parents[1] / "scripts" / "dumb" / "probe_memory.py"
+    done = subprocess.run([sys.executable, str(script), "--checkpoint", str(tmp_path), "--max-length", "32", "--batch-size", "2",
+                           "--gradient-accumulation-steps", "3"], capture_output=True, text=True, timeout=300,
+                          env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src")})
+    assert done.returncode == 0, done.stderr[-2000:]
+    assert "PROBE max_length=32 batch_size=2 accumulation=3 devices=1 FITS" in done.stdout

@@ -3,7 +3,7 @@
 Status: written on 2026-11-02, before any run of this experiment (smoke tests aside). Changes after a real run has
 started are added below under "Amendments", dated, and never replace the text above them.
 
-Code: branch `phase2048` of mbert-jax, commit `COMMIT_PLACEHOLDER` (the commit `setup_phase.sh` checks out).
+Code: branch `phase2048` of mbert-jax, commit `3de74276658f504aaa91929fd7f31d343e3237df` (the commit `setup_phase.sh` checks out).
 Scripts: `gs://t5-dutch-english-usc2/mbert/phase2048/scripts/` (= `experiments/phase2048/` of that branch).
 Outputs: `gs://t5-dutch-english-usc2/mbert/phase2048/`.
 

@@ -32,10 +32,21 @@ from flax.traverse_util import flatten_dict
 from safetensors.numpy import save_file
 
 
-def load_orbax_checkpoint(checkpoint_path: Path):
-    """Load Orbax checkpoint as raw pytree."""
-    # Orbax requires absolute paths
-    checkpoint_path = checkpoint_path.absolute()
+def load_orbax_checkpoint(checkpoint_path, params_only: bool = False):
+    """Load Orbax checkpoint as raw pytree.
+
+    params_only: only the params subtree is read, where it is (gs:// too). The optimizer state of a training
+    checkpoint is twice the size of the params, and from another region every byte read is billed.
+    """
+    if str(checkpoint_path).startswith("gs://"):
+        if not params_only:
+            raise ValueError(f"{checkpoint_path}: a gs:// checkpoint is read with --params-only only; copy it first otherwise")
+        from etils import epath
+
+        checkpoint_path = epath.Path(str(checkpoint_path))
+    else:
+        # Orbax requires absolute paths
+        checkpoint_path = Path(checkpoint_path).absolute()
     print(f"Loading from {checkpoint_path}")
 
     checkpointer = ocp.PyTreeCheckpointer()
@@ -48,10 +59,17 @@ def load_orbax_checkpoint(checkpoint_path: Path):
         restore_path = checkpoint_path
 
     # As NumPy: global arrays of a multi-host run have a sharding over devices that aren't here
-    restore_args = jax.tree_util.tree_map(
-        lambda _: ocp.RestoreArgs(restore_type=np.ndarray), dict(checkpointer.metadata(restore_path).item_metadata)
-    )
-    raw = checkpointer.restore(restore_path, args=ocp.args.PyTreeRestore(restore_args=restore_args))
+    metadata = dict(checkpointer.metadata(restore_path).item_metadata)
+    if params_only:
+        if "params" not in metadata:
+            raise ValueError(f"{restore_path}: no 'params' at the top of the checkpoint, only {sorted(metadata)}")
+        item = {"params": metadata["params"]}
+        restore_args = jax.tree_util.tree_map(lambda _: ocp.RestoreArgs(restore_type=np.ndarray), item)
+        raw = checkpointer.restore(restore_path, args=ocp.args.PyTreeRestore(
+            item=item, restore_args=restore_args, partial_restore=True))
+    else:
+        restore_args = jax.tree_util.tree_map(lambda _: ocp.RestoreArgs(restore_type=np.ndarray), metadata)
+        raw = checkpointer.restore(restore_path, args=ocp.args.PyTreeRestore(restore_args=restore_args))
 
     # Navigate checkpoint structure to find params
     if isinstance(raw, dict):
@@ -170,9 +188,11 @@ def main():
     parser.add_argument("--global-attn-every-n-layers", type=int, default=3)
     parser.add_argument("--tokenizer", type=str, required=True,
                         help="Tokenizer name/path (required for HF conversion)")
+    parser.add_argument("--params-only", action="store_true",
+                        help="Read only the params, where they are (a gs:// step directory too), not the optimizer state")
     args = parser.parse_args()
 
-    checkpoint_path = Path(args.checkpoint)
+    checkpoint_path = args.checkpoint
     output_dir = Path(args.output)
 
     print("="*60)
@@ -184,7 +204,7 @@ def main():
     print("="*60)
 
     # Load
-    params = load_orbax_checkpoint(checkpoint_path)
+    params = load_orbax_checkpoint(checkpoint_path, params_only=args.params_only)
 
     # Infer config from params
     print("\nInferring config from checkpoint...")

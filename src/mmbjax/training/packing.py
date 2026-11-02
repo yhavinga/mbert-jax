@@ -1304,7 +1304,8 @@ class EpochTrackingDataLoader:
         """Iterate through batches, auto-restarting on epoch boundaries."""
         while self.num_epochs is None or self.epoch < self.num_epochs:
             self._current_iter = iter(self._create_pipeline())
-            if self._restore_state is not None:
+            restored = self._restore_state is not None
+            if restored:
                 self._current_iter.set_state(self._restore_state)
                 self._restore_state = None
             batches = 0
@@ -1317,7 +1318,8 @@ class EpochTrackingDataLoader:
                 # A literal </s> in a text is tokenized as text (split_special_tokens), so this id ends a document
                 self._documents_completed += int(np.count_nonzero(batch["input_ids"] == self.tokenizer.eos_token_id))
                 yield batch
-            if batches == 0:
+            # A restored pass can have no batch left: its state was saved after the pass's last batch
+            if batches == 0 and not restored:
                 raise RuntimeError(
                     f"Epoch {self.epoch} of shard {self.shard_index}/{self.shard_count} has "
                     f"{self.documents_read - self._documents_of_finished_epochs} documents, "

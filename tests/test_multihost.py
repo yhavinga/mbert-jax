@@ -222,8 +222,9 @@ def worker_main(spec):
         tm.PackedMLMDataCollator = FixedCollator
         tm.load_dataset_for_training = lambda **_kwargs: fixed_rows()
         tm.create_packed_dataloader = lambda **_kwargs: FixedPackedLoader()
-    elif data == "real_pipeline":
+    elif data in ("real_pipeline", "local_files"):
         # Real split_dataset_by_node, real Grain packing, real masking; only the download is fake.
+        # local_files: each host's own parquet files through --data-files-list, as staged by scripts/stage_share.py
         import datasets
 
         from mmbjax.training import packing
@@ -259,10 +260,11 @@ def worker_main(spec):
                     words = rng.randint(0, VOCAB_WORDS, size=rng.randint(3, spec.get("longest_document", 10) + 1))
                     yield {"text": " ".join(f"w{w}" for w in words), "row": shard * 100000 + i}
 
-        fake = datasets.IterableDataset.from_generator(generate, gen_kwargs={"shards": list(range(8))})
-        fake_load = lambda *_a, **_k: fake  # noqa: E731
-        tm.load_dataset = fake_load
-        packing.load_dataset = fake_load
+        if data == "real_pipeline":
+            fake = datasets.IterableDataset.from_generator(generate, gen_kwargs={"shards": list(range(8))})
+            fake_load = lambda *_a, **_k: fake  # noqa: E731
+            tm.load_dataset = fake_load
+            packing.load_dataset = fake_load
 
     argv = [
         "train_minimal.py",
@@ -284,6 +286,8 @@ def worker_main(spec):
         "--checkpoint-dir", "gs://" + spec["checkpoint_dir"],
         "--gradient-accumulation-steps", str(spec.get("accumulation", 1)),
     ] + (["--use-packing"] if spec["route"] == "packed" else []) + spec.get("extra_args", [])
+    if "files_lists" in spec:
+        argv += ["--data-files-list", spec["files_lists"][process_id]]
     sys.argv = argv
 
     real_load_eval_batches = tm.load_eval_batches
@@ -661,6 +665,84 @@ def test_split_documents_resume_after_a_kill_with_the_next_batch(tmp_path):
     saved = json.loads((Path(ckpt + "_data_state") / "6" / "process_0.json").read_text())
     assert saved["identity"]["long_documents"] == "split_into_pieces"
     assert saved["state"]["pieces_read"] > 0
+
+
+def _write_shares(tmp_path, documents_per_host):
+    """Per host two parquet files of documents of 3 to 10 words and the list --data-files-list reads."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    lists = []
+    for host, n in enumerate(documents_per_host):
+        rng = np.random.RandomState(100 + host)
+        paths = []
+        for part, size in enumerate((n // 2, n - n // 2)):
+            texts = [" ".join(f"w{w}" for w in rng.randint(0, VOCAB_WORDS, size=rng.randint(3, 11))) for _ in range(size)]
+            path = tmp_path / f"part{part}-w{host}of{len(documents_per_host)}.parquet"
+            pq.write_table(pa.table({"text": texts}), path)
+            paths.append(str(path))
+        listed = tmp_path / f"files_w{host}.txt"
+        listed.write_text("\n".join(paths) + "\n")
+        lists.append(str(listed))
+    return lists
+
+
+def _last_batches_of_passes(files_list, rows_per_host, passes):
+    """Indices of the batches that end a pass of the trainer's loader on these files, for the first passes."""
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+    from mmbjax.training import EpochTrackingDataLoader
+
+    loader = EpochTrackingDataLoader(dataset_name="fake", tokenizer=_make_tokenizer(), max_length=MAX_LENGTH,
+                                     batch_size=rows_per_host, seed=42, shuffle_buffer_size=10000,
+                                     data_files=Path(files_list).read_text().split())
+    ends, iterator, index = [], iter(loader), 0
+    next(iterator)
+    while len(ends) < passes:
+        epoch = loader.epoch
+        next(iterator)
+        if loader.epoch != epoch:
+            ends.append(index)
+        index += 1
+    return ends
+
+
+def test_shares_of_other_sizes_run_every_step_through_passes_and_resume_in_the_third(tmp_path):
+    """mC4 nl takes 2.21 passes in 653,000 steps, and the shares of its hosts differ by a document. Each host
+    starts its next pass on its own, at another step; no host may fall out of step or hang a collective, and a
+    checkpoint on the last batch of a pass of one host resumes with the next batches of both."""
+    lists = _write_shares(tmp_path, [61, 64])
+    ends = [_last_batches_of_passes(files, 4, 3) for files in lists]
+    assert ends[0] != ends[1], "the passes must end at other steps on the two hosts, or this tests nothing"
+    steps = max(ends[0][2], ends[1][2]) + 3
+    spec = dict(route="packed", data="local_files", per_device=2, files_lists=lists, max_steps=steps,
+                extra_args=["--system-metrics-every", "2", "--log-every", "1"])
+
+    whole, whole_logs = _run(tmp_path, "whole", 2, 2, checkpoint_dir=str(tmp_path / "ckpt_whole"), **spec)
+    _assert_identical_across_hosts_and_chips(whole)
+    assert whole[0]["state_step"] == steps
+    for process_id, log in enumerate(whole_logs):
+        assert f"Completed epoch 3 (shard {process_id}/2)" in log
+    whole_data = _data_line(whole_logs[0])["hosts"]
+    assert whole_data["host0"]["epoch"] == whole_data["host1"]["epoch"] == 3
+
+    # Stopped right after the last batch of host 0's second pass: a third start of it must go on with pass 3
+    stop = ends[0][1] + 1
+    ckpt = str(tmp_path / "ckpt")
+    stopped, _ = _run(tmp_path, "stopped", 2, 2, checkpoint_dir=ckpt, **{**spec, "extra_args": spec["extra_args"] + ["--stop-at-step", str(stop)]})
+    assert stopped[0]["state_step"] == stop
+    resumed, logs = _run(tmp_path, "resumed", 2, 2, checkpoint_dir=ckpt, **spec)
+    _assert_identical_across_hosts_and_chips(resumed)
+    assert resumed[0]["restored"]["step"] == stop and resumed[0]["state_step"] == steps
+    for process_id in range(2):
+        assert "Data state restored" in logs[process_id]
+        whole_batches = _raw_batches(tmp_path, "whole", process_id)
+        assert len(whole_batches) == steps
+        assert _raw_batches(tmp_path, "resumed", process_id) == whole_batches[stop:], process_id
+    # What training got, across the resume; documents_read also counts what prefetch read ahead
+    resumed_data = _data_line(logs[0])["hosts"]
+    for host in ("host0", "host1"):
+        for name in ("tokens_read", "documents_completed", "pieces_read", "epoch"):
+            assert resumed_data[host][name] == whole_data[host][name], (host, name)
 
 
 def test_packed_resume_without_data_state_refuses_to_repeat_data(tmp_path):

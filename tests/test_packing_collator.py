@@ -986,6 +986,53 @@ def test_loader_on_local_parquet_files_covers_them_and_resumes(tmp_path):
         assert np.array_equal(next(iterator)["input_ids"], expected["input_ids"])
 
 
+def test_a_resume_after_any_batch_of_three_passes_continues_with_the_next(tmp_path):
+    """mC4 nl takes 2.21 passes in 653,000 steps: a checkpoint can fall in any pass, also on its last batch."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from src.mmbjax.training import EpochTrackingDataLoader
+
+    files = []
+    for part in range(3):
+        path = tmp_path / f"part{part}.parquet"
+        pq.write_table(pa.table({"text": [f"w{part} w{i % 95}" for i in range(40)]}), path)
+        files.append(str(path))
+
+    def loader():
+        return EpochTrackingDataLoader(dataset_name="ignored", tokenizer=_left_truncating_tokenizer(), max_length=16,
+                                       batch_size=2, shuffle_buffer_size=10, data_files=files)
+
+    whole = loader()
+    iterator = iter(whole)
+    batches, epochs, counts = [], [], []
+    while whole.epoch < 3:
+        batches.append(next(iterator))
+        epochs.append(whole.epoch)
+        counts.append(json.dumps(whole.accounting()))
+    batches.pop(), epochs.pop(), counts.pop()  # the first batch of the fourth pass
+    last_of_pass = [i + 1 for i in range(len(epochs) - 1) if epochs[i + 1] != epochs[i]]
+    assert len(last_of_pass) == 2, "the batches must span three passes"
+    assert not np.array_equal(batches[0]["input_ids"], batches[last_of_pass[0]]["input_ids"]), "each pass has its own order"
+
+    for kill_at in range(1, len(batches)):
+        first = loader()
+        iterator = iter(first)
+        for _ in range(kill_at):
+            next(iterator)
+        state = json.loads(json.dumps(first.get_state(), default=int))
+        iterator.close()
+
+        resumed = loader()
+        resumed.set_state(state)
+        iterator = iter(resumed)
+        for i in range(kill_at, len(batches)):
+            batch = next(iterator)
+            for key in batches[i]:
+                assert np.array_equal(batch[key], batches[i][key]), (kill_at, i, key)
+            assert (resumed.epoch, json.dumps(resumed.accounting())) == (epochs[i], counts[i]), (kill_at, i)
+
+
 # --------------------------------------------------------------------------- --masking
 
 GOLDEN_UNIFORM15 = "8b98bdaf1f5ac53837e87b468f5a3a9d0a66783539e87ec3e8e26cc7c687b687"

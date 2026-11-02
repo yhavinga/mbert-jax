@@ -212,6 +212,22 @@ def test_max_batches_marks_the_result_incomplete(ew, tiny_checkpoint, tmp_path, 
     assert not result["windows"]["16"]["complete"]
 
 
+def test_the_eval_is_the_first_to_use_the_rotary_cache(ew, tiny_checkpoint, tmp_path, monkeypatch):
+    """As in a fresh process on the VM: whatever builds the cos/sin cache first, it must hold arrays, not tracers."""
+    from mmbjax.modules import rope
+
+    step_dir = tiny_checkpoint[0]
+    _eval_file(tmp_path / "held_out.parquet")
+    monkeypatch.setattr(ew, "AutoTokenizer", types.SimpleNamespace(from_pretrained=lambda *_a, **_k: _make_tokenizer()))
+    rope.clear_rotary_cache()
+    result = ew.main([
+        "--checkpoint", str(step_dir), "--eval-file", str(tmp_path / "held_out.parquet"), "--tokenizer", "fake",
+        "--windows", "8", "16", "--tokens-per-device", "32", "--hidden-size", "16", "--num-layers", "2",
+        "--num-heads", "2", "--intermediate-size", "32", "--max-batches", "1",
+    ])
+    assert result["windows"]["16"]["groups"]["all"]["masked"] > 0
+
+
 def test_a_checkpoint_of_another_model_is_refused(ew, tiny_checkpoint, tmp_path, monkeypatch):
     step_dir = tiny_checkpoint[0]
     _eval_file(tmp_path / "held_out.parquet")

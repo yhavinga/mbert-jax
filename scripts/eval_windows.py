@@ -222,10 +222,11 @@ def main(argv=None):
 
     replicated, batch_sharding = tm.create_shardings()
     ones = jnp.ones((1, args.windows[0]), dtype=jnp.int32)
-    # Shapes only: the checkpoint fills them, in the replicated sharding the trainer uses
-    shapes = jax.eval_shape(lambda: model.init(jax.random.PRNGKey(0), input_ids=ones, attention_mask=ones, deterministic=True)["params"])
-    target = jax.tree_util.tree_map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=replicated), shapes)
-    params = tm.load_params_of_run(args.checkpoint, target)
+    # Eagerly, as the trainer does: the first call of the model fills the module-level RoPE cache
+    # (mmbjax/modules/rope.py), and under jax.eval_shape or jit it would keep tracers there
+    init_params = tm.to_global(model.init(jax.random.PRNGKey(0), input_ids=ones, attention_mask=ones, deterministic=True)["params"], replicated)
+    params = tm.load_params_of_run(args.checkpoint, init_params)
+    del init_params
 
     texts = read_documents(args.eval_file, args.num_documents)
     # Each host tokenizes and packs its own share of the documents; the masks don't depend on the split

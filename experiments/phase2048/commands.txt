@@ -31,5 +31,5 @@ gcloud compute tpus tpu-vm ssh mbert-mix --zone us-central2-b --worker=all --qui
 # same queue on a single-host VM (WORKERS=1 WORKER=0 bash ~/dumb_phase.sh ..., after setup_phase.sh there).
 # A second start continues: jobs with a result in $R/dumb are skipped.
 
-# 5. Decision, on the Mac, in the mbert-jax worktree of branch phase2048
-mkdir -p /tmp/p2048-results && gsutil -m cp "$R/dumb/*.json" /tmp/p2048-results/ && python experiments/phase2048/decide.py --results /tmp/p2048-results --start $NAME --output /tmp/p2048-results/decision.json && gsutil cp /tmp/p2048-results/decision.json $R/decision-$NAME.json
+# 5. Decision, on the Mac, in the mbert-jax worktree of branch phase2048: DUMB and the window eval (amendment 1)
+mkdir -p /tmp/p2048-results /tmp/p2048-eval && gsutil -m cp "$R/dumb/*.json" /tmp/p2048-results/ && gsutil -m cp "$R/eval/$NAME-*.json" /tmp/p2048-eval/ && python experiments/phase2048/decide.py --results /tmp/p2048-results --eval /tmp/p2048-eval --start $NAME --output /tmp/p2048-results/decision.json && gsutil cp /tmp/p2048-results/decision.json $R/decision-$NAME.json

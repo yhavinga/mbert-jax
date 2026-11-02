@@ -151,4 +151,25 @@ the result files (`tests/test_phase2048_decide.py`).
 
 ## Amendments
 
-None.
+### 1. A paired window test can also decide "2048 helps" (2026-11-02, before any real run)
+
+Why: DBRD has 2.6% of its test reviews over 1024 tokens and 0.18% over 2048, so DBRD@2048 can differ from
+DBRD@1024 on at most 58 of 2,224 examples. The rule above would then almost always end in "no measurable
+difference", also when the 2048 phase works. The question is whether L does no harm on the short tasks and uses the
+longer context; DUMB measures the first, the window eval measures the second. Chosen by Yeb on 2026-11-02.
+
+The window eval now decides along with DUMB. With the results of `scripts/eval_windows.py` for S, C and L
+(`$RUN_ROOT/eval/<start>-{S,C,L}.json`, both windows over all documents of `heldout.parquet`):
+
+- "L uses the longer context" if L's loss on the long documents (`long_documents`, documents over 1024 tokens) at
+  window 2048 is lower than L's own loss on the same group at window 1024, AND L's loss on positions 1024-2047
+  (`positions_high` at window 2048) is lower than C's. The test is paired: both windows and all three models score
+  the same masked tokens, which `decide.py` checks on the counts of masked tokens; a difference is an error.
+- The decision: "2048 harms" as above, checked first. Otherwise "2048 helps" if L exceeds C on DBRD as above OR L
+  uses the longer context. Otherwise "no measurable difference".
+
+This replaces "The window eval is supporting evidence and decides nothing". Its other groups (`all`,
+`positions_low`, `long_documents_positions_low`) stay reported and decide nothing. Positions 0-1023 against
+1024-2047 is not used as a test: positions 0-1023 contain the starts of documents and, in `positions_low`, all the
+short documents, so their loss differs for reasons other than context. Code: `decide.py` (`uses_context`), tests
+in `tests/test_phase2048_decide.py`.

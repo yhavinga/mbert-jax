@@ -128,8 +128,11 @@ masking. Windows 1024 and 2048, each document cut into the trainer's pieces for 
   model, about 15 minutes for S, C and L.
 - DUMB: 9 fine-tunes per worker, the 4 workers in parallel, after per worker 3 conversions and the memory probes.
   DBRD@512 took 3.5 minutes per run and SICK-NL 2 to 4 (24 for the first, which compiles all its shapes) on a v4-8.
-  DBRD@1024 and @2048 are not measured on v4; from their padded tokens (64 and 60 million against 34 million at 512)
-  and the smaller micro-batches, 10 to 30 minutes each. About 2 to 3 hours for the queue.
+  DBRD@2048 on 4 v6e chips at 3 x 4 x 16: the first epoch took 13:48, about 9.5 minutes of it compiling batch
+  shapes, then 11.8 micro-steps per second, 2.3 minutes per epoch of 1,628 micro-steps. A v4 chip ran the trainer
+  1.74 times slower than a v6e chip, so about 4 minutes per epoch on v4: some 30 minutes for a worker's first
+  DBRD@2048 run and 15 for later ones (the compile cache is per worker). DBRD@1024 somewhat less. About 2.5 to 3
+  hours for the queue, the conversions and memory probes included.
 
 ## Decision rule
 

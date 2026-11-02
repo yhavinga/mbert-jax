@@ -1,0 +1,35 @@
+# The 2048 phase on mbert-mix (v4-32, us-central2-b, 4 workers), from /Users/yeb/Developer/yhavinga/hammond.
+# Before: the mix run at 653,000 (its ~/logs/culturax-nl-230m-chunk1024-mix.exit with EXIT 0 on all workers),
+# setup_mbert_mask.sh done, and protocol.md in gs://t5-dutch-english-usc2/mbert/phase2048/ (written before any run).
+# One thing at a time on the TPU: every start script refuses while a trainer, an eval or a fine-tune runs.
+# Wall times are estimates from the smoke test on a v6e-8 and the long run on this VM type (protocol.md, "Estimates").
+
+# 0. S, chosen before C and L start (protocol.md, "Models"); then, in each shell that runs the commands below:
+S=gs://t5-dutch-english-usc2/mbert/culturax-nl-230m-chunk1024/ckpt_keep/653000; MASKING=uniform15; NAME=u15
+#  or
+S=gs://t5-dutch-english-usc2/mbert/culturax-nl-230m-chunk1024-mix/ckpt/653000; MASKING=mix; NAME=mix
+R=gs://t5-dutch-english-usc2/mbert/phase2048
+
+# 1. Code of the phase in ~/mbert-p2048 on every worker (~/mbert-jax stays the mix run's)
+gcloud compute tpus tpu-vm ssh mbert-mix --zone us-central2-b --worker=all --quiet --command='gsutil -q cp gs://t5-dutch-english-usc2/mbert/phase2048/scripts/setup_phase.sh ~/ && COMMIT=COMMIT_PLACEHOLDER bash ~/setup_phase.sh' < /dev/null
+
+# 2. Arm C, then arm L when ~/logs/p2048-$NAME-C1024.exit says EXIT 0 on all workers. A preemption or maintenance
+# event: the same command again, it resumes from the arm's last checkpoint (every 2,000 steps).
+gcloud compute tpus tpu-vm ssh mbert-mix --zone us-central2-b --worker=all --quiet --command="bash ~/start_phase.sh C $S $MASKING $NAME" < /dev/null
+gcloud compute tpus tpu-vm ssh mbert-mix --zone us-central2-b --worker=all --quiet --command="bash ~/start_phase.sh L $S $MASKING $NAME" < /dev/null
+# Progress: gsutil cat $R/p2048-$NAME-C1024/logs/w<N>.log | grep -a "^Step\|^EVAL" | tail   (process_0 may be any worker)
+# At the end of each arm, on the worker with the Step lines: grep -a "^DATA" ... : per host documents_completed and tokens_read
+
+# 3. MLM window eval of S, C and L: all 40,000 held-out documents, windows 1024 and 2048
+gcloud compute tpus tpu-vm ssh mbert-mix --zone us-central2-b --worker=all --quiet --command="bash ~/eval_phase.sh $NAME-S=$S $NAME-C=$R/p2048-$NAME-C1024/ckpt/20000 $NAME-L=$R/p2048-$NAME-L2048/ckpt/20000" < /dev/null
+# Results: $R/eval/$NAME-{S,C,L}.json; logs $R/eval/logs/w<N>.log, .exit
+
+# 4. DUMB: 36 fine-tunes (3 models x 4 cells x 3 seeds), each worker a TPU of its own 4 chips, 9 jobs each
+gcloud compute tpus tpu-vm ssh mbert-mix --zone us-central2-b --worker=all --quiet --command="bash ~/dumb_phase.sh $NAME-S=$S $NAME-C=$R/p2048-$NAME-C1024/ckpt/20000 $NAME-L=$R/p2048-$NAME-L2048/ckpt/20000" < /dev/null
+# Progress: gsutil ls $R/dumb/*.json | wc -l (36 when done); per worker $R/dumb/logs/dumb_phase_w<N>.log and .exit at the end.
+# The script stops at once with "preflight failed" when a worker cannot run as a TPU of its own 4 chips; then run the
+# same queue on a single-host VM (WORKERS=1 WORKER=0 bash ~/dumb_phase.sh ..., after setup_phase.sh there).
+# A second start continues: jobs with a result in $R/dumb are skipped.
+
+# 5. Decision, on the Mac, in the mbert-jax worktree of branch phase2048
+mkdir -p /tmp/p2048-results && gsutil -m cp "$R/dumb/*.json" /tmp/p2048-results/ && python experiments/phase2048/decide.py --results /tmp/p2048-results --start $NAME --output /tmp/p2048-results/decision.json && gsutil cp /tmp/p2048-results/decision.json $R/decision-$NAME.json

@@ -11,9 +11,12 @@
 # skipped, so a second start (after a preemption) continues and nothing of another round is overwritten.
 # Across regions per start: the params of the checkpoint, 0.92 GB, read in place with --params-only (its optimizer
 # state stays behind); the held-out file, 68 MB; scripts and results, under 1 MB.
-# Needs ~/.cache/huggingface/token on the VM (commands.txt). Environment overrides, for a smoke test only: OUT CKPT ONLY_JOBS.
+# Needs ~/.cache/huggingface/token on the VM (commands.txt). QUEUES=1: all jobs one after the other on chips 0-3, for
+# when chips 4-7 fail the preflight next to them. Environment overrides, for a smoke test only: OUT CKPT ONLY_JOBS.
 set -euo pipefail
 COMMIT=${COMMIT:?set COMMIT to the commit of commands.txt}
+QUEUES=${QUEUES:-2}
+[ "$QUEUES" = 1 ] || [ "$QUEUES" = 2 ] || { echo "QUEUES must be 1 or 2, not $QUEUES"; exit 1; }
 STEP=${1:-300000}
 NAME=mix-$STEP
 CKPT=${CKPT:-gs://t5-dutch-english-usc2/mbert/culturax-nl-230m-chunk1024-mix/ckpt_keep/$STEP}
@@ -44,7 +47,7 @@ if [ ! -f \$HOME/dumb/ckpt$NAME/params.pkl ]; then
   rm -f \$HOME/dumb/ckpt$NAME/model.safetensors
 fi
 .venv/bin/python \$HOME/verify_ckpt.py \$HOME/dumb/ckpt$NAME || exit 4
-# task per-chip-batch accumulation seed; worker w takes the jobs i with i % 2 == w
+# task per-chip-batch accumulation seed; queue w takes the jobs i with i % QUEUES == w
 JOBS="dbrd 24 2 42
 dbrd 24 2 43
 dbrd 24 2 44
@@ -59,7 +62,7 @@ queue() {
   timeout 600 .venv/bin/python -c "import jax, jax.numpy as jnp; n = jax.device_count(); assert (n, jax.process_count()) == (4, 1), (n, jax.process_count()); print('devices', jax.devices(), float(jnp.arange(4.0).sum()))" || { echo "preflight failed: chips \$chips are not 4 chips of one process"; return 2; }
   i=0; failed=0
   while read -r task batch accumulation seed; do
-    mine=\$(( i % 2 == w )); i=\$((i + 1))
+    mine=\$(( i % $QUEUES == w )); i=\$((i + 1))
     [ \$mine = 1 ] || continue
     job=$NAME--\$task--seed\$seed
     [ -z "$ONLY_JOBS" ] || [[ " $ONLY_JOBS " == *" \$job "* ]] || continue
@@ -82,11 +85,14 @@ queue() {
 }
 queue 0 0,1,2,3 8476 > \$HOME/logs/dumb_${NAME}_w0.log 2>&1 &
 first=\$!
-queue 1 4,5,6,7 8477 > \$HOME/logs/dumb_${NAME}_w1.log 2>&1 &
-second=\$!
+code1=0
+if [ $QUEUES = 2 ]; then
+  queue 1 4,5,6,7 8477 > \$HOME/logs/dumb_${NAME}_w1.log 2>&1 &
+  second=\$!
+fi
 wait \$first; code0=\$?
-wait \$second; code1=\$?
-cat \$HOME/logs/dumb_${NAME}_w0.log \$HOME/logs/dumb_${NAME}_w1.log
+[ $QUEUES = 2 ] && { wait \$second; code1=\$?; }
+cat \$HOME/logs/dumb_${NAME}_w*.log
 echo "queues: worker 0 exit \$code0, worker 1 exit \$code1"
 [ \$code0 = 0 ] && [ \$code1 = 0 ]
 EOF

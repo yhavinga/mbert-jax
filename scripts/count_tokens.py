@@ -61,7 +61,12 @@ CORPORA = {
 
 TEXT_CHUNK = 256  # documents per tokenizer call
 SAMPLE_SEED = 0  # of the files whose packing is run
-SAMPLES = {"culturax": 12, "fineweb2": 8, "mc4": 32}
+# Files at the start of the random order, counted first; of each, SLICES random slices of SLICE_DOCS consecutive
+# documents (the whole file when shorter) go through the trainer's packing. A slice packs in under a minute,
+# a whole FineWeb-2 file in ten: a spot v6e lived 4 to 14 minutes.
+SAMPLES = {"culturax": 8, "fineweb2": 4, "mc4": 32}
+SLICES = {"culturax": 4, "fineweb2": 4, "mc4": 1}
+SLICE_DOCS = 100_000
 
 
 def piece_lengths(n_tokens: np.ndarray, max_length: int) -> tuple[np.ndarray, np.ndarray]:
@@ -190,6 +195,22 @@ def _gcs_ls(pattern: str) -> list[str]:
     return listing.stdout.split()
 
 
+def file_order(files: list[str], stratum: set[str]) -> tuple[list[str], list[str]]:
+    """The stratum's files, and the other files in a seeded random order.
+
+    The stratum holds the files counted in name order before this order existed. Every prefix of the
+    random part is a simple random sample of the files outside the stratum.
+    """
+    rest = [f for f in files if output_stem(f) not in stratum]
+    order = np.random.default_rng(SAMPLE_SEED).permutation(len(rest))
+    return [f for f in files if output_stem(f) in stratum], [rest[i] for i in order]
+
+
+def read_stratum(work: Path, corpus: str) -> set[str]:
+    path = work / corpus / "stratum.json"
+    return set(json.loads(path.read_text())["stems"]) if path.exists() else set()
+
+
 def cmd_count(args) -> None:
     from huggingface_hub import hf_hub_download
 
@@ -197,21 +218,47 @@ def cmd_count(args) -> None:
     work = Path(args.work).expanduser()
     download_dir = work / "download" / args.corpus
     out = work / args.corpus
-    (out / "counts").mkdir(parents=True, exist_ok=True)
-    (out / "lengths").mkdir(parents=True, exist_ok=True)
+    for sub in ("counts", "lengths", "parts"):
+        (out / sub).mkdir(parents=True, exist_ok=True)
     files = source_files(args.corpus)
     if args.limit_files:
         files = files[: args.limit_files]
     done = {p.stem for p in (out / "counts").glob("*.npz") if not p.name.endswith(".tmp.npz")}
+    done_parts: dict[str, set[int]] = {}
+    fs = None
     if args.gcs:
+        import gcsfs
+
+        fs = gcsfs.GCSFileSystem()
         # A spot VM loses its disk on preemption; what reached the bucket is done
         base = f"{args.gcs.rstrip('/')}/{args.corpus}"
         done |= {url.rsplit("/", 1)[1][: -len(".npz")] for url in _gcs_ls(f"{base}/counts/*.npz")}
-    todo = [f for f in files if output_stem(f) not in done]
+        if _gcs_ls(f"{base}/stratum.json"):
+            _run(["gcloud", "storage", "cp", "--quiet", f"{base}/stratum.json", str(out / "stratum.json")])
+        for path in fs.glob(f"{base}/parts/*/*.npz".replace("gs://", "")):
+            stem, part = path.split("/")[-2:]
+            done_parts.setdefault(stem, set()).add(int(part[: -len(".npz")]))
+    stratum, random_order = file_order(files, read_stratum(work, args.corpus))
+    todo = [f for f in stratum + random_order if output_stem(f) not in done]
+    if args.limit_order is not None:
+        todo = [f for f in random_order[: args.limit_order] if output_stem(f) not in done]
     (out / "files.json").write_text(json.dumps({**spec, "files": files}, indent=1))
     if args.gcs:
         _run(["gcloud", "storage", "cp", "--quiet", str(out / "files.json"), f"{base}/files.json"])
-    print(f"{args.corpus}: {len(files)} files, {len(todo)} to do, {args.workers} tokenizer processes", flush=True)
+    print(f"{args.corpus}: {len(files)} files, {len(stratum)} in the stratum, {len(todo)} to do, "
+          f"{sum(len(v) for v in done_parts.values())} parts in the bucket, {args.workers} tokenizer processes", flush=True)
+
+    def save_part(stem, i, result):
+        # A file of FineWeb-2 takes minutes and a spot VM may live four: keep every finished task
+        local = out / "parts" / stem / f"{i}.npz"
+        local.parent.mkdir(parents=True, exist_ok=True)
+        np.savez(local, counts=result[0], utf8_bytes=result[1], xxh64=result[2])
+        fs.put_file(str(local), f"{base}/parts/{stem}/{i}.npz".replace("gs://", ""))
+
+    def fetch_part(stem, i):
+        with fs.open(f"{base}/parts/{stem}/{i}.npz".replace("gs://", ""), "rb") as f:
+            saved = np.load(f)
+            return saved["counts"], saved["utf8_bytes"], saved["xxh64"]
 
     on_disk = threading.Semaphore(args.max_on_disk)
 
@@ -248,7 +295,7 @@ def cmd_count(args) -> None:
 
     t0 = time.time()
     done_docs = done_tokens = done_files = 0
-    with cf.ThreadPoolExecutor(args.downloads) as downloads, cf.ThreadPoolExecutor(4) as finishers, \
+    with cf.ThreadPoolExecutor(args.downloads) as downloads, cf.ThreadPoolExecutor(8) as finishers, \
             cf.ProcessPoolExecutor(args.workers, mp_context=multiprocessing.get_context("spawn"),
                                    initializer=_init_worker, initargs=(args.tokenizer, args.max_length)) as pool:
         pending = {downloads.submit(download, f): ("download", f) for f in todo}
@@ -265,14 +312,22 @@ def cmd_count(args) -> None:
                     tasks = _tasks(result)
                     parts[key] = [None] * len(tasks)
                     waiting[key] = len(tasks)
+                    stem = output_stem(key)
                     for i, task in enumerate(tasks):
-                        pending[pool.submit(_count_task, result, task)] = ("tokenize", (key, i))
-                elif kind == "tokenize":
+                        if i in done_parts.get(stem, ()):
+                            pending[finishers.submit(fetch_part, stem, i)] = ("fetched", (key, i))
+                        else:
+                            pending[pool.submit(_count_task, result, task)] = ("tokenize", (key, i))
+                elif kind in ("tokenize", "fetched"):
                     repo_path, i = key
                     parts[repo_path][i] = result
+                    if kind == "tokenize" and fs is not None and len(parts[repo_path]) > 1:
+                        pending[finishers.submit(save_part, output_stem(repo_path), i, result)] = ("saved", key)
                     waiting[repo_path] -= 1
                     if waiting[repo_path] == 0:
                         pending[finishers.submit(finish, repo_path, local_of.pop(repo_path), parts.pop(repo_path))] = ("finish", repo_path)
+                elif kind == "saved":
+                    pass
                 else:
                     repo_path, docs, tokens, nbytes = result
                     done_files += 1
@@ -344,10 +399,20 @@ def listed_for_read_order(directory: Path, wanted: list[str]) -> list[str]:
 
 
 def sample_files(corpus: str, work: Path, samples: int) -> list[str]:
-    """Stems of a seeded random sample of whole source files, in sample order."""
+    """Stems of the first files of the seeded random order: a simple random sample of the files outside the stratum."""
     files = json.loads((work / corpus / "files.json").read_text())["files"]
-    picked = np.random.default_rng(SAMPLE_SEED).choice(len(files), size=samples, replace=False)
-    return [output_stem(files[i]) for i in picked]
+    return [output_stem(f) for f in file_order(files, read_stratum(work, corpus))[1][:samples]]
+
+
+def sample_slices(corpus: str, work: Path) -> list[tuple[str, int, int]]:
+    """(stem, first document, documents) of each slice of the packing sample, from the counted sample files."""
+    slices = []
+    for index, stem in enumerate(sample_files(corpus, work, SAMPLES[corpus])):
+        n = len(np.load(work / corpus / "counts" / f"{stem}.npz")["counts"])
+        length = min(n, SLICE_DOCS)
+        rng = np.random.default_rng([SAMPLE_SEED, index])
+        slices += [(stem, int(rng.integers(0, n - length + 1)), length) for _ in range(SLICES[corpus])]
+    return slices
 
 
 def cmd_pack(args) -> None:
@@ -359,8 +424,6 @@ def cmd_pack(args) -> None:
     work = Path(args.work).expanduser()
     lengths_dir = work / args.corpus / "lengths"
     spec = CORPORA[args.corpus]
-    if args.sample is not None and args.samples is None:
-        args.samples = SAMPLES[args.corpus]
     real = load_tokenizer(args.tokenizer)
     tokenizer = LengthTokenizer(real.bos_token_id, real.eos_token_id, real.pad_token_id, token_id=100)
     common = dict(tokenizer=tokenizer, max_length=args.max_length, batch_size=args.rows_per_host,
@@ -368,12 +431,19 @@ def cmd_pack(args) -> None:
                   shuffle_buffer_size=SHUFFLE_BUFFER)
 
     if args.sample is not None:
-        # One file of the seeded sample, as a host of its own: the --data-files-list route over that file
-        stem = sample_files(args.corpus, work, args.samples)[args.sample]
-        files = [str(lengths_dir / f"{stem}.parquet")]
+        # One slice of the seeded sample, as a host of its own: the --data-files-list route over that slice
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        stem, start, length = sample_slices(args.corpus, work)[args.sample]
+        counts = np.load(work / args.corpus / "counts" / f"{stem}.npz")["counts"][start:start + length]
+        path = work / args.corpus / "pack" / "slices" / f"sample{args.sample}.parquet"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        pq.write_table(pa.table({"text": counts.astype(np.int32)}), path)
+        files = [str(path)]
         common.update(shard_index=0, shard_count=1)
         loader = EpochTrackingDataLoader(dataset_name=spec["repo"], dataset_config=spec["config"], data_files=files, **common)
-        route = f"sample file {stem}"
+        route = f"slice of {stem}: documents {start} to {start + length}"
     elif args.corpus == "culturax" and args.hosts == HOSTS:
         # The long run's route: this host's own files, through --data-files-list
         files = listed_for_read_order(lengths_dir, long_run_file_order(args.rank, args.hosts))
@@ -394,7 +464,7 @@ def cmd_pack(args) -> None:
 
     # A spot VM lives minutes, a pass over a host's data takes over an hour: resume as the trainer does,
     # from the loader's own get_state()
-    name = f"sample{args.sample}_of{args.samples}" if args.sample is not None else f"rank{args.rank}_of{args.hosts}"
+    name = f"sample{args.sample}" if args.sample is not None else f"rank{args.rank}_of{args.hosts}"
     state_path = work / args.corpus / "pack" / f"{name}.state.json"
     state_path.parent.mkdir(parents=True, exist_ok=True)
     gcs_state = f"{args.gcs.rstrip('/')}/{args.corpus}/pack/{name}.state.json" if args.gcs else None
@@ -436,47 +506,138 @@ def cmd_pack(args) -> None:
 
 # --------------------------------------------------------------------------------------------- summary
 
-def corpus_stats(counts: np.ndarray, hashes: np.ndarray, nbytes: np.ndarray, max_length: int) -> dict:
-    counts = counts.astype(np.int64)
-    pieces, trained = piece_lengths(counts, max_length)
-    total = int(counts.sum())
-    p50, p90, p99 = (int(v) for v in np.percentile(counts, [50, 90, 99], method="inverted_cdf"))
-    unique, first = np.unique(hashes, return_index=True)
-    repeated = np.ones(len(hashes), dtype=bool)
-    repeated[first] = False
-    stats = {
-        "documents": int(len(counts)),
-        "tokens": total,
-        "tokens_with_specials": int(trained.sum()),
-        "utf8_bytes": int(nbytes.astype(np.int64).sum()),
-        "mean_tokens_per_doc": total / len(counts),
-        "p50": p50, "p90": p90, "p99": p99, "max": int(counts.max()),
-        "empty_documents": int(np.count_nonzero(counts == 0)),
-        "pieces": int(pieces.sum()),
-        "split_documents": int(np.count_nonzero(pieces > 1)),
-        "exact_duplicate_documents": int(np.count_nonzero(repeated)),
-        "exact_duplicate_token_share": float(counts[repeated].sum() / total),
-    }
-    for limit in (1024, 2048):
-        long = counts > limit
-        stats[f"doc_share_over_{limit}"] = float(long.mean())
-        stats[f"token_share_over_{limit}"] = float(counts[long].sum() / total)
-    return stats
+LIMITS = (1024, 2048)
 
 
-def rows_estimate(sample_rows, sample_tokens, total_tokens, n_files):
-    """Ratio estimator of the packed rows of a corpus from whole sampled files, and its standard error.
+def file_totals(counts: np.ndarray, nbytes: np.ndarray, max_length: int) -> dict:
+    """Sums over the documents of one file: the corpus totals are sums of these."""
+    n = counts.astype(np.int64)
+    pieces, trained = piece_lengths(n, max_length)
+    totals = {"documents": len(n), "tokens": int(n.sum()), "tokens_with_specials": int(trained.sum()),
+              "pieces": int(pieces.sum()), "split_documents": int(np.count_nonzero(pieces > 1)),
+              "utf8_bytes": int(nbytes.astype(np.int64).sum()), "empty_documents": int(np.count_nonzero(n == 0))}
+    for limit in LIMITS:
+        long = n > limit
+        totals[f"documents_over_{limit}"] = int(np.count_nonzero(long))
+        totals[f"tokens_over_{limit}"] = int(n[long].sum())
+    return totals
 
-    rows/token of the sample times the corpus's exact tokens; the variance from the files' residuals,
-    with the finite-population correction (Cochran, Sampling Techniques, 3rd ed., 1977, section 6.3).
+
+def ratio_estimate(y_sample, x_sample, x_total: float, n_population: int):
+    """Ratio estimator of a population total from a simple random sample of whole files.
+
+    sum(y)/sum(x) of the sample times the population's known total of x; the standard error from the
+    files' residuals with the finite-population correction (Cochran, Sampling Techniques, 3rd ed., 1977,
+    section 6.3). Returns (total, se, ratio, ratio_se).
     """
-    y = np.asarray(sample_rows, dtype=np.float64)
-    x = np.asarray(sample_tokens, dtype=np.float64)
+    y = np.asarray(y_sample, dtype=np.float64)
+    x = np.asarray(x_sample, dtype=np.float64)
     k = len(y)
     ratio = y.sum() / x.sum()
+    if k == n_population:
+        return ratio * x_total, 0.0, ratio, 0.0
     residual_var = ((y - ratio * x) ** 2).sum() / (k - 1)
-    ratio_se = np.sqrt((1 - k / n_files) / k * residual_var) / x.mean()
-    return ratio * total_tokens, ratio_se * total_tokens, ratio, ratio_se
+    ratio_se = float(np.sqrt((1 - k / n_population) / k * residual_var) / x.mean())
+    return ratio * x_total, ratio_se * x_total, ratio, ratio_se
+
+
+def weighted_percentiles(values: np.ndarray, weights: np.ndarray, qs) -> list[int]:
+    """The smallest value whose weighted share of documents reaches q percent (inverted CDF)."""
+    order = np.argsort(values, kind="stable")
+    cumulative = np.cumsum(weights[order], dtype=np.float64)
+    cumulative /= cumulative[-1]
+    return [int(values[order][min(np.searchsorted(cumulative, q / 100), len(values) - 1)]) for q in qs]
+
+
+def file_documents(corpus: str, files: list[str], work: Path) -> tuple[str, dict[str, int]]:
+    """Per source file, without downloading it: its exact documents (parquet footers) or else its bytes."""
+    from huggingface_hub import HfApi, HfFileSystem
+
+    spec = CORPORA[corpus]
+    cache = work / corpus / "auxiliary.json"
+    if cache.exists():
+        saved = json.loads(cache.read_text())
+        return saved["name"], saved["values"]
+    if spec["suffix"] == ".parquet":
+        import pyarrow.parquet as pq
+
+        hub = HfFileSystem()
+
+        def rows(f):
+            with hub.open(f"datasets/{spec['repo']}@{spec['revision']}/{f}", "rb", block_size=1 << 20) as handle:
+                return pq.ParquetFile(handle).metadata.num_rows
+
+        with cf.ThreadPoolExecutor(16) as pool:
+            name, values = "documents", dict(zip((output_stem(f) for f in files), pool.map(rows, files)))
+    else:
+        tree = HfApi().list_repo_tree(spec["repo"], path_in_repo=spec["prefix"].rstrip("/"), recursive=True,
+                                      repo_type="dataset", revision=spec["revision"])
+        sizes = {entry.path: entry.size for entry in tree if hasattr(entry, "size")}
+        name, values = "compressed_bytes", {output_stem(f): sizes[f] for f in files}
+    cache.write_text(json.dumps({"name": name, "values": values}))
+    return name, values
+
+
+def corpus_summary(corpus: str, work: Path, max_length: int) -> dict:
+    """Exact totals when every file is counted; otherwise the stratum exact plus a ratio estimate of the rest
+    from the longest fully counted prefix of the seeded random order."""
+    files = json.loads((work / corpus / "files.json").read_text())["files"]
+    stratum, order = (list(map(output_stem, part)) for part in file_order(files, read_stratum(work, corpus)))
+    counted = {p.stem for p in (work / corpus / "counts").glob("*.npz") if not p.name.endswith(".tmp.npz")}
+    if not set(stratum) <= counted:
+        raise RuntimeError(f"{corpus}: stratum files without counts: {sorted(set(stratum) - counted)[:5]}")
+    m = next((i for i, s in enumerate(order) if s not in counted), len(order))
+    sample = order[:m]
+    if m < 2:
+        raise RuntimeError(f"{corpus}: only {m} files of the random order are counted")
+    complete = m == len(order)
+    aux_name, aux = file_documents(corpus, files, work)
+
+    per_file, counts, hashes, weights = {}, [], [], []
+    rest_aux = sum(aux[s] for s in order)
+    expansion = 1.0 if complete else rest_aux / sum(aux[s] for s in sample)
+    for s in stratum + sample:
+        saved = np.load(work / corpus / "counts" / f"{s}.npz")
+        per_file[s] = file_totals(saved["counts"], saved["utf8_bytes"], max_length)
+        if aux_name == "documents" and per_file[s]["documents"] != aux[s]:
+            raise AssertionError(f"{corpus} {s}: {per_file[s]['documents']} documents counted, the footer has {aux[s]}")
+        counts.append(saved["counts"].astype(np.int64))
+        hashes.append(saved["xxh64"])
+        weights.append(np.full(len(saved["counts"]), 1.0 if s in stratum else expansion))
+    counts, hashes, weights = np.concatenate(counts), np.concatenate(hashes), np.concatenate(weights)
+
+    totals, se = {}, {}
+    for key in per_file[sample[0]]:
+        exact = sum(per_file[s][key] for s in stratum)
+        if complete:
+            totals[key], se[key] = exact + sum(per_file[s][key] for s in sample), 0.0
+            continue
+        estimate, error, _, _ = ratio_estimate([per_file[s][key] for s in sample], [aux[s] for s in sample], rest_aux, len(order))
+        totals[key], se[key] = exact + estimate, error
+    if aux_name == "documents":
+        totals["documents"], se["documents"] = sum(aux.values()), 0.0
+    _, first = np.unique(hashes, return_index=True)
+    repeated = np.ones(len(hashes), dtype=bool)
+    repeated[first] = False
+    p50, p90, p99 = weighted_percentiles(counts, weights, (50, 90, 99))
+    stats = {
+        "files": len(files), "files_in_stratum": len(stratum), "files_counted": len(stratum) + m, "exact": complete,
+        "auxiliary": aux_name if not complete else None,
+        "documents": totals["documents"], "tokens": totals["tokens"], "tokens_with_specials": totals["tokens_with_specials"],
+        "pieces": totals["pieces"], "utf8_bytes": totals["utf8_bytes"], "split_documents": totals["split_documents"],
+        "empty_documents": totals["empty_documents"],
+        "se": {k: se[k] for k in ("documents", "tokens", "tokens_with_specials", "pieces")},
+        "mean_tokens_per_doc": totals["tokens"] / totals["documents"],
+        "p50": p50, "p90": p90, "p99": p99, "max_counted": int(counts.max()),
+        # Exact duplicates among the counted documents only: an estimate can't find pairs across uncounted files
+        "exact_duplicate_documents_counted": int(np.count_nonzero(repeated)),
+        "exact_duplicate_share_counted": float(repeated.mean()),
+        "exact_duplicate_token_share_counted": float(counts[repeated].sum() / counts.sum()),
+    }
+    for limit in LIMITS:
+        stats[f"doc_share_over_{limit}"] = totals[f"documents_over_{limit}"] / totals["documents"]
+        stats[f"token_share_over_{limit}"] = totals[f"tokens_over_{limit}"] / totals["tokens"]
+    return stats, per_file, aux
 
 
 def cmd_summary(args) -> None:
@@ -484,53 +645,52 @@ def cmd_summary(args) -> None:
     global_rows = ROWS_PER_HOST * HOSTS
     rows = {}
     for corpus in args.corpora:
-        meta = json.loads((work / corpus / "files.json").read_text())
-        stems = [output_stem(f) for f in meta["files"]]
-        parts = {s: np.load(work / corpus / "counts" / f"{s}.npz") for s in stems}
-        stats = corpus_stats(np.concatenate([parts[s]["counts"] for s in stems]), np.concatenate([parts[s]["xxh64"] for s in stems]),
-                             np.concatenate([parts[s]["utf8_bytes"] for s in stems]), args.max_length)
-        per_file = {}
-        for s in stems:
-            pieces, trained = piece_lengths(parts[s]["counts"], args.max_length)
-            per_file[s] = {"documents": len(parts[s]["counts"]), "pieces": int(pieces.sum()), "trained": int(trained.sum())}
+        stats, per_file, aux = corpus_summary(corpus, work, args.max_length)
 
-        # Steps from the trainer's pipeline run over each file of the seeded sample
-        k = SAMPLES[corpus]
-        samples = [json.loads((work / corpus / "pack" / f"sample{i}_of{k}.json").read_text()) for i in range(k)]
+        # Steps from the trainer's pipeline over each slice of the seeded sample
+        slices = sample_slices(corpus, work)
+        samples = [json.loads((work / corpus / "pack" / f"sample{i}.json").read_text()) for i in range(len(slices))]
         dropped = []
-        for sample, stem in zip(samples, sample_files(corpus, work, k)):
-            exact = per_file[stem]
+        for sample, (stem, start, length) in zip(samples, slices):
+            saved = np.load(work / corpus / "counts" / f"{stem}.npz")
+            exact = file_totals(saved["counts"][start:start + length], saved["utf8_bytes"][start:start + length], args.max_length)
             # Only the last packed batch of a pass may be missing: batch(drop_remainder=True) drops it when partial
-            lost_pieces, lost_tokens = exact["pieces"] - sample["pieces"], exact["trained"] - sample["real_tokens"]
+            lost_pieces, lost_tokens = exact["pieces"] - sample["pieces"], exact["tokens_with_specials"] - sample["real_tokens"]
             if sample["documents"] != exact["documents"] or not (0 <= lost_pieces and 0 <= lost_tokens < ROWS_PER_HOST * args.max_length):
-                raise AssertionError(f"{corpus} {stem}: the pipeline read {sample['documents']} documents, {sample['pieces']} "
-                                     f"pieces, {sample['real_tokens']} tokens; the counts give {exact}")
+                raise AssertionError(f"{corpus} {stem} [{start}:{start + length}]: the pipeline read {sample['documents']} "
+                                     f"documents, {sample['pieces']} pieces, {sample['real_tokens']} tokens; the counts give {exact}")
             dropped.append([lost_pieces, lost_tokens])
         sample_rows = [s["batches"] * ROWS_PER_HOST for s in samples]
         sample_tokens = [s["real_tokens"] for s in samples]
-        total_rows, rows_se, ratio, ratio_se = rows_estimate(sample_rows, sample_tokens, stats["tokens_with_specials"], len(stems))
+        tokens, tokens_se = stats["tokens_with_specials"], stats["se"]["tokens_with_specials"]
+        # Slices of files, not whole files of a finite list: no finite-population correction
+        _, _, ratio, ratio_se = ratio_estimate(sample_rows, sample_tokens, tokens, float("inf"))
+        rows_total = ratio * tokens
+        rows_se = float(np.hypot(ratio_se * tokens, ratio * tokens_se))
         stats.update({
-            "sampled_files": k, "files": len(stems), "sample_dropped_pieces_tokens": dropped,
-            "sampled_token_share": sum(sample_tokens) / stats["tokens_with_specials"],
+            "packing_sample_files": SAMPLES[corpus], "packing_sample_slices": len(slices),
+            "packing_sample_documents": sum(s["documents"] for s in samples),
+            "packing_sample_dropped_pieces_tokens": dropped,
             "packing_fill": sum(sample_tokens) / (sum(sample_rows) * args.max_length),
-            "steps_per_epoch": total_rows / global_rows,
-            "steps_per_epoch_95": [(total_rows - 1.96 * rows_se) / global_rows, (total_rows + 1.96 * rows_se) / global_rows],
+            "rows_per_token": ratio, "rows_per_token_se": ratio_se,
+            "steps_per_epoch": rows_total / global_rows,
+            "steps_per_epoch_95": [(rows_total - 1.96 * rows_se) / global_rows, (rows_total + 1.96 * rows_se) / global_rows],
         })
         stats["epochs_at_653000_steps"] = 653000 / stats["steps_per_epoch"]
 
         if corpus == "culturax":
-            # The long run's hosts: their exact documents and pieces, and the steps predicted for their own pass
+            # The long run's hosts: documents exact, pieces exact once all their files are counted, steps predicted
             hosts = []
-            for rank in range(HOSTS):
-                names = [n[: -len(".parquet")] for n in long_run_file_order(rank)]
-                tokens = sum(per_file[n]["trained"] for n in names)
-                hosts.append({
-                    "worker": rank, "documents": sum(per_file[n]["documents"] for n in names),
-                    "pieces": sum(per_file[n]["pieces"] for n in names), "tokens_with_specials": tokens,
-                    "predicted_steps": ratio * tokens / ROWS_PER_HOST,
-                    "predicted_steps_95": [(ratio - 1.96 * ratio_se) * tokens / ROWS_PER_HOST,
-                                           (ratio + 1.96 * ratio_se) * tokens / ROWS_PER_HOST],
-                })
+            for worker in range(HOSTS):
+                names = [n[: -len(".parquet")] for n in long_run_file_order(worker)]
+                host = {"worker": worker, "documents": sum(aux[n] for n in names)}
+                if all(n in per_file for n in names):
+                    tokens = sum(per_file[n]["tokens_with_specials"] for n in names)
+                    host.update({"pieces": sum(per_file[n]["pieces"] for n in names), "tokens_with_specials": tokens,
+                                 "predicted_steps": ratio * tokens / ROWS_PER_HOST,
+                                 "predicted_steps_95": [(ratio - 1.96 * ratio_se) * tokens / ROWS_PER_HOST,
+                                                        (ratio + 1.96 * ratio_se) * tokens / ROWS_PER_HOST]})
+                hosts.append(host)
             stats["long_run_hosts"] = hosts
         full = [work / corpus / "pack" / f"rank{r}_of{HOSTS}.json" for r in range(HOSTS)]
         if all(p.exists() for p in full):
@@ -558,12 +718,12 @@ def main(argv=None) -> None:
     count.add_argument("--max-on-disk", type=int, default=8, help="Source files on disk at once")
     count.add_argument("--gcs", default=None, help="Bucket prefix for the results; files already there are skipped")
     count.add_argument("--limit-files", type=int, default=None, help="Only the first N files (a smoke-test)")
+    count.add_argument("--limit-order", type=int, default=None, help="Only the first N files of the random order")
     pack = sub.add_parser("pack")
     pack.add_argument("--corpus", choices=CORPORA, required=True)
     pack.add_argument("--work", required=True)
     pack.add_argument("--rank", type=int, default=0, help="Host of a full pass over the corpus split over --hosts")
-    pack.add_argument("--sample", type=int, default=None, help="Instead: one pass over the N-th file of the sample")
-    pack.add_argument("--samples", type=int, default=None, help="Files in the seeded sample")
+    pack.add_argument("--sample", type=int, default=None, help="Instead: one pass over the N-th slice of the sample")
     pack.add_argument("--hosts", type=int, default=HOSTS)
     pack.add_argument("--rows-per-host", type=int, default=ROWS_PER_HOST)
     pack.add_argument("--gcs", default=None, help="Bucket prefix: the loader state is saved there, and resumed from")

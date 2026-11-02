@@ -26,6 +26,28 @@ def test_piece_lengths_matches_split_into_pieces(max_length):
         assert tokens[k] == sum(len(p) for p in real), k
 
 
+def test_file_order_keeps_the_stratum_out_of_the_random_order():
+    files = [f"nl/nl_part_{i:05d}.parquet" for i in range(20)]
+    stratum, order = count_tokens.file_order(files, {"nl_part_00000", "nl_part_00001"})
+    assert stratum == files[:2]
+    assert sorted(order) == files[2:] and order != files[2:]
+    assert count_tokens.file_order(files, {"nl_part_00000", "nl_part_00001"})[1] == order
+
+
+def test_ratio_estimate_of_the_whole_population_is_its_total():
+    y, x = [10, 31, 25, 7], [2, 6, 5, 1]
+    total, se, ratio, ratio_se = count_tokens.ratio_estimate(y, x, sum(x), len(x))
+    assert total == pytest.approx(sum(y)) and se == 0.0
+    total, se, _, _ = count_tokens.ratio_estimate(y[:3], x[:3], sum(x), len(x))
+    assert total == pytest.approx(66 / 13 * 14) and se > 0
+
+
+def test_weighted_percentiles_with_unit_weights_are_the_inverted_cdf():
+    values = np.random.default_rng(1).integers(0, 5000, size=1001)
+    expected = [int(v) for v in np.percentile(values, [50, 90, 99], method="inverted_cdf")]
+    assert count_tokens.weighted_percentiles(values, np.ones(len(values)), (50, 90, 99)) == expected
+
+
 class WordTokenizer:
     """One token per word, ids from 10 up: enough of a tokenizer for TokenizeTransform."""
 

@@ -855,6 +855,68 @@ def test_resume_in_another_masking_mode_is_refused(tmp_path):
     assert "Data state restored" in logs[0]
 
 
+def test_mix_heads_shared_trains_as_the_mix_without_the_flag(tmp_path):
+    spec = dict(route="packed", data="real_pipeline", per_device=2, rows_per_shard=500, max_steps=3)
+    plain, _ = _run(tmp_path, "plain", 2, 2, extra_args=["--masking", "mix"], **spec)
+    shared, logs = _run(tmp_path, "shared", 2, 2, extra_args=["--masking", "mix", "--mix-heads", "shared"], **spec)
+    assert shared[0]["digests"] == plain[0]["digests"] and shared[1]["digests"] == plain[1]["digests"]
+    assert "Prediction heads" not in logs[0] and "Head 0" not in logs[0]
+
+
+def test_mix_heads_train_per_head_resume_and_start_other_runs(tmp_path):
+    import sqlite3
+
+    import pytest
+
+    pytest.importorskip("trackio")
+    eval_file = tmp_path / "held_out.parquet"
+    _write_eval_parquet(eval_file)
+    ckpt = str(tmp_path / "ckpt")
+    rate2 = ["--masking", "mix", "--mix-heads", "rate2", "--eval-file", str(eval_file), "--eval-every", "2", "--eval-batches", "2"]
+    spec = dict(route="packed", data="real_pipeline", per_device=2, rows_per_shard=500, checkpoint_every=2)
+
+    first, logs = _run(tmp_path, "first", 2, 2, max_steps=2, checkpoint_dir=ckpt, tracker="trackio",
+                       extra_args=rate2 + ["--wandb-project", "mh", "--wandb-run-name", "r"], **spec)
+    _assert_identical_across_hosts_and_chips(first)
+    # 128 tokens and 16 wide: a dense layer, a norm scale and a bias
+    assert f"Prediction heads: 2 (--mix-heads rate2), {16 * 16 + 16 + 128} parameters beyond head 0" in logs[0]
+    assert "Masked tokens per prediction head on this host: [" in logs[0]
+    steps = [line for line in logs[0].splitlines() if line.startswith("Step 1:") or line.startswith("Step 2:")]
+    assert len(steps) == 2 and all(" | Head 0: " in line and " | Head 1: " in line for line in steps), steps
+    assert any(line.startswith("EVAL step=2") for line in logs[0].splitlines())
+    rows = sqlite3.connect(tmp_path / "first" / "trackio_0" / "mh.db").execute("SELECT step, metrics FROM metrics").fetchall()
+    logged = {step: json.loads(metrics) for step, metrics in rows if "train/loss" in json.loads(metrics)}
+    for k in (0, 1):
+        assert logged[2][f"train/head{k}_loss"] > 0 and logged[2][f"train/head{k}_n_masked_tokens"] > 0
+        assert 0 <= logged[2][f"train/head{k}_accuracy"] <= 100
+
+    # A resume: its own checkpoint and data state, with both heads
+    resumed, logs = _run(tmp_path, "resumed", 2, 2, max_steps=4, checkpoint_dir=ckpt, extra_args=rate2, **spec)
+    assert resumed[0]["restored"]["step"] == 2 and resumed[0]["state_step"] == 4
+    assert "Data state restored" in logs[0]
+    _assert_identical_across_hosts_and_chips(resumed)
+    # A resume with one head is refused
+    output, procs = _start(tmp_path, "one_head", 2, 2, max_steps=6, checkpoint_dir=ckpt, extra_args=["--masking", "mix"], **spec)
+    try:
+        codes = _wait_for_workers(procs)
+    finally:
+        _kill_workers(procs)
+    assert 1 in codes and 0 not in codes, codes
+
+    # --init-from into a run with the same heads: every parameter, head 1 too
+    step_dir = str(tmp_path / "ckpt" / "4")
+    phase, _ = _run(tmp_path, "phase", 2, 2, max_steps=2, checkpoint_dir=str(tmp_path / "ckpt_phase"),
+                    extra_args=rate2 + ["--init-from", step_dir], **spec)
+    assert set(phase[0]["init_from"]["digests"].values()) == set(resumed[0]["digests"].values())
+    # --init-from into a run of one head, as an anneal with single tokens: head 0
+    anneal, logs = _run(tmp_path, "anneal", 2, 2, max_steps=2, checkpoint_dir=str(tmp_path / "ckpt_anneal"),
+                        extra_args=["--masking", "uniform10", "--init-from", step_dir], **spec)
+    assert "head 0 becomes the one prediction head; left behind: decoder_1, prediction_head_1" in logs[0]
+    assert anneal[0]["state_step"] == 2 and anneal[0]["init_from"]["replicated"]
+    loaded = _params(tmp_path, "anneal", kind="params")
+    assert not any("prediction_head_1" in key or "decoder_1" in key for key in loaded)
+
+
 def _data_line(log):
     """The DATA line the coordinator prints at the end of a packed run."""
     lines = [line for line in log.splitlines() if line.startswith("DATA step=")]

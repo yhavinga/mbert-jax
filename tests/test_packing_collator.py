@@ -15,7 +15,9 @@ import jax.random as jr
 
 from src.mmbjax.configuration_mmbbert import MMBertConfig
 from src.mmbjax.heads.masked_lm import ModernBertForMaskedLM
-from src.mmbjax.training import DENOISER_NAMES, MixedDenoiserCollator, PackedMLMDataCollator, TokenizeTransform
+from src.mmbjax.training import (
+    DENOISER_NAMES, MIX_HEADS, MixedDenoiserCollator, PackedMLMDataCollator, TokenizeTransform, mix_head_count,
+)
 
 
 @pytest.fixture
@@ -1300,3 +1302,127 @@ def test_model_sees_nothing_of_the_tokens_behind_the_prefix():
     assert np.array_equal(only_segments[0][0, seen], only_segments[1][0, seen])
     visible = logits(other_ids, attention_mask, segment_ids, position_ids), logits(input_ids, attention_mask, segment_ids, position_ids)
     assert not np.array_equal(visible[0][0, :hidden_from], visible[1][0, :hidden_from])
+
+
+# --------------------------------------------------------------------------- --mix-heads
+
+GOLDEN_MIX = "857c7a097f41146530eeedd59180149fb163fb8badf7249a9bc61c8e530195a3"
+GOLDEN_MIX_NEXT_DRAW = 896220570
+
+
+def test_mix_heads_shared_collates_to_the_bytes_of_the_mix_before_the_flag(mock_tokenizer):
+    """The digest was computed with packing.py of 652e335, the code of the mix runs."""
+    for flag in ({}, {"mix_heads": "shared"}):
+        np.random.seed(42)
+        collator = MixedDenoiserCollator(_masking_tokenizer(mock_tokenizer), **flag)
+        batches = [collator(_packed_batch(seed=seed)) for seed in range(3)]
+        assert "head_ids" not in batches[0]
+        assert _digest({f"{i}{key}": batch[key] for i, batch in enumerate(batches) for key in batch}) == GOLDEN_MIX
+        assert np.random.randint(2**31) == GOLDEN_MIX_NEXT_DRAW
+
+
+def _record_denoisers(monkeypatch):
+    """The denoiser of each segment, in the order the collator draws them: row by row, segment by segment."""
+    drawn = []
+    real = MixedDenoiserCollator._draw_masked
+
+    def draw(denoiser, n):
+        drawn.append(denoiser)
+        return real(denoiser, n)
+
+    monkeypatch.setattr(MixedDenoiserCollator, "_draw_masked", staticmethod(draw))
+    return drawn
+
+
+def _assert_head_ids_follow_the_segments(raw, batch, drawn, heads):
+    """Per segment the head of its denoiser, 0 at padding and behind a short prefix; returns the heads and switches seen."""
+    order = iter(drawn)
+    seen, switches = set(), 0
+    for row in range(raw["input_ids"].shape[0]):
+        segments = np.where(raw["input_ids"][row] == 0, -1, raw["input_ids_segment_ids"][row])
+        boundaries = np.flatnonzero(segments[1:] != segments[:-1]) + 1
+        covered = np.zeros(len(segments), dtype=bool)
+        previous = None
+        for start, end in zip(np.r_[0, boundaries], np.r_[boundaries, len(segments)]):
+            if segments[start] == -1:
+                continue
+            head = heads[DENOISER_NAMES[next(order)]]
+            visible = batch["attention_mask"][row, start:end] == 1
+            assert np.all(batch["head_ids"][row, start:end][visible] == head), (row, start, end)
+            assert np.all(batch["head_ids"][row, start:end][~visible] == 0), "hidden behind a short prefix: padding"
+            assert np.all(batch["head_ids"][row, start:end][batch["labels"][row, start:end] != -100] == head)
+            covered[start:end] = True
+            seen.add(head)
+            switches += previous is not None and previous != head
+            previous = head
+        assert np.all(batch["head_ids"][row, ~covered] == 0)
+        assert np.all(batch["labels"][row, ~covered] == -100)
+    assert next(order, None) is None, "a segment more was drawn than the batch has"
+    return seen, switches
+
+
+@pytest.mark.parametrize("mix_heads", ["rate2", "per-denoiser"])
+def test_head_ids_follow_the_denoiser_of_each_segment_across_its_boundaries(mock_tokenizer, monkeypatch, mix_heads):
+    drawn = _record_denoisers(monkeypatch)
+    np.random.seed(7)
+    collator = MixedDenoiserCollator(_masking_tokenizer(mock_tokenizer), mix_heads=mix_heads)
+    seen, switches = set(), 0
+    for seed in range(5):
+        raw = _packed_batch(seed=seed)
+        drawn.clear()
+        batch = collator(raw)
+        assert batch["head_ids"].dtype == np.int32 and batch["head_ids"].shape == raw["input_ids"].shape
+        batch_seen, batch_switches = _assert_head_ids_follow_the_segments(raw, batch, drawn, MIX_HEADS[mix_heads])
+        seen |= batch_seen
+        switches += batch_switches
+    assert seen == set(range(mix_head_count(mix_heads)))
+    assert switches > 50, "few neighbouring segments of different heads: the boundaries were hardly tested"
+
+
+def test_head_ids_stay_with_their_segment_through_the_grain_packing(monkeypatch):
+    from src.mmbjax.training import create_packed_dataset_streaming
+
+    class WordTokenizer:
+        pad_token_id, bos_token_id, eos_token_id, mask_token_id = 0, 1, 2, 3
+        all_special_ids = [0, 1, 2, 3]
+        vocab_size = 1000
+
+        def __call__(self, text, **_kwargs):
+            return {"input_ids": [10 + int(word[1:]) for word in text.split()]}
+
+    rng = np.random.RandomState(0)
+    # Up to 300 tokens: some documents are split into pieces, which are packed as segments of their own
+    documents = [{"text": " ".join(f"w{w}" for w in rng.randint(0, 900, size=rng.randint(1, 300)))} for _ in range(600)]
+    packed = iter(create_packed_dataset_streaming(documents, tokenizer=WordTokenizer(), max_length=128, batch_size=8))
+    drawn = _record_denoisers(monkeypatch)
+    np.random.seed(0)
+    collator = MixedDenoiserCollator(WordTokenizer(), mix_heads="per-denoiser")
+    seen, switches = set(), 0
+    for _ in range(10):
+        raw = next(packed)
+        drawn.clear()
+        batch = collator(raw)
+        batch_seen, batch_switches = _assert_head_ids_follow_the_segments(raw, batch, drawn, MIX_HEADS["per-denoiser"])
+        seen |= batch_seen
+        switches += batch_switches
+    assert seen == set(range(8)) and switches > 20
+
+
+def test_head_ids_take_no_draws_so_the_masks_are_those_of_the_shared_mix(mock_tokenizer):
+    """A --mix-heads run with the seed of a mix run trains on the same masks: only the heads differ."""
+    tokenizer = _masking_tokenizer(mock_tokenizer)
+
+    def run(mix_heads):
+        np.random.seed(42)
+        collator = MixedDenoiserCollator(tokenizer, mix_heads=mix_heads)
+        batches = [collator(_packed_batch(seed=seed)) for seed in range(3)]
+        return batches, np.random.randint(2**31)
+
+    shared, shared_next = run("shared")
+    for mix_heads in ("rate2", "per-denoiser"):
+        routed, routed_next = run(mix_heads)
+        assert routed_next == shared_next == GOLDEN_MIX_NEXT_DRAW
+        for ours, theirs in zip(routed, shared, strict=True):
+            assert set(ours) == set(theirs) | {"head_ids"}
+            for key in theirs:
+                assert np.array_equal(ours[key], theirs[key]), (mix_heads, key)

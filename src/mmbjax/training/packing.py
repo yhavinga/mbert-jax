@@ -43,6 +43,23 @@ SPAN_LENGTH_STD_OVER_MEAN = 0.25
 PREFIX_MAX_MASKED = 16
 DENOISER_NAMES = ("single_r15", *(f"span_mu{mean}_r{round(rate * 100)}" for mean, rate in SPAN_DENOISERS), "short_prefix")
 
+# --mix-heads: the MLM prediction head that predicts each denoiser's masked tokens. Head 0 also predicts the held-out
+# masks (15% single tokens) and is the head an export keeps. UltraBERT (arXiv:2610.15028) found mask rates mixed under
+# one head to behave like their mean rate, and a head per rate to do better; rate2 splits the mix by corruption.
+MIX_HEADS = {
+    "shared": {name: 0 for name in DENOISER_NAMES},
+    "rate2": {
+        "single_r15": 0, "span_mu3_r15": 0, "span_mu8_r15": 0, "span_mu64_r15": 0,
+        "span_mu3_r50": 1, "span_mu8_r50": 1, "span_mu64_r50": 1, "short_prefix": 1,
+    },
+    "per-denoiser": {name: index for index, name in enumerate(DENOISER_NAMES)},
+}
+
+
+def mix_head_count(mix_heads: str) -> int:
+    """Prediction heads of a --mix-heads choice."""
+    return max(MIX_HEADS[mix_heads].values()) + 1
+
 
 __all__ = [
     "PIECE_SHUFFLE_WINDOW",
@@ -52,6 +69,8 @@ __all__ = [
     "PackedMLMDataCollator",
     "MixedDenoiserCollator",
     "DENOISER_NAMES",
+    "MIX_HEADS",
+    "mix_head_count",
     "InstructionResponseMaskingCollator",
     "HybridMaskingCollator",
     "StreamingBufferDataSource",
@@ -379,10 +398,16 @@ class MixedDenoiserCollator(PackedMLMDataCollator):
     All draws come from NumPy's global RNG, as in the parent, so a seed fixes them. The short prefix
     leaves the tokens behind its masked block out by turning them into padding, in every array the
     model reads: the batch then holds nothing of them, whatever the attention does.
+
+    mix_heads (MIX_HEADS) other than "shared" adds head_ids to the batch: at every position of a segment the
+    prediction head of that segment's denoiser, 0 at padding and hidden tokens. It takes no draws, so the masks stay
+    those of "shared".
     """
 
-    def __init__(self, tokenizer):
+    def __init__(self, tokenizer, mix_heads: str = "shared"):
         super().__init__(tokenizer, mlm_probability=0.15)
+        heads = MIX_HEADS[mix_heads]
+        self.head_of_denoiser = None if mix_heads == "shared" else np.array([heads[name] for name in DENOISER_NAMES], dtype=np.int32)
         self.segments = np.zeros(len(DENOISER_NAMES), dtype=np.int64)
         self.maskable_tokens = np.zeros(len(DENOISER_NAMES), dtype=np.int64)
         self.masked_tokens = np.zeros(len(DENOISER_NAMES), dtype=np.int64)
@@ -400,6 +425,7 @@ class MixedDenoiserCollator(PackedMLMDataCollator):
         maskable = ~np.isin(input_ids, self.tokenizer.all_special_ids)
         masked_indices = np.zeros(input_ids.shape, dtype=bool)
         hidden = np.zeros(input_ids.shape, dtype=bool)
+        head_ids = np.zeros(input_ids.shape, dtype=np.int32)
         for row in range(input_ids.shape[0]):
             boundaries = np.flatnonzero(segment_ids[row, 1:] != segment_ids[row, :-1]) + 1
             for start, end in zip(np.r_[0, boundaries], np.r_[boundaries, input_ids.shape[1]]):
@@ -409,6 +435,8 @@ class MixedDenoiserCollator(PackedMLMDataCollator):
                 denoiser = np.random.randint(len(DENOISER_NAMES))
                 chosen = candidates[self._draw_masked(denoiser, len(candidates))]
                 masked_indices[row, chosen] = True
+                if self.head_of_denoiser is not None:
+                    head_ids[row, start:end] = self.head_of_denoiser[denoiser]
                 if DENOISER_NAMES[denoiser] == "short_prefix" and len(chosen):
                     hidden[row, chosen[-1] + 1:end] = True
                     self.hidden_tokens[denoiser] += end - chosen[-1] - 1
@@ -420,16 +448,20 @@ class MixedDenoiserCollator(PackedMLMDataCollator):
         input_ids[hidden] = self.tokenizer.pad_token_id
         segment_ids[hidden] = -1
         positions[hidden] = 0
+        head_ids[hidden] = 0
         self._replace_masked_tokens(input_ids, masked_indices)
         attention_mask = np.where(is_padding | hidden, 0, 1).astype(np.int32)
 
-        return {
+        collated = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "labels": labels,
             "position_ids": positions,
             "segment_ids": segment_ids,
         }
+        if self.head_of_denoiser is not None:
+            collated["head_ids"] = head_ids
+        return collated
 
     @staticmethod
     def _draw_masked(denoiser: int, n: int) -> np.ndarray:

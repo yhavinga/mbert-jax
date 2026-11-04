@@ -40,11 +40,19 @@ class ModernBertLMHead(nn.Module):
 
 
 class ModernBertForMaskedLM(nn.Module):
+    """With num_prediction_heads > 1 (--mix-heads), head k > 0 has a prediction head and decoder bias of its own, at
+    prediction_head_k and decoder_k. Head 0 keeps the names of the single head, so a one-head model, an export and a
+    fine-tune find it where they always did. The encoder and the decoder weight (the embedding matrix) are shared.
+    """
+
     config: MMBertConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
+    num_prediction_heads: int = 1
 
     def setup(self) -> None:
+        if self.num_prediction_heads < 1:
+            raise ValueError(f"num_prediction_heads must be at least 1, not {self.num_prediction_heads}")
         self.model = ModernBertModel(
             config=self.config,
             dtype=self.dtype,
@@ -60,12 +68,38 @@ class ModernBertForMaskedLM(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
         )
+        for k in range(1, self.num_prediction_heads):
+            setattr(self, f"prediction_head_{k}", ModernBertPredictionHead(
+                config=self.config, dtype=self.dtype, param_dtype=self.param_dtype,
+            ))
+            setattr(self, f"decoder_{k}", ModernBertLMHead(
+                config=self.config, dtype=self.dtype, param_dtype=self.param_dtype,
+            ))
 
     def _get_embedding_kernel(self) -> jnp.ndarray:
         params = self.variables.get("params")
         if params is None:
             raise ValueError("Parameters must be initialized before calling the LM head.")
         return params["model"]["embeddings"]["word_embeddings"]["embedding"]
+
+    def _routed_logits(self, hidden_states: jnp.ndarray, embedding_kernel: jnp.ndarray, head_ids: jnp.ndarray) -> jnp.ndarray:
+        """Each position through the prediction head and decoder bias of its head id.
+
+        Every head runs at every position, but the projection onto the vocabulary, hidden x vocab against a head's
+        hidden x hidden, runs once. jnp.where picks exactly, so a position of head 0 gets the one-head logits.
+        """
+        heads = [self.prediction_head] + [getattr(self, f"prediction_head_{k}") for k in range(1, self.num_prediction_heads)]
+        decoders = [self.decoder] + [getattr(self, f"decoder_{k}") for k in range(1, self.num_prediction_heads)]
+        routed = heads[0](hidden_states)
+        for k in range(1, self.num_prediction_heads):
+            routed = jnp.where((head_ids == k)[..., None], heads[k](hidden_states), routed)
+        logits = jnp.einsum("bsh,vh->bsv", routed.astype(jnp.float32), embedding_kernel.astype(jnp.float32))
+        if self.config.decoder_bias:
+            bias = decoders[0].bias.astype(jnp.float32)
+            for k in range(1, self.num_prediction_heads):
+                bias = jnp.where((head_ids == k)[..., None], decoders[k].bias.astype(jnp.float32), bias)
+            logits = logits + bias
+        return logits
 
     def __call__(
         self,
@@ -77,11 +111,16 @@ class ModernBertForMaskedLM(nn.Module):
         labels: Optional[jnp.ndarray] = None,
         sliding_window_mask: Optional[jnp.ndarray] = None,
         segment_ids: Optional[jnp.ndarray] = None,
+        head_ids: Optional[jnp.ndarray] = None,
         deterministic: bool = True,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
     ) -> MaskedLMOutput | Tuple[jnp.ndarray, ...]:
+        """head_ids: (batch, seq) prediction head per position, with num_prediction_heads > 1. None means head 0
+        everywhere: the held-out evaluation and anything else that doesn't route."""
+        if head_ids is not None and self.num_prediction_heads == 1:
+            raise ValueError("head_ids given to a model with one prediction head: build it with num_prediction_heads")
         output_attentions = (
             self.config.output_attentions if output_attentions is None else output_attentions
         )
@@ -103,9 +142,14 @@ class ModernBertForMaskedLM(nn.Module):
         )
         hidden_states = outputs.last_hidden_state
 
-        hidden_states = self.prediction_head(hidden_states)
         embedding_kernel = self._get_embedding_kernel()
-        logits = self.decoder(hidden_states, embedding_kernel)
+        if head_ids is None and self.num_prediction_heads > 1 and self.is_initializing():
+            # An init without head_ids must still create every head
+            head_ids = jnp.zeros(hidden_states.shape[:2], dtype=jnp.int32)
+        if head_ids is None:
+            logits = self.decoder(self.prediction_head(hidden_states), embedding_kernel)
+        else:
+            logits = self._routed_logits(hidden_states, embedding_kernel, head_ids)
 
         loss = None
         if labels is not None:

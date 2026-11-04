@@ -9,6 +9,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 import argparse
+import functools
 import gc
 import os
 import json
@@ -49,7 +50,9 @@ from mmbjax.heads.masked_lm import ModernBertForMaskedLM
 
 # Grain for sequence packing (optional, requires --use-packing)
 from mmbjax.training import (
+    DENOISER_NAMES,
     GRAIN_AVAILABLE,
+    MIX_HEADS,
     PIECE_SHUFFLE_WINDOW,
     PackedMLMDataCollator,
     MixedDenoiserCollator,
@@ -58,6 +61,7 @@ from mmbjax.training import (
     TokenizeTransform,
     create_packed_dataloader,
     create_packed_dataset_streaming,
+    mix_head_count,
 )
 
 
@@ -237,7 +241,7 @@ def data_state_path(checkpoint_dir, step, process_index):
     return epath.Path(f"{str(checkpoint_dir).rstrip('/')}_data_state") / str(step) / f"process_{process_index}.json"
 
 
-def data_state_identity(args, rows_per_host, data_files, masking="uniform15"):
+def data_state_identity(args, rows_per_host, data_files, masking="uniform15", mix_heads="shared"):
     """What must be the same for the saved indices to point at the same documents, and for a run to stay one experiment."""
     identity = {
         "data_files": data_files,
@@ -256,6 +260,8 @@ def data_state_identity(args, rows_per_host, data_files, masking="uniform15"):
     # Only when it isn't the default: data states saved before --masking existed have no such key
     if masking != "uniform15":
         identity["masking"] = masking
+    if mix_heads != "shared":
+        identity["mix_heads"] = mix_heads
     return identity
 
 
@@ -291,6 +297,10 @@ def restore_data_state(path, data_loader, identity, allow_restart):
     print(f"Data state restored on process {jax.process_index()} at step {saved['step']}: {saved['state']}", flush=True)
 
 
+# Top-level parameter names of prediction heads beyond head 0 (ModernBertForMaskedLM with num_prediction_heads > 1)
+EXTRA_HEAD = re.compile(r"(prediction_head|decoder)_\d+")
+
+
 def load_params_of_run(step_dir, target_params):
     """The parameters saved in step_dir by another run, in the shapes, dtypes and shardings of target_params.
 
@@ -309,6 +319,13 @@ def load_params_of_run(step_dir, target_params):
         raise ValueError(f"--init-from {step_dir}: no 'params' in the checkpoint, only {sorted(saved)}")
     saved_shapes = {path: (tuple(leaf.shape), np.dtype(leaf.dtype)) for path, leaf in traverse_util.flatten_dict(dict(saved["params"])).items()}
     target_shapes = {path: (tuple(leaf.shape), np.dtype(leaf.dtype)) for path, leaf in traverse_util.flatten_dict(target_params).items()}
+    # A one-head model (an anneal, say) may start from a --mix-heads run: it takes head 0, which is at the names
+    # of the single head, and leaves the others behind, as an export does
+    extra_heads = sorted({path[0] for path in saved_shapes if EXTRA_HEAD.fullmatch(path[0])})
+    if extra_heads and not any(EXTRA_HEAD.fullmatch(path[0]) for path in target_shapes):
+        saved_shapes = {path: shape for path, shape in saved_shapes.items() if path[0] not in extra_heads}
+        if is_coordinator():
+            print(f"  --init-from {step_dir}: head 0 becomes the one prediction head; left behind: {', '.join(extra_heads)}")
     if saved_shapes != target_shapes:
         # partial_restore would skip saved parameters this model lacks: that must not pass unnoticed
         differ = sorted((path for path in saved_shapes.keys() | target_shapes.keys() if saved_shapes.get(path) != target_shapes.get(path)), key=str)
@@ -343,10 +360,12 @@ def log_data_accounting(data_loader, optimizer_step):
 UNIFORM_RATES = {"uniform5": 0.05, "uniform10": 0.10, "uniform15": 0.15, "uniform30": 0.30}
 
 
-def create_masking_collator(masking, tokenizer):
+def create_masking_collator(masking, tokenizer, mix_heads="shared"):
     """The training collator of --masking, for packed plain-text data."""
     if masking == "mix":
-        return MixedDenoiserCollator(tokenizer)
+        return MixedDenoiserCollator(tokenizer, mix_heads=mix_heads)
+    if mix_heads != "shared":
+        raise ValueError(f"--mix-heads {mix_heads} routes the denoisers of --masking mix, not {masking}")
     return PackedMLMDataCollator(tokenizer=tokenizer, mlm_probability=UNIFORM_RATES[masking])
 
 
@@ -701,6 +720,15 @@ def parse_args():
         help="Masking of training batches: single tokens at 5%%, 10%%, 15%% or 30%%, or 'mix' for one of 8 denoisers per packed segment; "
              "--eval-file always gets 15%% single tokens (default: uniform15)"
     )
+    parser.add_argument(
+        "--mix-heads",
+        type=str,
+        choices=list(MIX_HEADS),
+        default="shared",
+        help="With --masking mix: one MLM prediction head (dense, activation, norm, decoder bias) per group of denoisers, "
+             "encoder and decoder weight shared. 'rate2': head 0 for the denoisers at 15%%, head 1 for those at 50%% and the "
+             "short prefix; 'per-denoiser': 8 heads. Head 0 serves --eval-file and the export (default: shared, one head)"
+    )
 
     args = parser.parse_args()
     if args.no_wandb:
@@ -711,6 +739,8 @@ def parse_args():
         not args.use_packing or args.dataset_format != "text" or args.masking_mode != "standard" or args.datasets_config
     ):
         parser.error(f"--masking {args.masking} needs --use-packing on one plain-text dataset, with --masking-mode standard")
+    if args.mix_heads != "shared" and args.masking != "mix":
+        parser.error(f"--mix-heads {args.mix_heads} needs --masking mix: it routes the denoisers of the mix")
     if args.per_layer_norms_every % args.log_every != 0:
         parser.error("--per-layer-norms-every must be a multiple of --log-every: other steps aren't logged")
     return args
@@ -805,8 +835,8 @@ class FlaxDataCollatorForLanguageModeling:
         return inputs, labels
 
 
-def compute_mlm_loss_and_accuracy(logits, labels):
-    """Compute cross-entropy loss and accuracy on masked positions only."""
+def masked_token_scores(logits, labels):
+    """Per position, flattened: log-probability of the label, argmax == label on masked positions, and the mask."""
     # Force float32 - log_softmax over 32K vocab loses precision in BF16 on TPU
     logits = logits.astype(jnp.float32)
     
@@ -823,18 +853,39 @@ def compute_mlm_loss_and_accuracy(logits, labels):
         log_probs, labels_flat[:, None], axis=-1
     ).squeeze(-1)
 
-    # Masked mean loss
-    loss = -jnp.sum(target_log_probs * mask) / jnp.maximum(jnp.sum(mask), 1)
-
-    # Compute accuracy on masked tokens
     predictions = jnp.argmax(logits_flat, axis=-1)
     correct = (predictions == labels_flat) * mask
+    return target_log_probs, correct, mask
+
+
+def reduce_masked_scores(target_log_probs, correct, mask):
+    """Loss, accuracy and perplexity: means over the masked positions."""
+    loss = -jnp.sum(target_log_probs * mask) / jnp.maximum(jnp.sum(mask), 1)
     accuracy = jnp.sum(correct) / jnp.maximum(jnp.sum(mask), 1)
-
-    # Compute perplexity
     perplexity = jnp.exp(loss)
-
     return loss, accuracy, perplexity
+
+
+def compute_mlm_loss_and_accuracy(logits, labels):
+    """Compute cross-entropy loss and accuracy on masked positions only."""
+    return reduce_masked_scores(*masked_token_scores(logits, labels))
+
+
+def compute_per_head_metrics(target_log_probs, correct, mask, head_ids, num_heads):
+    """Loss, accuracy and count of each prediction head's own masked tokens.
+
+    For the log only: training minimizes the mean over all masked tokens, as with one head, so a head's share of
+    the gradient is its share of the masked tokens.
+    """
+    head_ids = head_ids.reshape(-1)
+    metrics = {}
+    for k in range(num_heads):
+        mine = mask & (head_ids == k)
+        n = jnp.sum(mine)
+        metrics[f"head{k}_loss"] = -jnp.sum(target_log_probs * mine) / jnp.maximum(n, 1)
+        metrics[f"head{k}_accuracy"] = jnp.sum(correct * mine) / jnp.maximum(n, 1)
+        metrics[f"head{k}_masked"] = n
+    return metrics
 
 
 def compute_gradient_norm(gradients):
@@ -883,6 +934,9 @@ def compute_per_layer_gradient_norms(gradients):
             add("final_layer_norm", grad)
         elif "prediction_head" in path or "decoder" in path:
             add("lm_head", grad)
+        elif EXTRA_HEAD.fullmatch(path[0]):
+            # lm_head stays head 0, comparable with one-head runs
+            add(f"lm_head_{path[0].rsplit('_', 1)[1]}", grad)
         else:
             add("other", grad)
 
@@ -1123,8 +1177,12 @@ def wants_per_layer_norms(optimizer_step, micro_step, gradient_accumulation_step
     return (optimizer_step + 1) % every == 0 and (micro_step + 1) % gradient_accumulation_steps == 0
 
 
-def train_step(state, batch, dropout_rng, learning_rate, compute_per_layer=False):
-    """Single training step with proper RNG handling and comprehensive metrics."""
+def train_step(state, batch, dropout_rng, learning_rate, compute_per_layer=False, num_heads=1):
+    """Single training step with proper RNG handling and comprehensive metrics.
+
+    num_heads > 1 (--mix-heads): batch["head_ids"] routes each position to its prediction head, and the metrics
+    get the loss and accuracy per head.
+    """
     dropout_rng, new_dropout_rng = jax.random.split(dropout_rng)
 
     def loss_fn(params):
@@ -1140,6 +1198,8 @@ def train_step(state, batch, dropout_rng, learning_rate, compute_per_layer=False
             model_kwargs["position_ids"] = batch["position_ids"]
         if "segment_ids" in batch:
             model_kwargs["segment_ids"] = batch["segment_ids"]
+        if num_heads > 1:
+            model_kwargs["head_ids"] = batch["head_ids"]
 
         output = state.apply_fn(
             {"params": params},
@@ -1147,7 +1207,9 @@ def train_step(state, batch, dropout_rng, learning_rate, compute_per_layer=False
         )
         # Extract logits
         logits = output.logits if hasattr(output, "logits") else output["logits"]
-        loss, accuracy, perplexity = compute_mlm_loss_and_accuracy(logits, batch["labels"])
+        scores = masked_token_scores(logits, batch["labels"])
+        loss, accuracy, perplexity = reduce_masked_scores(*scores)
+        head_metrics = compute_per_head_metrics(*scores, batch["head_ids"], num_heads) if num_heads > 1 else {}
         
         # Diagnostics for debugging bfloat16 issues
         logits_min = jnp.min(logits)
@@ -1155,9 +1217,9 @@ def train_step(state, batch, dropout_rng, learning_rate, compute_per_layer=False
         logits_has_nan = jnp.any(jnp.isnan(logits))
         logits_has_inf = jnp.any(jnp.isinf(logits))
         
-        return loss, (logits, accuracy, perplexity, logits_min, logits_max, logits_has_nan, logits_has_inf)
+        return loss, (logits, accuracy, perplexity, logits_min, logits_max, logits_has_nan, logits_has_inf, head_metrics)
 
-    (loss, (logits, accuracy, perplexity, logits_min, logits_max, logits_has_nan, logits_has_inf)), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
+    (loss, (logits, accuracy, perplexity, logits_min, logits_max, logits_has_nan, logits_has_inf, head_metrics)), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
 
     # Check for NaN in gradients
     grad_leaves = jax.tree_util.tree_leaves(grads)
@@ -1190,6 +1252,7 @@ def train_step(state, batch, dropout_rng, learning_rate, compute_per_layer=False
         "logits_has_nan": logits_has_nan,
         "logits_has_inf": logits_has_inf,
         "grads_has_nan": grads_has_nan,
+        **head_metrics,
     }
 
     # Optionally compute per-layer gradient norms
@@ -1492,6 +1555,7 @@ def main(args):
             "weight_decay": weight_decay,
             "mlm_probability": None if args.masking == "mix" else UNIFORM_RATES[args.masking],
             "masking": args.masking,
+            "mix_heads": args.mix_heads,
             "init_from": args.init_from,
             "gradient_clipping": 1.0,
 
@@ -1555,10 +1619,12 @@ def main(args):
     compute_dtype = getattr(jnp, compute_dtype_str)
     param_dtype = getattr(jnp, param_dtype_str)
 
+    num_heads = mix_head_count(args.mix_heads)
     model = ModernBertForMaskedLM(
         config,
         dtype=compute_dtype,
-        param_dtype=param_dtype
+        param_dtype=param_dtype,
+        num_prediction_heads=num_heads,
     )
     
     # Init params
@@ -1580,6 +1646,11 @@ def main(args):
     param_count = sum(x.size for x in jax.tree.leaves(params))
     if is_coordinator():
         print(f"  Parameters: {param_count:,} ({param_count/1e6:.1f}M)")
+        if num_heads > 1:
+            extra = sum(x.size for name, subtree in params.items() if EXTRA_HEAD.fullmatch(name) for x in jax.tree.leaves(subtree))
+            print(f"  Prediction heads: {num_heads} (--mix-heads {args.mix_heads}), {extra:,} parameters beyond head 0")
+            for name in DENOISER_NAMES:
+                print(f"    {name}: head {MIX_HEADS[args.mix_heads][name]}")
 
     # Create optimizer and training state
     optimizer_type = args.optimizer
@@ -1731,7 +1802,7 @@ def main(args):
                 print("  - Response tokens: 25% masking")
         else:
             # Standard single dataset
-            collator = create_masking_collator(args.masking, tokenizer)
+            collator = create_masking_collator(args.masking, tokenizer, args.mix_heads)
     else:
         collator = FlaxDataCollatorForLanguageModeling(
             tokenizer=tokenizer,
@@ -1793,7 +1864,7 @@ def main(args):
     # JIT compile with static argnums for compute_per_layer
     # out_shardings: state must stay replicated for the checkpoints and the next step, and
     # metrics must stay readable by float() on each host
-    train_step_jit = jax.jit(train_step, static_argnums=(4,), out_shardings=replicated_sharding)
+    train_step_jit = jax.jit(functools.partial(train_step, num_heads=num_heads), static_argnums=(4,), out_shardings=replicated_sharding)
 
     eval_batches = None
     if args.eval_file:
@@ -1892,7 +1963,7 @@ def main(args):
 
     # The other half of a packed checkpoint: where this host's data was, so it isn't trained on again
     if args.use_packing:
-        data_identity = data_state_identity(args, batch_size, data_files, args.masking)
+        data_identity = data_state_identity(args, batch_size, data_files, args.masking, args.mix_heads)
         if start_step > 0:
             restore_data_state(data_state_path(checkpoint_dir, start_step, process_idx), packed_dataloader, data_identity, args.allow_data_restart)
 
@@ -2015,6 +2086,9 @@ def main(args):
                     n_masked = int(np.sum(labels != -100))
                     n_total = labels.size
                     print(f"Masked tokens on this host: {n_masked}/{n_total} ({100*n_masked/n_total:.1f}%)")
+                    if num_heads > 1:
+                        per_head = [int(np.sum((labels != -100) & (local_batch["head_ids"] == k))) for k in range(num_heads)]
+                        print(f"Masked tokens per prediction head on this host: {per_head}")
                     # Check for segment -1 (padding)
                     n_padding = int(np.sum(seg_ids == -1))
                     print(f"Padding tokens (segment=-1): {n_padding}/{seg_ids.size} ({100*n_padding/seg_ids.size:.1f}%)")
@@ -2075,10 +2149,17 @@ def main(args):
                         logits_has_inf = bool(metrics["logits_has_inf"])
                         grads_has_nan = bool(metrics["grads_has_nan"])
 
+                        # Per prediction head: loss, accuracy in %, and masked tokens of the last micro-batch
+                        heads = [(window_mean(f"head{k}_loss"), window_mean(f"head{k}_accuracy") * 100, int(metrics[f"head{k}_masked"]))
+                                 for k in range(num_heads)] if num_heads > 1 else []
+                        heads_line = "".join(f" | Head {k}: {head_loss:.4f} {head_accuracy:.1f}% n={head_masked}"
+                                             for k, (head_loss, head_accuracy, head_masked) in enumerate(heads))
+
                         # Print diagnostics for first 10 optimizer steps
                         if optimizer_step < start_optimizer_step + 10:
                             print(f"Step {optimizer_step}: loss={loss_value:.4f}, logits=[{logits_min:.2f}, {logits_max:.2f}], "
-                                  f"nan={logits_has_nan}, inf={logits_has_inf}, grad_nan={grads_has_nan}, grad_norm={grad_norm_value:.4f}")
+                                  f"nan={logits_has_nan}, inf={logits_has_inf}, grad_nan={grads_has_nan}, grad_norm={grad_norm_value:.4f}"
+                                  f"{heads_line}")
 
                         # Since the previous log step, with padding excluded from the tokens
                         now = time.time()
@@ -2106,7 +2187,7 @@ def main(args):
                             print(f"\nStep {optimizer_step:4d} | Loss: {loss_value:.4f} | Acc: {accuracy_value:.1f}% | "
                                   f"PPL: {perplexity_value:.1f} | LR: {lr_value:.2e} | "
                                   f"Grad: {grad_norm_value:.2f} | Ratio: {update_ratio_value:.2e} | "
-                                  f"Tok/s: {tokens_per_sec:.0f} | Step: {step_seconds:.3f}s | Input: {input_seconds_per_step:.3f}s", flush=True)
+                                  f"Tok/s: {tokens_per_sec:.0f} | Step: {step_seconds:.3f}s | Input: {input_seconds_per_step:.3f}s{heads_line}", flush=True)
 
                         if wandb is not None:
                             wandb_log = {
@@ -2127,6 +2208,10 @@ def main(args):
                                 "performance/step_seconds": step_seconds,
                                 "performance/input_seconds_per_step": input_seconds_per_step,
                             }
+                            for k, (head_loss, head_accuracy, head_masked) in enumerate(heads):
+                                wandb_log[f"train/head{k}_loss"] = head_loss
+                                wandb_log[f"train/head{k}_accuracy"] = head_accuracy
+                                wandb_log[f"train/head{k}_n_masked_tokens"] = head_masked
                             if ln_lr_schedule:
                                 wandb_log["train/layer_norm_lr"] = ln_lr_value
 

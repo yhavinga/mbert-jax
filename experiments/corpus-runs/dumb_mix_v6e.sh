@@ -14,6 +14,9 @@
 # Needs ~/.cache/huggingface/token on the VM (commands.txt). QUEUES=1: all jobs one after the other on chips 0-3, for
 # when chips 4-7 fail the preflight next to them. Environment overrides, for a smoke test only: OUT CKPT ONLY_JOBS.
 # For a fine-tune LR sweep: LR (default 2e-5, the protocol's) and NAME (default mix-<STEP>), with CKPT, OUT and ONLY_JOBS.
+# On a worker of a v4-32, as a single-host TPU of its own 4 chips (as dumb_phase.sh of phase2048): QUEUES=1, CODE a
+# checkout of its own (the training's ~/mbert-jax may be at another commit there), LOGTAG a name per worker, so the
+# workers' logs in $OUT/logs/ do not overwrite each other.
 set -euo pipefail
 COMMIT=${COMMIT:?set COMMIT to the commit of commands.txt}
 QUEUES=${QUEUES:-2}
@@ -24,6 +27,8 @@ LR=${LR:-2e-5}
 CKPT=${CKPT:-gs://t5-dutch-english-usc2/mbert/culturax-nl-230m-chunk1024-mix/ckpt_keep/$STEP}
 OUT=${OUT:-gs://t5-dutch-english-usc2/mbert/masking/dumb}
 ONLY_JOBS=${ONLY_JOBS:-}
+CODE=${CODE:-mbert-jax}
+LOGTAG=${LOGTAG:-v6e}
 [ -s ~/.cache/huggingface/token ] || { echo "$(hostname): no ~/.cache/huggingface/token, put it there first (commands.txt)"; exit 1; }
 pgrep -f '[t]rain_minimal.py|[f]inetune.py|[e]val_windows.py' > /dev/null && { echo "$(hostname): the TPU is in use"; exit 1; }
 gsutil -q stat "$CKPT/commit_success.txt" || { echo "$(hostname): $CKPT has no commit_success.txt (yet)"; exit 1; }
@@ -33,10 +38,10 @@ cat > ~/run_dumb_$NAME.sh <<EOF
 set -uo pipefail
 cd \$HOME
 # Code, venv and held-out file, as setup_fineweb2.sh does
-[ -d mbert-jax/.git ] || git clone -q https://github.com/yhavinga/mbert-jax.git mbert-jax || exit 2
-git -C mbert-jax fetch -q origin corpus-runs && git -C mbert-jax checkout -q $COMMIT || exit 2
+[ -d $CODE/.git ] || git clone -q https://github.com/yhavinga/mbert-jax.git $CODE || exit 2
+git -C $CODE fetch -q origin corpus-runs && git -C $CODE checkout -q $COMMIT || exit 2
 gsutil -q cp gs://t5-dutch-english-usc2/mbert/corpus-runs/scripts/vm.lock gs://t5-dutch-english-usc2/mbert/phase2048/scripts/verify_ckpt.py \$HOME/ || exit 2
-cd mbert-jax
+cd $CODE
 if ! command -v uv > /dev/null; then curl -LsSf https://astral.sh/uv/install.sh | sh; export PATH="\$HOME/.local/bin:\$PATH"; fi
 [ -x .venv/bin/python ] || uv venv -q --python 3.12 .venv || exit 2
 uv pip install -q --python .venv/bin/python -r \$HOME/vm.lock || exit 2
@@ -98,5 +103,5 @@ cat \$HOME/logs/dumb_${NAME}_w*.log
 echo "queues: worker 0 exit \$code0, worker 1 exit \$code1"
 [ \$code0 = 0 ] && [ \$code1 = 0 ]
 EOF
-setsid nohup bash -c "bash ~/run_dumb_$NAME.sh > ~/logs/dumb_$NAME.log 2>&1; echo EXIT \$? > ~/logs/dumb_$NAME.exit; gsutil -q cp ~/logs/dumb_$NAME.log $OUT/logs/dumb_${NAME}_v6e.log; gsutil -q cp ~/logs/dumb_$NAME.exit $OUT/logs/dumb_${NAME}_v6e.exit" > /dev/null 2>&1 < /dev/null &
+setsid nohup bash -c "bash ~/run_dumb_$NAME.sh > ~/logs/dumb_$NAME.log 2>&1; echo EXIT \$? > ~/logs/dumb_$NAME.exit; gsutil -q cp ~/logs/dumb_$NAME.log $OUT/logs/dumb_${NAME}_$LOGTAG.log; gsutil -q cp ~/logs/dumb_$NAME.exit $OUT/logs/dumb_${NAME}_$LOGTAG.exit" > /dev/null 2>&1 < /dev/null &
 echo "started the DUMB queue of $NAME on $(hostname): ~/logs/dumb_$NAME.log, results in $OUT"

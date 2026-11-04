@@ -13,12 +13,14 @@
 # state stays behind); the held-out file, 68 MB; scripts and results, under 1 MB.
 # Needs ~/.cache/huggingface/token on the VM (commands.txt). QUEUES=1: all jobs one after the other on chips 0-3, for
 # when chips 4-7 fail the preflight next to them. Environment overrides, for a smoke test only: OUT CKPT ONLY_JOBS.
+# For a fine-tune LR sweep: LR (default 2e-5, the protocol's) and NAME (default mix-<STEP>), with CKPT, OUT and ONLY_JOBS.
 set -euo pipefail
 COMMIT=${COMMIT:?set COMMIT to the commit of commands.txt}
 QUEUES=${QUEUES:-2}
 [ "$QUEUES" = 1 ] || [ "$QUEUES" = 2 ] || { echo "QUEUES must be 1 or 2, not $QUEUES"; exit 1; }
 STEP=${1:-300000}
-NAME=mix-$STEP
+NAME=${NAME:-mix-$STEP}
+LR=${LR:-2e-5}
 CKPT=${CKPT:-gs://t5-dutch-english-usc2/mbert/culturax-nl-230m-chunk1024-mix/ckpt_keep/$STEP}
 OUT=${OUT:-gs://t5-dutch-english-usc2/mbert/masking/dumb}
 ONLY_JOBS=${ONLY_JOBS:-}
@@ -68,7 +70,7 @@ queue() {
     [ -z "$ONLY_JOBS" ] || [[ " $ONLY_JOBS " == *" \$job "* ]] || continue
     gsutil -q stat $OUT/\$job.json && { echo "\$job: a result exists, skipped"; continue; }
     echo "\$(date +%H:%M:%S) \$job: batch \$batch x 4 chips x \$accumulation on chips \$chips"
-    .venv/bin/python -u scripts/dumb/finetune.py --checkpoint \$HOME/dumb/ckpt$NAME --task \$task --output \$HOME/dumb/runs/\$job --epochs 3 --batch-size \$batch --gradient-accumulation-steps \$accumulation --learning-rate 2e-5 --max-length 512 --seed \$seed > \$HOME/logs/\$job.log 2>&1
+    .venv/bin/python -u scripts/dumb/finetune.py --checkpoint \$HOME/dumb/ckpt$NAME --task \$task --output \$HOME/dumb/runs/\$job --epochs 3 --batch-size \$batch --gradient-accumulation-steps \$accumulation --learning-rate $LR --max-length 512 --seed \$seed > \$HOME/logs/\$job.log 2>&1
     code=\$?
     echo "EXIT \$code" >> \$HOME/logs/\$job.log
     gsutil -q cp \$HOME/logs/\$job.log $OUT/logs/\$job.log

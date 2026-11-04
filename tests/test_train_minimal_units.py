@@ -226,6 +226,7 @@ def test_masking_default_keeps_the_route_and_the_data_state_of_the_long_run(tm, 
 
 @pytest.mark.parametrize("saved,resumed", [
     ("uniform15", "uniform30"), ("uniform15", "mix"), ("uniform30", "uniform15"), ("uniform30", "mix"), ("mix", "uniform15"), ("mix", "uniform30"),
+    ("uniform15", "uniform10"), ("uniform10", "uniform5"), ("mix", "uniform10"),
 ])
 def test_resume_across_masking_modes_is_refused(tm, tmp_path, saved, resumed):
     args = types.SimpleNamespace(
@@ -295,6 +296,23 @@ def test_eval_batches_are_the_same_15_percent_masks_in_every_mode(tm, tmp_path):
     labels = np.stack([batch["labels"] for batch in batches["mix"]])
     real = np.stack([batch["attention_mask"] for batch in batches["mix"]]).sum()
     assert 0.08 < np.sum(labels != -100) / real < 0.2
+
+
+@pytest.mark.parametrize("masking,rate", [("uniform5", 0.05), ("uniform10", 0.10)])
+def test_anneal_rates_mask_less_with_the_same_handling(tm, masking, rate):
+    tokenizer = _eval_tokenizer()
+    collator = tm.create_masking_collator(masking, tokenizer)
+    assert type(collator) is tm.PackedMLMDataCollator
+    input_ids = np.random.RandomState(0).randint(5, 200, size=(64, 256)).astype(np.int32)
+    np.random.seed(0)
+    batch = collator({"input_ids": input_ids, "input_ids_segment_ids": np.zeros_like(input_ids), "input_ids_positions": np.zeros_like(input_ids)})
+    masked = batch["labels"] != -100
+    assert masked.mean() == pytest.approx(rate, abs=0.01)
+    assert np.mean(batch["input_ids"][masked] == tokenizer.mask_token_id) == pytest.approx(0.8, abs=0.03)
+    # The held-out masks stay those of 15% single tokens
+    eval_collator = tm.create_eval_collator(masking, collator, tokenizer)
+    assert type(eval_collator) is tm.PackedMLMDataCollator and eval_collator.mlm_probability == 0.15
+    assert _masking_args(tm, "--masking", masking, "--use-packing").masking == masking
 
 
 def test_uniform30_masks_twice_as_much_with_the_same_handling(tm):

@@ -339,11 +339,15 @@ def log_data_accounting(data_loader, optimizer_step):
     return hosts
 
 
+# Single-token masking rates of --masking; 5% and 10% are for an anneal phase after pretraining
+UNIFORM_RATES = {"uniform5": 0.05, "uniform10": 0.10, "uniform15": 0.15, "uniform30": 0.30}
+
+
 def create_masking_collator(masking, tokenizer):
     """The training collator of --masking, for packed plain-text data."""
     if masking == "mix":
         return MixedDenoiserCollator(tokenizer)
-    return PackedMLMDataCollator(tokenizer=tokenizer, mlm_probability={"uniform15": 0.15, "uniform30": 0.30}[masking])
+    return PackedMLMDataCollator(tokenizer=tokenizer, mlm_probability=UNIFORM_RATES[masking])
 
 
 def create_eval_collator(masking, train_collator, tokenizer):
@@ -692,9 +696,9 @@ def parse_args():
     parser.add_argument(
         "--masking",
         type=str,
-        choices=["uniform15", "uniform30", "mix"],
+        choices=[*UNIFORM_RATES, "mix"],
         default="uniform15",
-        help="Masking of training batches: single tokens at 15%% or 30%%, or 'mix' for one of 8 denoisers per packed segment; "
+        help="Masking of training batches: single tokens at 5%%, 10%%, 15%% or 30%%, or 'mix' for one of 8 denoisers per packed segment; "
              "--eval-file always gets 15%% single tokens (default: uniform15)"
     )
 
@@ -1486,7 +1490,7 @@ def main(args):
             "layer_norm_lr_factor": layer_norm_lr_factor,
             "min_lr": min_lr,
             "weight_decay": weight_decay,
-            "mlm_probability": {"uniform15": 0.15, "uniform30": 0.30, "mix": None}[args.masking],
+            "mlm_probability": None if args.masking == "mix" else UNIFORM_RATES[args.masking],
             "masking": args.masking,
             "init_from": args.init_from,
             "gradient_clipping": 1.0,

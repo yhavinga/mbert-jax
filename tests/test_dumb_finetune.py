@@ -66,3 +66,33 @@ def test_memory_probe_runs_the_worst_case_and_says_it_fits(tmp_path):
                           env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src")})
     assert done.returncode == 0, done.stderr[-2000:]
     assert "PROBE max_length=32 batch_size=2 accumulation=3 devices=1 FITS" in done.stdout
+
+
+def test_a_mix_heads_checkpoint_fine_tunes_from_head_0_without_the_other_heads(tmp_path):
+    import json
+    import pickle
+
+    from flax import traverse_util
+
+    from mmbjax.heads.masked_lm import ModernBertForMaskedLM
+
+    # 128 positions: create_model_and_state initializes on that length
+    config = MMBertConfig(vocab_size=64, hidden_size=32, intermediate_size=32, num_hidden_layers=3, num_attention_heads=2,
+                          max_position_embeddings=128, global_attn_every_n_layers=3, pad_token_id=0)
+    ones = jnp.ones((1, 8), dtype=jnp.int32)
+    pretrained = ModernBertForMaskedLM(config, num_prediction_heads=2).init(jax.random.PRNGKey(0), input_ids=ones)["params"]
+    assert {"prediction_head_1", "decoder_1"} <= set(pretrained)
+    # What scripts/convert_gcs_checkpoint.py writes: the whole masked-LM tree, every head
+    (tmp_path / "params.pkl").write_bytes(pickle.dumps(jax.tree_util.tree_map(np.asarray, jax.device_get(pretrained))))
+    (tmp_path / "config.json").write_text(json.dumps({**config.to_dict(), "tokenizer_name": "unused"}))
+
+    params, loaded_config = finetune.load_pretrained_params(tmp_path)
+    model, state = finetune.create_model_and_state(loaded_config, params, num_labels=2, learning_rate=1e-4, rng=jax.random.PRNGKey(1))
+    fresh = model.init(jax.random.PRNGKey(1), ones, deterministic=True)["params"]
+    assert set(state.params) == set(fresh), "a head of the masked LM came along into the classifier"
+    flat = traverse_util.flatten_dict(state.params)
+    for path, leaf in traverse_util.flatten_dict({"model": pretrained["model"], "head": pretrained["prediction_head"]}).items():
+        assert np.array_equal(np.asarray(flat[path]), np.asarray(leaf)), path
+    assert not np.array_equal(np.asarray(state.params["head"]["dense"]["kernel"]), np.asarray(pretrained["prediction_head_1"]["dense"]["kernel"]))
+    logits = model.apply({"params": state.params}, ones, deterministic=True).logits
+    assert logits.shape == (1, 2) and bool(jnp.all(jnp.isfinite(logits)))

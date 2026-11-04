@@ -34,6 +34,38 @@ def flatten_dict(d, parent_key='', sep='.'):
     return dict(items)
 
 
+# Head k > 0 of a --mix-heads checkpoint (ModernBertForMaskedLM with num_prediction_heads > 1)
+EXTRA_HEAD = re.compile(r"(prediction_head|decoder)_(\d+)")
+
+
+def select_export_head(params: dict, export_head=None) -> dict:
+    """The parameters with one prediction head, under the names of the single head: what HF's ModernBertForMaskedLM holds.
+
+    A --mix-heads checkpoint keeps head 0 under those names and head k at prediction_head_k and decoder_k; without
+    export_head it is refused, because HF holds one head and which one to publish is a choice.
+    """
+    extra = sorted(key for key in params if EXTRA_HEAD.fullmatch(key))
+    indices = {int(EXTRA_HEAD.fullmatch(key).group(2)) for key in extra}
+    heads = 1 + len(indices)
+    if indices != set(range(1, heads)):
+        raise ValueError(f"Prediction heads {sorted(indices)} besides head 0: expected 1 to {heads - 1}")
+    if export_head is None:
+        if extra:
+            raise ValueError(f"This checkpoint has {heads} prediction heads ({', '.join(extra)} besides prediction_head and "
+                             "decoder); HF's ModernBertForMaskedLM holds one: choose it with --export-head")
+        return params
+    if not 0 <= export_head < heads:
+        raise ValueError(f"--export-head {export_head}: this checkpoint has heads 0 to {heads - 1}")
+    selected = {key: value for key, value in params.items() if key not in extra}
+    if export_head > 0:
+        selected["prediction_head"] = params[f"prediction_head_{export_head}"]
+        if "decoder" in params:
+            selected["decoder"] = params[f"decoder_{export_head}"]
+    left_out = [str(k) for k in range(heads) if k != export_head]
+    print(f"Exporting prediction head {export_head} of {heads}" + (f"; left out: head {', '.join(left_out)}" if left_out else ""))
+    return selected
+
+
 def map_flax_key_to_hf(flax_key: str) -> str:
     """Map a Flax parameter key to HuggingFace ModernBERT key."""
 
@@ -109,8 +141,9 @@ def save_tokenizer_with_mask(tokenizer_name: str, output_dir: Path, vocab_size: 
     return tokenizer
 
 
-def convert_flax_to_hf(input_dir: Path, output_dir: Path, tokenizer_override: str = None, verify: bool = True):
-    """Convert Flax checkpoint to HuggingFace format."""
+def convert_flax_to_hf(input_dir: Path, output_dir: Path, tokenizer_override: str = None, verify: bool = True,
+                       export_head: int = None):
+    """Convert Flax checkpoint to HuggingFace format. export_head: see select_export_head."""
 
     print(f"Loading Flax checkpoint from {input_dir}")
 
@@ -121,6 +154,7 @@ def convert_flax_to_hf(input_dir: Path, output_dir: Path, tokenizer_override: st
 
     with open(params_path, 'rb') as f:
         flax_params = pickle.load(f)
+    flax_params = select_export_head(flax_params, export_head)
 
     # Load config to get model dimensions
     config_path = input_dir / "config.json"
@@ -333,6 +367,13 @@ def main():
         action="store_true",
         help="Skip verification with transformers"
     )
+    parser.add_argument(
+        "--export-head",
+        type=int,
+        default=None,
+        help="Prediction head of a --mix-heads checkpoint to write as the model's head.dense, head.norm and "
+             "decoder.bias; 0 is the head of the 15%% single tokens and the held-out eval (default: one-head checkpoints only)"
+    )
 
     args = parser.parse_args()
 
@@ -341,7 +382,7 @@ def main():
 
     convert_flax_to_hf(input_dir, output_dir, 
                        tokenizer_override=args.tokenizer if hasattr(args, 'tokenizer') else None,
-                       verify=not args.no_verify)
+                       verify=not args.no_verify, export_head=args.export_head)
 
     print(f"\nConversion complete!")
     print(f"Load with: ModernBertForMaskedLM.from_pretrained('{output_dir}')")

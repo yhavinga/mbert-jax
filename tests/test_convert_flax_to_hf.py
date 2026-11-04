@@ -20,6 +20,7 @@ from convert_flax_to_hf import (
     flatten_dict,
     map_flax_key_to_hf,
     convert_flax_to_hf,
+    select_export_head,
 )
 
 
@@ -297,3 +298,113 @@ class TestConversion:
 
         # Layer 1 should have attn_norm
         assert "model.layers.1.attn_norm.weight" in hf_state
+
+
+class TestExportHead:
+    """--export-head: one prediction head of a --mix-heads checkpoint as the head of a plain ModernBertForMaskedLM."""
+
+    @staticmethod
+    def _params(heads):
+        params = {"model": {"x": np.zeros(1)}, "prediction_head": {"dense": {"kernel": np.full((2, 2), 0.0)}},
+                  "decoder": {"bias": np.full(3, 0.0)}}
+        for k in range(1, heads):
+            params[f"prediction_head_{k}"] = {"dense": {"kernel": np.full((2, 2), float(k))}}
+            params[f"decoder_{k}"] = {"bias": np.full(3, float(k))}
+        return params
+
+    def test_a_multi_head_checkpoint_needs_the_choice(self):
+        with pytest.raises(ValueError, match="choose it with --export-head"):
+            select_export_head(self._params(2))
+        single = self._params(1)
+        assert select_export_head(single) is single
+        selected = select_export_head(single, 0)
+        assert selected.keys() == single.keys() and all(selected[key] is single[key] for key in single)
+
+    @pytest.mark.parametrize("heads,head", [(2, 0), (2, 1), (8, 0), (8, 5)])
+    def test_the_chosen_head_under_the_names_of_the_single_head(self, heads, head):
+        selected = select_export_head(self._params(heads), head)
+        assert set(selected) == {"model", "prediction_head", "decoder"}
+        assert np.all(selected["prediction_head"]["dense"]["kernel"] == head)
+        assert np.all(selected["decoder"]["bias"] == head)
+
+    def test_a_head_that_is_not_there_is_refused(self):
+        for heads, head in [(1, 1), (2, 2), (2, -1)]:
+            with pytest.raises(ValueError, match="this checkpoint has heads 0 to"):
+                select_export_head(self._params(heads), head)
+        gap = self._params(3)
+        del gap["prediction_head_1"], gap["decoder_1"]
+        with pytest.raises(ValueError, match="expected 1 to"):
+            select_export_head(gap, 0)
+
+
+def _word_tokenizer_dir(tmp_path, words):
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from tokenizers.pre_tokenizers import Whitespace
+    from transformers import PreTrainedTokenizerFast
+
+    specials = ["<pad>", "<s>", "</s>", "<unk>", "<mask>"]
+    vocab = {token: i for i, token in enumerate(specials + [f"w{i}" for i in range(words)])}
+    backend = Tokenizer(WordLevel(vocab, unk_token="<unk>"))
+    backend.pre_tokenizer = Whitespace()
+    tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend, pad_token="<pad>", bos_token="<s>", eos_token="</s>",
+                                        unk_token="<unk>", mask_token="<mask>")
+    directory = tmp_path / "tokenizer"
+    tokenizer.save_pretrained(directory)
+    return directory
+
+
+def test_exported_heads_give_the_logits_of_jax_in_transformers(tmp_path):
+    """HF parity of an export of each head of a two-head JAX model, on CPU: a plain ModernBertForMaskedLM, no custom code."""
+    import jax
+    import jax.numpy as jnp
+    from transformers import ModernBertForMaskedLM as HFModernBertForMaskedLM
+
+    sys.path.insert(0, str(ROOT / "src"))
+    from mmbjax.configuration_mmbbert import MMBertConfig
+    from mmbjax.heads.masked_lm import ModernBertForMaskedLM
+
+    config = MMBertConfig(vocab_size=64, hidden_size=32, intermediate_size=48, num_hidden_layers=3, num_attention_heads=2,
+                          max_position_embeddings=64, local_attention=8, global_attn_every_n_layers=3, pad_token_id=0,
+                          bos_token_id=1, eos_token_id=2)
+    model = ModernBertForMaskedLM(config, num_prediction_heads=2)
+    ones = jnp.ones((1, 8), dtype=jnp.int32)
+    params = model.init(jax.random.PRNGKey(0), input_ids=ones, attention_mask=ones)["params"]
+    # Heads far apart, so an export of the wrong one can't pass
+    noise = jax.random.normal(jax.random.PRNGKey(1), (32, 32))
+    params = {**params, "prediction_head_1": {**params["prediction_head_1"], "dense": {"kernel": noise}},
+              "decoder_1": {"bias": jax.random.normal(jax.random.PRNGKey(2), (64,))}}
+
+    input_dir = tmp_path / "flax"
+    input_dir.mkdir()
+    (input_dir / "params.pkl").write_bytes(pickle.dumps(jax.tree_util.tree_map(np.asarray, jax.device_get(params))))
+    (input_dir / "config.json").write_text(json.dumps({
+        "vocab_size": 64, "hidden_size": 32, "num_hidden_layers": 3, "num_attention_heads": 2, "intermediate_size": 48,
+        "max_position_embeddings": 64, "global_attn_every_n_layers": 3, "local_attention": 8,
+    }))
+    tokenizer_dir = _word_tokenizer_dir(tmp_path, 40)
+
+    rng = np.random.RandomState(0)
+    input_ids = rng.randint(5, 45, size=(2, 24)).astype(np.int32)
+    input_ids[:, 0] = 1
+    attention_mask = np.ones_like(input_ids)
+    jax_logits = {
+        0: np.asarray(model.apply({"params": params}, input_ids=jnp.asarray(input_ids), attention_mask=jnp.asarray(attention_mask)).logits),
+        1: np.asarray(model.apply({"params": params}, input_ids=jnp.asarray(input_ids), attention_mask=jnp.asarray(attention_mask),
+                                  head_ids=jnp.ones_like(jnp.asarray(input_ids))).logits),
+    }
+    assert np.abs(jax_logits[0] - jax_logits[1]).max() > 1.0
+
+    with pytest.raises(ValueError, match="choose it with --export-head"):
+        convert_flax_to_hf(input_dir, tmp_path / "refused", tokenizer_override=str(tokenizer_dir), verify=False)
+    for head in (0, 1):
+        output_dir = tmp_path / f"hf_head{head}"
+        convert_flax_to_hf(input_dir, output_dir, tokenizer_override=str(tokenizer_dir), verify=False, export_head=head)
+        hf = HFModernBertForMaskedLM.from_pretrained(output_dir, attn_implementation="eager").eval()
+        assert type(hf).__module__.startswith("transformers.")
+        from safetensors.torch import load_file
+        assert set(load_file(output_dir / "model.safetensors")) == set(hf.state_dict())
+        with torch.no_grad():
+            hf_logits = hf(input_ids=torch.from_numpy(input_ids.astype(np.int64)),
+                           attention_mask=torch.from_numpy(attention_mask.astype(np.int64))).logits.numpy()
+        np.testing.assert_allclose(hf_logits, jax_logits[head], atol=2e-4, rtol=1e-4)

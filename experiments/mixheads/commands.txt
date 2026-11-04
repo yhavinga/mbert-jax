@@ -1,0 +1,53 @@
+# culturax-nl-230m-chunk1024-mixheads: the command of culturax-nl-230m-chunk1024-mix (start_mix.sh in
+# gs://t5-dutch-english-usc2/mbert/masking/scripts, without its --stop-at-step) with --mix-heads rate2: head 0 predicts the
+# masked tokens of the denoisers at 15% (single tokens, spans of mean 3, 8 and 64), head 1 those at 50% (spans of mean 3, 8
+# and 64) and of the short prefix. Encoder and decoder weight (the embedding matrix) are shared; head 0 predicts the held-out
+# masks (15% single tokens), and is the head DUMB's finetune.py starts from and convert_flax_to_hf.py --export-head 0 writes.
+# From /Users/yeb/Developer/yhavinga/hammond. Code: branch mix-heads of github.com/yhavinga/mbert-jax at COMMIT. Scripts: $B
+# (a copy of experiments/mixheads/start_mixheads.sh). Not started: see "Wait for" below.
+COMMIT=e9c9fd64e48688454c1aa1d9fc0a4a7a59575b2b
+B=gs://t5-dutch-english-usc2/mbert/mixheads/scripts
+R=gs://t5-dutch-english-usc2/mbert/culturax-nl-230m-chunk1024-mixheads
+VM=mbert-mix
+
+# Wait for: a v4-32 in us-central2-b with nothing running on it, whose 4 workers have the CulturaX share of
+# setup_mbert_mask.sh (~/culturax_nl_files.txt, ~/culturax_nl, ~/heldout.parquet, ~/mbert-jax/.venv). mbert-mix has it; on
+# 4 November it was given the mC4 run. start_mixheads.sh refuses while a trainer runs. mbert-mix and mbert-corpus take the
+# on-demand quota (32 of 32 chips) and 8 of 8 external IPs in us-central2: no third v4-32 there while both exist.
+#
+# Parameters: 230,110,592 with one head; rate2 adds 1,081,728 (a 1024 x 1024 dense layer, a norm scale of 1024 and a decoder
+# bias of 32,128): 231,192,320 (+0.47%).
+# Steps: 653,000 of 128 x 1024, one pass over CulturaX nl, as the mix run: ~42 hours at its 0.233 s per step, ~46 with
+# checkpoints (0.252 s measured on mbert-mix); the second head added 0.4% in the smoke test below.
+#
+# Smoke test (4 November, spot v6e-8 in us-east1-d: one host of 8 chips, 8 x 1024 per chip as here, one CulturaX nl file,
+# code at COMMIT; logs and Trackio databases in gs://t5-dutch-english-use1/mbert/mixheads-smoke/). 200 steps each from the
+# same seeds, so the same batches and masks: median 0.1345 s per step with --mix-heads shared, 0.1350 with rate2, over the
+# 10-step windows of steps 30 to 200. rate2 at steps 50/100/150/200: head 0 loss 9.13/7.85/7.15/6.94, head 1
+# 9.02/7.66/7.17/6.88, no NaN; total 9.04/7.72/7.16/6.90 against 8.96/7.63/7.04/6.76 shared; EVAL (head 0) 7.739 at 100 and
+# 6.929 at 200. The first batch had 4,671 masked tokens on head 0, 12,434 on head 1. A resume from its checkpoint at 200
+# trained on to 250 (loss 6.87 at 210). Spot preemptions ended the VM before --init-from ran there; that path is tested on
+# CPU (tests/test_multihost.py::test_mix_heads_train_per_head_resume_and_start_other_runs).
+
+# 0. Only on a v4-32 without that share: create it through the guard, put the HF token on each worker, run the setup
+# (~50 minutes, 52 GB per host; ready when each ~/setup_mbert_mask.log ends in EXIT 0), as gs://.../masking/scripts/commands.txt does
+HAMMOND_BUCKET=t5-dutch-english-usc2 .venv/bin/python training/tpu.py up --accelerator v4-32 --zone us-central2-b --name $VM --on-demand --wait
+for w in 0 1 2 3; do gcloud compute tpus tpu-vm ssh $VM --zone us-central2-b --worker=$w --quiet --command='mkdir -p ~/.cache/huggingface; umask 077; cat > ~/.cache/huggingface/token' < ~/.cache/huggingface/token; done
+gcloud compute tpus tpu-vm ssh $VM --zone us-central2-b --worker=all --quiet --command='gsutil -q cp gs://t5-dutch-english-usc2/mbert/masking/scripts/setup_mbert_mask.sh ~/ && (setsid nohup bash -c "bash ~/setup_mbert_mask.sh > ~/setup_mbert_mask.log 2>&1; echo EXIT \$? >> ~/setup_mbert_mask.log" > /dev/null 2>&1 < /dev/null &)' < /dev/null
+
+# 1. The start script on every worker
+gcloud compute tpus tpu-vm ssh $VM --zone us-central2-b --worker=all --quiet --command="gsutil -q cp $B/start_mixheads.sh ~/" < /dev/null
+
+# 2. Start. The first start writes COMMIT to $R/start.txt; after a preemption or maintenance event the same command resumes
+# from the last checkpoint and data state (one at another commit is refused). Code in ~/mbert-mixheads; ~/mbert-jax stays.
+gcloud compute tpus tpu-vm ssh $VM --zone us-central2-b --worker=all --quiet --command="COMMIT=$COMMIT bash ~/start_mixheads.sh" < /dev/null
+# Progress: gsutil cat $R/logs/w<N>.log | grep -ao "^Step.*\|EVAL step=.*" | tail   (process_0 may be any worker: the one with
+# Step lines). Per head at the end of each Step line: "| Head 0: <loss> <accuracy>% n=<masked tokens> | Head 1: ...", in
+# Trackio train/head{0,1}_{loss,accuracy,n_masked_tokens}; the log starts with "Prediction heads: 2 (--mix-heads rate2),
+# 1,081,728 parameters beyond head 0" and the masked tokens per head of the first batch.
+# Checkpoints: the trainer keeps the last 3 (every 5,000 steps). Steps wanted for DUMB (100,000 multiples and 653,000) must be
+# copied to ckpt_keep/ within an hour, as for the mix run: gsutil -m cp -r $R/ckpt/<STEP> $R/ckpt_keep/
+
+# 3. Afterwards. DUMB: finetune.py starts from params.pkl of convert_gcs_checkpoint.py --params-only and takes prediction_head,
+# which is head 0; head 1 is left out. To HF: convert_flax_to_hf.py -i <dir of params.pkl> -o <out> --export-head 0 gives a
+# plain ModernBertForMaskedLM (without --export-head a multi-head checkpoint is refused).

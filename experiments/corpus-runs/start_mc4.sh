@@ -8,10 +8,14 @@
 # Each host starts its next pass on its own when its share runs out, with seed 42 + the pass number for the order of its
 # files, the shuffle buffer and the window of pieces; the hosts' passes end at other steps, as their shares differ by a
 # document and in tokens by 0.13%.
+# MASKING: mix (default) or uniform15, the masking of culturax-nl-230m-chunk1024; with uniform15 the run is
+# mc4-nl-230m-chunk1024, without the -mix suffix. Mix lost to 15% on SICK-NL at step 653,000 (80.76 against 84.90).
 # Environment overrides, for the smoke test only: RUN_ROOT RUN STOP_AT CHECKPOINT_EVERY EVAL_EVERY.
 set -euo pipefail
+MASKING=${MASKING:-mix}
+case $MASKING in mix) SUFFIX=-mix ;; uniform15) SUFFIX= ;; *) echo "MASKING must be mix or uniform15, not $MASKING"; exit 1 ;; esac
 RUN_ROOT=${RUN_ROOT:-gs://t5-dutch-english-usc2/mbert}
-RUN=${RUN:-mc4-nl-230m-chunk1024-mix}
+RUN=${RUN:-mc4-nl-230m-chunk1024$SUFFIX}
 CHECKPOINT_EVERY=${CHECKPOINT_EVERY:-5000}
 EVAL_EVERY=${EVAL_EVERY:-25000}
 STOP_AT=${STOP_AT:-}
@@ -27,7 +31,7 @@ if gsutil -q stat "$OUT/tracking/$RUN.db"; then
 fi
 cat > ~/run_$RUN.sh <<EOF
 cd ~/mbert-corpus
-TRACKIO_DIR=\$HOME/trackio TOKENIZERS_PARALLELISM=false PYTHONPATH=src .venv/bin/python -u scripts/train_minimal.py --dataset yhavinga/mc4_nl_cleaned --dataset-config full --tokenizer yhavinga/dutch-llama-tokenizer --use-packing --max-length 1024 --hidden-size 1024 --num-layers 22 --num-heads 16 --intermediate-size 1536 --global-attn-every-n-layers 3 --lr-schedule cosine --min-lr 1e-6 --weight-decay 0.01 --layer-norm-lr-factor 1.0 --log-every 10 --dataset-num-rows 64545895 --per-device-batch-size 8 --learning-rate 4.8e-4 --warmup-steps 1250 --max-steps 653000 ${STOP_AT:+--stop-at-step $STOP_AT} --masking mix --checkpoint-every $CHECKPOINT_EVERY --checkpoint-dir $OUT/ckpt --wandb-project $RUN --wandb-run-name $RUN --tracking-sync-dir $OUT/tracking --system-metrics-every 1000 --eval-file \$HOME/heldout.parquet --eval-every $EVAL_EVERY --eval-batches 50 --data-files-list \$HOME/mc4_nl_files.txt >> ~/logs/$RUN.log 2>&1
+TRACKIO_DIR=\$HOME/trackio TOKENIZERS_PARALLELISM=false PYTHONPATH=src .venv/bin/python -u scripts/train_minimal.py --dataset yhavinga/mc4_nl_cleaned --dataset-config full --tokenizer yhavinga/dutch-llama-tokenizer --use-packing --max-length 1024 --hidden-size 1024 --num-layers 22 --num-heads 16 --intermediate-size 1536 --global-attn-every-n-layers 3 --lr-schedule cosine --min-lr 1e-6 --weight-decay 0.01 --layer-norm-lr-factor 1.0 --log-every 10 --dataset-num-rows 64545895 --per-device-batch-size 8 --learning-rate 4.8e-4 --warmup-steps 1250 --max-steps 653000 ${STOP_AT:+--stop-at-step $STOP_AT} --masking $MASKING --checkpoint-every $CHECKPOINT_EVERY --checkpoint-dir $OUT/ckpt --wandb-project $RUN --wandb-run-name $RUN --tracking-sync-dir $OUT/tracking --system-metrics-every 1000 --eval-file \$HOME/heldout.parquet --eval-every $EVAL_EVERY --eval-batches 50 --data-files-list \$HOME/mc4_nl_files.txt >> ~/logs/$RUN.log 2>&1
 echo EXIT \$? > ~/logs/$RUN.exit
 EOF
 cat > ~/sync_$RUN.sh <<EOF

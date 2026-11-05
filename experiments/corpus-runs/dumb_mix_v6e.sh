@@ -17,6 +17,8 @@
 # On a worker of a v4-32, as a single-host TPU of its own 4 chips (as dumb_phase.sh of phase2048): QUEUES=1, CODE a
 # checkout of its own (the training's ~/mbert-jax may be at another commit there), LOGTAG a name per worker, so the
 # workers' logs in $OUT/logs/ do not overwrite each other.
+# A --mix-heads checkpoint (prediction_head_<n>, decoder_<n> next to head 0): EXPORT_HEAD=0 keeps one head after the
+# conversion, as convert_flax_to_hf.py --export-head does; verify_ckpt.py and finetune.py expect one.
 set -euo pipefail
 COMMIT=${COMMIT:?set COMMIT to the commit of commands.txt}
 QUEUES=${QUEUES:-2}
@@ -29,6 +31,7 @@ OUT=${OUT:-gs://t5-dutch-english-usc2/mbert/masking/dumb}
 ONLY_JOBS=${ONLY_JOBS:-}
 CODE=${CODE:-mbert-jax}
 LOGTAG=${LOGTAG:-v6e}
+EXPORT_HEAD=${EXPORT_HEAD:-}
 [ -s ~/.cache/huggingface/token ] || { echo "$(hostname): no ~/.cache/huggingface/token, put it there first (commands.txt)"; exit 1; }
 pgrep -f '[t]rain_minimal.py|[f]inetune.py|[e]val_windows.py' > /dev/null && { echo "$(hostname): the TPU is in use"; exit 1; }
 gsutil -q stat "$CKPT/commit_success.txt" || { echo "$(hostname): $CKPT has no commit_success.txt (yet)"; exit 1; }
@@ -52,6 +55,22 @@ export HF_DATASETS_TRUST_REMOTE_CODE=1 TOKENIZERS_PARALLELISM=false JAX_COMPILAT
 if [ ! -f \$HOME/dumb/ckpt$NAME/params.pkl ]; then
   .venv/bin/python scripts/convert_gcs_checkpoint.py --checkpoint $CKPT --params-only --output \$HOME/dumb/ckpt$NAME --tokenizer yhavinga/dutch-llama-tokenizer --global-attn-every-n-layers 3 || exit 3
   rm -f \$HOME/dumb/ckpt$NAME/model.safetensors
+  if [ -n "$EXPORT_HEAD" ]; then
+    .venv/bin/python - \$HOME/dumb/ckpt$NAME/params.pkl $EXPORT_HEAD <<'PY' || exit 3
+import pickle, re, sys
+path, k = sys.argv[1], int(sys.argv[2])
+p = pickle.load(open(path, "rb"))
+extra = [n for n in p if re.fullmatch(r"(prediction_head|decoder)_[0-9]+", n)]
+heads = 1 + len([n for n in extra if n.startswith("prediction_head_")])
+assert 0 <= k < heads, f"EXPORT_HEAD={k}: {path} has heads 0 to {heads - 1}"
+if k:
+    p["prediction_head"], p["decoder"] = p[f"prediction_head_{k}"], p[f"decoder_{k}"]
+for n in extra:
+    del p[n]
+pickle.dump(p, open(path, "wb"))
+print(f"head {k} of {heads} kept as prediction_head/decoder; left out: {sorted(extra)}")
+PY
+  fi
 fi
 .venv/bin/python \$HOME/verify_ckpt.py \$HOME/dumb/ckpt$NAME || exit 4
 # task per-chip-batch accumulation seed; queue w takes the jobs i with i % QUEUES == w

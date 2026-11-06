@@ -72,7 +72,9 @@ print(f"head {k} of {heads} kept as prediction_head/decoder; left out: {sorted(e
 PY
   fi
 fi
-.venv/bin/python \$HOME/verify_ckpt.py \$HOME/dumb/ckpt$NAME || exit 4
+# On chips 0-3 as a TPU of its own, as queue 0: without these variables a worker of a v4-32 waits for the other hosts
+# of the slice, and fails after 15 minutes when one of them does not check a checkpoint at the same time
+TPU_CHIPS_PER_PROCESS_BOUNDS=2,2,1 TPU_PROCESS_BOUNDS=1,1,1 TPU_VISIBLE_CHIPS=0,1,2,3 TPU_PROCESS_PORT=8476 TPU_PROCESS_ADDRESSES=localhost:8476 CLOUD_TPU_TASK_ID=0 ALLOW_MULTIPLE_LIBTPU_LOAD=1 .venv/bin/python \$HOME/verify_ckpt.py \$HOME/dumb/ckpt$NAME || exit 4
 # task per-chip-batch accumulation seed; queue w takes the jobs i with i % QUEUES == w
 JOBS="dbrd 24 2 42
 dbrd 24 2 43

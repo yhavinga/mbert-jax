@@ -1,6 +1,7 @@
 """Tests for Grain dataloader packing components."""
 
 import os
+from collections import Counter
 
 import numpy as np
 import json
@@ -1300,3 +1301,303 @@ def test_model_sees_nothing_of_the_tokens_behind_the_prefix():
     assert np.array_equal(only_segments[0][0, seen], only_segments[1][0, seen])
     visible = logits(other_ids, attention_mask, segment_ids, position_ids), logits(input_ids, attention_mask, segment_ids, position_ids)
     assert not np.array_equal(visible[0][0, :hidden_from], visible[1][0, :hidden_from])
+
+
+# --------------------------------------------------------------------------- --masking decay
+
+def _decay_tokenizer():
+    """Like yhavinga/dutch-llama-tokenizer: no <mask> of its own, so the trainer adds it, and then <answer>."""
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from tokenizers.pre_tokenizers import Whitespace
+    from transformers import PreTrainedTokenizerFast
+
+    from src.mmbjax.training import add_answer_token
+
+    vocab = {token: i for i, token in enumerate(["<unk>", "<s>", "</s>", "<pad>"] + [f"w{i}" for i in range(95)])}
+    backend = Tokenizer(WordLevel(vocab, unk_token="<unk>"))
+    backend.pre_tokenizer = Whitespace()
+    tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend, unk_token="<unk>", bos_token="<s>", eos_token="</s>",
+                                        pad_token="<pad>", split_special_tokens=True)
+    tokenizer.add_special_tokens({"mask_token": "<mask>"})
+    return tokenizer, add_answer_token(tokenizer)
+
+
+def _words(rng, n):
+    return " ".join(f"w{w}" for w in rng.randint(0, 95, size=n))
+
+
+def _decay_rows(n=120, seed=0, longest_answer=30):
+    """Web documents and instruction examples, as the rows of build_decay_mix.py."""
+    rng = np.random.RandomState(seed)
+    rows = []
+    for i in range(n):
+        if i % 3:
+            rows.append({"text": _words(rng, rng.randint(1, 50)), "inputs": None, "targets": None})
+        else:
+            rows.append({"text": None, "inputs": _words(rng, rng.randint(1, 20)), "targets": _words(rng, rng.randint(1, longest_answer))})
+    return rows
+
+
+def test_add_answer_token_comes_after_mask_and_keeps_the_vocabulary():
+    from src.mmbjax.training import add_answer_token
+
+    tokenizer, answer_token_id = _decay_tokenizer()
+    assert (tokenizer.mask_token_id, answer_token_id, len(tokenizer)) == (99, 100, 101)
+    assert answer_token_id in tokenizer.all_special_ids
+    # A literal <answer> in a text is text, as every special token on the trainer's route
+    assert answer_token_id not in tokenizer("w1 <answer> w2", add_special_tokens=False)["input_ids"]
+    with pytest.raises(ValueError, match="in the tokenizer already"):
+        add_answer_token(tokenizer)
+
+
+def test_answer_token_of_the_real_tokenizer_is_32001_and_the_model_vocabulary_stays_32128():
+    from transformers import AutoTokenizer
+
+    from src.mmbjax.training import add_answer_token
+
+    try:
+        tokenizer = AutoTokenizer.from_pretrained("yhavinga/dutch-llama-tokenizer", split_special_tokens=True, local_files_only=True)
+    except OSError:
+        pytest.skip("yhavinga/dutch-llama-tokenizer is not in the local Hugging Face cache")
+    tokenizer.add_special_tokens({"mask_token": "<mask>"})
+    assert tokenizer.mask_token_id == 32000
+    assert add_answer_token(tokenizer) == 32001
+    assert tokenizer.mask_token_id == 32000
+    # train_minimal.py rounds len(tokenizer) up to 128: the parameters of S keep their shapes
+    assert ((len(tokenizer) + 127) // 128) * 128 == 32128
+    # The verbalizers of eval_zeroshot_mlm.py are single tokens
+    for word in ("▁positief", "▁negatief", "▁A", "▁B", "▁C", "▁D"):
+        assert tokenizer.convert_tokens_to_ids(word) != tokenizer.unk_token_id, word
+
+
+def _roles_by_hand(tokenizer, answer_token_id, row, max_length):
+    """(ids, roles) of each piece of a row, written out from the definition."""
+    from src.mmbjax.training.packing import split_into_pieces
+
+    def ids(text):
+        return tokenizer(text, add_special_tokens=False)["input_ids"]
+
+    if row["inputs"] is None:
+        return [(piece, [0] * len(piece)) for piece in split_into_pieces(ids(row["text"]), max_length, 1, 2)]
+    instruction, answer = ids(row["inputs"]), ids(row["targets"])
+    piece = [1, *instruction, answer_token_id, *answer, 2]
+    if len(piece) > max_length:
+        return []
+    return [(piece, [1] * (len(instruction) + 1) + [2] + [3] * (len(answer) + 1))]
+
+
+def test_roles_survive_packing():
+    from src.mmbjax.training import create_packed_dataset_streaming
+
+    tokenizer, answer_token_id = _decay_tokenizer()
+    rows = _decay_rows()
+    expected = sorted((tuple(ids), tuple(roles)) for row in rows for ids, roles in _roles_by_hand(tokenizer, answer_token_id, row, 32))
+    batches = list(create_packed_dataset_streaming(rows, tokenizer=tokenizer, max_length=32, batch_size=4, answer_token_id=answer_token_id))
+    got = []
+    for batch in batches:
+        assert batch["token_role"].dtype == np.int8 and batch["token_role"].shape == batch["input_ids"].shape
+        # Packing moves the roles with their tokens
+        assert np.array_equal(batch["token_role_segment_ids"], batch["input_ids_segment_ids"])
+        assert np.array_equal(batch["token_role_positions"], batch["input_ids_positions"])
+        for row in range(batch["input_ids"].shape[0]):
+            ids, roles, segments = batch["input_ids"][row], batch["token_role"][row], batch["input_ids_segment_ids"][row]
+            padding = ids == tokenizer.pad_token_id
+            assert not roles[padding].any(), "padding has role 0"
+            for segment in np.unique(segments[~padding]):
+                where = (segments == segment) & ~padding
+                got.append((tuple(ids[where].tolist()), tuple(roles[where].tolist())))
+    # Packing keeps at most what fits in whole batches: every packed piece is one of the expected, with its roles
+    assert got and Counter(got) <= Counter(expected)
+    assert any(3 in roles for _, roles in got) and any(set(roles) == {0} for _, roles in got)
+
+
+def test_too_long_instruction_examples_are_skipped_and_counted(capsys):
+    from src.mmbjax.training import TokenizeTransform
+
+    tokenizer, answer_token_id = _decay_tokenizer()
+    transform = TokenizeTransform(tokenizer, max_length=10, answer_token_id=answer_token_id)
+    # <s> 3 <answer> 4 </s> = 10 fits; one more does not, and is not cut
+    assert len(transform.map({"text": None, "inputs": "w1 w2 w3", "targets": "w4 w5 w6 w7"})[0]["input_ids"]) == 10
+    assert transform.map({"text": None, "inputs": "w1 w2 w3 w8", "targets": "w4 w5 w6 w7", "source": "flan/x/y"}) == []
+    assert transform.skipped_too_long == 1
+    assert "skipped instruction example 1: 11 tokens > max_length 10 (source flan/x/y)" in capsys.readouterr().out
+    # A long web document is still split into pieces, with roles 0
+    pieces = transform.map({"text": " ".join(["w1"] * 30), "inputs": None, "targets": None})
+    assert len(pieces) == 4 and all(not piece["token_role"].any() for piece in pieces)
+
+
+def _decay_batches(tokenizer, answer_token_id, rows, length=64, batch_rows=8):
+    from src.mmbjax.training import create_packed_dataset_streaming
+
+    return list(create_packed_dataset_streaming(rows, tokenizer=tokenizer, max_length=length, batch_size=batch_rows,
+                                                answer_token_id=answer_token_id))
+
+
+def _answer_runs(batch):
+    """(row, columns) of each answer in a raw batch: role 3 without the closing </s>."""
+    runs = []
+    for row in range(batch["input_ids"].shape[0]):
+        answer = (batch["token_role"][row] == 3) & (batch["input_ids"][row] != 2)
+        columns = np.flatnonzero(answer)
+        for run in np.split(columns, np.flatnonzero(np.diff(columns) != 1) + 1):
+            if len(run):
+                runs.append((row, run))
+    return runs
+
+
+def test_decay_masks_whole_short_answers_and_never_instructions_or_answer_token():
+    from src.mmbjax.training import DecayCollator
+
+    tokenizer, answer_token_id = _decay_tokenizer()
+    rows = [row for seed in range(6) for row in _decay_rows(seed=seed, longest_answer=40)]
+    collator = DecayCollator(tokenizer, web_mask_rate=0.05, answer_full_max=16, answer_token_id=answer_token_id)
+    np.random.seed(0)
+    short_runs = long_runs = 0
+    long_masked = long_tokens = 0
+    for raw in _decay_batches(tokenizer, answer_token_id, rows):
+        out = collator(raw)
+        roles, original = raw["token_role"], raw["input_ids"]
+        masked = out["labels"] != -100
+        assert np.array_equal(out["labels"][masked], original[masked])
+        # Instruction, <s>, <answer>, </s> and padding: never a label, never changed
+        never = (roles == 1) | (roles == 2) | np.isin(original, tokenizer.all_special_ids)
+        assert not masked[never].any()
+        assert np.array_equal(out["input_ids"][never], original[never])
+        assert np.all(original[roles == 2] == answer_token_id) and np.all(out["input_ids"][roles == 2] == answer_token_id)
+        for row, run in _answer_runs(raw):
+            if len(run) <= 16:
+                short_runs += 1
+                # Every token a label and a <mask>: no 80/10/10, as at inference
+                assert masked[row, run].all()
+                assert np.all(out["input_ids"][row, run] == tokenizer.mask_token_id)
+            else:
+                long_runs += 1
+                long_masked += int(masked[row, run].sum())
+                long_tokens += len(run)
+    assert short_runs > 50 and long_runs > 20
+    # span_mu8_r50 masks half of a long answer
+    assert long_masked / long_tokens == pytest.approx(0.5, abs=0.03)
+    stats = collator.decay_stats()
+    assert stats["instruction_masked"] == 0 and stats["answers_full"] == short_runs and stats["answers_span"] == long_runs
+    assert stats["answer_masked"] == stats["answer_masked_full"] + long_masked
+    assert 0 < stats["answer_loss_share"] < 1 and stats["answers_empty"] == 0
+
+
+def test_decay_web_tokens_get_the_draws_of_packed_mlm_collator():
+    from src.mmbjax.training import DecayCollator
+
+    tokenizer, answer_token_id = _decay_tokenizer()
+    web_only = [{"text": _words(np.random.RandomState(i), 1 + i % 50), "inputs": None, "targets": None} for i in range(200)]
+    raw = _decay_batches(tokenizer, answer_token_id, web_only)[0]
+    assert not raw["token_role"].any()
+    for seed in (0, 1):
+        np.random.seed(seed)
+        decay = DecayCollator(tokenizer, web_mask_rate=0.05, answer_full_max=16, answer_token_id=answer_token_id)(raw)
+        after_decay = np.random.randint(2**31)
+        np.random.seed(seed)
+        plain = PackedMLMDataCollator(tokenizer, mlm_probability=0.05)(raw)
+        assert after_decay == np.random.randint(2**31), "the RNG must stand where the parent leaves it"
+        assert decay.keys() == plain.keys()
+        for key in plain:
+            assert decay[key].dtype == plain[key].dtype and np.array_equal(decay[key], plain[key]), key
+
+    # With instruction examples in the batch, web tokens still get 5% with 80/10/10
+    rows = [row for seed in range(40) for row in _decay_rows(seed=seed)]
+    collator = DecayCollator(tokenizer, web_mask_rate=0.05, answer_full_max=16, answer_token_id=answer_token_id)
+    np.random.seed(0)
+    masked_web = maskable_web = as_mask = 0
+    for raw in _decay_batches(tokenizer, answer_token_id, rows):
+        out = collator(raw)
+        web = (raw["token_role"] == 0) & ~np.isin(raw["input_ids"], tokenizer.all_special_ids)
+        masked = (out["labels"] != -100) & web
+        masked_web += int(masked.sum())
+        maskable_web += int(web.sum())
+        as_mask += int(np.sum(out["input_ids"][masked] == tokenizer.mask_token_id))
+    assert masked_web / maskable_web == pytest.approx(0.05, abs=0.006)
+    assert as_mask / masked_web == pytest.approx(0.8, abs=0.04)
+    assert collator.decay_stats()["web_masked_rate"] == pytest.approx(masked_web / maskable_web)
+
+
+# The digests of the default route, computed with packing.py of 9bdde82 (before the decay route existed)
+GOLDEN_DEFAULT_STREAMING = "622a6033f73089b9bd084fe9c0a9f6288535a0f5d1b4ec5f688404b7edb07c94"
+GOLDEN_DEFAULT_PIECES = "24cbaa47fa0806e922c571d945089df90e63248edc792f673a6dfb3c86af00ce"
+GOLDEN_DEFAULT_LOCAL_FILES = "5c599267ad3ebd0f5afa10991cfd4f30cda91e122ac2863be532b89afc672f55"
+GOLDEN_DEFAULT_COLLATED = "c1f60f49dca191a6520643e656a99300bac9672fcaef0885388b8c4093a9dd66"
+
+
+def _digest_of_batches(batches):
+    import hashlib
+
+    digest = hashlib.sha256()
+    for batch in batches:
+        for key in sorted(batch):
+            value = np.asarray(batch[key])
+            digest.update(key.encode())
+            digest.update(value.dtype.str.encode())
+            digest.update(value.tobytes())
+    return digest.hexdigest()
+
+
+def test_default_route_is_unchanged_by_the_decay_route(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from src.mmbjax.training import EpochTrackingDataLoader, create_packed_dataset_streaming
+
+    tokenizer = _left_truncating_tokenizer()
+    documents = [{"text": " ".join(f"w{(i * 7 + j) % 95}" for j in range(1 + (i * 13) % 40))} for i in range(300)]
+    iterator = iter(create_packed_dataset_streaming(documents, tokenizer=tokenizer, max_length=16, batch_size=4, seed=3))
+    streaming = [next(iterator) for _ in range(20)]
+    assert sorted(streaming[0]) == ["input_ids", "input_ids_positions", "input_ids_segment_ids"]
+    assert _digest_of_batches(streaming) == GOLDEN_DEFAULT_STREAMING
+    pieces = [piece for document in documents[:50] for piece in TokenizeTransform(tokenizer, 16).map(document)]
+    assert sorted(pieces[0]) == ["input_ids", "length"]
+    assert _digest_of_batches(pieces) == GOLDEN_DEFAULT_PIECES
+
+    files = []
+    for part in range(3):
+        path = tmp_path / f"part{part}.parquet"
+        pq.write_table(pa.table({"text": [f"w{part} " + " ".join(f"w{(i + j) % 95}" for j in range(i % 30)) for i in range(80)]}), path)
+        files.append(str(path))
+    loader = EpochTrackingDataLoader(dataset_name="ignored", tokenizer=tokenizer, max_length=16, batch_size=2, shuffle_buffer_size=10, data_files=files)
+    iterator = iter(loader)
+    assert _digest_of_batches([next(iterator) for _ in range(25)]) == GOLDEN_DEFAULT_LOCAL_FILES
+    assert loader.accounting() == {"documents_read": 240, "documents_completed": 32, "pieces_read": 55, "tokens_read": 664,
+                                   "epoch": 0, "counted_from_start": True}
+    np.random.seed(42)
+    assert _digest_of_batches([PackedMLMDataCollator(tokenizer, 0.05)(batch) for batch in streaming]) == GOLDEN_DEFAULT_COLLATED
+
+
+def test_decay_route_on_local_parquet_resumes_with_its_roles(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from src.mmbjax.training import EpochTrackingDataLoader
+
+    tokenizer, answer_token_id = _decay_tokenizer()
+    path = tmp_path / "mix.parquet"
+    rows = _decay_rows(n=300)
+    pq.write_table(pa.table({key: [row[key] for row in rows] for key in ("text", "inputs", "targets")}), path)
+
+    def loader():
+        return EpochTrackingDataLoader(dataset_name="ignored", tokenizer=tokenizer, max_length=32, batch_size=2,
+                                       shuffle_buffer_size=10, data_files=[str(path)], answer_token_id=answer_token_id)
+
+    whole = iter(loader())
+    batches = [next(whole) for _ in range(30)]
+    assert all("token_role" in batch for batch in batches)
+    assert any((batch["token_role"] == 2).any() for batch in batches)
+    first = loader()
+    iterator = iter(first)
+    for _ in range(11):
+        next(iterator)
+    resumed = loader()
+    resumed.set_state(json.loads(json.dumps(first.get_state(), default=int)))
+    iterator = iter(resumed)
+    for expected in batches[11:]:
+        got = next(iterator)
+        for key in expected:
+            assert np.array_equal(got[key], expected[key]), key
+    with pytest.raises(ValueError, match="not for dataset_configs"):
+        EpochTrackingDataLoader(dataset_configs=[{"name": "x"}], tokenizer=tokenizer, answer_token_id=answer_token_id)

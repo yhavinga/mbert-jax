@@ -43,6 +43,14 @@ SPAN_LENGTH_STD_OVER_MEAN = 0.25
 PREFIX_MAX_MASKED = 16
 DENOISER_NAMES = ("single_r15", *(f"span_mu{mean}_r{round(rate * 100)}" for mean, rate in SPAN_DENOISERS), "short_prefix")
 
+# The token between an instruction and its answer in --masking decay, added after <mask> so <mask> keeps its id
+ANSWER_TOKEN = "<answer>"
+# token_role of each token on the decay route. <s> and the instruction are 1, </s> closes the answer with 3;
+# as special tokens <s>, <answer> and </s> are never masked whatever their role.
+ROLE_WEB, ROLE_INSTRUCTION, ROLE_ANSWER_TOKEN, ROLE_ANSWER = 0, 1, 2, 3
+# The denoiser of MixedDenoiserCollator that masks the answers longer than --answer-full-max
+LONG_ANSWER_DENOISER = DENOISER_NAMES.index("span_mu8_r50")
+
 
 __all__ = [
     "PIECE_SHUFFLE_WINDOW",
@@ -51,6 +59,13 @@ __all__ = [
     "FLANTokenizeTransform",
     "PackedMLMDataCollator",
     "MixedDenoiserCollator",
+    "DecayCollator",
+    "add_answer_token",
+    "ANSWER_TOKEN",
+    "ROLE_WEB",
+    "ROLE_INSTRUCTION",
+    "ROLE_ANSWER_TOKEN",
+    "ROLE_ANSWER",
     "DENOISER_NAMES",
     "InstructionResponseMaskingCollator",
     "HybridMaskingCollator",
@@ -161,6 +176,26 @@ def _require_bos_token(tokenizer) -> None:
         )
 
 
+def add_answer_token(tokenizer) -> int:
+    """Add <answer> as a special token and return its id; call after <mask> is in the tokenizer.
+
+    It goes at the end of the vocabulary, so every other id stays what the start checkpoint was trained with:
+    with yhavinga/dutch-llama-tokenizer <mask> stays 32000 and <answer> is 32001, and the model's vocab_size,
+    len(tokenizer) rounded up to 128, stays 32128.
+    """
+    if tokenizer.mask_token_id is None:
+        raise ValueError("add <mask> before <answer>: the order of the added tokens fixes their ids")
+    mask_token_id, size = tokenizer.mask_token_id, len(tokenizer)
+    if ANSWER_TOKEN in tokenizer.get_vocab():
+        raise ValueError(f"{ANSWER_TOKEN} is in the tokenizer already, at id {tokenizer.convert_tokens_to_ids(ANSWER_TOKEN)}")
+    tokenizer.add_special_tokens({"additional_special_tokens": [ANSWER_TOKEN]}, replace_additional_special_tokens=False)
+    answer_token_id = tokenizer.convert_tokens_to_ids(ANSWER_TOKEN)
+    if tokenizer.mask_token_id != mask_token_id or answer_token_id != size or len(tokenizer) != size + 1:
+        raise ValueError(f"{ANSWER_TOKEN} got id {answer_token_id} and <mask> {tokenizer.mask_token_id}; expected {size} "
+                         f"and {mask_token_id}, the end of a vocabulary of {size}")
+    return answer_token_id
+
+
 def _stack_batch(batch: list) -> Dict[str, np.ndarray]:
     """Stack a list of dicts into a single dict of stacked arrays."""
     if not batch:
@@ -199,12 +234,21 @@ class TokenizeTransform:
     map() does the work and belongs in Grain's read threads, as a long document takes long to
     tokenize. flat_map() then hands out its pieces one by one, and with a parent's checkpointable
     index plus the position in the document Grain can resume in the middle of a document.
+
+    With answer_token_id (the route of --masking decay) every piece also has a token_role per token
+    (ROLE_*), and a row with inputs/targets instead of text is one piece <s> inputs <answer> targets </s>,
+    the two parts tokenized apart and joined at id level. Such a piece is never split: one longer than
+    max_length is skipped and counted in skipped_too_long.
     """
 
-    def __init__(self, tokenizer, max_length: int):
+    def __init__(self, tokenizer, max_length: int, answer_token_id: Optional[int] = None):
         _require_bos_token(tokenizer)
         self.tokenizer = tokenizer
         self.max_length = max_length
+        self.answer_token_id = answer_token_id
+        self.skipped_too_long = 0
+        import threading
+        self._skip_lock = threading.Lock()
         # A fast tokenizer drops a truncation setting on its first call, which mustn't happen with
         # read threads already using it.
         self._tokenize("")
@@ -220,11 +264,38 @@ class TokenizeTransform:
 
     def map(self, element: Dict[str, Any]) -> List[Dict[str, Any]]:
         """The pieces of a single text element."""
+        if self.answer_token_id is not None and element.get("inputs") is not None:
+            return self._instruction_pieces(element)
         pieces = split_into_pieces(
             self._tokenize(element["text"]), self.max_length, self.tokenizer.bos_token_id, self.tokenizer.eos_token_id
         )
         # Grain's FirstFitPackIterDataset requires numpy arrays, not Python lists
-        return [{"input_ids": np.array(piece, dtype=np.int32), "length": len(piece)} for piece in pieces]
+        if self.answer_token_id is None:
+            return [{"input_ids": np.array(piece, dtype=np.int32), "length": len(piece)} for piece in pieces]
+        return [
+            {"input_ids": np.array(piece, dtype=np.int32), "token_role": np.full(len(piece), ROLE_WEB, dtype=np.int8), "length": len(piece)}
+            for piece in pieces
+        ]
+
+    def instruction_ids(self, inputs: str, targets: str) -> Tuple[List[int], List[int]]:
+        """(ids, roles) of <s> inputs <answer> targets </s>; build_decay_mix.py counts its tokens with this too."""
+        instruction, answer = self._tokenize(inputs), self._tokenize(targets)
+        ids = [self.tokenizer.bos_token_id, *instruction, self.answer_token_id, *answer, self.tokenizer.eos_token_id]
+        roles = [ROLE_INSTRUCTION] * (len(instruction) + 1) + [ROLE_ANSWER_TOKEN] + [ROLE_ANSWER] * (len(answer) + 1)
+        return ids, roles
+
+    def _instruction_pieces(self, element: Dict[str, Any]) -> List[Dict[str, Any]]:
+        ids, roles = self.instruction_ids(element["inputs"], element["targets"])
+        if len(ids) > self.max_length:
+            # Cut, the question at the end of the inputs or the answer would be lost; the mix is built without these
+            with self._skip_lock:
+                self.skipped_too_long += 1
+                skipped = self.skipped_too_long
+            if skipped <= 10 or skipped % 1000 == 0:
+                print(f"[TokenizeTransform] skipped instruction example {skipped}: {len(ids)} tokens > max_length "
+                      f"{self.max_length} (source {element.get('source')})", flush=True)
+            return []
+        return [{"input_ids": np.array(ids, dtype=np.int32), "token_role": np.array(roles, dtype=np.int8), "length": len(ids)}]
 
     def flat_map(self, pieces: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         return pieces
@@ -474,6 +545,105 @@ class MixedDenoiserCollator(PackedMLMDataCollator):
                 "hidden_tokens": int(self.hidden_tokens[i]),
             }
             for i, name in enumerate(DENOISER_NAMES)
+        }
+
+
+class DecayCollator(PackedMLMDataCollator):
+    """--masking decay: web text at web_mask_rate, instruction examples with only their answer masked.
+
+    By token_role (TokenizeTransform with answer_token_id): web tokens get the parent's single tokens at
+    web_mask_rate with 80/10/10, drawn first and in the same calls, so a batch without instruction examples
+    collates to the bytes of PackedMLMDataCollator(mlm_probability=web_mask_rate) at the same RNG state.
+    Instruction tokens and <answer> are never masked. An answer of at most answer_full_max tokens is masked
+    whole and every token becomes <mask>, as at inference, where the answer is a <mask>. A longer answer
+    gets the spans of span_mu8_r50 (MixedDenoiserCollator._draw_masked) and the 80/10/10 of the parent.
+    """
+
+    STAT_NAMES = (
+        "flan_segments", "flan_tokens", "web_tokens", "web_maskable", "web_masked", "answers_full", "answers_span",
+        "answers_empty", "answer_tokens", "answer_masked", "answer_masked_full", "instruction_masked",
+    )
+
+    def __init__(self, tokenizer, web_mask_rate: float, answer_full_max: int, answer_token_id: int):
+        super().__init__(tokenizer, mlm_probability=web_mask_rate)
+        if answer_token_id not in tokenizer.all_special_ids:
+            raise ValueError(f"<answer> ({answer_token_id}) must be a special token of the tokenizer, so nothing masks it")
+        self.answer_full_max = answer_full_max
+        self.answer_token_id = answer_token_id
+        self.counts = dict.fromkeys(self.STAT_NAMES, 0)
+
+    def __call__(self, batch: Dict[str, Any]) -> Dict[str, np.ndarray]:
+        input_ids = np.array(batch["input_ids"])
+        segment_ids = np.array(batch["input_ids_segment_ids"])
+        positions = np.array(batch["input_ids_positions"])
+        roles = np.array(batch["token_role"])
+
+        # See the parent: padding comes with segment_id 0, which a real document also has
+        is_padding = (input_ids == self.tokenizer.pad_token_id)
+        segment_ids = np.where(is_padding, -1, segment_ids)
+        special = np.isin(input_ids, self.tokenizer.all_special_ids)
+
+        probability_matrix = np.full(input_ids.shape, self.mlm_probability)
+        probability_matrix[special] = 0.0
+        probability_matrix[roles != ROLE_WEB] = 0.0
+        masked_indices = np.random.binomial(1, probability_matrix).astype(bool)
+        web_masked = int(masked_indices.sum())
+
+        answer = (roles == ROLE_ANSWER) & ~special
+        always_mask = np.zeros(input_ids.shape, dtype=bool)
+        answers = 0
+        # Only rows with an answer draw more, so a batch of web text alone leaves the RNG where the parent does
+        for row in np.flatnonzero(answer.any(axis=1)):
+            columns = np.flatnonzero(answer[row])
+            # The answer of an example is one run of columns in its segment; </s> and <s> part two neighbours
+            breaks = np.flatnonzero((np.diff(columns) != 1) | (np.diff(segment_ids[row, columns]) != 0)) + 1
+            for run in np.split(columns, breaks):
+                answers += 1
+                if len(run) <= self.answer_full_max:
+                    always_mask[row, run] = True
+                    self.counts["answers_full"] += 1
+                else:
+                    masked_indices[row, run[MixedDenoiserCollator._draw_masked(LONG_ANSWER_DENOISER, len(run))]] = True
+                    self.counts["answers_span"] += 1
+
+        labels = np.where(masked_indices | always_mask, input_ids, -100)
+        self._replace_masked_tokens(input_ids, masked_indices)
+        input_ids[always_mask] = self.tokenizer.mask_token_id
+        attention_mask = np.where(is_padding, 0, 1).astype(np.int32)
+
+        real = ~is_padding
+        flan_segments = int(np.sum(roles == ROLE_ANSWER_TOKEN))
+        counts = self.counts
+        counts["flan_segments"] += flan_segments
+        counts["flan_tokens"] += int(np.sum((roles != ROLE_WEB) & real))
+        counts["web_tokens"] += int(np.sum((roles == ROLE_WEB) & real))
+        counts["web_maskable"] += int(np.sum((roles == ROLE_WEB) & ~special))
+        counts["web_masked"] += web_masked
+        counts["answers_empty"] += flan_segments - answers
+        counts["answer_tokens"] += int(answer.sum())
+        counts["answer_masked"] += int(np.sum((masked_indices | always_mask) & answer))
+        counts["answer_masked_full"] += int(always_mask.sum())
+        counts["instruction_masked"] += int(np.sum((masked_indices | always_mask) & (roles == ROLE_INSTRUCTION)))
+
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+            "position_ids": positions,
+            "segment_ids": segment_ids,
+        }
+
+    def decay_stats(self) -> Dict[str, float]:
+        """Since the start of this process, on this host. The loss is a mean over masked tokens, so
+        answer_loss_share is the weight of the answers in it."""
+        counts = self.counts
+        masked = counts["web_masked"] + counts["answer_masked"]
+        return {
+            **{name: int(value) for name, value in counts.items()},
+            "flan_token_share": counts["flan_tokens"] / max(counts["flan_tokens"] + counts["web_tokens"], 1),
+            "web_masked_rate": counts["web_masked"] / max(counts["web_maskable"], 1),
+            "answer_masked_rate": counts["answer_masked"] / max(counts["answer_tokens"], 1),
+            "answer_loss_share": counts["answer_masked"] / max(masked, 1),
         }
 
 
@@ -755,6 +925,8 @@ def create_packed_dataloader(
     dataset_format: str = "text",
     # This host's own parquet files on local disk, instead of streaming and sharding dataset_name
     data_files: Optional[List[str]] = None,
+    # The decay route: rows with text or inputs/targets, and token_role in the batches
+    answer_token_id: Optional[int] = None,
 ):
     """Create Grain dataset iterator with sequence packing and epoch restart.
 
@@ -781,6 +953,7 @@ def create_packed_dataloader(
         stopping_strategy: "first_exhausted" or "all_exhausted"
         dataset_format: Dataset format - "text" or "inputs_targets" (single-dataset mode only)
         data_files: Parquet files of this host (single-dataset mode only)
+        answer_token_id: Id of <answer> for the decay route (single-dataset mode only)
 
     Returns:
         EpochTrackingDataLoader with sequence packing and epoch tracking
@@ -819,6 +992,7 @@ def create_packed_dataloader(
         stopping_strategy=stopping_strategy,
         dataset_format=dataset_format,
         data_files=data_files,
+        answer_token_id=answer_token_id,
     )
 
 
@@ -829,6 +1003,7 @@ def create_packed_dataset_streaming(
     batch_size: int,
     dataset_format: str = "text",
     seed: int = 0,
+    answer_token_id: Optional[int] = None,
 ):
     """Create a packed IterDataset from a streaming dataset.
 
@@ -844,6 +1019,8 @@ def create_packed_dataset_streaming(
         batch_size: Number of packing bins (sequences per batch)
         dataset_format: "text" for standard text datasets, "inputs_targets" for FLAN-style
         seed: Seed of the window that shuffles pieces before packing (format "text")
+        answer_token_id: The decay route (format "text"): rows with text or with inputs/targets, and a
+            token_role per token in the batch (see TokenizeTransform)
 
     Returns:
         IterDataset that yields packed batches
@@ -852,6 +1029,8 @@ def create_packed_dataset_streaming(
         raise ImportError(
             "Grain is not available. Install with: pip install grain"
         )
+    if answer_token_id is not None and dataset_format != "text":
+        raise ValueError(f"answer_token_id takes rows of the decay mix on format 'text', not '{dataset_format}'")
 
     # Wrap stream as a lazy-loading RandomAccessDataSource
     if isinstance(stream_dataset, StreamingBufferDataSource):
@@ -863,7 +1042,7 @@ def create_packed_dataset_streaming(
     if dataset_format == "inputs_targets":
         tokenize = FLANTokenizeTransform(tokenizer, max_length)
     else:  # Default to "text" format
-        tokenize = TokenizeTransform(tokenizer, max_length)
+        tokenize = TokenizeTransform(tokenizer, max_length, answer_token_id=answer_token_id)
 
     # Build Grain pipeline: source -> tokenize -> to_iter -> (pieces -> shuffle) -> pack -> batch
     map_dataset = grain.MapDataset.source(source).map(tokenize.map)
@@ -873,14 +1052,23 @@ def create_packed_dataset_streaming(
             grain_exp.FlatMapIterDataset(iter_dataset, tokenize), window_size=PIECE_SHUFFLE_WINDOW, seed=seed
         )
 
+    # Packing keeps only the features of length_struct, so the roles must be one of them; they come with
+    # token_role_segment_ids and token_role_positions, equal to those of input_ids. Padding gets role 0:
+    # the collators find it by its pad id.
+    length_struct = {"input_ids": max_length}
+    padding_struct = {"input_ids": tokenizer.pad_token_id}
+    if answer_token_id is not None:
+        length_struct["token_role"] = max_length
+        padding_struct["token_role"] = ROLE_WEB
+
     # Apply packing - FirstFitPackIterDataset yields one packed sequence at a time
     # num_packing_bins controls parallel packing efficiency, not output batch size
     packed_dataset = grain_exp.FirstFitPackIterDataset(
         parent=iter_dataset,
-        length_struct={"input_ids": max_length},
+        length_struct=length_struct,
         num_packing_bins=batch_size,
         shuffle_bins=True,
-        padding_struct={"input_ids": tokenizer.pad_token_id},
+        padding_struct=padding_struct,
     )
 
     # Batch the packed sequences to get (batch_size, max_length) shaped tensors
@@ -924,6 +1112,7 @@ class EpochTrackingDataLoader:
         # Dataset format parameter
         dataset_format: str = "text",
         data_files: Optional[List[str]] = None,
+        answer_token_id: Optional[int] = None,
     ):
         """Initialize the epoch-tracking data loader.
 
@@ -947,10 +1136,14 @@ class EpochTrackingDataLoader:
             dataset_format: Dataset format - "text" or "inputs_targets" (single-dataset mode)
             data_files: Parquet files of this host, instead of streaming and sharding
                 dataset_name. Their order is shuffled with the seed, as a stream's files are.
+            answer_token_id: The decay route, single-dataset mode only: see create_packed_dataset_streaming
         """
         # Determine mode
         self.multi_dataset_mode = dataset_configs is not None
         self.data_files = data_files
+        if answer_token_id is not None and self.multi_dataset_mode:
+            raise ValueError("answer_token_id is for one dataset of mixed rows (build_decay_mix.py), not for dataset_configs")
+        self.answer_token_id = answer_token_id
 
         if self.multi_dataset_mode:
             self.dataset_configs = dataset_configs
@@ -1070,6 +1263,7 @@ class EpochTrackingDataLoader:
                     batch_size=self.batch_size,
                     dataset_format=self.dataset_format,
                     seed=self.base_seed + self.epoch,
+                    answer_token_id=self.answer_token_id,
                 ),
                 prefetch_buffer_size=BATCH_PREFETCH,
             )

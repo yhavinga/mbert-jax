@@ -1,0 +1,67 @@
+# Arm F of the FLAN-decay proof on mbert-corpus (v4-32, us-central2-b, 4 workers), from /Users/yeb/Developer/yhavinga/hammond.
+# Protocol: protocol.md, copied to $R before any run. Code: branch flan-decay of github.com/yhavinga/mbert-jax at COMMIT
+# (each script checks it out in ~/mbert-flan); scripts: $B (copies of experiments/flan-decay/ of that commit).
+# One thing at a time on the TPU: start_flan.sh and eval_zeroshot.sh refuse while a trainer, an eval or a fine-tune runs.
+# The builder (step 2) uses the CPU only and may run while arm W (anneal-u15-uniform5) still trains.
+# Wall times are estimates (protocol.md, "Estimates"), not measured for F.
+COMMIT=bd6ddca909168bd4fb1dc9cd1cc748bb861a53c5
+R=gs://t5-dutch-english-usc2/mbert/flan-decay
+B=$R/scripts
+S=gs://t5-dutch-english-usc2/mbert/culturax-nl-230m-chunk1024/ckpt_keep/653000
+W=gs://t5-dutch-english-usc2/mbert/anneal/anneal-u15-uniform5/ckpt/20000
+C=gs://t5-dutch-english-usc2/mbert/phase2048/p2048-u15-C1024/ckpt/20000
+F=$R/flan-F/ckpt/20000
+PY='$HOME/mbert-dumb/.venv/bin/python'
+
+# 0. From the Mac, in a checkout of branch flan-decay at COMMIT (git rev-parse HEAD prints COMMIT): scripts and protocol
+# into the bucket, before any run
+gsutil -m cp experiments/flan-decay/setup_flan.sh experiments/flan-decay/start_flan.sh experiments/flan-decay/eval_zeroshot.sh experiments/flan-decay/protocol.md experiments/flan-decay/commands.txt $B/ && gsutil cp experiments/flan-decay/protocol.md $R/protocol.md
+
+# 1. HF token through stdin, on each worker (it is there from the FineWeb-2 setup; again does no harm). Never printed.
+for w in 0 1 2 3; do gcloud compute tpus tpu-vm ssh mbert-corpus --zone us-central2-b --worker=$w --quiet --command='mkdir -p ~/.cache/huggingface; umask 077; cat > ~/.cache/huggingface/token' < ~/.cache/huggingface/token; done
+
+# 2. The mix of each host, detached (~20-30 minutes, the 4 hosts at once; CPU and network only): ~/flan_decay/mix-<build>.parquet
+# (~2.5 GB of the ~20 GB free), ~/flan_decay_files.txt, the manifest in $R/mix/w<N>.json. A second start keeps a finished mix.
+gcloud compute tpus tpu-vm ssh mbert-corpus --zone us-central2-b --worker=all --quiet --command="gsutil -q cp $B/setup_flan.sh ~/ && mkdir -p ~/logs && (COMMIT=$COMMIT PY=$PY setsid nohup bash -c 'bash ~/setup_flan.sh > ~/logs/setup_flan.log 2>&1; echo EXIT \$? >> ~/logs/setup_flan.log' > /dev/null 2>&1 < /dev/null &)" < /dev/null
+# Progress and the end (each log ends in EXIT 0; its MIX line has the rows, tokens and flan_token_share of the host):
+gcloud compute tpus tpu-vm ssh mbert-corpus --zone us-central2-b --worker=all --quiet --command='tail -n 3 ~/logs/setup_flan.log' < /dev/null
+gsutil ls $R/mix/   # w0.json ... w3.json when all are done
+for w in 0 1 2 3; do gsutil cat $R/mix/w$w.json | python3 -c "import json, sys; m = json.load(sys.stdin); print('w$w', m['web']['documents'], m['web']['tokens'], m['flan']['examples'], m['flan']['tokens'], round(m['flan_token_share'], 4), m['flan']['pool_examples'])"; done
+
+# 3. Smoke test of the trainer, when W is done (~/logs/anneal-u15-uniform5.exit says EXIT 0 on all workers) and before F:
+# 300 steps into $R/smoke as run flan-F-smoke (checkpoints at 150 and 300), then a resume to 400 that must restore every
+# host's data state. ~10 minutes, then ~8. --stop-at-step keeps F's schedule of 20,000 steps.
+SMOKE="RUN_ROOT=$R/smoke RUN=flan-F-smoke CHECKPOINT_EVERY=150 EVAL_EVERY=150 EVAL_BATCHES=5 SYSTEM_EVERY=50"
+gcloud compute tpus tpu-vm ssh mbert-corpus --zone us-central2-b --worker=all --quiet --command="gsutil -q cp $B/start_flan.sh ~/ && $SMOKE STOP_AT=300 COMMIT=$COMMIT PY=$PY bash ~/start_flan.sh $S uniform15" < /dev/null
+# When ~/logs/flan-F-smoke.exit says EXIT 0 on all workers:
+gcloud compute tpus tpu-vm ssh mbert-corpus --zone us-central2-b --worker=all --quiet --command="$SMOKE STOP_AT=400 COMMIT=$COMMIT PY=$PY bash ~/start_flan.sh $S uniform15" < /dev/null
+# Check, on the worker with the Step lines (process_0 may be any worker):
+gsutil cat $R/smoke/flan-F-smoke/logs/w0.log | grep -a "Added <answer>\|decay mix\|^MASKING\|^EVAL\|Data state restored\|skipped instruction\|^DATA\|Step  [34]00 "
+# Expected: "Added <answer> token (ID: 32001)"; a "decay mix" line per host; MASKING with instruction_masked 0,
+# flan_token_share ~0.10, web_masked_rate ~0.05, answers_full > answers_span; no "skipped instruction" line; EVAL losses
+# near W's at the same steps; in the second start "Data state restored" on every host; EXIT 0 in every .exit.
+# Then remove the smoke run (F starts fresh in its own directory):
+gsutil -m rm -r $R/smoke/flan-F-smoke && gcloud compute tpus tpu-vm ssh mbert-corpus --zone us-central2-b --worker=all --quiet --command='rm -f ~/trackio/flan-F-smoke.db* ~/run_flan-F-smoke.sh ~/sync_flan-F-smoke.sh' < /dev/null
+
+# 4. Smoke test of the zero-shot eval: S and W on workers 0 and 1, 50 examples per task, into $R/smoke (~5 minutes).
+# It shows that a worker runs as a TPU of its own 4 chips without waiting for the other hosts.
+gcloud compute tpus tpu-vm ssh mbert-corpus --zone us-central2-b --worker=all --quiet --command="gsutil -q cp $B/eval_zeroshot.sh ~/ && RUN_ROOT=$R/smoke EXTRA='--max-examples 50' COMMIT=$COMMIT PY=$PY bash ~/eval_zeroshot.sh S=$S W=$W" < /dev/null
+gsutil cat $R/smoke/zeroshot/logs/S.exit $R/smoke/zeroshot/logs/W.exit; gsutil cat $R/smoke/zeroshot/logs/S.log | grep -a "devices\|ZEROSHOT"
+gsutil -m rm -r $R/smoke
+
+# 5. Arm F (~1.5 hours). After a preemption or maintenance event the same command resumes from F's last checkpoint
+# (every 2,000 steps) and data state; a resume with another start, masking or COMMIT is refused.
+gcloud compute tpus tpu-vm ssh mbert-corpus --zone us-central2-b --worker=all --quiet --command="gsutil -q cp $B/start_flan.sh ~/ && COMMIT=$COMMIT PY=$PY bash ~/start_flan.sh $S uniform15" < /dev/null
+# Progress: gsutil cat $R/flan-F/logs/w<N>.log | grep -ao "^Step.*\|EVAL step=.*\|MASKING step=.*" | tail
+# The end: ~/logs/flan-F.exit with EXIT 0 on all workers. Per host what training got: grep -a "^DATA" in the coordinator's
+# log, for F and for W (gs://t5-dutch-english-usc2/mbert/anneal/anneal-u15-uniform5/logs/w<N>.log).
+
+# 6. Zero-shot of S, W, F and C, one model per worker (~10 minutes): $R/zeroshot/{S,W,F,C}.json, logs in $R/zeroshot/logs/
+gcloud compute tpus tpu-vm ssh mbert-corpus --zone us-central2-b --worker=all --quiet --command="gsutil -q cp $B/eval_zeroshot.sh ~/ && COMMIT=$COMMIT PY=$PY bash ~/eval_zeroshot.sh S=$S W=$W F=$F C=$C" < /dev/null
+for m in S W F C; do gsutil cat $R/zeroshot/$m.json | python3 -c "import json, sys; r = json.load(sys.stdin)['tasks']; print('$m', {t: round(v['mean_accuracy'], 4) for t, v in r.items()})"; done
+
+# 7. DUMB of F (and of W, if its driver has not run it): not part of this folder. The existing driver, worker w taking
+# the w-th NAME=CKPT, results gs://t5-dutch-english-usc2/mbert/masking/dumb/<NAME>--{dbrd,sicknl}--seed{42,43,44}.json:
+# gcloud compute tpus tpu-vm ssh mbert-corpus --zone us-central2-b --worker=all --quiet --command="gsutil -q cp gs://t5-dutch-english-usc2/mbert/corpus-runs/scripts/dumb_v4_vm.sh ~/ && (setsid nohup bash -c 'bash ~/dumb_v4_vm.sh flan-F=$F > ~/logs/dumb_v4.log 2>&1; echo EXIT \$? > ~/logs/dumb_v4.exit' > /dev/null 2>&1 < /dev/null &)" < /dev/null
+
+# 8. Decision: the rule of protocol.md, "Decision rule", on the DUMB results of W and F and the zero-shot results of W and F.

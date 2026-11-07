@@ -15,15 +15,26 @@ last host than on the first, segments of 1,000 rows 0.08%, as striding row by ro
          row count, and this host's rows are written as one parquet file with the column `text`; then the
          download is deleted. Then the list --data-files-list reads. A file already staged with the planned
          rows is kept, so a second start continues.
+  rehydrate  On a worker, after stage: FineWeb-2's rehydration (misc/rehydration of github.com/huggingface/fineweb-2)
+         of the staged share, as a selection without repeats. A document of weight w (of its minhash_cluster_size)
+         is kept with probability w / --max-reps, one draw per row of the source file, whichever host has it.
+         The cluster sizes are read from the Hugging Face files, that column only; before anything is written,
+         some segments of every file are compared row by row with the source. The kept rows go to --out under the
+         staged names, another directory, so the trainer's data state (its list of paths) is another; the summary
+         has per file the rows and tokens (of the lengths parquets) in and kept. A file already written with the
+         rows to keep is kept, so a second start continues.
 
   python scripts/stage_share.py plan --corpus fineweb2 --lengths ~/tc/fineweb2/lengths
   python scripts/stage_share.py stage --corpus fineweb2 --rank 0 --out ~/fineweb2_nl --list ~/fineweb2_nl_files.txt
+  python scripts/stage_share.py rehydrate --corpus fineweb2 --rank 0 --staged ~/fineweb2_nl --out ~/fineweb2_nl_rh3 \\
+      --list ~/fineweb2_nl_rh3_files.txt --lengths ~/tc/fineweb2/lengths --max-reps 3 --seed 42
 """
 from __future__ import annotations
 
 import argparse
 import concurrent.futures as cf
 import gzip
+import io
 import json
 import os
 import shutil
@@ -276,6 +287,249 @@ def cmd_stage(args) -> None:
     print(f"SHARE {json.dumps(summary)}", flush=True)
 
 
+# -------------------------------------------------------------------------------------------- rehydrate
+
+# FineWeb-2's rehydration weights of nld_Latn per maximum of repetitions: misc/rehydration/weights/up_to_03_reps.json
+# of github.com/huggingface/fineweb-2 (commit 995a1ca). With them nld_Latn's 147,301,270 documents become 233,693,423
+# (weights/resulting_ds_sizes.json).
+REHYDRATION_WEIGHTS = {3: {1: 1, 4: 2, 10: 3, 45: 2, 124: 1}}
+
+
+def expand_weights(weights: dict[int, int]) -> list[int]:
+    """table[s]: the weight of cluster size s, built as the Rehydrater of misc/rehydration builds it. A size takes the
+    weight of the largest key at or below it; a size past the table takes the last entry."""
+    table = [1]
+    for size in range(1, max(weights) + 1):
+        table.append(weights.get(size, table[-1]))
+    return table
+
+
+def cluster_weights(sizes, weights: dict[int, int]):
+    import numpy as np
+
+    if len(sizes) and sizes.min() < 0:
+        raise ValueError(f"a cluster size of {sizes.min()}")
+    table = np.array(expand_weights(weights))
+    return table[np.minimum(sizes, len(table) - 1)]
+
+
+def keep_rows(seed: int, file_index: int, rows: int, ranges: list[tuple[int, int]], weights, max_reps: int):
+    """Whether each of this host's rows of a file is kept, with probability weight / max_reps. The draws are one per
+    row of the whole source file, so a document's fate is the same whichever host has it."""
+    import numpy as np
+
+    if len(weights) and weights.max() > max_reps:
+        raise ValueError(f"a weight of {weights.max()} is more than --max-reps {max_reps}")
+    draws = np.random.default_rng([seed, file_index]).random(rows)
+    mine = np.concatenate([draws[start:stop] for start, stop in ranges] + [np.empty(0)])
+    if len(mine) != len(weights):
+        raise ValueError(f"{len(weights)} weights for {len(mine)} rows")
+    return mine < weights / max_reps
+
+
+class _RangeFile(io.RawIOBase):
+    """A file read by HTTP range requests, at the address the Hub's /resolve/ URL redirects to. pyarrow reads a
+    column as one range per row group, ~1,000 per FineWeb-2 file and host; HfFileSystem sends each range to /resolve/,
+    of which the Hub allows a free account 5,000 per 5 minutes. This asks /resolve/ once per file."""
+
+    def __init__(self, url: str, size: int):
+        super().__init__()
+        self.url, self.size, self.position = url, size, 0
+
+    def readable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return True
+
+    def tell(self) -> int:
+        return self.position
+
+    def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
+        self.position = (offset, self.position + offset, self.size + offset)[whence]
+        return self.position
+
+    def read(self, n: int = -1) -> bytes:
+        from huggingface_hub.utils import http_backoff
+
+        n = self.size - self.position if n is None or n < 0 else min(n, self.size - self.position)
+        if n <= 0:
+            return b""
+        span = f"bytes={self.position}-{self.position + n - 1}"
+        r = http_backoff("GET", self.url, headers={"Range": span}, retry_on_status_codes=(429, 500, 502, 503, 504))
+        r.raise_for_status()
+        if r.status_code != 206 or len(r.content) != n:
+            raise IOError(f"{self.url.split('?')[0]}: {span} gave status {r.status_code} with {len(r.content)} bytes")
+        self.position += n
+        return r.content
+
+
+def open_source(repo: str, revision: str, path: str):
+    """A file of the dataset repo at that revision, for pyarrow, which then reads only what it needs of it."""
+    from huggingface_hub import get_hf_file_metadata, hf_hub_url
+
+    meta = get_hf_file_metadata(hf_hub_url(repo, path, repo_type="dataset", revision=revision))
+    if meta.size is None:
+        raise ValueError(f"the Hub gives no size of {repo}@{revision}/{path}")
+    return _RangeFile(meta.location, meta.size)
+
+
+def _rows(parquet, ranges: list[tuple[int, int]], column: str):
+    """The rows in the sorted ranges of one column of a parquet file, in its order: only the row groups they are in are
+    read."""
+    import pyarrow as pa
+
+    parts, offset = [], 0
+    for i in range(parquet.metadata.num_row_groups):
+        n = parquet.metadata.row_group(i).num_rows
+        if any(start < offset + n and stop > offset for start, stop in ranges):
+            parts.extend(take_rows(ranges, offset, parquet.read_row_group(i, columns=[column]).column(column)))
+        offset += n
+    return pa.chunked_array([chunk for part in parts for chunk in part.chunks], type=parquet.schema_arrow.field(column).type)
+
+
+def check_file(corpus: str, index: int, path: str, rows: int, tokens: int, ranges: list[tuple[int, int]], staged: str,
+               lengths: str, max_reps: int, seed: int, rank: int):
+    """This host's rows of one source file: the rows to keep, and the counts of the summary. Before that, the staged
+    file is compared with the source on its first, its last and one random segment. Returns (counts, keep)."""
+    import numpy as np
+    import pyarrow.parquet as pq
+
+    spec = CORPORA[corpus]
+    wanted = sum(stop - start for start, stop in ranges)
+    staged_file = pq.ParquetFile(staged)
+    if staged_file.metadata.num_rows != wanted:
+        raise ValueError(f"{staged} has {staged_file.metadata.num_rows} rows, rank {rank}'s share of {path} {wanted}")
+    source = pq.ParquetFile(open_source(spec["repo"], spec["revision"], path))
+    if source.metadata.num_rows != rows:
+        raise ValueError(f"{path} has {source.metadata.num_rows} rows, the plan {rows}")
+    counts = pq.read_table(lengths, columns=["text"]).column("text").to_numpy().astype(np.int64)
+    if len(counts) != rows or int(counts.sum()) != tokens:
+        raise ValueError(f"{lengths} has {len(counts)} rows of {int(counts.sum())} tokens, the plan {rows} of {tokens}")
+
+    firsts = np.cumsum([0] + [stop - start for start, stop in ranges])  # where each segment starts in the staged file
+    segments = []
+    if ranges:
+        segments = sorted({0, len(ranges) - 1, int(np.random.default_rng([seed, index, rank]).integers(len(ranges)))})
+    for s in segments:
+        start, stop = ranges[s]
+        theirs = _rows(source, [(start, stop)], "text").to_pylist()
+        if _rows(staged_file, [(firsts[s], firsts[s + 1])], "text").to_pylist() != theirs:
+            raise ValueError(f"rows {firsts[s]}-{firsts[s + 1]} of {staged} are not rows {start}-{stop} of {path}")
+
+    sizes = _rows(source, ranges, "minhash_cluster_size")
+    if sizes.null_count:
+        raise ValueError(f"{path}: {sizes.null_count} rows of rank {rank} without a minhash_cluster_size")
+    weights = cluster_weights(sizes.to_numpy(), REHYDRATION_WEIGHTS[max_reps])
+    keep = keep_rows(seed, index, rows, ranges, weights, max_reps)
+    mine = np.concatenate([counts[start:stop] for start, stop in ranges] + [np.empty(0, np.int64)])
+    by_weight = {str(w): {"rows_in": int((weights == w).sum()), "rows_kept": int((keep & (weights == w)).sum()),
+                          "tokens_in": int(mine[weights == w].sum()), "tokens_kept": int(mine[keep & (weights == w)].sum())}
+                 for w in sorted(set(REHYDRATION_WEIGHTS[max_reps].values()))}
+    return {"path": path, "rows_in": wanted, "rows_kept": int(keep.sum()), "tokens_in": int(mine.sum()),
+            "tokens_kept": int(mine[keep].sum()), "by_weight": by_weight,
+            "segments_checked": [[int(a), int(b)] for a, b in (ranges[s] for s in segments)]}, keep
+
+
+def write_kept(staged: str, keep, out: str) -> tuple[str, int, int, float]:
+    """The kept rows of a staged file, in its order, written under a temporary name first. A file already written with
+    as many rows is kept. Returns (out, rows, bytes, seconds)."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    target = Path(out)
+    wanted = int(keep.sum())
+    t = time.time()
+    if not (target.exists() and pq.ParquetFile(target).metadata.num_rows == wanted):
+        partial = target.with_name(target.name + ".partial")
+        partial.unlink(missing_ok=True)
+        source = pq.ParquetFile(staged)
+        if source.metadata.num_rows != len(keep):
+            raise ValueError(f"{staged} has {source.metadata.num_rows} rows, {len(keep)} decided")
+        writer = pq.ParquetWriter(partial, pa.schema([("text", pa.string())]), compression="zstd",
+                                  compression_level=ZSTD_LEVEL)
+        parts, pending, offset = [], 0, 0
+        for i in range(source.metadata.num_row_groups):
+            texts = source.read_row_group(i, columns=["text"]).column("text")
+            part = texts.filter(pa.array(keep[offset:offset + len(texts)]))
+            offset += len(texts)
+            parts.append(part)
+            pending += len(part)
+            if pending >= ROWS_PER_GROUP:
+                _write(writer, parts)
+                parts, pending = [], 0
+        _write(writer, parts)
+        writer.close()
+        written = pq.ParquetFile(partial).metadata.num_rows
+        if written != wanted:
+            raise ValueError(f"{partial}: {written} rows written, {wanted} kept")
+        os.replace(partial, target)
+    return out, wanted, target.stat().st_size, time.time() - t
+
+
+def cmd_rehydrate(args) -> None:
+    plan = load_plan(args.corpus)
+    hosts = plan["hosts"]
+    if not 0 <= args.rank < hosts:
+        raise ValueError(f"--rank {args.rank} is not one of the plan's {hosts} hosts")
+    # The same call as the stage step's, so the sizes read line up with the staged rows
+    mine = share_ranges([f["rows"] for f in plan["files"]], hosts)[args.rank]
+    staged_dir, out_dir = Path(args.staged).expanduser(), Path(args.out).expanduser()
+    if staged_dir.resolve() == out_dir.resolve():
+        raise ValueError(f"--out is --staged ({staged_dir}): the rehydrated share needs paths of its own")
+    lengths = Path(args.lengths).expanduser()
+    files = plan["files"][:args.max_files]
+    names = [share_file_name(f["path"], args.rank, hosts) for f in files]
+    out_dir.mkdir(parents=True, exist_ok=True)
+    print(f"rank {args.rank} of {hosts}: {len(files)} of {len(plan['files'])} files, keeping each document with "
+          f"probability w / {args.max_reps} of {REHYDRATION_WEIGHTS[args.max_reps]}, seed {args.seed}; "
+          f"{args.readers} files read at a time, {args.workers} written", flush=True)
+    t = time.time()
+    # Every file is checked before any is written: a share that does not line up with the source writes nothing
+    with cf.ThreadPoolExecutor(max_workers=args.readers) as pool:
+        futures = [pool.submit(check_file, args.corpus, i, f["path"], f["rows"], f["tokens"], file_ranges,
+                               str(staged_dir / name), str(lengths / f"{output_stem(f['path'])}.parquet"),
+                               args.max_reps, args.seed, args.rank)
+                   for i, (f, file_ranges, name) in enumerate(zip(files, mine, names))]
+        try:
+            for done, future in enumerate(cf.as_completed(futures), 1):
+                counts, _ = future.result()
+                print(f"[{done}/{len(files)}] checked {counts['path']}: {counts['rows_kept']:,} of {counts['rows_in']:,} "
+                      f"rows kept, segments {counts['segments_checked']} as the source", flush=True)
+        except BaseException:
+            # Else the error waits for the files still queued, minutes of range requests
+            pool.shutdown(cancel_futures=True)
+            raise
+        checked = [future.result() for future in futures]
+    print(f"all {len(files)} files checked in {time.time() - t:.0f} s", flush=True)
+    written = {}
+    with cf.ProcessPoolExecutor(max_workers=args.workers) as pool:
+        futures = [pool.submit(write_kept, str(staged_dir / name), keep, str(out_dir / name))
+                   for name, (_, keep) in zip(names, checked)]
+        for done, future in enumerate(cf.as_completed(futures), 1):
+            path, n, nbytes, seconds = future.result()
+            written[path] = nbytes
+            print(f"[{done}/{len(files)}] {Path(path).name}: {n:,} rows, {nbytes / 1e9:.2f} GB, {seconds:.0f} s", flush=True)
+    paths = [str(out_dir / name) for name in names]
+    per_file = [{**counts, "out": p, "bytes": written[p]} for p, (counts, _) in zip(paths, checked)]
+    totals = {key: sum(f[key] for f in per_file) for key in ("rows_in", "rows_kept", "tokens_in", "tokens_kept", "bytes")}
+    by_weight = {w: {key: sum(f["by_weight"][w][key] for f in per_file) for key in per_file[0]["by_weight"][w]}
+                 for w in per_file[0]["by_weight"]} if per_file else {}
+    summary = {"corpus": args.corpus, "repo": plan["repo"], "revision": plan["revision"], "rank": args.rank, "hosts": hosts,
+               "max_reps": args.max_reps, "weights": {str(k): v for k, v in REHYDRATION_WEIGHTS[args.max_reps].items()},
+               "seed": args.seed, "staged": str(staged_dir), "files": len(paths), **totals, "by_weight": by_weight,
+               "tokens_note": plan["tokens_note"], "seconds": round(time.time() - t), "per_file": per_file}
+    if len(files) < len(plan["files"]):
+        # No list and no share.json: those are of the whole share, which a smoke test of a few files is not
+        print(f"PART {json.dumps({k: v for k, v in summary.items() if k != 'per_file'})}", flush=True)
+        return
+    if totals["rows_in"] != plan["shares"][args.rank]["documents"]:
+        raise ValueError(f"{totals['rows_in']} rows read, rank {args.rank}'s share in the plan {plan['shares'][args.rank]}")
+    (out_dir / "share.json").write_text(json.dumps(summary, indent=1) + "\n")
+    Path(args.list).expanduser().write_text("\n".join(paths) + "\n")
+    print(f"SHARE {json.dumps({k: v for k, v in summary.items() if k != 'per_file'})}", flush=True)
+
+
 def main(argv=None) -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -294,6 +548,22 @@ def main(argv=None) -> None:
                    help="where a source file waits while its rows are taken, e.g. /dev/shm: then the disk only writes "
                         "the share (default: --out)")
     s.set_defaults(func=cmd_stage)
+    r = sub.add_parser("rehydrate")
+    # Only FineWeb-2 has a minhash_cluster_size
+    r.add_argument("--corpus", required=True, choices=["fineweb2"])
+    r.add_argument("--rank", type=int, required=True, help="this host's share, the worker number")
+    r.add_argument("--staged", required=True, help="directory of the share the stage step wrote")
+    r.add_argument("--out", required=True, help="directory of the kept rows' parquet files, not --staged")
+    r.add_argument("--list", required=True, help="file to write their paths to, for --data-files-list")
+    r.add_argument("--lengths", required=True, help="directory of the lengths parquets of count_tokens.py, for the tokens")
+    r.add_argument("--max-reps", type=int, required=True, choices=sorted(REHYDRATION_WEIGHTS))
+    r.add_argument("--seed", type=int, default=42)
+    r.add_argument("--readers", type=int, default=16,
+                   help="source files read at a time; a range request takes ~0.2 s, a file ~1,000 of them per host")
+    r.add_argument("--workers", type=int, default=4, help="files written at a time")
+    r.add_argument("--max-files", type=int, default=None,
+                   help="only the plan's first files, for a smoke test: then no list and no share.json")
+    r.set_defaults(func=cmd_rehydrate)
     args = parser.parse_args(argv)
     args.func(args)
 

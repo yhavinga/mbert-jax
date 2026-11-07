@@ -23,10 +23,18 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import argparse  # noqa: E402
 import json  # noqa: E402
+import os  # noqa: E402
 import time  # noqa: E402
 from collections import Counter  # noqa: E402
 
 import jax  # noqa: E402
+
+# One host of a slice as a TPU of its own (eval_zeroshot.sh sets TPU_PROCESS_BOUNDS=1,1,1): jax.distributed.initialize()
+# in train_minimal's import takes the slice from the TPU metadata, not from these variables, and aborts after waiting
+# for the other hosts. A runtime of one process set up first makes that import skip its own.
+if os.environ.get("TPU_PROCESS_BOUNDS") == "1,1,1" and not jax.distributed.is_initialized():
+    jax.distributed.initialize(coordinator_address="localhost:8482", num_processes=1, process_id=0)
+
 import jax.numpy as jnp  # noqa: E402
 import numpy as np  # noqa: E402
 import train_minimal as tm  # noqa: E402  # Its import initializes the runtime, as the trainer's does

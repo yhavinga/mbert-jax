@@ -26,9 +26,9 @@ git -C "$CODE" fetch -q origin flan-decay
 git -C "$CODE" checkout -q "$COMMIT"
 mkdir -p ~/logs
 rm -f ~/logs/zeroshot_$name.exit
-# With these variables the import of train_minimal (its jax.distributed.initialize()) finds a cluster of one process,
-# localhost, without TPU_WORKER_ID, raises the ValueError it catches and stays a single process; it does not wait for
-# the other hosts of the slice. eval_zeroshot_mlm.py refuses more than one process.
+# With these variables eval_zeroshot_mlm.py sets up a runtime of one process before it imports train_minimal, whose
+# jax.distributed.initialize() would otherwise take the slice from the TPU metadata and abort after waiting for the
+# other hosts (exit 134 on 7 Nov). eval_zeroshot_mlm.py refuses more than one process.
 cat > ~/run_zeroshot_$name.sh <<EOF
 set -uo pipefail
 export TPU_CHIPS_PER_PROCESS_BOUNDS=2,2,1 TPU_PROCESS_BOUNDS=1,1,1 TPU_VISIBLE_CHIPS=0,1,2,3 TPU_PROCESS_PORT=8476

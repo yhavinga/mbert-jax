@@ -15,7 +15,8 @@ START_CKPT=${1%/}; START_MASKING=$2; ANNEAL_MASKING=$3; START_NAME=$4
 COMMIT=${COMMIT:?set COMMIT to the commit of the anneal branch}
 case $ANNEAL_MASKING in uniform5|uniform10) ;; *) echo "ANNEAL_MASKING must be uniform5 or uniform10, not $ANNEAL_MASKING"; exit 1 ;; esac
 
-STEPS=20000
+# STEPS: a longer anneal (default 20,000, the arms of the test); any other length gets its own run, -<STEPS> appended
+STEPS=${STEPS:-20000}
 WARMUP=1000
 PEAK_LR=1e-4
 MIN_LR=1e-6
@@ -24,6 +25,7 @@ DATA_FILES=$HOME/culturax_nl_files.txt
 CODE=$HOME/mbert-anneal
 PY=${PY:-$HOME/mbert-corpus/.venv/bin/python}
 RUN=anneal-$START_NAME-$ANNEAL_MASKING
+[ "$STEPS" = 20000 ] || RUN=$RUN-$STEPS
 OUT=$RUN_ROOT/$RUN
 
 pgrep -f '[t]rain_minimal.py' > /dev/null && { echo "$(hostname): a trainer is running"; exit 1; }

@@ -397,6 +397,9 @@ def test_decay_mix_build_comes_from_the_files_of_the_builder(tm, tmp_path):
         pq.write_table(table, path)
         return str(path)
 
+    import build_decay_mix
+
+    assert build_decay_mix.METADATA_KEY == tm.DECAY_MIX_METADATA_KEY
     assert tm.decay_mix_build([write("mix.parquet", "0123456789ab")]) == "0123456789ab"
     with pytest.raises(ValueError, match="no file of scripts/build_decay_mix.py"):
         tm.decay_mix_build([write("nl_part_00033.parquet")])

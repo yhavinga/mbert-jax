@@ -6,14 +6,15 @@
 # AdamW, linear warmup over 1,000 steps to 1e-4, cosine to 1e-6 at step 20,000, 128 x 1024 per step, a fresh data state.
 # Only the start model and its masking differ between arms, so u15 + anneal is the control for mix + anneal.
 # START_CKPT: step directory of S. START_MASKING: the masking S was trained with, checked against S's data state.
-# ANNEAL_MASKING: uniform5 or uniform10. START_NAME: a short name of S, e.g. u15 or mix: run anneal-<START_NAME>-<ANNEAL_MASKING>.
+# ANNEAL_MASKING: uniform5 or uniform10, or uniform15 for the control of a 15% start model (as the 2048 phase's arm C
+# is for 20,000 steps). START_NAME: a short name of S, e.g. u15 or mix: run anneal-<START_NAME>-<ANNEAL_MASKING>.
 # The code is a clone of its own (~/mbert-anneal, at COMMIT), with the venv of the corpus runs; PY overrides it on a VM
 # whose venv of that lock is elsewhere (mbert-corpus: PY=$HOME/mbert-dumb/.venv/bin/python).
 set -euo pipefail
 [ $# = 4 ] || { echo "usage: COMMIT=<commit> bash start_anneal.sh START_CKPT START_MASKING ANNEAL_MASKING START_NAME"; exit 1; }
 START_CKPT=${1%/}; START_MASKING=$2; ANNEAL_MASKING=$3; START_NAME=$4
 COMMIT=${COMMIT:?set COMMIT to the commit of the anneal branch}
-case $ANNEAL_MASKING in uniform5|uniform10) ;; *) echo "ANNEAL_MASKING must be uniform5 or uniform10, not $ANNEAL_MASKING"; exit 1 ;; esac
+case $ANNEAL_MASKING in uniform5|uniform10|uniform15) ;; *) echo "ANNEAL_MASKING must be uniform5, uniform10 or uniform15, not $ANNEAL_MASKING"; exit 1 ;; esac
 
 # STEPS: a longer anneal (default 20,000, the arms of the test); any other length gets its own run, -<STEPS> appended
 STEPS=${STEPS:-20000}

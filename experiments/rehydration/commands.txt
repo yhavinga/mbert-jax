@@ -1,0 +1,31 @@
+# fineweb2-nl-230m-chunk1024-rh3 (protocol.md): FineWeb-2 nl rehydrated (at most 3 repetitions, as a selection without
+# repeats), the command of fineweb2-nl-230m-chunk1024 to step 300,000, on mbert-mix (v4-32, us-central2-b, 4 workers).
+# From /Users/yeb/Developer/yhavinga/hammond. Data code: branch rehydration of github.com/yhavinga/mbert-jax at COMMIT.
+# Trainer: ~/mbert-jax on mbert-mix at 0d92db4, that of fineweb2-nl-230m-chunk1024. Scripts: $S (copies of
+# experiments/rehydration/ and of experiments/corpus-runs/start_fineweb2.sh of that branch).
+COMMIT=71e4c49421c4de94d3a8f681c2079eab1b4da4a5
+S=gs://t5-dutch-english-usc2/mbert/rehydration/scripts
+R=gs://t5-dutch-english-usc2/mbert/fineweb2-nl-230m-chunk1024-rh3
+
+# 1. The rehydrated shares, detached, CPU only (nice 19, idle I/O class; the boot disk's scheduler is none, so the I/O
+# class changes nothing there), also while fineweb2-nl-230m-chunk1024 trains. Needs ~/fineweb2_nl and
+# ~/fineweb2_nl_files.txt of setup_fineweb2.sh (experiments/corpus-runs) and ~/.cache/huggingface/token.
+# Done on 7 Nov, 13:19-13:48 UTC, next to fineweb2-nl-230m-chunk1024 (protocol.md, "The shares"): 28 minutes per host,
+# 18 of them range requests (16 files at a time, ~0.25 s per request) and 11 writing (4 at a time); 77,892,669 of
+# 147,301,270 documents kept, 18.45-18.48 GB per host, 31 GB free afterwards; the trainer 3% slower while writing.
+# A second run keeps the files written (it reads the cluster sizes again: ~18 minutes).
+gcloud compute tpus tpu-vm ssh mbert-mix --zone us-central2-b --worker=all --quiet --command="gsutil -q cp $S/rehydrate_fineweb2.sh ~/ && COMMIT=$COMMIT bash ~/rehydrate_fineweb2.sh" < /dev/null
+# Ready when each ~/logs/rehydrate_fineweb2.log ends in EXIT 0; the shares: gsutil cat gs://t5-dutch-english-usc2/mbert/rehydration/shares/fineweb2-rh3-w*.json
+# Smoke test of one file on one worker (writes the first file of the share, no list, no share.json):
+# --worker=0 --command="... && MAX_FILES=1 COMMIT=$COMMIT bash ~/rehydrate_fineweb2.sh", log ~/logs/rehydrate_fineweb2_smoke.log
+
+# 2. Start, when ~/logs/fineweb2-nl-230m-chunk1024.exit says EXIT 0 on all workers. ROWS is the kept documents of the
+# 4 shares (step 1: the sum of rows_kept). FILES in single quotes: the run script expands $HOME, as F's does. A
+# preemption or maintenance event: the same command resumes from the last checkpoint and data state.
+gcloud compute tpus tpu-vm ssh mbert-mix --zone us-central2-b --worker=all --quiet --command="gsutil -q cp $S/start_fineweb2.sh ~/start_fineweb2_rh3.sh && MASKING=uniform15 RUN=fineweb2-nl-230m-chunk1024-rh3 STOP_AT=300000 FILES='\$HOME/fineweb2_nl_rh3_files.txt' ROWS=77892669 bash ~/start_fineweb2_rh3.sh" < /dev/null
+# Progress: gsutil cat $R/logs/w<N>.log | grep -ao "^Step.*\|EVAL step=.*" | tail   (process_0 may be any worker)
+# 300,000 steps at ~0.225 s (fineweb2-nl-230m-chunk1024 on this VM, checkpoints and evals included): ~19 hours.
+# Per host what training got: grep -a "^DATA" in that log at the end; ~/logs/fineweb2-nl-230m-chunk1024-rh3.exit has EXIT 0.
+
+# 3. DUMB of $R/ckpt/300000 (copy it to $R/ckpt_keep/ first), as fw2-300000: protocol.md, "Evaluation", results
+# gs://t5-dutch-english-usc2/mbert/masking/dumb/fw2rh3-300000--{dbrd,sicknl}--seed{42,43,44}.json.

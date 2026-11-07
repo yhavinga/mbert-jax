@@ -201,6 +201,10 @@ def test_builder_mix_has_the_token_share_and_the_web_documents_of_arm_w_in_its_o
     # And not just the files' order: the trainer's shuffle moved the documents
     assert web != [row["text"] for row in pq.read_table(Path(web_files).read_text().split()[0]).to_pylist()][:len(web)]
 
+    # A second start finds its build and keeps it
+    again, source = _build(tmp_path, 0, web_files, monkeypatch)
+    assert again == json.loads(json.dumps(manifest)) and not source.read
+
     # The share in the trainer's own token counts
     from mmbjax.training import TokenizeTransform
 

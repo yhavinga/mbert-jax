@@ -345,7 +345,13 @@ def build(args, tokenizer, source):
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     path = out / f"mix-{build}.parquet"
+    manifest_path = out / f"manifest-{build}.json"
     print(f"build {build} of rank {args.rank}/{args.world}: {path}", flush=True)
+    if path.exists() and manifest_path.exists():
+        # Written only after the check of its order: a second start keeps it
+        Path(args.list).write_text(f"{path}\n")
+        print(f"done before: {path}, listed in {args.list}", flush=True)
+        return json.loads(manifest_path.read_text())
 
     pool, flan_report = select_flan(args, tokenizer, source, niv2_languages)
     # The pool is in shard order, which groups rows by folder: shuffled, every stretch of the mix has every folder
@@ -385,10 +391,10 @@ def build(args, tokenizer, source):
         # Lower bound: the trainer pads rows, so it reads more steps from these tokens than this
         "steps_at_full_rows": total / (args.rows_per_host * args.max_length),
     }
-    (out / f"manifest-{build}.json").write_text(json.dumps(manifest, indent=1) + "\n")
+    manifest_path.write_text(json.dumps(manifest, indent=1) + "\n")
     Path(args.list).write_text(f"{path}\n")
     print(f"MIX {json.dumps({k: manifest[k] for k in ('build', 'file', 'rows', 'tokens', 'flan_token_share', 'steps_at_full_rows')})}", flush=True)
-    print(f"done: {path}, listed in {args.list}; manifest {out / f'manifest-{build}.json'}", flush=True)
+    print(f"done: {path}, listed in {args.list}; manifest {manifest_path}", flush=True)
     return manifest
 
 

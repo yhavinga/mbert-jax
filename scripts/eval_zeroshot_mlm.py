@@ -32,9 +32,9 @@ import numpy as np  # noqa: E402
 import train_minimal as tm  # noqa: E402  # Its import initializes the runtime, as the trainer's does
 from datasets import load_dataset  # noqa: E402
 from etils import epath  # noqa: E402
+from eval_windows import build_model, pack_rows, pad_to_rows  # noqa: E402
 from transformers import AutoTokenizer  # noqa: E402
 
-from eval_windows import build_model, pack_rows, pad_to_rows  # noqa: E402
 from mmbjax.training import add_answer_token  # noqa: E402
 
 PROMPT_FORMAT = "<s> {prompt} <answer> <mask> </s>"
@@ -197,8 +197,9 @@ def parse_args(argv=None):
 
 def main(argv=None):
     args = parse_args(argv)
-    if jax.process_count() != 1:
-        raise SystemExit(f"{jax.process_count()} processes: run this on one host as a TPU of its own (experiments/flan-decay/eval_zeroshot.sh)")
+    if jax.process_count() != 1 or jax.device_count() != jax.local_device_count():
+        raise SystemExit(f"{jax.process_count()} processes, {jax.device_count()} devices: run this on one host as a TPU of its own "
+                         "(experiments/flan-decay/eval_zeroshot.sh)")
     started = time.time()
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, split_special_tokens=True)
     if tokenizer.mask_token is None:

@@ -197,4 +197,7 @@ name filter; the NIv2 FLORES tasks are translation tasks and are out by language
 
 ## Amendments
 
-(none)
+1. 2026-11-07, decided by Yeb before F and its smoke test started: "FLAN helps zero-shot" alone, with no gain in
+   fine-tuning, does not count as a reason to put FLAN in the final run. FLAN goes into the final run only on outcome
+   2 ("FLAN helps fine-tuning"), which already excludes 1. Outcome 3 is still measured and reported, without a
+   consequence.

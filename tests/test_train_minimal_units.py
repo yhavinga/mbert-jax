@@ -325,3 +325,80 @@ def test_uniform30_masks_twice_as_much_with_the_same_handling(tm):
     masked = batch["labels"] != -100
     assert masked.mean() == pytest.approx(0.30, abs=0.01)
     assert np.mean(batch["input_ids"][masked] == tokenizer.mask_token_id) == pytest.approx(0.8, abs=0.02)
+
+
+DECAY_OPTIONS = {"--masking": "decay", "--use-packing": None, "--web-mask-rate": "0.05", "--answer-full-max": "16",
+                 "--data-files-list": "files.txt"}
+
+
+def _flags(options):
+    return [part for flag, value in options.items() for part in ([flag] if value is None else [flag, value])]
+
+
+def test_decay_flags_need_each_other_and_the_mixed_files(tm):
+    args = _masking_args(tm, *_flags(DECAY_OPTIONS))
+    assert (args.masking, args.web_mask_rate, args.answer_full_max) == ("decay", 0.05, 16)
+    refused = [{key: value for key, value in DECAY_OPTIONS.items() if key != left_out} for left_out in DECAY_OPTIONS if left_out != "--masking"]
+    refused += [{**DECAY_OPTIONS, "--masking-mode": "instruction_response"}, {**DECAY_OPTIONS, "--datasets-config": "c.json"},
+                {**DECAY_OPTIONS, "--web-mask-rate": "0"}, {**DECAY_OPTIONS, "--answer-full-max": "0"},
+                # The decay knobs mean nothing on another masking: refused rather than ignored
+                {**DECAY_OPTIONS, "--masking": "uniform5"}, {"--use-packing": None, "--answer-full-max": "16"}]
+    for options in refused:
+        with pytest.raises(SystemExit):
+            _masking_args(tm, *_flags(options))
+
+
+def _decay_identity_args(tm, rate=0.05, full_max=16):
+    return types.SimpleNamespace(dataset="d", dataset_config="c", datasets_config=None, max_length=1024, tokenizer="t",
+                                 shuffle_buffer_size=10, web_mask_rate=rate, answer_full_max=full_max)
+
+
+def test_decay_identity_holds_its_masking_and_its_mix(tm, tmp_path):
+    identity = tm.data_state_identity(_decay_identity_args(tm), 32, ["mix-abc.parquet"], "decay", "abc")
+    assert {key: identity[key] for key in ("masking", "web_mask_rate", "answer_full_max", "answer_token", "mix")} == {
+        "masking": "decay", "web_mask_rate": 0.05, "answer_full_max": 16, "answer_token": "<answer>", "mix": "abc"}
+    # Arm W's identity has none of these: its uniform5 state is no state of F, nor F's of W
+    uniform5 = tm.data_state_identity(_decay_identity_args(tm), 32, ["mix-abc.parquet"], "uniform5")
+    assert uniform5["masking"] == "uniform5" and "mix" not in uniform5 and "web_mask_rate" not in uniform5
+
+    path = tm.epath.Path(tmp_path) / "state.json"
+    loader = mock.Mock(get_state=mock.Mock(return_value={"epoch": 0}))
+    tm.save_data_state(path, loader, identity, 2000)
+    tm.restore_data_state(path, loader, identity, allow_restart=False)
+    for other in (tm.data_state_identity(_decay_identity_args(tm, rate=0.1), 32, ["mix-abc.parquet"], "decay", "abc"),
+                  tm.data_state_identity(_decay_identity_args(tm, full_max=8), 32, ["mix-abc.parquet"], "decay", "abc"),
+                  tm.data_state_identity(_decay_identity_args(tm), 32, ["mix-abc.parquet"], "decay", "def"), uniform5):
+        with pytest.raises(RuntimeError, match="another data setup"):
+            tm.restore_data_state(path, loader, other, allow_restart=True)
+
+
+def test_decay_collator_of_the_flag_and_its_held_out_masks(tm):
+    from mmbjax.training import add_answer_token
+
+    tokenizer = _eval_tokenizer()
+    answer_token_id = add_answer_token(tokenizer)
+    collator = tm.create_masking_collator("decay", tokenizer, 0.05, 16, answer_token_id)
+    assert type(collator) is tm.DecayCollator
+    assert (collator.mlm_probability, collator.answer_full_max, collator.answer_token_id) == (0.05, 16, answer_token_id)
+    # Held-out loss on the masks of every other run: 15% single tokens, no roles needed
+    eval_collator = tm.create_eval_collator("decay", collator, tokenizer)
+    assert type(eval_collator) is tm.PackedMLMDataCollator and eval_collator.mlm_probability == 0.15
+
+
+def test_decay_mix_build_comes_from_the_files_of_the_builder(tm, tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    def write(name, build=None):
+        path = tmp_path / name
+        table = pa.table({"text": ["a"]})
+        if build is not None:
+            table = table.replace_schema_metadata({tm.DECAY_MIX_METADATA_KEY: build.encode()})
+        pq.write_table(table, path)
+        return str(path)
+
+    assert tm.decay_mix_build([write("mix.parquet", "0123456789ab")]) == "0123456789ab"
+    with pytest.raises(ValueError, match="no file of scripts/build_decay_mix.py"):
+        tm.decay_mix_build([write("nl_part_00033.parquet")])
+    with pytest.raises(ValueError, match="more than one build"):
+        tm.decay_mix_build([write("a.parquet", "a"), write("b.parquet", "b")])

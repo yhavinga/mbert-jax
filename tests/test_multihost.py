@@ -855,6 +855,60 @@ def test_resume_in_another_masking_mode_is_refused(tmp_path):
     assert "Data state restored" in logs[0]
 
 
+def _write_decay_mixes(tmp_path, rows_per_host):
+    """Per host one parquet file of web documents and instruction examples, as scripts/build_decay_mix.py writes it."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    lists = []
+    for host in range(2):
+        rng = np.random.RandomState(200 + host)
+        words = lambda n: " ".join(f"w{w}" for w in rng.randint(0, VOCAB_WORDS, size=n))  # noqa: E731
+        rows = [{"text": words(rng.randint(3, 11)), "inputs": None, "targets": None} if i % 3 else
+                {"text": None, "inputs": words(rng.randint(2, 6)), "targets": words(rng.randint(1, 8))} for i in range(rows_per_host)]
+        table = pa.table({key: [row[key] for row in rows] for key in ("text", "inputs", "targets")})
+        path = tmp_path / f"mix-b{host}.parquet"
+        pq.write_table(table.replace_schema_metadata({b"flan_decay_build": f"b{host}".encode()}), path)
+        listed = tmp_path / f"mix_files_w{host}.txt"
+        listed.write_text(f"{path}\n")
+        lists.append(str(listed))
+    return lists
+
+
+def test_decay_route_trains_on_two_hosts_logs_its_masking_and_resumes(tmp_path):
+    eval_file = tmp_path / "held_out.parquet"
+    _write_eval_parquet(eval_file)
+    ckpt = str(tmp_path / "ckpt")
+    spec = dict(route="packed", data="local_files", per_device=2, files_lists=_write_decay_mixes(tmp_path, 600), max_steps=6,
+                checkpoint_every=3, checkpoint_dir=ckpt)
+    flags = ["--masking", "decay", "--web-mask-rate", "0.05", "--answer-full-max", "4", "--system-metrics-every", "3",
+             "--eval-file", str(eval_file), "--eval-every", "3", "--eval-batches", "5"]
+    stopped, logs = _run(tmp_path, "stopped", 2, 2, extra_args=flags + ["--stop-at-step", "3"], **spec)
+    _assert_identical_across_hosts_and_chips(stopped)
+    assert stopped[0]["state_step"] == 3
+    assert "Added <answer> token (ID: 128)" in logs[0]
+    stats = json.loads([line for line in logs[0].splitlines() if line.startswith("MASKING step=3")][0].split(" ", 2)[2])
+    assert stats["flan_segments"] > 0 and stats["answers_full"] > 0 and stats["instruction_masked"] == 0
+    assert 0 < stats["flan_token_share"] < 1 and 0 < stats["answer_loss_share"] < 1
+    for process_id in range(2):
+        identity = json.loads((Path(ckpt + "_data_state") / "3" / f"process_{process_id}.json").read_text())["identity"]
+        assert {key: identity[key] for key in ("masking", "web_mask_rate", "answer_full_max", "mix")} == {
+            "masking": "decay", "web_mask_rate": 0.05, "answer_full_max": 4, "mix": f"b{process_id}"}
+
+    resumed, logs = _run(tmp_path, "resumed", 2, 2, extra_args=flags, **spec)
+    _assert_identical_across_hosts_and_chips(resumed)
+    assert resumed[0]["restored"]["step"] == 3 and resumed[0]["state_step"] == 6
+    assert all("Data state restored" in log for log in logs)
+    # Another answer rule is another experiment: no resume from this one's data state
+    output, procs = _start(tmp_path, "refused", 2, 2, extra_args=[*flags[:5], "8", *flags[6:]], **{**spec, "max_steps": 9})
+    try:
+        codes = _wait_for_workers(procs)
+    finally:
+        _kill_workers(procs)
+    assert 1 in codes, codes
+    assert "is of another data setup" in "".join((output / f"stdout_{i}.log").read_text() for i in range(2))
+
+
 def _data_line(log):
     """The DATA line the coordinator prints at the end of a packed run."""
     lines = [line for line in log.splitlines() if line.startswith("DATA step=")]

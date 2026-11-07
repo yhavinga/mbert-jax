@@ -49,13 +49,16 @@ from mmbjax.heads.masked_lm import ModernBertForMaskedLM
 
 # Grain for sequence packing (optional, requires --use-packing)
 from mmbjax.training import (
+    ANSWER_TOKEN,
     GRAIN_AVAILABLE,
     PIECE_SHUFFLE_WINDOW,
+    DecayCollator,
     PackedMLMDataCollator,
     MixedDenoiserCollator,
     InstructionResponseMaskingCollator,
     HybridMaskingCollator,
     TokenizeTransform,
+    add_answer_token,
     create_packed_dataloader,
     create_packed_dataset_streaming,
 )
@@ -237,8 +240,11 @@ def data_state_path(checkpoint_dir, step, process_index):
     return epath.Path(f"{str(checkpoint_dir).rstrip('/')}_data_state") / str(step) / f"process_{process_index}.json"
 
 
-def data_state_identity(args, rows_per_host, data_files, masking="uniform15"):
-    """What must be the same for the saved indices to point at the same documents, and for a run to stay one experiment."""
+def data_state_identity(args, rows_per_host, data_files, masking="uniform15", mix=None):
+    """What must be the same for the saved indices to point at the same documents, and for a run to stay one experiment.
+
+    mix: the build of the decay mix in data_files (--masking decay), see decay_mix_build.
+    """
     identity = {
         "data_files": data_files,
         "dataset": args.dataset,
@@ -256,7 +262,28 @@ def data_state_identity(args, rows_per_host, data_files, masking="uniform15"):
     # Only when it isn't the default: data states saved before --masking existed have no such key
     if masking != "uniform15":
         identity["masking"] = masking
+    if masking == "decay":
+        identity.update(web_mask_rate=args.web_mask_rate, answer_full_max=args.answer_full_max, answer_token=ANSWER_TOKEN, mix=mix)
     return identity
+
+
+# Key in the parquet metadata of a file of scripts/build_decay_mix.py
+DECAY_MIX_METADATA_KEY = b"flan_decay_build"
+
+
+def decay_mix_build(data_files):
+    """The build id of this host's decay mix, from its parquet files: --masking decay on files without one would be W's data."""
+    import pyarrow.parquet as pq
+
+    builds = {}
+    for path in data_files:
+        metadata = pq.read_schema(path).metadata or {}
+        if DECAY_MIX_METADATA_KEY not in metadata:
+            raise ValueError(f"--masking decay: {path} is no file of scripts/build_decay_mix.py (no {DECAY_MIX_METADATA_KEY.decode()} in its metadata)")
+        builds[path] = metadata[DECAY_MIX_METADATA_KEY].decode()
+    if len(set(builds.values())) != 1:
+        raise ValueError(f"--masking decay: the data files are of more than one build: {builds}")
+    return next(iter(builds.values()))
 
 
 def save_data_state(path, data_loader, identity, step):
@@ -343,10 +370,12 @@ def log_data_accounting(data_loader, optimizer_step):
 UNIFORM_RATES = {"uniform5": 0.05, "uniform10": 0.10, "uniform15": 0.15, "uniform30": 0.30}
 
 
-def create_masking_collator(masking, tokenizer):
-    """The training collator of --masking, for packed plain-text data."""
+def create_masking_collator(masking, tokenizer, web_mask_rate=None, answer_full_max=None, answer_token_id=None):
+    """The training collator of --masking, for packed plain-text data; decay also takes the rows of instructions."""
     if masking == "mix":
         return MixedDenoiserCollator(tokenizer)
+    if masking == "decay":
+        return DecayCollator(tokenizer, web_mask_rate=web_mask_rate, answer_full_max=answer_full_max, answer_token_id=answer_token_id)
     return PackedMLMDataCollator(tokenizer=tokenizer, mlm_probability=UNIFORM_RATES[masking])
 
 
@@ -696,10 +725,24 @@ def parse_args():
     parser.add_argument(
         "--masking",
         type=str,
-        choices=[*UNIFORM_RATES, "mix"],
+        choices=[*UNIFORM_RATES, "mix", "decay"],
         default="uniform15",
-        help="Masking of training batches: single tokens at 5%%, 10%%, 15%% or 30%%, or 'mix' for one of 8 denoisers per packed segment; "
+        help="Masking of training batches: single tokens at 5%%, 10%%, 15%% or 30%%, 'mix' for one of 8 denoisers per packed segment, "
+             "or 'decay' for the mix of scripts/build_decay_mix.py (web text and instruction examples, see DecayCollator); "
              "--eval-file always gets 15%% single tokens (default: uniform15)"
+    )
+    parser.add_argument(
+        "--web-mask-rate",
+        type=float,
+        default=None,
+        help="--masking decay: single-token rate of the web text, with 80/10/10 as in uniform5 (no default: name it)"
+    )
+    parser.add_argument(
+        "--answer-full-max",
+        type=int,
+        default=None,
+        help="--masking decay: answers of at most this many tokens are masked whole, every token <mask>; longer ones "
+             "get the spans of span_mu8_r50 (no default: name it)"
     )
 
     args = parser.parse_args()
@@ -711,6 +754,15 @@ def parse_args():
         not args.use_packing or args.dataset_format != "text" or args.masking_mode != "standard" or args.datasets_config
     ):
         parser.error(f"--masking {args.masking} needs --use-packing on one plain-text dataset, with --masking-mode standard")
+    if args.masking == "decay":
+        if args.web_mask_rate is None or args.answer_full_max is None:
+            parser.error("--masking decay needs --web-mask-rate and --answer-full-max")
+        if not 0 < args.web_mask_rate < 1 or args.answer_full_max < 1:
+            parser.error(f"--web-mask-rate must be in (0, 1) and --answer-full-max at least 1, not {args.web_mask_rate} and {args.answer_full_max}")
+        if not args.data_files_list:
+            parser.error("--masking decay needs --data-files-list with this host's files of scripts/build_decay_mix.py")
+    elif args.web_mask_rate is not None or args.answer_full_max is not None:
+        parser.error("--web-mask-rate and --answer-full-max are for --masking decay only")
     if args.per_layer_norms_every % args.log_every != 0:
         parser.error("--per-layer-norms-every must be a multiple of --log-every: other steps aren't logged")
     return args
@@ -1387,6 +1439,10 @@ def main(args):
         tokenizer.add_special_tokens({'mask_token': '<mask>'})
         if is_coordinator():
             print(f"  Added <mask> token (ID: {tokenizer.mask_token_id})")
+    # After <mask>, so <mask> keeps the id the start checkpoint was trained with
+    answer_token_id = add_answer_token(tokenizer) if args.masking == "decay" else None
+    if answer_token_id is not None and is_coordinator():
+        print(f"  Added {ANSWER_TOKEN} token (ID: {answer_token_id})")
 
     # Determine vocab size
     tokenizer_vocab_size = len(tokenizer)  # Includes added special tokens
@@ -1490,7 +1546,7 @@ def main(args):
             "layer_norm_lr_factor": layer_norm_lr_factor,
             "min_lr": min_lr,
             "weight_decay": weight_decay,
-            "mlm_probability": None if args.masking == "mix" else UNIFORM_RATES[args.masking],
+            "mlm_probability": None if args.masking == "mix" else args.web_mask_rate if args.masking == "decay" else UNIFORM_RATES[args.masking],
             "masking": args.masking,
             "init_from": args.init_from,
             "gradient_clipping": 1.0,
@@ -1501,6 +1557,7 @@ def main(args):
             "dataset_num_rows": args.dataset_num_rows,
             "tokenizer": args.tokenizer,
             "shuffle_buffer_size": args.shuffle_buffer_size,
+            **({"web_mask_rate": args.web_mask_rate, "answer_full_max": args.answer_full_max} if args.masking == "decay" else {}),
 
             # Infrastructure
             "backend": backend,
@@ -1731,7 +1788,7 @@ def main(args):
                 print("  - Response tokens: 25% masking")
         else:
             # Standard single dataset
-            collator = create_masking_collator(args.masking, tokenizer)
+            collator = create_masking_collator(args.masking, tokenizer, args.web_mask_rate, args.answer_full_max, answer_token_id)
     else:
         collator = FlaxDataCollatorForLanguageModeling(
             tokenizer=tokenizer,
@@ -1757,6 +1814,9 @@ def main(args):
         data_files = Path(args.data_files_list).read_text().split() if args.data_files_list else None
         if data_files and dataset_configs:
             raise ValueError("--data-files-list replaces --dataset; it can't be combined with --datasets-config")
+        mix = decay_mix_build(data_files) if args.masking == "decay" else None
+        if mix is not None:
+            print(f"  Process {process_idx}: decay mix {mix} in {data_files}", flush=True)
 
         packed_dataloader = create_packed_dataloader(
             dataset_name=args.dataset if not dataset_configs else None,
@@ -1773,6 +1833,7 @@ def main(args):
             shuffle_buffer_size=args.shuffle_buffer_size,
             stopping_strategy=args.stopping_strategy,
             data_files=data_files,
+            answer_token_id=answer_token_id,
         )
         if is_coordinator():
             print(f"  ✓ Packing enabled: documents will be packed into {max_length}-token sequences")
@@ -1892,7 +1953,7 @@ def main(args):
 
     # The other half of a packed checkpoint: where this host's data was, so it isn't trained on again
     if args.use_packing:
-        data_identity = data_state_identity(args, batch_size, data_files, args.masking)
+        data_identity = data_state_identity(args, batch_size, data_files, args.masking, mix)
         if start_step > 0:
             restore_data_state(data_state_path(checkpoint_dir, start_step, process_idx), packed_dataloader, data_identity, args.allow_data_restart)
 
@@ -2158,6 +2219,11 @@ def main(args):
                                 print(f"MASKING step={optimizer_step} {json.dumps(denoiser_stats)}", flush=True)
                                 if wandb is not None:
                                     wandb.log({f"masking/{name}_{key}": value for name, stats in denoiser_stats.items() for key, value in stats.items()}, step=optimizer_step)
+                            if args.masking == "decay":
+                                decay_stats = collator.decay_stats()
+                                print(f"MASKING step={optimizer_step} {json.dumps(decay_stats)}", flush=True)
+                                if wandb is not None:
+                                    wandb.log({f"masking/{key}": value for key, value in decay_stats.items()}, step=optimizer_step)
 
                     if eval_batches is not None and optimizer_step % args.eval_every == 0:
                         evaluate(optimizer_step)

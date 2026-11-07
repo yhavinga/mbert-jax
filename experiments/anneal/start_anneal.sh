@@ -7,7 +7,8 @@
 # Only the start model and its masking differ between arms, so u15 + anneal is the control for mix + anneal.
 # START_CKPT: step directory of S. START_MASKING: the masking S was trained with, checked against S's data state.
 # ANNEAL_MASKING: uniform5 or uniform10. START_NAME: a short name of S, e.g. u15 or mix: run anneal-<START_NAME>-<ANNEAL_MASKING>.
-# The code is a clone of its own (~/mbert-anneal, at COMMIT), with the venv of the corpus runs.
+# The code is a clone of its own (~/mbert-anneal, at COMMIT), with the venv of the corpus runs; PY overrides it on a VM
+# whose venv of that lock is elsewhere (mbert-corpus: PY=$HOME/mbert-dumb/.venv/bin/python).
 set -euo pipefail
 [ $# = 4 ] || { echo "usage: COMMIT=<commit> bash start_anneal.sh START_CKPT START_MASKING ANNEAL_MASKING START_NAME"; exit 1; }
 START_CKPT=${1%/}; START_MASKING=$2; ANNEAL_MASKING=$3; START_NAME=$4
@@ -21,12 +22,12 @@ MIN_LR=1e-6
 RUN_ROOT=gs://t5-dutch-english-usc2/mbert/anneal
 DATA_FILES=$HOME/culturax_nl_files.txt
 CODE=$HOME/mbert-anneal
-PY=$HOME/mbert-corpus/.venv/bin/python
+PY=${PY:-$HOME/mbert-corpus/.venv/bin/python}
 RUN=anneal-$START_NAME-$ANNEAL_MASKING
 OUT=$RUN_ROOT/$RUN
 
 pgrep -f '[t]rain_minimal.py' > /dev/null && { echo "$(hostname): a trainer is running"; exit 1; }
-[ -f "$DATA_FILES" ] && [ -f ~/heldout.parquet ] && [ -x "$PY" ] || { echo "$(hostname): needs the CulturaX share, ~/heldout.parquet and ~/mbert-corpus/.venv"; exit 1; }
+[ -f "$DATA_FILES" ] && [ -f ~/heldout.parquet ] && [ -x "$PY" ] || { echo "$(hostname): needs the CulturaX share, ~/heldout.parquet and $PY"; exit 1; }
 [ -d "$CODE/.git" ] || git clone -q https://github.com/yhavinga/mbert-jax.git "$CODE"
 git -C "$CODE" fetch -q origin anneal
 git -C "$CODE" checkout -q "$COMMIT"

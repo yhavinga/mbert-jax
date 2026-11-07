@@ -200,16 +200,28 @@ class HubShards:
         import pyarrow.parquet as pq
 
         executor = concurrent.futures.ThreadPoolExecutor(self.ahead)
-        futures = [executor.submit(self._download, name) for name in names]
+        waiting, pending = iter(names), []
+
+        def refill():
+            # At most `ahead` shards on their way or in download_dir, so an early stop wastes little
+            while len(pending) < self.ahead:
+                name = next(waiting, None)
+                if name is None:
+                    return
+                pending.append((name, executor.submit(self._download, name)))
+
         try:
-            for name, future in zip(names, futures):
+            refill()
+            while pending:
+                name, future = pending.pop(0)
                 path = future.result()
                 table = pq.read_table(path, columns=FLAN_COLUMNS)
                 os.remove(path)
+                refill()
                 yield name, table
         finally:
             executor.shutdown(wait=True, cancel_futures=True)
-            for future in futures:
+            for _, future in pending:
                 if future.done() and not future.cancelled() and future.exception() is None and os.path.exists(future.result()):
                     os.remove(future.result())
 
@@ -242,8 +254,9 @@ def select_flan(args, tokenizer, source, niv2_languages):
                 if excluded[task] is not None:
                     dropped[excluded[task]] += 1
                     continue
-                # A few more than the cap leaves room, as some fail the filters below
-                if counts[task] + taken_here[task] >= per_host_cap * 1.2 + 5:
+                # A few more than the task still needs leaves room, as some fail the filters below
+                need = per_host_cap - counts[task]
+                if need <= 0 or taken_here[task] >= need * 1.2 + 5:
                     continue
                 taken_here[task] += 1
                 candidates.append(row)
@@ -340,6 +353,9 @@ def build(args, tokenizer, source):
         "rows_per_host": args.rows_per_host, "max_length": args.max_length, "seed": args.seed, "tokenizer": args.tokenizer,
         "niv2_languages": hashlib.sha256(Path(args.niv2_languages).read_bytes()).hexdigest(),
         "train_seed": TRAIN_SEED, "train_shuffle_buffer": TRAIN_SHUFFLE_BUFFER,
+        # The code that selects, counts and orders: a fixed builder or packing makes another build, not a kept old one
+        "code": {Path(module).name: hashlib.sha256(Path(module).read_bytes()).hexdigest()
+                 for module in (__file__, sys.modules["mmbjax.training.packing"].__file__)},
     }
     build = build_id(config)
     out = Path(args.out)

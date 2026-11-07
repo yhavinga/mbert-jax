@@ -264,3 +264,29 @@ def test_a_file_in_another_order_fails_the_check_of_the_trainers_order(tmp_path,
     bdm.write_mix(bad, sequence, texts, [], np.arange(n), "x")
     with pytest.raises(RuntimeError, match="not the one the order was made for"):
         bdm.verify_order(bad, tokenizer, n)
+
+
+def test_hub_shards_download_a_few_ahead_and_leave_nothing_behind(tmp_path):
+    import threading
+
+    shards = object.__new__(bdm.HubShards)  # without __init__: no listing of the Hub
+    shards.download_dir, shards.ahead = tmp_path, 2
+    downloaded, lock = [], threading.Lock()
+
+    def download(name):
+        path = tmp_path / name.replace("/", "_")
+        pq.write_table(pa.table({column: ["x"] for column in bdm.FLAN_COLUMNS}), path)
+        with lock:
+            downloaded.append(name)
+        return str(path)
+
+    shards._download = download
+    names = [f"t0_zsopt_data/part.{i}.parquet" for i in range(10)]
+    tables = shards.tables(names)
+    for (name, table), expected in zip(tables, names[:3]):
+        assert name == expected and table.num_rows == 1
+        # The shard being read is gone; what waits is at most `ahead`
+        assert len(list(tmp_path.glob("*.parquet"))) <= 2
+    tables.close()
+    assert len(downloaded) <= 3 + 2
+    assert not list(tmp_path.glob("*.parquet")), "an early stop leaves no shard behind"

@@ -19,9 +19,11 @@ English (en) to Dutch (nl) translator. ... Please translate the following Englis
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
+import traceback
 from pathlib import Path
 
 import numpy as np
@@ -108,6 +110,24 @@ def make_decode_cache_sharded():
         return jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), nnx.to_pure_dict(cache_state))
 
     maxengine.MaxEngine._nnx_init_cache_dict = init_cache_dict
+
+
+def make_packed_prefill_complete():
+    """MaxText 0.2.5's packed prefill (MaxEngine.prefill_concat) returns no "token_logp", which its insert_partial reads
+    for every prompt (KeyError in the pilot of 8 Nov). The value is the log-probability of each prompt's first token,
+    which prefill_concat does compute, in the ResultTokens it returns; stacked per prompt it has the shape of "tokens"."""
+    import jax.numpy as jnp
+    from maxtext.inference.maxengine import maxengine
+
+    original = maxengine.MaxEngine.prefill_concat
+
+    def prefill_concat(self, **kwargs):
+        cache, results, first_tokens = original(self, **kwargs)
+        if "token_logp" not in results:
+            results["token_logp"] = jnp.stack([t.log_prob for t in first_tokens])
+        return cache, results, first_tokens
+
+    maxengine.MaxEngine.prefill_concat = prefill_concat
 
 
 def make_engine(args, shapes):
@@ -233,6 +253,7 @@ def main(argv=None):
     codec.check(texts[:3] + texts[-3:])
     make_result_tokens_a_pytree()
     make_decode_cache_sharded()
+    make_packed_prefill_complete()
     started = time.time()
     engine = make_engine(args, shapes)
     print(f"engine ready in {time.time() - started:.0f} s", flush=True)
@@ -255,4 +276,19 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # OfflineEngine's detokenization thread is no daemon and polls until the engine says it stopped: after an error in
+    # the main thread the process would hang there, holding the TPU and never reaching translate.sh's EXIT line (pilot
+    # of 8 Nov). So the process ends here, with the error's traceback and code, whatever the threads do.
+    code = 0
+    try:
+        main()
+    except SystemExit as stop:
+        code = stop.code if isinstance(stop.code, int) else (0 if stop.code is None else 1)
+        if not isinstance(stop.code, int) and stop.code is not None:
+            print(stop.code, file=sys.stderr)
+    except BaseException:
+        traceback.print_exc()
+        code = 1
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(code)

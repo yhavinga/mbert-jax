@@ -96,6 +96,47 @@ On every worker `~/logs/flan_nl_translate.log` has five `DONE` lines (one per cl
    `commands.txt`. Not to be started by this sub-project (Yeb decides).
 4. Before any run of F-nl: put the final commit in `COMMIT_NL` of `commands.txt`, copy `protocol.md` to
    `$R/protocol.md` (step 0).
+5. Publish FLAN-nl on Hugging Face after step 1: section "Publish" below, step 11 of `commands.txt`.
+
+## Publish: FLAN-nl on Hugging Face
+
+Yeb's consent (8 Nov, evening): the Dutch rows go public as the dataset `yhavinga/flan-nl`, with the ids of their source
+rows so that every row leads back to Open-Orca/FLAN. Open-Orca/FLAN has no id column; (revision, file, row) is the id.
+Code: `experiments/flan-nl/publish.py`, tests `tests/test_flan_nl_publish.py`. Copies: `$R/publish/` (`publish.py`,
+and what it imports: `flan_nl.py` and F's `scripts/build_decay_mix.py`, both of this branch); on worker 0 in
+`/dev/shm/flan_nl/publish/` (not in `code/`, not in `$R/scripts/`). `yhavinga/flan-nl` did not exist on 8 Nov 20:11 UTC
+(neither as dataset nor as model; checked with Yeb's token on worker 0).
+
+1. `link`: done, 8 Nov 20:21-20:29 UTC on worker 0 (CPU, `nice -n 19`, one process). All 1,357,022 FLAN rows of F
+   (w0 340,016, w1 339,792, w2 338,986, w3 338,228) have their `flan_file` and `flan_row` in Open-Orca/FLAN at
+   `6845b1b3b53c6d5c5b1e49767ed759df3fc246cc`, plus `_template_idx`, `_task_source`, `_task_name`, `_template_type`
+   of that row. Per host it read the shards F's `select_flan` read (`host_units`, F's order, `shards_read` of F's
+   manifests `gs://t5-dutch-english-usc2/mbert/flan-decay/mix/w<N>.json`: every unit of every folder) and matched on
+   (task, inputs, targets); 1,229 rows share their content with another row of their host, and such twins took the
+   equal source rows one by one in shard order. Each shard was downloaded to `/dev/shm/flan_nl/oo-flan/` and deleted
+   after reading (the directory holds only empty folders now). Output: `/dev/shm/flan_nl/links/` and `$R/links/`
+   (`w<N>.parquet`: host, position, flan_file, flan_row, template_idx, task_source, task_name, template_type;
+   `report.json`); log `$R/logs/flan_nl_link.log`. "Done" = the log ends in `EXIT 0` and `$R/links/report.json` has
+   `rows` = `linked` = 1,357,022.
+   Checked after (`$R/publish/dev/verify_links.py`, `spot_check.py`): every source row once; each in a shard (for
+   `cot_zsopt_data` a row residue) of its own host that F read; folder, task and template type as in the extract; no
+   (folder, task) over F's 500 per host; 15 random links, fetched the way the card says, equal the English extract.
+   Effect on the translation: w0's medium `shard-00010`, which ran during `link`, took 800.3 s against 789.2, 791.7 and
+   794.3 s on w1-w3 (+1.1%; the shard before, `shard-00002`, +0.4%): within the spread between workers.
+2. `build`, after the assembly (step 8) ends in `EXIT 0`: step 11b of `commands.txt` (worker 0, CPU, ~2 minutes). Reads
+   `/dev/shm/flan_nl/nl/w<N>.parquet` and `nl/report.json`, `links/`, `plan2/examples.parquet` (`translated` = status
+   is not `dutch_task`); writes `/dev/shm/flan_nl/hf/` (`data/train-0000k-of-0000n.parquet`, zstd, each under 400 MB,
+   sorted by (flan_file, flan_row); `README.md`, the dataset card with every number from the data and the two
+   reports) and copies it to `$R/hf/`. Columns: id (`w<N>-<position>`), inputs, targets, translated, task_name,
+   task_source, folder, template_type, template_idx, flan_revision, flan_file, flan_row. No English text: it reads
+   only the Dutch rows. It refuses, before writing anything, a Dutch row without a link, a link of another task, a row
+   whose plan status is neither `translate` nor `dutch_task`, a report that does not add up to the data (FLAN rows of
+   F = links; translated and Dutch-task rows; FLAN rows minus dropped = rows), and a drop reason the card cannot
+   explain; and it refuses an `--out` that is not empty (rerun: `rm -rf /dev/shm/flan_nl/hf` first).
+   Dry run, done: the 27B pilot rows (filtered to plan2's tasks, their report padded to add up) with the real links:
+   `/dev/shm/flan_nl/publish/dry/hf/`, card `$R/publish/dev/dry-README.md` (its counts are the pilot's, not real).
+3. Read `$R/hf/README.md`, then `upload` (step 11c): `create_repo(repo_type="dataset", private=False, exist_ok=True)`
+   and `upload_folder` of README.md and data/; it prints the URL. Built and tested with a fake hub, not run.
 
 ## For the final report
 
@@ -122,5 +163,6 @@ Main commits on `flan-nl` (from 2411eb8): c57f726 setup/convert, 29ae713 library
 continuous batching, 57841a4 position order past 2 GB, b167a5d templates top 30 + mechanism, 85252d8 / 0c407a8
 phrasing table (31 keys, variants by Yeb drafted with Gemini), register, Head/Tail and lexical rules, 1b52081 protocol
 for 27B. Tests: `tests/test_flan_nl.py`, 45 passed (local venv with pytest, numpy, pyarrow, langid; `--noconftest`,
-since the conftest imports jax and flax); ruff clean. The mix builder was also dry-run on worker 0 with pilot rows
+since the conftest imports jax and flax); ruff clean. The publish step: `publish.py` and `tests/test_flan_nl_publish.py`
+(14 tests; with `test_flan_nl.py` 59 passed, ruff clean). The mix builder was also dry-run on worker 0 with pilot rows
 (passed `verify_order` and the byte check); `assemble` with templates was dry-run on a plan2 sample.

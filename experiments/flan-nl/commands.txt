@@ -79,3 +79,19 @@ for w in 0 1 2 3; do gsutil cat $R/mix/w$w.json | python3 -c "import json, sys; 
 # $SSH --worker=all --command "gsutil -q cp $B/start_flan_nl.sh ~/ && COMMIT=$F_COMMIT PY=$PY bash ~/start_flan_nl.sh $S uniform15" < /dev/null
 # Then DUMB (flan-decay/commands.txt, step 7, with flan-Fnl=gs://t5-dutch-english-usc2/mbert/flan-decay/flan-Fnl/ckpt/20000)
 # and the zero-shot eval (step 6, with Fnl=<that step dir>), and the rule of protocol.md, "Decision rule".
+
+# 11. FLAN-nl on Hugging Face (Yeb's consent of 8 Nov: public as yhavinga/flan-nl, every row with its source row in
+# Open-Orca/FLAN), worker 0, CPU. publish.py and what it imports (flan_nl.py, scripts/build_decay_mix.py of this branch)
+# are in $R/publish/, on the VM in /dev/shm/flan_nl/publish/ (not in $CODE, not in $B). HANDOVER.md, "Publish".
+# 11a. link (done 8 Nov 20:21-20:29 UTC, ~8 minutes): F's 1,357,022 FLAN rows -> their file and row in Open-Orca/FLAN at
+# F's revision, read from the shards F read (each downloaded to /dev/shm/flan_nl/oo-flan and deleted after) -> $R/links/.
+# Log ~/logs/flan_nl_link.log, ends in EXIT 0; then the copy to $R/links/.
+$SSH --worker=0 --command "mkdir -p ~/logs /dev/shm/flan_nl/publish/fmix /dev/shm/flan_nl/links /dev/shm/flan_nl/oo-flan && gsutil -q cp '$R/publish/*.py' /dev/shm/flan_nl/publish/ && gsutil -q cp 'gs://t5-dutch-english-usc2/mbert/flan-decay/mix/w*.json' /dev/shm/flan_nl/publish/fmix/ && (setsid nohup bash -c 'HF_HUB_DISABLE_PROGRESS_BARS=1 nice -n 19 $VENV -u /dev/shm/flan_nl/publish/publish.py link --english /dev/shm/flan_nl/en --manifests /dev/shm/flan_nl/publish/fmix --out /dev/shm/flan_nl/links --download-dir /dev/shm/flan_nl/oo-flan > ~/logs/flan_nl_link.log 2>&1; echo EXIT \$? >> ~/logs/flan_nl_link.log' > /dev/null 2>&1 < /dev/null &)" < /dev/null
+$SSH --worker=0 --command "grep -a 'LINKED\|done:\|EXIT\|Error' ~/logs/flan_nl_link.log" < /dev/null
+$SSH --worker=0 --command "gsutil -m -q cp /dev/shm/flan_nl/links/w0.parquet /dev/shm/flan_nl/links/w1.parquet /dev/shm/flan_nl/links/w2.parquet /dev/shm/flan_nl/links/w3.parquet /dev/shm/flan_nl/links/report.json $R/links/ && gsutil -q cp ~/logs/flan_nl_link.log $R/logs/flan_nl_link.log" < /dev/null
+# 11b. build, after step 8 ends in EXIT 0 (~2 minutes): /dev/shm/flan_nl/hf/{data/train-*.parquet,README.md} -> $R/hf/.
+# It refuses a non-empty --out: rerun after rm -rf /dev/shm/flan_nl/hf. After a reboot the links come from $R/links/.
+$SSH --worker=0 --command "mkdir -p /dev/shm/flan_nl/publish /dev/shm/flan_nl/links && gsutil -q cp '$R/publish/*.py' /dev/shm/flan_nl/publish/ && { [ -s /dev/shm/flan_nl/links/report.json ] || gsutil -m -q cp '$R/links/*' /dev/shm/flan_nl/links/; } && nice -n 19 $VENV -u /dev/shm/flan_nl/publish/publish.py build --nl /dev/shm/flan_nl/nl --links /dev/shm/flan_nl/links --plan /dev/shm/flan_nl/plan2 --out /dev/shm/flan_nl/hf > ~/logs/flan_nl_publish_build.log 2>&1; echo EXIT \$? >> ~/logs/flan_nl_publish_build.log; tail -n 2 ~/logs/flan_nl_publish_build.log; [ -s /dev/shm/flan_nl/hf/README.md ] && gsutil -m -q cp -r /dev/shm/flan_nl/hf $R/" < /dev/null
+gsutil cat $R/hf/README.md   # the dataset card: read it before 11c
+# 11c. upload: a public dataset repo (created if absent) with README.md and data/; prints the URL
+$SSH --worker=0 --command "HF_HUB_DISABLE_PROGRESS_BARS=1 $VENV -u /dev/shm/flan_nl/publish/publish.py upload --folder /dev/shm/flan_nl/hf --repo yhavinga/flan-nl --public" < /dev/null

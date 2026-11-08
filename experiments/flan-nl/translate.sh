@@ -37,6 +37,8 @@ set -uo pipefail
 export TPU_CHIPS_PER_PROCESS_BOUNDS=2,2,1 TPU_PROCESS_BOUNDS=1,1,1 TPU_VISIBLE_CHIPS=0,1,2,3 TPU_PROCESS_PORT=8476
 export TPU_PROCESS_ADDRESSES=localhost:8476 CLOUD_TPU_TASK_ID=0 ALLOW_MULTIPLE_LIBTPU_LOAD=1
 export TOKENIZERS_PARALLELISM=false HF_HUB_OFFLINE=1
+# The engine compiles a program per prefill length and number of packed prompts, minutes in all; a restart reuses them
+export JAX_COMPILATION_CACHE_DIR=$SHM/jax_cache
 timeout 600 $PY -c "import jax; assert (jax.device_count(), jax.process_count()) == (4, 1), (jax.device_count(), jax.process_count()); print('devices', jax.devices())" || { echo "preflight failed: not 4 chips of one process"; exit 2; }
 echo "\$(date +%H:%M:%S) $(hostname): $SEGMENTS -> $OUT with $CKPT"
 for class in $CLASSES; do

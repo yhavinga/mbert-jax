@@ -62,7 +62,10 @@ The translation (`flan_nl.py`, `translate.py`):
   acceptability, spelling, punctuation and case (CoLA, BLiMP, JFLEG, `fix_punct`, `true_case`, `word_segment`, ...);
   word games, letters and strings (rhymes, character counts, lists of random letter strings, ...); POS tagging, NER
   and other token-level tasks (and next or missing English words, LAMBADA); translation and tokenization; tasks about
-  English words (WiC, XL-WiC, the English-language Q&A, overlapping words).
+  English words (WiC, XL-WiC, the English-language Q&A, overlapping words); relations between bare words (odd man out,
+  the BARD analogies, hypernyms, meronyms, antonyms, semantic relations of word pairs: a word translated out of
+  context loses the sense the answer rests on). The assembly applies the lists again, so a task added after the plan
+  is left out too.
 - The six Dutch NIv2 tasks of F's pool (`task1133`, `task409`, `task1543`-`task1546`) have Dutch text with an English
   task definition; they stay as in F.
 - Examples left out: an answer that is a whole-word stretch of the English instruction (case and spacing aside) while

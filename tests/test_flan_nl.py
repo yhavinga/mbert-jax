@@ -124,6 +124,8 @@ def test_task_filters():
     assert fn.task_drop_reason("task583_udeps_eng_coarse_pos_tagging") == "token_level"
     assert fn.task_drop_reason("task560_alt_translation_en_entk") == "translation"
     assert fn.task_drop_reason("super_glue/wic:1.0.2") == "english_words"
+    assert fn.task_drop_reason("task142_odd-man-out_classification_no_category") == "word_relations"
+    assert fn.task_drop_reason("task1155_bard_analogical_reasoning_trash_or_treasure") == "word_relations"
     assert fn.task_drop_reason("glue/sst2:2.0.0") is None and fn.task_drop_reason("task1312_amazonreview_polarity_classification") is None
     assert "task1543_conll2002_parts_of_speech_tagging_answer_generation" in fn.DUTCH_TASKS
     assert not fn.DUTCH_TASKS & set(fn._REASON)

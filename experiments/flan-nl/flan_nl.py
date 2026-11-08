@@ -106,6 +106,22 @@ DROPPED_TASKS = {
         "task225_english_language_answer_generation", "task226_english_language_answer_relevance_classification",
         "task039_qasc_find_overlapping_words",
     },
+    # Relations between bare words: out of context a word is translated in one sense, and the relation the answer
+    # rests on can be gone ("outing, bacon, blt, club, submarine" became "uitje, spek, BLT-sandwich, club,
+    # onderzeeër", where the sandwich sense of club and sub is lost; the main session, 8 Nov)
+    "word_relations": {
+        "task141_odd-man-out_classification_category", "task142_odd-man-out_classification_no_category",
+        "task143_odd-man-out_classification_generate_category",
+        "task1152_bard_analogical_reasoning_causation", "task1153_bard_analogical_reasoning_affordance",
+        "task1154_bard_analogical_reasoning_travel", "task1155_bard_analogical_reasoning_trash_or_treasure",
+        "task1156_bard_analogical_reasoning_tools", "task1157_bard_analogical_reasoning_rooms_for_containers",
+        "task1158_bard_analogical_reasoning_manipulating_items", "task1159_bard_analogical_reasoning_containers",
+        "task1418_bless_semantic_relation_classification", "task1429_evalution_semantic_relation_classification",
+        "task1505_root09_semantic_relation_classification", "task1508_wordnet_antonyms", "task1509_evalution_antonyms",
+        "task1510_evalution_relation_extraction", "task1582_bless_hypernym_generation",
+        "task1583_bless_meronym_classification", "task1584_evalution_meronym_classification",
+        "task1585_root09_hypernym_generation",
+    },
 }
 # The six Dutch tasks of F's pool (experiments/flan-decay/niv2_languages.json): their text is Dutch already and only the
 # task definition is English; they stay as in F
@@ -720,6 +736,11 @@ def assemble(args):
     for k in range(len(columns["host"])):
         h, p, status = columns["host"][k], columns["position"][k], columns["status"][k]
         report[h]["flan_rows"] += 1
+        # The lists in this file decide, also for a task added after the plan was made (its segments were
+        # translated for nothing)
+        reason = task_drop_reason(task_of(columns["source"][k]))
+        if reason is not None and status == "translate":
+            status = f"task:{reason}"
         x, y = english[(h, p)]
         if status == "dutch_task":
             report[h]["kept_dutch_task"] += 1

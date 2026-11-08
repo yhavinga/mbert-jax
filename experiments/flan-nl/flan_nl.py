@@ -441,6 +441,44 @@ def render(pieces, translation, template_text=None):
     return "".join(out)
 
 
+# In Yeb's table but translated in context: 27B renders Head and Tail differently per example (beginzin/eindzin,
+# kop/staart, ...), consistently within one, and the labels follow what it chose (head_tail_labels; Yeb, 8 Nov)
+UNPROTECTED = {"Head and Tail, separated with <sep>."}
+# (the terms in an example's translated text, its labels for "Head:" and "Tail:"), checked in this order
+HEAD_TAIL_PAIRS = [
+    (("inleidende zin", "afsluitende zin"), ("Inleidende zin:", "Afsluitende zin:")),
+    (("beginzin", "eindzin"), ("Beginzin:", "Eindzin:")),
+    (("kop", "staart"), ("Kop:", "Staart:")),
+    (("head", "tail"), ("Head:", "Tail:")),
+    (("begin", "einde"), ("Begin:", "Einde:")),
+]
+# Where the text names no pair: one of these, by sha256 of the example's id
+HEAD_TAIL_FALLBACK = [("Beginzin:", "Eindzin:"), ("Kop:", "Staart:")]
+
+
+def _has_phrase(text, phrase):
+    """phrase as whole words in text, both already casefolded."""
+    return re.search(r"(?<!\w)" + re.escape(phrase) + r"(?!\w)", text) is not None
+
+
+def head_tail_labels(host, position, machine_text):
+    """((Head label, Tail label), how) for one example: the pair whose terms its translated text uses, else a seeded one."""
+    text = machine_text.casefold()
+    for terms, labels in HEAD_TAIL_PAIRS:
+        if all(_has_phrase(text, term) for term in terms):
+            return labels, "/".join(terms)
+    digest = hashlib.sha256(f"{host}:{position}:head-tail".encode()).hexdigest()
+    return HEAD_TAIL_FALLBACK[int(digest, 16) % len(HEAD_TAIL_FALLBACK)], "hash"
+
+
+def lexical_choice(variants, machine_text):
+    """The one variant whose words (without the final colon) occur in the example's translated text, or None when
+    none or several do: a label then names what the translation itself calls it ("Achtergrond:" after "achtergrond")."""
+    text = machine_text.casefold()
+    hits = [v for v in variants if _has_phrase(text, v.rstrip(":").strip().casefold())]
+    return hits[0] if len(hits) == 1 else None
+
+
 _JE = {"je", "jij", "jouw", "jou", "jezelf"}
 _U = {"u", "uw", "uzelf", "alstublieft"}
 
@@ -488,7 +526,7 @@ def read_phrasing_table(path, protected):
     if not isinstance(table, dict):
         raise ValueError(f"{path}: not an object of English strings")
     for english, variants in table.items():
-        if english not in protected:
+        if english not in protected and english not in UNPROTECTED:
             raise ValueError(f"{path}: {english!r} is not a template string of the plan")
         if not isinstance(variants, list) or not variants or not all(isinstance(v, str) and v.strip() for v in variants):
             raise ValueError(f"{path}: {english!r} needs a list of one or more non-empty Dutch strings")
@@ -691,7 +729,7 @@ def load_templates(paths):
             keys |= set(data)
         else:
             raise ValueError(f"{path}: neither a template list nor a phrasing table")
-    return tuple(sorted(keys, key=lambda k: (-len(k), k)))
+    return tuple(sorted(keys - UNPROTECTED, key=lambda k: (-len(k), k)))
 
 
 def _plan_rows(rows):
@@ -1004,7 +1042,7 @@ def assemble(args):
             raise SystemExit("the plan protects template strings: --templates-nl (templates_nl.json) is required")
         phrasing = read_phrasing_table(args.templates_nl, set(template_segments))
     variant_rows = {t: Counter() for t in template_segments}
-    register_rows = Counter()
+    register_rows, head_tail_rows, decided = Counter(), Counter(), Counter()
     rows = {h: {"position": [], "source": [], "inputs": [], "targets": []} for h in range(args.world)}
     report = {h: Counter() for h in range(args.world)}
     for k in range(len(columns["host"])):
@@ -1030,12 +1068,18 @@ def assemble(args):
             # machine translation
             machine = " ".join(translation[v] for kind, v in instruction + answer if kind == "S")
             register, how = example_register(h, p, machine)
-            template_text, mismatched = {}, 0
-            for t in used:
+            template_text, mismatched, how_chosen = {}, 0, Counter()
+            if used & {"Head:", "Tail:"}:
+                (head, tail), head_tail = head_tail_labels(h, p, machine)
+                template_text.update({k: v for k, v in (("Head:", head), ("Tail:", tail)) if k in used})
+            for t in used - {"Head:", "Tail:"}:
                 if t in phrasing:
                     fitting, ok = variants_for(register, phrasing[t])
-                    template_text[t] = choose_variant(h, p, t, fitting)
                     mismatched += not ok
+                    lexical = lexical_choice(fitting, machine) if len(fitting) > 1 else None
+                    template_text[t] = lexical or choose_variant(h, p, t, fitting)
+                    if len(fitting) > 1:
+                        how_chosen["lexical" if lexical else "seeded"] += 1
                 else:
                     template_text[t] = translation[template_segments[t]]
             bad = [failed[v] for kind, v in instruction + answer if kind == "S" and v in failed] + \
@@ -1056,6 +1100,9 @@ def assemble(args):
             if used:
                 register_rows[f"{register} ({how})"] += 1
                 register_rows["rows with a variant outside the register"] += mismatched > 0
+                decided.update(how_chosen)
+            if used & {"Head:", "Tail:"}:
+                head_tail_rows[f"{template_text.get('Head:', '-')} {template_text.get('Tail:', '-')} ({head_tail})"] += 1
         for key, value in (("position", p), ("source", columns["source"][k]), ("inputs", out[0]), ("targets", out[1])):
             rows[h][key].append(value)
     for h in range(args.world):
@@ -1063,7 +1110,8 @@ def assemble(args):
     summary = {"segments": len(ids), "segments_repaired": dict(repaired), "segments_unusable": dict(Counter(failed.values())),
                "hosts": {h: dict(sorted(report[h].items())) for h in range(args.world)},
                "template_variants": {t: dict(c.most_common()) for t, c in variant_rows.items()},
-               "template_registers": dict(register_rows)}
+               "template_registers": dict(register_rows), "head_tail_pairs": dict(head_tail_rows.most_common()),
+               "variant_decisions": dict(decided)}
     json.dump(summary, open(f"{args.out}/report.json", "w"), indent=1, ensure_ascii=False)
     print(f"ASSEMBLE {json.dumps(summary)}", flush=True)
 

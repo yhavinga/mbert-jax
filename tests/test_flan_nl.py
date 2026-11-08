@@ -422,3 +422,32 @@ def test_tail_after_sep_is_protected_and_extra_keys_load(tmp_path):
     (tmp_path / "table.json").write_text('{"Q:": ["Vraag:"], "Given the question:": ["Gegeven de vraag:"]}')
     keys = fn.load_templates([tmp_path / "top.json", tmp_path / "extra.json", tmp_path / "table.json"])
     assert keys == ("Given the question:", "Head:", "Tail:", "Q:")
+
+
+def test_head_and_tail_labels_follow_the_terms_of_the_translation():
+    def labels(text, position=0):
+        return fn.head_tail_labels(0, position, text)
+
+    assert labels("U krijgt een beginzin en een eindzin, gescheiden door <sep>.") == (("Beginzin:", "Eindzin:"), "beginzin/eindzin")
+    assert labels("Een inleidende zin en een afsluitende zin.")[0] == ("Inleidende zin:", "Afsluitende zin:")
+    assert labels("De kop en de staart van de gebeurtenis.")[0] == ("Kop:", "Staart:")
+    assert labels("U krijgt 'Head' en 'Tail'.")[0] == ("Head:", "Tail:")
+    assert labels("Het begin en het einde.")[0] == ("Begin:", "Einde:")
+    # Beginzin does not count as begin
+    assert labels("Een beginzin, en het einde.")[1] == "hash"
+    fallback = {labels("Geen paar hier.", p)[0] for p in range(50)}
+    assert fallback == {("Beginzin:", "Eindzin:"), ("Kop:", "Staart:")}
+    assert "Head and Tail, separated with <sep>." not in fn.load_templates([])
+
+
+def test_a_variant_named_by_the_translation_wins():
+    assert fn.lexical_choice(["Context:", "Achtergrond:"], "Lees de achtergrond en beantwoord de vraag.") == "Achtergrond:"
+    assert fn.lexical_choice(["Tekst:", "Tekstfragment:"], "Een tekstfragment uit een tekst.") is None
+    assert fn.lexical_choice(["Opties:", "Antwoordmogelijkheden:"], "Kies een antwoord.") is None
+    assert fn.lexical_choice(["Probleem:", "Opdracht:"], "In deze opdracht krijgt u een zin.") == "Opdracht:"
+
+
+def test_the_table_may_hold_an_unprotected_key(tmp_path):
+    path = tmp_path / "t.json"
+    path.write_text('{"Head and Tail, separated with <sep>.": ["Beginzin en eindzin, gescheiden door <sep>."], "Q:": ["V:"]}')
+    assert set(fn.read_phrasing_table(path, {"Q:"})) == {"Q:", "Head and Tail, separated with <sep>."}

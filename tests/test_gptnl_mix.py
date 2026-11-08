@@ -68,12 +68,14 @@ def _world(tmp_path, monkeypatch):
     gptnl[fourth][0] = (culturax[gptnl_mix.culturax_path(5)][3], "nl")
     for folder in gptnl_mix.EXCLUDED:
         gptnl[f"{folder}/{folder}_0001.parquet"] = [("an English text", "en")] * 5
-    for path, rows in gptnl.items():
+    for k, (path, rows) in enumerate(gptnl.items()):
         target = hub / "gptnl" / path
         target.parent.mkdir(parents=True, exist_ok=True)
-        pq.write_table(pa.table({"id": [f"{path}#{i}" for i in range(len(rows))], "text": [t for t, _ in rows],
-                                 "language": [lang for _, lang in rows], "license": ["cc-by"] * (len(rows) - 1) + ["public-domain"]}),
-                       target)
+        columns = {"id": [f"{path}#{i}" for i in range(len(rows))], "text": [t for t, _ in rows],
+                   "language": [lang for _, lang in rows], "license": ["cc-by"] * (len(rows) - 1) + ["public-domain"]}
+        # The order of the columns differs between GPT-NL's files
+        order = ["id", "text", "language", "license"] if k % 2 else ["language", "license", "id", "text"]
+        pq.write_table(pa.table({name: columns[name] for name in order}), target)
     counts = tmp_path / "cx_counts"
     counts.mkdir()
     (tmp_path / "cx_lengths").mkdir()
@@ -340,7 +342,8 @@ def test_a_second_mix_keeps_what_is_written_and_a_source_out_of_line_with_the_pl
     for path in world.gptnl:
         table = pq.read_table(tmp_path / "hub" / "gptnl" / path)
         texts = table.column("text").to_pylist()
-        pq.write_table(table.set_column(1, "text", pa.array([t + " extra" for t in texts])), tmp_path / "hub" / "gptnl" / path)
+        pq.write_table(table.set_column(table.schema.get_field_index("text"), "text", pa.array([t + " extra" for t in texts])),
+                       tmp_path / "hub" / "gptnl" / path)
     with pytest.raises(ValueError, match="bytes, the plan"):
         _mix(tmp_path, 2, out="share2b")
     assert not list((tmp_path / "share2b").glob("*.parquet")), "a share file was written from a source out of line"

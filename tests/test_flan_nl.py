@@ -159,6 +159,8 @@ def test_generic_checks_of_a_translation():
                                 True, dutch) == "commentary"
     assert fn.check_translation("cabin", "hut; cabine", True, dutch) == "alternatives"
     assert fn.check_translation("Counselor", "Begeleider/adviseur", True, dutch) == "alternatives"
+    assert fn.check_translation("elderly", "ouder\nbejaard\nsenior", True, dutch) == "alternatives"
+    assert fn.check_translation("Answer:\nyes", "Antwoord:\nja", True, dutch) is None
     assert fn.check_translation("Not similar", "Niet vergelijkbaarक", True, dutch) == "foreign_script"
     assert fn.check_translation("Dood Ari - Part 1", "Dood Ari – Deel 1", True, dutch) is None
 

@@ -460,9 +460,10 @@ def check_translation(source, output, ended, identify_language):
     if match and not _COMMENTARY.search(source) and "translat" not in source.lower():
         return "commentary"
     # Several translations offered instead of one ("niet overweg kunnen met / geen goede band met", "hut; cabine",
-    # "Begeleider/adviseur", pilot of 8 Nov)
-    if (" / " in output and "/" not in source) or \
-            (len(source.split()) <= 4 and any(c in output and c not in source for c in ";/")):
+    # "Begeleider/adviseur", and for single words a list of one per line: "ouder\nbejaard\nsenior\n...", 8 Nov)
+    short = len(source.split()) <= 4
+    if (" / " in output and "/" not in source) or (short and any(c in output and c not in source for c in ";/")) or \
+            (short and "\n" not in source and "\n" in output.strip()):
         return "alternatives"
     if _foreign_script(source, output):
         return "foreign_script"

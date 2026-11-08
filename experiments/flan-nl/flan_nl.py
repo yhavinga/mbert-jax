@@ -585,6 +585,31 @@ def plan(args):
     print(f"PLAN {json.dumps(summary)}", flush=True)
 
 
+def sample(args):
+    """A plan of N random examples to translate, with all their segments, for the pilot on one worker."""
+    import random
+
+    import pyarrow as pa
+    import pyarrow.compute as pc
+    import pyarrow.parquet as pq
+
+    examples = _read_parquet(f"{args.plan}/examples.parquet")
+    examples = examples.filter(pc.equal(examples.column("status"), "translate"))
+    chosen = sorted(random.Random(args.seed).sample(range(examples.num_rows), args.n))
+    examples = examples.take(chosen)
+    needed = {v for column in ("instruction", "answer") for pieces in examples.column(column).to_pylist()
+              for kind, v in json.loads(pieces) if kind == "S"}
+    parts = []
+    for worker in range(args.world):
+        table = _read_parquet(f"{args.plan}/segments-w{worker}.parquet")
+        parts.append(table.filter(pc.is_in(table.column("id"), pa.array(sorted(needed), pa.int64()))))
+    segments = pa.concat_tables(parts).sort_by("id")
+    pq.write_table(examples, f"{args.out}/examples.parquet", compression="zstd")
+    pq.write_table(segments, f"{args.out}/segments-w0.parquet", compression="zstd")
+    print(f"sample: {examples.num_rows} examples, {segments.num_rows} segments, "
+          f"{sum(segments.column('tokens').to_pylist()):,} tokens -> {args.out}", flush=True)
+
+
 def _identify(texts):
     import langid
     langid.set_languages(LANGID_LANGUAGES)
@@ -689,6 +714,12 @@ def main(argv=None):
     p.add_argument("--out", required=True)
     p.add_argument("--world", type=int, default=4)
     p.add_argument("--processes", type=int, default=64)
+    p = sub.add_parser("sample", help="a plan of N random examples, for the pilot")
+    p.add_argument("--plan", required=True)
+    p.add_argument("--out", required=True)
+    p.add_argument("--n", type=int, default=300)
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--world", type=int, default=4)
     p = sub.add_parser("assemble", help="the translations back into examples")
     p.add_argument("--english", nargs="+", required=True)
     p.add_argument("--plan", required=True)
@@ -697,7 +728,7 @@ def main(argv=None):
     p.add_argument("--world", type=int, default=4)
     p.add_argument("--processes", type=int, default=64)
     args = parser.parse_args(argv)
-    {"extract": extract, "plan": plan, "assemble": assemble}[args.step](args)
+    {"extract": extract, "plan": plan, "sample": sample, "assemble": assemble}[args.step](args)
 
 
 if __name__ == "__main__":

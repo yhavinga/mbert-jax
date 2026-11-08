@@ -594,7 +594,8 @@ def cmd_mix(args) -> None:
     selection = Path(args.selection).expanduser()
     if sha256(selection) != share["sha256"]:
         raise ValueError(f"{selection} is not the selection of the plan ({share['selection']}, sha256 {share['sha256']})")
-    s = np.load(selection)
+    # Each item of an NpzFile is read from the file again, and a slice keeps its own copy alive: read them once
+    s = dict(np.load(selection))
     pos = s["pos"]
     documents = len(pos)
     if documents != share["documents"] or not (np.sort(pos) == np.arange(documents)).all():

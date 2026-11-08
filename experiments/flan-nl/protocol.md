@@ -40,11 +40,17 @@ through the trainer's route, and its web rows are checked to be F's byte for byt
 
 The translation (`flan_nl.py`, `translate.py`):
 
-- Model: TranslateGemma 27B (`google/translategemma-27b-it` at revision `7d10f0b72f89a2d0f268cea30727d8b77c0d25c2`),
-  its language model converted to MaxText 0.2.5 (`convert.py`), run by MaxText's `OfflineEngine` on the 4 chips of
-  each host, greedy decoding, a stop at `<end_of_turn>` or `<eos>`. 12B
-  (`google/translategemma-12b-it` at `d1b225e1caa17f1ddc7e62065d8637d0923f34e2`) only if 27B is too slow; the model
-  used is recorded under "Amendments" before F-nl starts.
+- Model: TranslateGemma 12B (`google/translategemma-12b-it` at revision `d1b225e1caa17f1ddc7e62065d8637d0923f34e2`),
+  its language model converted to MaxText 0.2.5 (`convert.py`), run by MaxText's `MaxEngine` (prefill, insert,
+  generate) with continuous batching of our own (`decode_all` in `translate.py`) on the 4 chips of each host, greedy
+  decoding, a stop at `<end_of_turn>` or `<eos>`, four length classes of segments with their own cache shapes.
+  27B (`google/translategemma-27b-it` at `7d10f0b72f89a2d0f268cea30727d8b77c0d25c2`, en-nl MetricX 1.67 against 2.01
+  for 12B in the TranslateGemma report) was the first choice, to be used if its projected run on the 4 workers was at
+  most 10 hours. Measured on a v4 host on 8 Nov: 27B 53 ms per decode step at 160 slots x 576 and 38 ms per prefill of
+  256 tokens; 12B 38 ms at 256 x 512, 34 ms at 96 x 1,472, 18.5 ms per prefill of 256 tokens. Over the 1.81 M distinct
+  segments (220 M source tokens, ~55 M per worker) that projects to ~18 hours for 27B and ~9 hours for 12B, so 12B.
+  The 27B pilot of 300 examples (quality) and its measurements stay in `gs://t5-dutch-english-usc2/mbert/flan-nl/pilot/`
+  and `out/27b/`; the 12B pilot is in `pilot/out/12b/` and `pilot/nl12b/`.
 - Prompt: the model's chat template, a user turn `{type: text, source_lang_code: en, target_lang_code: nl, text}`.
 - Segments: the instruction and the answer are translated, each distinct string once (yes/no and the like repeat).
   Multiple-choice options (labelled lists A/B/C, a/b/c, 1/2/3, i/ii/iii, `Option1:`, and bullet lists after a header
@@ -60,12 +66,17 @@ The translation (`flan_nl.py`, `translate.py`):
 - The six Dutch NIv2 tasks of F's pool (`task1133`, `task409`, `task1543`-`task1546`) have Dutch text with an English
   task definition; they stay as in F.
 - Examples left out: an answer that is a whole-word stretch of the English instruction (case and spacing aside) while
-  its translation is not one of the Dutch instruction (extractive QA); a segment whose translation did not end
-  (decode limit), is empty, has an implausible length (outside 0.5-2.2 times the source's characters from 30
-  characters on, or more than 3 times plus 30), carries commentary instead of a translation, or is not Dutch
-  (`langid` 1.1.6 over nl, en, de, fr, es, it, pt, af, from 5 words on; nl and af count as Dutch); a sentence of
-  more than 512 tokens; a Dutch example of more than 1,024 tokens as the trainer counts them. Every count is in the
-  plan (`plan/plan.json`), the assembly (`nl/report.json`) and the mix manifests (`mix/w<N>.json`).
+  its translation is not one of the Dutch instruction (extractive QA; typographic quotes and dashes count as plain
+  ones); a segment whose translation did not end (decode limit), is empty, has an implausible length (outside
+  0.5-2.2 times the source's characters from 30 characters on, or more than 3 times plus 30), carries a translator's
+  commentary ("Hier is de vertaling", "Vertaling:", "(Opmerking: ...", ...), offers alternatives (" / ", or ";" and
+  "/" after a source of at most 4 words), has letters of a script the source does not have (Devanagari, CJK, Cyrillic,
+  ...), or is not Dutch (`langid` 1.1.6 over nl, en, de, fr, es, it, pt, af says neither nl nor af, from 5 words on,
+  and the output has English function words in it: names and short Dutch alone fooled `langid` in the pilot); a
+  sentence of more than 512 tokens; a Dutch example of more than 1,024 tokens as the trainer counts them. One repair,
+  counted: the Devanagari danda that TranslateGemma now and then writes for a period becomes the period (or nothing
+  where the source ends without one). Every count is in the plan (`plan/plan.json`), the assembly (`nl/report.json`)
+  and the mix manifests (`mix/w<N>.json`).
 - No DBRD or SICK-NL data: the pool is F's, which excludes the SICK tasks and any task named after SICK, DBRD,
   Belebele or FLORES.
 

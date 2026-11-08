@@ -23,8 +23,13 @@ gsutil -m cp experiments/flan-nl/*.sh experiments/flan-nl/*.py experiments/flan-
 # The HF token is there from F's setup (flan-decay/commands.txt, step 1).
 $SSH --worker=all --command "mkdir -p $CODE ~/logs && gsutil -q cp '$B/*' $CODE/ && W=\$(hostname | sed 's/.*-w-//') && ARG= && { [ \$W = 0 ] && ARG=convert || true; } && (setsid nohup bash -c \"bash $CODE/setup.sh \$ARG > ~/logs/flan_nl_setup.log 2>&1; echo EXIT \\\$? >> ~/logs/flan_nl_setup.log\" > /dev/null 2>&1 < /dev/null &)" < /dev/null
 $SSH --worker=all --command 'tail -n 2 ~/logs/flan_nl_setup.log' < /dev/null
-# The safetensors on worker 0 are not needed after the conversion (52 GB of RAM):
+# 12B, the model of the run (protocol.md, "Data of F-nl"): its conversion on worker 3 into $R/translategemma-12b-maxtext,
+# and its tokenizer on every worker (the same tokenizer and template as 27B's)
+$SSH --worker=3 --command "(MODEL=12b setsid nohup bash -c 'bash $CODE/setup.sh convert > ~/logs/flan_nl_setup12b.log 2>&1; echo EXIT \$? >> ~/logs/flan_nl_setup12b.log' > /dev/null 2>&1 < /dev/null &)" < /dev/null
+$SSH --worker=all --command "MODEL=12b bash $CODE/setup.sh" < /dev/null
+# The safetensors are not needed after the conversions (52 and 24 GB of RAM):
 $SSH --worker=0 --command 'rm -f /dev/shm/flan_nl/hf-27b/*.safetensors' < /dev/null
+$SSH --worker=3 --command 'rm -f /dev/shm/flan_nl/hf-12b/*.safetensors' < /dev/null
 
 # 2. The FLAN rows of F's mix of every host (seconds): $R/en/w<N>.parquet
 $SSH --worker=all --command "W=\$(hostname | sed 's/.*-w-//') && $VENV $CODE/flan_nl.py extract --rank \$W --list ~/flan_decay_files.txt --out /dev/shm/flan_nl/en-w\$W.parquet && gsutil -q cp /dev/shm/flan_nl/en-w\$W.parquet $R/en/w\$W.parquet" < /dev/null
@@ -33,20 +38,24 @@ $SSH --worker=all --command "W=\$(hostname | sed 's/.*-w-//') && $VENV $CODE/fla
 $SSH --worker=0 --command "mkdir -p /dev/shm/flan_nl/plan /dev/shm/flan_nl/en && for w in 0 1 2 3; do gsutil -q cp $R/en/w\$w.parquet /dev/shm/flan_nl/en/w\$w.parquet; done && TOKENIZERS_PARALLELISM=false $VENV -u $CODE/flan_nl.py plan --english /dev/shm/flan_nl/en/w{0,1,2,3}.parquet --tokenizer /dev/shm/flan_nl/tokenizer-27b --out /dev/shm/flan_nl/plan --processes 96 > ~/logs/flan_nl_plan.log 2>&1; echo EXIT \$? >> ~/logs/flan_nl_plan.log; gsutil -m -q cp /dev/shm/flan_nl/plan/* $R/plan/" < /dev/null
 gsutil cat $R/plan/plan.json
 
-# 4. Pilot on worker 0: 300 random examples to translate (seed 0), translated, assembled, 15 pairs shown
-$SSH --worker=0 --command "mkdir -p /dev/shm/flan_nl/pilot && $VENV $CODE/flan_nl.py sample --plan /dev/shm/flan_nl/plan --out /dev/shm/flan_nl/pilot --n 300 --seed 0 && gsutil -m -q cp /dev/shm/flan_nl/pilot/* $R/pilot/ && SEGMENTS=$R/pilot/segments-w0.parquet OUT=$R/pilot/out/27b/w0 NAME=flan_nl_pilot bash $CODE/translate.sh" < /dev/null
-$SSH --worker=0 --command "grep -a '^SHARD\|^DONE\|^EXIT\|Error' ~/logs/flan_nl_pilot.log" < /dev/null
-$SSH --worker=0 --command "mkdir -p /dev/shm/flan_nl/pilot/nl /dev/shm/flan_nl/pilot/out && gsutil -m -q rsync -r $R/pilot/out/27b /dev/shm/flan_nl/pilot/out && $VENV $CODE/flan_nl.py assemble --english /dev/shm/flan_nl/en/w{0,1,2,3}.parquet --plan /dev/shm/flan_nl/pilot --translations /dev/shm/flan_nl/pilot/out --out /dev/shm/flan_nl/pilot/nl --processes 8 && gsutil -m -q cp -r /dev/shm/flan_nl/pilot/nl $R/pilot/" < /dev/null
+# 4. Pilot: 300 random examples to translate (seed 0), translated, assembled. 27B first (on worker 0, $R/pilot/out/27b,
+# $R/pilot/nl), then 12B, the model of the run (on worker 2, $R/pilot/out/12b, $R/pilot/nl12b). Throughput per class:
+# the SHARD lines of the logs; the first shards of the run are a random sample of each class (translate.py).
+$SSH --worker=0 --command "mkdir -p /dev/shm/flan_nl/pilot && $VENV $CODE/flan_nl.py sample --plan /dev/shm/flan_nl/plan --out /dev/shm/flan_nl/pilot --n 300 --seed 0 && gsutil -m -q cp /dev/shm/flan_nl/pilot/* $R/pilot/" < /dev/null
+$SSH --worker=2 --command "SEGMENTS=$R/pilot/segments-w0.parquet OUT=$R/pilot/out/12b/w0 NAME=flan_nl_pilot12 bash $CODE/translate.sh" < /dev/null
+$SSH --worker=2 --command "grep -a '^SHARD\|^DONE\|^EXIT\|Error' ~/logs/flan_nl_pilot12.log" < /dev/null
+$SSH --worker=2 --command "mkdir -p /dev/shm/flan_nl/pilot/nl12b /dev/shm/flan_nl/pilot/out12b && gsutil -q cp '$R/plan/*' /dev/shm/flan_nl/plan/ && gsutil -m -q cp $R/en/w0.parquet $R/en/w1.parquet $R/en/w2.parquet $R/en/w3.parquet /dev/shm/flan_nl/en/ && gsutil -m -q cp $R/pilot/examples.parquet $R/pilot/segments-w0.parquet /dev/shm/flan_nl/pilot/ && gsutil -m -q rsync -r $R/pilot/out/12b /dev/shm/flan_nl/pilot/out12b && $VENV $CODE/flan_nl.py assemble --english /dev/shm/flan_nl/en/w{0,1,2,3}.parquet --plan /dev/shm/flan_nl/pilot --translations /dev/shm/flan_nl/pilot/out12b --out /dev/shm/flan_nl/pilot/nl12b --processes 8 && gsutil -m -q cp -r /dev/shm/flan_nl/pilot/nl12b $R/pilot/" < /dev/null
 
-# 5. The full translation, every worker its quarter, the short class then the long one (shards in $R/out/27b/w<N>/<class>/).
+# 5. The full translation with 12B, every worker its quarter, class after class (tiny, small, medium, long; shards in
+# $R/translations/12b/w<N>/<class>/; ~9 hours estimated).
 # The same command resumes after a crash or a reboot (after step 1 again): stored shards are skipped.
 $SSH --worker=all --command "bash $CODE/translate.sh" < /dev/null
 # Progress and the end (each log ends in EXIT 0):
 $SSH --worker=all --command "grep -a '^SHARD' ~/logs/flan_nl_translate.log | tail -n 1; grep -a '^DONE\|^EXIT\|Error' ~/logs/flan_nl_translate.log" < /dev/null
-for w in 0 1 2 3; do echo w$w $(gsutil ls $R/out/27b/w$w/short/ | wc -l) $(gsutil ls $R/out/27b/w$w/long/ | wc -l); done
+for w in 0 1 2 3; do echo w$w $(for c in tiny small medium long; do gsutil ls $R/translations/12b/w$w/$c/ 2>/dev/null | wc -l; done); done   # of 39, 37, 20 and 17 shards
 
 # 6. Assembly on worker 0 (~10 minutes): the Dutch rows of every host and what was dropped why -> $R/nl/
-$SSH --worker=0 --command "mkdir -p /dev/shm/flan_nl/out /dev/shm/flan_nl/nl && gsutil -m -q rsync -r $R/out/27b /dev/shm/flan_nl/out && $VENV -u $CODE/flan_nl.py assemble --english /dev/shm/flan_nl/en/w{0,1,2,3}.parquet --plan /dev/shm/flan_nl/plan --translations /dev/shm/flan_nl/out --out /dev/shm/flan_nl/nl --processes 96 > ~/logs/flan_nl_assemble.log 2>&1; echo EXIT \$? >> ~/logs/flan_nl_assemble.log; gsutil -m -q cp /dev/shm/flan_nl/nl/* $R/nl/" < /dev/null
+$SSH --worker=0 --command "mkdir -p /dev/shm/flan_nl/out /dev/shm/flan_nl/nl && gsutil -m -q rsync -r $R/translations/12b /dev/shm/flan_nl/out && $VENV -u $CODE/flan_nl.py assemble --english /dev/shm/flan_nl/en/w{0,1,2,3}.parquet --plan /dev/shm/flan_nl/plan --translations /dev/shm/flan_nl/out --out /dev/shm/flan_nl/nl --processes 96 > ~/logs/flan_nl_assemble.log 2>&1; echo EXIT \$? >> ~/logs/flan_nl_assemble.log; gsutil -m -q cp /dev/shm/flan_nl/nl/* $R/nl/" < /dev/null
 gsutil cat $R/nl/report.json
 
 # 7. The Dutch mix of every host (CPU, the trainer's venv; ~20 minutes): ~/flan_decay_nl/mix-<build>.parquet,

@@ -1,0 +1,56 @@
+# culturax-gptnl-nl-230m-chunk1024, arm G of protocol.md: 30% GPT-NL Public Corpus (its originally Dutch collections,
+# their documents in nl) and 70% CulturaX nl in tokens, the command of culturax-nl-230m-chunk1024 to step 300,000, on
+# mbert-mix (v4-32, us-central2-b, 4 workers). From /Users/yeb/Developer/yhavinga/hammond. Data code: branch gptnl-mix of
+# github.com/yhavinga/mbert-jax (COUNT for step 1, PLAN for step 2, COMMIT, which has the plan, for step 3). Trainer: ~/mbert-jax on
+# mbert-mix at 0d92db4, that of fineweb2-nl-230m-chunk1024 and -rh3. Scripts: $S (copies of experiments/gptnl/).
+# Steps 1 to 3 run on the CPUs of the workers next to a trainer (nice 19, idle I/O class, the trainer's venv, no jax
+# import), each detached with its log in ~/logs/gptnl_<step>.log ending in "EXIT <code>", copied to $G/logs/.
+COUNT=f855872f611e4cd2eddc39aee16b0e86e8dd2a86
+PLAN=d3a85eeb58b977a2520c344fcdfb58c83d976f99
+COMMIT=7fb2392f17968411afce2a1dd367ca34532f056e
+S=gs://t5-dutch-english-usc2/mbert/gptnl/scripts
+G=gs://t5-dutch-english-usc2/mbert/gptnl
+R=gs://t5-dutch-english-usc2/mbert/culturax-gptnl-nl-230m-chunk1024
+
+# 1. Token counts of the 530 parquet files of the included collections, each worker its part (the largest first, to
+# the worker with the fewest bytes), read by range requests; first the tokenization is checked against count_tokens.py
+# on 2,000 documents of CulturaX nl_part_00000. A second run skips the files in $G/lengths.
+# Done on 8 Nov, 10:45-11:17 UTC: started with WORKERS=16, stopped at 10:48 (pkill -s of its own session) as the
+# trainer's step time rose 5-8%, and continued with WORKERS=8: 27 minutes, the trainer 2.3% slower (protocol.md,
+# "The shares"). 14,701,839 documents, 33,083,747,516 tokens.
+gcloud compute tpus tpu-vm ssh mbert-mix --zone us-central2-b --worker=all --quiet --command="gsutil -q cp $S/prepare_gptnl.sh ~/ && WORKERS=8 COMMIT=$COUNT bash ~/prepare_gptnl.sh count" < /dev/null
+# Ready when each ~/logs/gptnl_count.log ends in EXIT 0 and gsutil ls $G/lengths | wc -l says 530.
+# Smoke test of two files on one worker: --worker=0 --command="... && MAX_FILES=2 WORKERS=2 COMMIT=$COUNT bash ~/prepare_gptnl.sh count"
+
+# 2. The plan, on worker 0 only: from $G/lengths, CulturaX's counts of count_tokens.py and ~/heldout.parquet, the
+# selections cxgptnl-w<N>.npz and cxgptnl_plan.json to $G/plan/. Deterministic (seed 42). Done 11:19-11:22, after a
+# first start at e8fdfa7 had stopped on its check of the CulturaX split (fixed in PLAN).
+gcloud compute tpus tpu-vm ssh mbert-mix --zone us-central2-b --worker=0 --quiet --command="gsutil -q cp $S/prepare_gptnl.sh ~/ && COMMIT=$PLAN bash ~/prepare_gptnl.sh plan" < /dev/null
+# Then, here: gsutil cp $G/plan/cxgptnl_plan.json experiments/gptnl/ in the checkout, commit (= COMMIT) and push.
+
+# 3. The shares, every worker: its documents read by range requests into /dev/shm/gptnl_work/spill, then 64 files in
+# ~/cxgptnl_nl, listed in ~/cxgptnl_nl_files.txt; the summary to $G/shares/cxgptnl-w<N>.json. A second run keeps the
+# spills and share files written with the planned rows. Done 11:23-11:35 (12 minutes per host; 13.5 GB per host,
+# 15-16 GB of the disk free afterwards), then checked independently (protocol.md, "The shares").
+gcloud compute tpus tpu-vm ssh mbert-mix --zone us-central2-b --worker=all --quiet --command="gsutil -q cp $S/prepare_gptnl.sh ~/ && COMMIT=$COMMIT bash ~/prepare_gptnl.sh mix" < /dev/null
+# Ready when each ~/logs/gptnl_mix.log ends in EXIT 0; the shares: gsutil cat $G/shares/cxgptnl-w*.json
+# Afterwards the temporary files (spills, inputs of step 2, the hashes of the check), on every worker:
+#   rm -r /dev/shm/gptnl_work /dev/shm/gptnl_verify
+
+# 4. The check of the start script (done on 8 Nov, protocol.md "What differs between G and X"): the run script it
+# writes, against culturax-nl-230m-chunk1024's, with G's 4 differences undone. No output means byte-identical.
+bash -c 'diff <(gsutil cat gs://t5-dutch-english-usc2/mbert/gptnl/scripts/start_cxgptnl.sh | PRINT_RUN_SCRIPT=1 bash | sed -e "s/culturax-gptnl-nl-230m-chunk1024/culturax-nl-230m-chunk1024/g" -e "s/--dataset-num-rows [0-9]*/--dataset-num-rows 117392666/" -e "s/ --stop-at-step 300000//" -e "s/cxgptnl_nl_files.txt/culturax_nl_files.txt/") <(gsutil cat gs://t5-dutch-english-usc2/mbert/culturax-nl-230m-chunk1024/scripts/run_culturax-nl-230m-chunk1024.sh)'
+
+# 5. Start, when ~/logs/fineweb2-nl-230m-chunk1024-rh3.exit says EXIT 0 on all workers (and R's step 300,000 is in its
+# ckpt_keep/). The script refuses while a trainer, a fine-tune or gptnl_mix.py runs. A preemption or maintenance event:
+# the same command resumes from the last checkpoint (every 10,000 steps, as X) and data state.
+gcloud compute tpus tpu-vm ssh mbert-mix --zone us-central2-b --worker=all --quiet --command="gsutil -q cp $S/start_cxgptnl.sh ~/ && bash ~/start_cxgptnl.sh" < /dev/null
+# Progress: gsutil cat $R/logs/w<N>.log | grep -ao "^Step.*\|EVAL step=.*" | tail   (process_0 may be any worker)
+# 300,000 steps at ~0.23 s (R on this VM, checkpoints and evals included): ~19-20 hours.
+# Per host what training got: grep -a "^DATA" in that log at the end; ~/logs/culturax-gptnl-nl-230m-chunk1024.exit has EXIT 0.
+# Smoke test, only on a free TPU and with another run name: RUN=cxgptnl-smoke STOP_AT=60 CHECKPOINT_EVERY=30 EVAL_EVERY=30
+# bash ~/start_cxgptnl.sh, then delete gs://t5-dutch-english-usc2/mbert/cxgptnl-smoke/ by its literal path.
+
+# 6. DUMB of $R/ckpt/300000 (copy it to $R/ckpt_keep/ first: the trainer keeps the last 3 checkpoints), the fixed
+# protocol as for X (protocol.md, "Evaluation"); results gs://t5-dutch-english-usc2/mbert/masking/dumb/cxgptnl-300000--{dbrd,sicknl}--seed{42,43,44}.json.
+gsutil -m cp -r $R/ckpt/300000 $R/ckpt_keep/

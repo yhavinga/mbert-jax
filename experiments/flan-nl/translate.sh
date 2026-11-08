@@ -1,22 +1,22 @@
 #!/bin/bash
 # On every worker of mbert-corpus (after setup.sh and the plan of commands.txt): this worker's segments through
-# TranslateGemma, the short length class and then the long one, detached from ssh, each worker a TPU of its own 4 chips.
+# TranslateGemma, length class after length class (translate.py), detached from ssh, each worker a TPU of its own 4 chips.
 #   bash translate.sh
 # Log: ~/logs/flan_nl_translate.log, a fresh file per start that ends in "EXIT <code>"; a copy goes to $ROOT/logs/.
 # Shards land in $OUT/<class>/; a second start skips every shard that is there.
-# Environment overrides: MODEL (27b or 12b), SEGMENTS, OUT, CLASSES, EXTRA (more flags, e.g. "--max-shards 1"), NAME
-# (of the log, for the pilot).
+# Environment overrides: MODEL (12b, the model of the run, or 27b), SEGMENTS, OUT, CLASSES, EXTRA (more flags, e.g.
+# "--max-shards 1"), NAME (of the log, for the pilot and the measurements).
 set -euo pipefail
 ROOT=gs://t5-dutch-english-usc2/mbert/flan-nl
-MODEL=${MODEL:-27b}
+MODEL=${MODEL:-12b}
 CKPT=$ROOT/translategemma-$MODEL-maxtext
 SHM=/dev/shm/flan_nl
 PY=$SHM/venv/bin/python
 CODE=$(cd "$(dirname "$0")" && pwd)
 WORKER=$(hostname | sed 's/.*-w-//')
 SEGMENTS=${SEGMENTS:-$ROOT/plan/segments-w$WORKER.parquet}
-OUT=${OUT:-$ROOT/out/$MODEL/w$WORKER}
-CLASSES=${CLASSES:-short long}
+OUT=${OUT:-$ROOT/translations/$MODEL/w$WORKER}
+CLASSES=${CLASSES:-tiny small medium long}
 EXTRA=${EXTRA:-}
 NAME=${NAME:-flan_nl_translate}
 

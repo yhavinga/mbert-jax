@@ -3,7 +3,7 @@
 
 Usage (translate.sh, on each worker, as a TPU of its own 4 chips):
     python translate.py --segments <plan>/segments-w0.parquet --out gs://.../out/w0 --ckpt gs://.../0/items \\
-        --tokenizer /dev/shm/flan_nl/tokenizer-27b --length-class short
+        --tokenizer /dev/shm/flan_nl/tokenizer-12b --model gemma3-12b --length-class small
 
 The model is MaxText's gemma3 with the converted checkpoint in MaxText's MaxEngine: a KV cache of fixed shape
 (slots x max_target_length), prompts padded to a few prefill lengths, continuous batching over the slots (decode_all),
@@ -29,13 +29,23 @@ from pathlib import Path
 
 import numpy as np
 
-# The engine's shapes per length class: the longest source segment (tokens), the prefill lengths a prompt is padded
-# to (the template adds ~70 tokens), the decode limit, and the slots. Slots x (prefill + decode) is the KV cache:
-# ~0.5 MB per token for the 27B (62 layers, 16 KV heads of 128, bf16), ~48 GB of the host's 128 GB next to the 54 GB
-# of weights.
+# The engine's shapes per length class: the longest source segment (tokens; the class takes those above the class
+# before it), the prefill lengths a prompt is padded to (the template adds ~70 tokens), and the decode limit. A step
+# attends over the whole cache of every slot, prefill and decode part, so its cost grows with prefill + decode (8 Nov
+# on a v4 host, 12B: 38 ms at 256 slots x 512): the classes keep that length close to what their segments need.
 LENGTH_CLASSES = {
-    "short": {"max_source": 128, "prefill_lengths": [128, 256], "max_decode": 320, "slots": 160},
-    "long": {"max_source": 512, "prefill_lengths": [256, 384, 512, 640], "max_decode": 832, "slots": 64},
+    "tiny": {"max_source": 32, "prefill_lengths": [128], "max_decode": 96},
+    "small": {"max_source": 128, "prefill_lengths": [128, 256], "max_decode": 256},
+    "medium": {"max_source": 256, "prefill_lengths": [256, 384], "max_decode": 448},
+    "long": {"max_source": 512, "prefill_lengths": [384, 512, 640], "max_decode": 832},
+}
+CLASS_ORDER = ["tiny", "small", "medium", "long"]
+# Slots per class: slots x (prefill + decode) x the KV of a token in bf16 (12B: 48 layers x 8 heads x 256 x 2 x 2 =
+# 0.39 MB; 27B: 62 x 16 x 128 x 2 x 2 = 0.51 MB) within ~75 GB (12B) or ~48 GB (27B) of the host's 4 x 30.7 GiB, next
+# to the weights (24 and 54 GB)
+SLOTS = {
+    "gemma3-12b": {"tiny": 512, "small": 320, "medium": 224, "long": 128},
+    "gemma3-27b": {"tiny": 320, "small": 160, "medium": 112, "long": 64},
 }
 # generation_config.json of TranslateGemma: <eos> and <end_of_turn>
 EOS_IDS = [1, 106]
@@ -260,7 +270,7 @@ def main(argv=None):
     parser.add_argument("--out", required=True, help="Bucket directory of this worker's shards of this length class")
     parser.add_argument("--ckpt", required=True, help="The MaxText parameters, <checkpoint>/0/items")
     parser.add_argument("--tokenizer", required=True, help="TranslateGemma's tokenizer directory")
-    parser.add_argument("--model", default="gemma3-27b", choices=["gemma3-27b", "gemma3-12b"])
+    parser.add_argument("--model", default="gemma3-12b", choices=sorted(SLOTS))
     parser.add_argument("--length-class", required=True, choices=sorted(LENGTH_CLASSES))
     parser.add_argument("--slots", type=int, default=None, help="Override the class's number of decode slots")
     parser.add_argument("--shard-size", type=int, default=4096, help="Segments per shard (default: 4096)")
@@ -276,13 +286,12 @@ def main(argv=None):
     if (jax.device_count(), jax.process_count()) != (4, 1):
         raise SystemExit(f"needs one process with 4 chips, has {jax.process_count()} process(es) with "
                          f"{jax.device_count()} devices: set the TPU_* variables of translate.sh")
-    shapes = dict(LENGTH_CLASSES[args.length_class])
-    if args.slots:
-        shapes["slots"] = args.slots
-    low = 0 if args.length_class == "short" else LENGTH_CLASSES["short"]["max_source"]
+    shapes = dict(LENGTH_CLASSES[args.length_class], slots=args.slots or SLOTS[args.model][args.length_class])
+    k = CLASS_ORDER.index(args.length_class)
+    low = LENGTH_CLASSES[CLASS_ORDER[k - 1]]["max_source"] if k else 0
     table = pq.read_table(args.segments)
     ids, texts, tokens = (table.column(c).to_pylist() for c in ("id", "text", "tokens"))
-    if max(tokens, default=0) > LENGTH_CLASSES["long"]["max_source"]:
+    if max(tokens, default=0) > LENGTH_CLASSES[CLASS_ORDER[-1]]["max_source"]:
         raise SystemExit(f"{args.segments} has a segment of {max(tokens)} tokens, more than the plan allows")
     chosen = [k for k, n in enumerate(tokens) if low < n <= shapes["max_source"]]
     ids, texts = [ids[k] for k in chosen], [texts[k] for k in chosen]

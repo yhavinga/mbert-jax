@@ -20,6 +20,7 @@ English (en) to Dutch (nl) translator. ... Please translate the following Englis
 import argparse
 import json
 import os
+import random
 import subprocess
 import sys
 import time
@@ -240,7 +241,10 @@ def main(argv=None):
         raise SystemExit(f"{args.segments} has a segment of {max(tokens)} tokens, more than the plan allows")
     chosen = [k for k, n in enumerate(tokens) if low < n <= shapes["max_source"]]
     ids, texts = [ids[k] for k in chosen], [texts[k] for k in chosen]
+    # Shards hold consecutive ids, so similar lengths; they are done in a fixed random order, so that the time of the
+    # first few is a fair sample of the whole class (the projection of the run's length)
     shards = shards_of(ids, texts, args.shard_size)
+    shards = random.Random(0).sample(shards, len(shards))
     done = done_shards(args.out)
     pending = sum(name not in done for name, _, _ in shards)
     print(f"{args.length_class}: {len(ids):,} segments in {len(shards)} shards, {len(shards) - pending} done before; "

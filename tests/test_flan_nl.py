@@ -143,6 +143,8 @@ def test_generic_checks_of_a_translation():
     assert fn.check_translation(source, "Ja.", True, dutch) == "length_ratio"
     assert fn.check_translation(source, good + " " + good + " " + good, True, dutch) == "length_ratio"
     assert fn.check_translation(source, "Hier is de vertaling: " + good, True, dutch) == "commentary"
+    assert fn.check_translation("not liking my parents", "niet overweg kunnen met / een hekel hebben aan", True, dutch) == "alternatives"
+    assert fn.check_translation("km/h or mph", "km/u of mph / mijl", True, dutch) is None
     assert fn.check_translation("Note: bring a towel.", "Opmerking: neem een handdoek mee.", True, dutch) is None
     # Too short for a language ID: names and single words pass
     assert fn.check_translation("Sinister Foxx", "Sinister Foxx", True, english) is None

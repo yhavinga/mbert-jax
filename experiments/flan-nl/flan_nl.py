@@ -423,6 +423,9 @@ def check_translation(source, output, ended, identify_language):
     match = _COMMENTARY.search(output)
     if match and not _COMMENTARY.search(source) and "translat" not in source.lower():
         return "commentary"
+    # Several translations offered instead of one ("niet overweg kunnen met / geen goede band met", pilot of 8 Nov)
+    if " / " in output and "/" not in source:
+        return "alternatives"
     if len(_WORD.findall(output)) >= MIN_LANGID_WORDS and identify_language(output) not in DUTCH_LANGUAGES:
         return "not_dutch"
     return None

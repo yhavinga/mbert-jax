@@ -37,15 +37,17 @@ LENGTH_CLASSES = {
     "tiny": {"max_source": 32, "prefill_lengths": [128], "max_decode": 96},
     "small": {"max_source": 128, "prefill_lengths": [128, 256], "max_decode": 256},
     "medium": {"max_source": 256, "prefill_lengths": [256, 384], "max_decode": 448},
-    "long": {"max_source": 512, "prefill_lengths": [384, 512, 640], "max_decode": 832},
+    "long": {"max_source": 384, "prefill_lengths": [384, 512], "max_decode": 640},
+    "xlong": {"max_source": 512, "prefill_lengths": [512, 640], "max_decode": 832},
 }
-CLASS_ORDER = ["tiny", "small", "medium", "long"]
+CLASS_ORDER = ["tiny", "small", "medium", "long", "xlong"]
 # Slots per class: slots x (prefill + decode) x the KV of a token in bf16 (12B: 48 layers x 8 heads x 256 x 2 x 2 =
-# 0.39 MB; 27B: 62 x 16 x 128 x 2 x 2 = 0.51 MB) within ~75 GB (12B) or ~48 GB (27B) of the host's 4 x 30.7 GiB, next
-# to the weights (24 and 54 GB)
+# 0.39 MB; 27B: 62 x 16 x 128 x 2 x 2 = 0.51 MB) next to the weights (24 and 54 GB) in the host's 4 x 30.7 GiB.
+# 27B measured on a v4 host on 8 Nov: tiny 384 x 224 peaks at 27.0 GiB per chip, small 224 x 512 at 28.9 GiB; the
+# others hold about as many slot-tokens. (The 12B run of 8 Nov had four classes, long being 256-512 with 128 slots.)
 SLOTS = {
-    "gemma3-12b": {"tiny": 512, "small": 320, "medium": 224, "long": 128},
-    "gemma3-27b": {"tiny": 320, "small": 160, "medium": 112, "long": 64},
+    "gemma3-12b": {"tiny": 512, "small": 320, "medium": 224, "long": 160, "xlong": 128},
+    "gemma3-27b": {"tiny": 384, "small": 224, "medium": 136, "long": 104, "xlong": 80},
 }
 # generation_config.json of TranslateGemma: <eos> and <end_of_turn>
 EOS_IDS = [1, 106]

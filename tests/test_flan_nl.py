@@ -388,3 +388,37 @@ def test_a_rendering_is_read_where_the_lines_agree():
     assert fn._rendering("Now, understand the problem?", "Teacher: Now, understand the problem? Solve it.",
                          "Docent: Begrijpt u het probleem? Los het op.") == "Begrijpt u het probleem?"
     assert fn._rendering("Q:", "Q: " + "word " * 80, "Een heel lang verhaal zonder dubbele punt " * 5 + ": x") is None
+
+
+def test_variants_are_classified_by_register():
+    assert fn.register_of("Begrijp je het probleem nu?") == "je"
+    assert fn.register_of("Begrijpt u het probleem nu?") == "u"
+    assert fn.register_of("Beantwoord alstublieft de volgende vraag:") == "u"
+    assert fn.register_of("Beantwoord de volgende vraag:") == "neutral"
+    assert fn.register_of("Uitvoer:") == "neutral"
+
+
+def test_the_register_of_an_example_comes_from_its_machine_translation_or_its_hash():
+    assert fn.example_register(0, 1, "U krijgt een zin. Geef uw antwoord.") == ("u", "mt")
+    assert fn.example_register(0, 1, "Je krijgt een zin, geef jouw antwoord. U?") == ("je", "mt")
+    hashed = [fn.example_register(0, p, "Een zin zonder aanspreekvorm.") for p in range(400)]
+    assert {how for _, how in hashed} == {"hash"} and 150 < sum(r == "u" for r, _ in hashed) < 250
+    assert hashed == [fn.example_register(0, p, "Andere tekst.") for p in range(400)]
+
+
+def test_only_variants_of_the_register_and_neutral_ones_are_chosen():
+    variants = ["Begrijp je het probleem nu?", "Begrijpt u het probleem nu?", "Is het probleem duidelijk?"]
+    assert fn.variants_for("u", variants) == (["Begrijpt u het probleem nu?", "Is het probleem duidelijk?"], True)
+    assert fn.variants_for("je", ["Begrijpt u het?"]) == (["Begrijpt u het?"], False)
+    for p in range(200):
+        assert fn.choose_variant(0, p, "Now, understand the problem?", fn.variants_for("u", variants)[0]) != variants[0]
+
+
+def test_tail_after_sep_is_protected_and_extra_keys_load(tmp_path):
+    text = "Head: PersonX eats<sep>Tail: to be full"
+    assert [text[a:b] for a, b in fn.template_spans(text, ("Head:", "Tail:"))] == ["Head:", "Tail:"]
+    (tmp_path / "top.json").write_text('{"templates": [{"english": "Q:"}, {"english": "Head:"}]}')
+    (tmp_path / "extra.json").write_text('["Tail:"]')
+    (tmp_path / "table.json").write_text('{"Q:": ["Vraag:"], "Given the question:": ["Gegeven de vraag:"]}')
+    keys = fn.load_templates([tmp_path / "top.json", tmp_path / "extra.json", tmp_path / "table.json"])
+    assert keys == ("Given the question:", "Head:", "Tail:", "Q:")

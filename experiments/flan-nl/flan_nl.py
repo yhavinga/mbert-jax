@@ -357,12 +357,13 @@ def _template_ends(text, end, key):
 
 
 def template_spans(text, keys, at_line_start=True):
-    """[(start, end)] of the template strings keys (longest first) at the line starts of text, and right after another
-    one ("Q: Answer the following question: ..."). at_line_start: whether text itself starts a line."""
+    """[(start, end)] of the template strings keys (longest first) at the line starts of text, right after <sep>
+    (ATOMIC's "Head: ...<sep>Tail: ..."), and right after another one ("Q: Answer the following question: ...").
+    at_line_start: whether text itself starts a line."""
     spans = []
     if not keys:
         return spans
-    starts = ([0] if at_line_start else []) + [m.end() for m in re.finditer(r"\n", text)]
+    starts = ([0] if at_line_start else []) + [m.end() for m in re.finditer(r"\n|<sep>", text)]
     for position in starts:
         while True:
             while position < len(text) and text[position] in " \t":
@@ -438,6 +439,39 @@ def render(pieces, translation, template_text=None):
     for kind, value in pieces:
         out.append(value if kind == "L" else translation[value] if kind == "S" else template_text[value])
     return "".join(out)
+
+
+_JE = {"je", "jij", "jouw", "jou", "jezelf"}
+_U = {"u", "uw", "uzelf", "alstublieft"}
+
+
+def register_of(text):
+    """"je", "u" or "neutral": how a Dutch text addresses the reader, by its whole words."""
+    words = set(re.findall(r"[^\W\d_]+", text.casefold()))
+    if words & _JE:
+        return "je"
+    if words & _U:
+        return "u"
+    return "neutral"
+
+
+def example_register(host, position, machine_text):
+    """(register, how) of one example: the one its machine-translated text uses more (u/uw against je/jij/jouw as
+    whole words; TranslateGemma mostly writes u), else one chosen by sha256 of the example's id, so that every
+    template string of the example is in the same register."""
+    words = re.findall(r"[^\W\d_]+", machine_text.casefold())
+    u = sum(w in _U - {"alstublieft"} for w in words)
+    je = sum(w in _JE for w in words)
+    if u != je:
+        return ("u" if u > je else "je"), "mt"
+    digest = hashlib.sha256(f"{host}:{position}:register".encode()).hexdigest()
+    return ("je", "u")[int(digest, 16) % 2], "hash"
+
+
+def variants_for(register, variants):
+    """The variants of that register and the neutral ones; all of them, and False, when there are none."""
+    fitting = [v for v in variants if register_of(v) in (register, "neutral")]
+    return (fitting, True) if fitting else (list(variants), False)
 
 
 def choose_variant(host, position, english, variants):
@@ -643,12 +677,21 @@ def _count_tokens(texts):
     return {t: len(_TOKENIZER(t, add_special_tokens=False)["input_ids"]) for t in texts}
 
 
-def load_templates(path):
-    """The template strings to protect, longest first: the "english" entries of templates/top30.json."""
-    if not path:
-        return ()
-    entries = json.loads(open(path).read())["templates"]
-    return tuple(sorted((e["english"] for e in entries), key=lambda k: (-len(k), k)))
+def load_templates(paths):
+    """The template strings to protect, longest first, from any number of files: templates_top30.json (its "english"
+    entries), templates_extra.json (a list), or a phrasing table (its keys), so that every key Yeb supplies is protected."""
+    keys = set()
+    for path in paths or ():
+        data = json.loads(open(path).read())
+        if isinstance(data, dict) and "templates" in data:
+            keys |= {e["english"] for e in data["templates"]}
+        elif isinstance(data, list):
+            keys |= set(data)
+        elif isinstance(data, dict):
+            keys |= set(data)
+        else:
+            raise ValueError(f"{path}: neither a template list nor a phrasing table")
+    return tuple(sorted(keys, key=lambda k: (-len(k), k)))
 
 
 def _plan_rows(rows):
@@ -961,6 +1004,7 @@ def assemble(args):
             raise SystemExit("the plan protects template strings: --templates-nl (templates_nl.json) is required")
         phrasing = read_phrasing_table(args.templates_nl, set(template_segments))
     variant_rows = {t: Counter() for t in template_segments}
+    register_rows = Counter()
     rows = {h: {"position": [], "source": [], "inputs": [], "targets": []} for h in range(args.world)}
     report = {h: Counter() for h in range(args.world)}
     for k in range(len(columns["host"])):
@@ -982,9 +1026,18 @@ def assemble(args):
             instruction = [(kind, value) for kind, value in json.loads(columns["instruction"][k])]
             answer = [(kind, value) for kind, value in json.loads(columns["answer"][k])]
             used = {v for kind, v in instruction if kind == "T"}
-            # Each template string once per example: a variant of the table, or its machine translation
-            template_text = {t: choose_variant(h, p, t, phrasing[t]) if t in phrasing else translation[template_segments[t]]
-                             for t in used}
+            # Each template string once per example: a variant of the table in the register of the example, or its
+            # machine translation
+            machine = " ".join(translation[v] for kind, v in instruction + answer if kind == "S")
+            register, how = example_register(h, p, machine)
+            template_text, mismatched = {}, 0
+            for t in used:
+                if t in phrasing:
+                    fitting, ok = variants_for(register, phrasing[t])
+                    template_text[t] = choose_variant(h, p, t, fitting)
+                    mismatched += not ok
+                else:
+                    template_text[t] = translation[template_segments[t]]
             bad = [failed[v] for kind, v in instruction + answer if kind == "S" and v in failed] + \
                   [failed[template_segments[t]] for t in used if t not in phrasing and template_segments[t] in failed]
             if bad:
@@ -1000,13 +1053,17 @@ def assemble(args):
             report[h]["translated"] += 1
             for t in used:
                 variant_rows[t][template_text[t] if t in phrasing else "(machine translation)"] += 1
+            if used:
+                register_rows[f"{register} ({how})"] += 1
+                register_rows["rows with a variant outside the register"] += mismatched > 0
         for key, value in (("position", p), ("source", columns["source"][k]), ("inputs", out[0]), ("targets", out[1])):
             rows[h][key].append(value)
     for h in range(args.world):
         pq.write_table(pa.table(rows[h]), f"{args.out}/w{h}.parquet", compression="zstd")
     summary = {"segments": len(ids), "segments_repaired": dict(repaired), "segments_unusable": dict(Counter(failed.values())),
                "hosts": {h: dict(sorted(report[h].items())) for h in range(args.world)},
-               "template_variants": {t: dict(c.most_common()) for t, c in variant_rows.items()}}
+               "template_variants": {t: dict(c.most_common()) for t, c in variant_rows.items()},
+               "template_registers": dict(register_rows)}
     json.dump(summary, open(f"{args.out}/report.json", "w"), indent=1, ensure_ascii=False)
     print(f"ASSEMBLE {json.dumps(summary)}", flush=True)
 
@@ -1026,7 +1083,8 @@ def main(argv=None):
     p.add_argument("--out", required=True)
     p.add_argument("--world", type=int, default=4)
     p.add_argument("--processes", type=int, default=64)
-    p.add_argument("--templates", default=None, help="templates/top30.json: template strings to protect from MT")
+    p.add_argument("--templates", nargs="*", default=None,
+                   help="templates_top30.json, templates_extra.json and/or a phrasing table: template strings to protect")
     p = sub.add_parser("sample", help="a plan of N random examples, for the pilot")
     p.add_argument("--plan", required=True)
     p.add_argument("--out", required=True)

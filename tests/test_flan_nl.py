@@ -323,3 +323,68 @@ def test_decode_all_gives_every_prompt_its_own_completion(slots, sync_every):
 def test_a_completion_that_ends_at_once_is_empty():
     outputs = tr.decode_all([[1, 0], [2, 3]], 1, FakeDevice(1), max_decode=8, sync_every=2)
     assert outputs == [([], True), ([2000, 2001, 2002], True)]
+
+
+TEMPLATES = tuple(sorted(["Q:", "A:", "Given the question:", "Answer the following question:", "Output:", "Input:",
+                          "Given the task definition and input, reply with output.", "OPTIONS:"], key=lambda k: -len(k)))
+
+
+def test_template_strings_at_line_starts_are_protected_pieces():
+    inputs = ("Given the task definition and input, reply with output. In this task, classify.\n\nInput: A dog.\n"
+              "Output:")
+    instruction, answer, _ = fn.plan_example(inputs, "dog", words, templates=TEMPLATES)
+    assert [v for k, v in instruction if k == "T"] == ["Given the task definition and input, reply with output.",
+                                                       "Input:", "Output:"]
+    assert all("Input:" not in v and "Output:" not in v for v in fn.segments_of(instruction))
+    table = {"Given the task definition and input, reply with output.": "Gegeven de taak en de invoer, antwoord.",
+             "Input:": "Invoer:", "Output:": "Uitvoer:"}
+    nl = fn.render(instruction, {s: f"NL[{s}]" for s in fn.segments_of(instruction)}, table)
+    assert nl == "Gegeven de taak en de invoer, antwoord. NL[In this task, classify.]\n\nInvoer: NL[A dog.]\nUitvoer:"
+    # Identity translations give the English back, templates and all
+    identity = {s: s for s in fn.segments_of(instruction)}
+    assert fn.render(instruction, identity, {t: t for t in TEMPLATES}) == inputs
+
+
+def test_template_strings_chain_and_need_a_line_start():
+    text = "Q: Answer the following question: Who?\nA:"
+    assert [text[a:b] for a, b in fn.template_spans(text, TEMPLATES)] == ["Q:", "Answer the following question:", "A:"]
+    # Not at a line start: content, translated with its sentence
+    assert fn.template_spans("He said Q: no.", TEMPLATES) == []
+    assert fn.template_spans("Q:Suggest a title.", TEMPLATES) == [(0, 2)]
+    # After a list of options the tail starts a line only after a newline
+    instruction, _, _ = fn.plan_example("Is it?\nOPTIONS:\n- yes\n- no\nA:", "yes", words, templates=TEMPLATES)
+    assert [v for k, v in instruction if k == "T"] == ["OPTIONS:", "A:"]
+
+
+def test_a_variant_is_chosen_per_example_deterministically():
+    variants = ["Gegeven de vraag:", "Bij de vraag:", "Vraag:"]
+    chosen = [fn.choose_variant(0, p, "Given the question:", variants) for p in range(3000)]
+    assert chosen == [fn.choose_variant(0, p, "Given the question:", variants) for p in range(3000)]
+    assert set(chosen) == set(variants) and min(chosen.count(v) for v in variants) > 800
+    assert fn.choose_variant(1, 5, "Q:", ["V:"]) == "V:"
+
+
+def test_the_phrasing_table_is_checked(tmp_path):
+    path = tmp_path / "templates_nl.json"
+    path.write_text('{"Q:": ["Vraag:", "V:"], "A:": ["Antwoord:"]}')
+    assert fn.read_phrasing_table(path, {"Q:", "A:", "Output:"}) == {"Q:": ["Vraag:", "V:"], "A:": ["Antwoord:"]}
+    path.write_text('{"Qq:": ["Vraag:"]}')
+    with pytest.raises(ValueError, match="not a template string"):
+        fn.read_phrasing_table(path, {"Q:"})
+    path.write_text('{"Q:": []}')
+    with pytest.raises(ValueError, match="one or more"):
+        fn.read_phrasing_table(path, {"Q:"})
+
+
+def test_an_option_label_is_not_a_template_string():
+    inputs = "Why did Alex do this?\nA: scare people\nB: become a dictator\nC: give people a future\nA:"
+    instruction, answer, info = fn.plan_example(inputs, "A", words, templates=TEMPLATES)
+    assert info["options"] == 3 and [v for k, v in instruction if k == "T"] == ["A:"]
+    assert fn.render(instruction, {s: s for s in fn.segments_of(instruction)}, {"A:": "Antwoord:"}).endswith(
+        "\nA: scare people\nB: become a dictator\nC: give people a future\nAntwoord:")
+
+
+def test_a_rendering_is_read_where_the_lines_agree():
+    assert fn._rendering("Now, understand the problem?", "Teacher: Now, understand the problem? Solve it.",
+                         "Docent: Begrijpt u het probleem? Los het op.") == "Begrijpt u het probleem?"
+    assert fn._rendering("Q:", "Q: " + "word " * 80, "Een heel lang verhaal zonder dubbele punt " * 5 + ": x") is None

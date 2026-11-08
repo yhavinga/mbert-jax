@@ -15,6 +15,7 @@ example stays consistent; an answer that is an option's label stays the label.
 Python 3.10 (the trainer's venv imports this for the mix) and the standard library only, so the tests run anywhere.
 """
 
+import hashlib
 import json
 import re
 import unicodedata
@@ -162,7 +163,7 @@ _FAMILIES = {
     "ROMAN": [r.upper() for r in _ROMAN],
 }
 # How a label is written around its letter, number or numeral, as FLAN's templates write them
-_STYLES = ["({}).", "({})", "[{}].", "[{}]", "{}).", "{})", "{}.", "Option{}:", "Option {}:"]
+_STYLES = ["({}).", "({})", "[{}].", "[{}]", "{}).", "{})", "{}.", "{}:", "Option{}:", "Option {}:"]
 # The text right after these introduces a list of bullets rather than labels (FLAN's "OPTIONS:\n- yes\n- no")
 _LIST_HEADER = re.compile(r"(?:OPTIONS|Options|Options are|Choices|Possible answers|Pick from|Choose your answer from|"
                           r"Available options|Available choices|Pick your answer from|Choose from|Select from|"
@@ -351,14 +352,52 @@ def _strip_end(text):
     return text.rstrip(" \t\n;,.")
 
 
-def plan_example(inputs, targets, count_tokens, limit=MAX_SEGMENT_TOKENS):
-    """(instruction pieces, answer pieces, info) of one FLAN example. info: options found, how the answer was mapped."""
+def _template_ends(text, end, key):
+    return key[-1] in ":.?!" or end == len(text) or text[end].isspace()
+
+
+def template_spans(text, keys, at_line_start=True):
+    """[(start, end)] of the template strings keys (longest first) at the line starts of text, and right after another
+    one ("Q: Answer the following question: ..."). at_line_start: whether text itself starts a line."""
+    spans = []
+    if not keys:
+        return spans
+    starts = ([0] if at_line_start else []) + [m.end() for m in re.finditer(r"\n", text)]
+    for position in starts:
+        while True:
+            while position < len(text) and text[position] in " \t":
+                position += 1
+            key = next((k for k in keys if text.startswith(k, position) and _template_ends(text, position + len(k), k)),
+                       None)
+            if key is None:
+                break
+            spans.append((position, position + len(key)))
+            position += len(key)
+    return spans
+
+
+def instruction_pieces(text, count_tokens, limit, splits, templates, at_line_start):
+    """text_pieces, with every template string of templates as a piece ("T", string) of its own: the assembly gives it
+    the Dutch of the phrasing table instead of a machine translation (templates_nl.json)."""
+    pieces, cursor = [], 0
+    for start, end in template_spans(text, templates, at_line_start):
+        pieces.extend(text_pieces(text[cursor:start], count_tokens, limit, splits))
+        pieces.append(("T", text[start:end]))
+        cursor = end
+    pieces.extend(text_pieces(text[cursor:], count_tokens, limit, splits))
+    return pieces
+
+
+def plan_example(inputs, targets, count_tokens, limit=MAX_SEGMENT_TOKENS, templates=()):
+    """(instruction pieces, answer pieces, info) of one FLAN example. info: options found, how the answer was mapped.
+    templates: the template strings to protect, longest first (template_spans)."""
     options = find_options(inputs)
     pieces, position, splits = [], 0, []
     for k, (label, label_start, start, stop) in enumerate(options):
         before = inputs[position:label_start]
         # Before the first label is the question; between two options only the separators the option left out
-        pieces.extend(text_pieces(before, count_tokens, limit, splits) if k == 0 else [("L", before)])
+        pieces.extend(instruction_pieces(before, count_tokens, limit, splits, templates, True) if k == 0
+                      else [("L", before)])
         pieces.append(("L", inputs[label_start:start]))
         pieces.extend(text_pieces(inputs[start:stop], count_tokens, limit, splits))
         position = stop
@@ -367,8 +406,10 @@ def plan_example(inputs, targets, count_tokens, limit=MAX_SEGMENT_TOKENS):
         # What closed the last option (".", ";") stays as it is; the text after it is translated
         separators = len(tail) - len(tail.lstrip(" \t\n;,."))
         pieces.append(("L", tail[:separators]))
+        position += separators
         tail = tail[separators:]
-    pieces.extend(text_pieces(tail, count_tokens, limit, splits))
+    pieces.extend(instruction_pieces(tail, count_tokens, limit, splits, templates,
+                                     position == 0 or inputs[position - 1] == "\n"))
     instruction = merge_literals(pieces)
 
     answer = targets.strip()
@@ -391,9 +432,33 @@ def segments_of(pieces):
     return [value for kind, value in pieces if kind == "S"]
 
 
-def render(pieces, translation):
-    """The text of pieces with every segment replaced by translation[segment]."""
-    return "".join(value if kind == "L" else translation[value] for kind, value in pieces)
+def render(pieces, translation, template_text=None):
+    """The text of pieces: segments replaced by translation[segment], template strings by template_text[string]."""
+    out = []
+    for kind, value in pieces:
+        out.append(value if kind == "L" else translation[value] if kind == "S" else template_text[value])
+    return "".join(out)
+
+
+def choose_variant(host, position, english, variants):
+    """One of Yeb's Dutch variants of a template string for one example: sha256 of the example's id (host, position)
+    and the English string, so a rerun chooses the same, and every occurrence in one example gets the same one."""
+    digest = hashlib.sha256(f"{host}:{position}:{english}".encode()).hexdigest()
+    return variants[int(digest, 16) % len(variants)]
+
+
+def read_phrasing_table(path, protected):
+    """templates_nl.json: {English template string: [Dutch variant, ...]}. Refused when absent, malformed, or with a
+    key the plan did not protect (a typo would otherwise change nothing)."""
+    table = json.loads(open(path).read())
+    if not isinstance(table, dict):
+        raise ValueError(f"{path}: not an object of English strings")
+    for english, variants in table.items():
+        if english not in protected:
+            raise ValueError(f"{path}: {english!r} is not a template string of the plan")
+        if not isinstance(variants, list) or not variants or not all(isinstance(v, str) and v.strip() for v in variants):
+            raise ValueError(f"{path}: {english!r} needs a list of one or more non-empty Dutch strings")
+    return table
 
 
 # ---------------------------------------------------------------------------------------------------------- checks
@@ -564,12 +629,26 @@ def extract(args):
 
 
 _TOKENIZER = None
+_TEMPLATES = ()
 
 
-def _load_tokenizer(path):
-    global _TOKENIZER
+def _load_tokenizer(path, templates=()):
+    global _TOKENIZER, _TEMPLATES
     from transformers import AutoTokenizer
     _TOKENIZER = AutoTokenizer.from_pretrained(path)
+    _TEMPLATES = tuple(templates)
+
+
+def _count_tokens(texts):
+    return {t: len(_TOKENIZER(t, add_special_tokens=False)["input_ids"]) for t in texts}
+
+
+def load_templates(path):
+    """The template strings to protect, longest first: the "english" entries of templates/top30.json."""
+    if not path:
+        return ()
+    entries = json.loads(open(path).read())["templates"]
+    return tuple(sorted((e["english"] for e in entries), key=lambda k: (-len(k), k)))
 
 
 def _plan_rows(rows):
@@ -592,7 +671,7 @@ def _plan_rows(rows):
             status = "dutch_task"
         else:
             try:
-                instruction, answer, info = plan_example(inputs, targets, count_tokens)
+                instruction, answer, info = plan_example(inputs, targets, count_tokens, templates=_TEMPLATES)
                 status = "translate"
             except SegmentTooLong:
                 status = "segment_too_long"
@@ -613,8 +692,12 @@ def plan(args):
     counted = {}
     report = Counter()
     chunk = 2000
+    templates = load_templates(args.templates)
     with concurrent.futures.ProcessPoolExecutor(args.processes, initializer=_load_tokenizer,
-                                                initargs=(args.tokenizer,)) as pool:
+                                                initargs=(args.tokenizer, templates)) as pool:
+        # Each template string is also a segment of its own: its machine translation stands in where the phrasing
+        # table has no entry for it
+        counted.update(pool.submit(_count_tokens, list(templates)).result())
         for path in args.english:
             table = _read_parquet(path)
             columns = {c: table.column(c).to_pylist() for c in ("host", "position", "source", "inputs", "targets")}
@@ -638,7 +721,7 @@ def plan(args):
     # segments has similar lengths, which suits the engine's length buckets
     texts = sorted(counted, key=lambda t: (counted[t], t))
     segment_ids = {t: i for i, t in enumerate(texts)}
-    encode = {"L": lambda v: v, "S": lambda v: segment_ids[v]}
+    encode = {"L": lambda v: v, "S": lambda v: segment_ids[v], "T": lambda v: v}
     examples["instruction"] = [json.dumps([[k, encode[k](v)] for k, v in p], ensure_ascii=False) for p in examples["instruction"]]
     examples["answer"] = [json.dumps([[k, encode[k](v)] for k, v in p], ensure_ascii=False) for p in examples["answer"]]
     pq.write_table(pa.table(examples), f"{args.out}/examples.parquet", compression="zstd")
@@ -651,8 +734,10 @@ def plan(args):
                "segment_tokens": sum(tokens), "answer_kind": dict(Counter(examples["answer_kind"])),
                "with_options": sum(1 for n in examples["options"] if n),
                "examples_split": sum(1 for n in examples["splits"] if n), "extra_segments_from_splits": sum(examples["splits"]),
-               "max_segment_tokens": MAX_SEGMENT_TOKENS, "tokenizer": args.tokenizer}
-    json.dump(summary, open(f"{args.out}/plan.json", "w"), indent=1)
+               "max_segment_tokens": MAX_SEGMENT_TOKENS, "tokenizer": args.tokenizer,
+               "templates": list(templates), "template_segments": {t: segment_ids[t] for t in templates},
+               "examples_with_templates": sum(1 for p in examples["instruction"] if '["T",' in p)}
+    json.dump(summary, open(f"{args.out}/plan.json", "w"), indent=1, ensure_ascii=False)
     print(f"PLAN {json.dumps(summary)}", flush=True)
 
 
@@ -670,6 +755,7 @@ def sample(args):
     examples = examples.take(chosen)
     needed = {v for column in ("instruction", "answer") for pieces in examples.column(column).to_pylist()
               for kind, v in json.loads(pieces) if kind == "S"}
+    needed |= set(json.loads(open(f"{args.plan}/plan.json").read()).get("template_segments", {}).values())
     parts = []
     for worker in range(args.world):
         table = _read_parquet(f"{args.plan}/segments-w{worker}.parquet")
@@ -679,6 +765,133 @@ def sample(args):
     pq.write_table(segments, f"{args.out}/segments-w0.parquet", compression="zstd")
     print(f"sample: {examples.num_rows} examples, {segments.num_rows} segments, "
           f"{sum(segments.column('tokens').to_pylist()):,} tokens -> {args.out}", flush=True)
+
+
+# ------------------------------------------------------------------------------------------------- template text
+
+# A label at the start of a line ("Q:", "Definition:", "Given the question:", "Detailed Instructions:"), or the first
+# sentence of a line ("Given the task definition and input, reply with output."): the fixed text of FLAN's templates
+_LABEL = re.compile(r"[A-Z][^\n:.?!]{0,40}?:")
+_SENTENCE = re.compile(r"[A-Z][^\n:]{0,160}?[.?!](?=\s|$)")
+MAX_LABEL_WORDS = 6
+MAX_SENTENCE_WORDS = 16
+
+
+def template_candidates(text):
+    """The fixed-looking strings of an instruction: labels and first sentences at line starts, and again right after
+    such a label ("Q: Answer the following question: ..."). A set, so a row counts once per string."""
+    found = set()
+    starts = [0] + [m.end() for m in re.finditer(r"\n", text)]
+    for start in starts:
+        position = start
+        for _ in range(3):
+            while position < len(text) and text[position] in " \t":
+                position += 1
+            label = _LABEL.match(text, position)
+            if label and len(label.group(0).split()) <= MAX_LABEL_WORDS:
+                found.add(label.group(0))
+            sentence = _SENTENCE.match(text, position)
+            if sentence and len(sentence.group(0).split()) <= MAX_SENTENCE_WORDS:
+                found.add(sentence.group(0))
+            if not label:
+                break
+            position = label.end()
+    return found
+
+
+def _rendering(english, source, output):
+    """How output renders the template string english, if source starts a line with it and the alignment is plain:
+    at the start of the segment, or on the same line of an output with as many lines."""
+    end = ":" if english.endswith(":") else None
+
+    def head(line):
+        if end:
+            k = line.find(":")
+            return line[:k + 1].strip() if k >= 0 else None
+        match = re.match(r"[^\n]*?[.?!](?=\s|$)", line)
+        return match.group(0).strip() if match else None
+
+    def plausible(got):
+        return got if got and "\n" not in got and len(got) <= 2.5 * len(english) + 20 else None
+
+    if source.startswith(english):
+        return plausible(head(output))
+    source_lines, output_lines = source.split("\n"), output.split("\n")
+    if len(source_lines) == len(output_lines):
+        for s, o in zip(source_lines, output_lines):
+            k = s.find(english)
+            if k < 0:
+                continue
+            # After as many labels on the line as the source has before the string ("Teacher: Now, understand ...")
+            before = s[:k]
+            if before.strip() and not before.rstrip().endswith(":"):
+                continue
+            o = o.lstrip()
+            for _ in range(before.count(":")):
+                colon = o.find(":")
+                if colon < 0:
+                    break
+                o = o[colon + 1:].lstrip()
+            else:
+                return plausible(head(o))
+    return None
+
+
+def templates(args):
+    """The most frequent fixed template strings over F's FLAN rows, with the 27B and 12B renderings of them."""
+    import glob
+
+    rows, tasks, total = Counter(), {}, 0
+    for path in args.english:
+        table = _read_parquet(path, ["source", "inputs"])
+        for source, inputs in zip(table.column("source").to_pylist(), table.column("inputs").to_pylist()):
+            total += 1
+            for candidate in template_candidates(inputs):
+                rows[candidate] += 1
+                tasks.setdefault(candidate, set()).add(task_of(source))
+    ranked = [s for s, _ in rows.most_common() if len(tasks[s]) >= args.min_tasks][:args.top]
+    segments = {}
+    for path in sorted(glob.glob(f"{args.plan}/segments-w*.parquet")):
+        table = _read_parquet(path, ["id", "text"])
+        segments.update(zip(table.column("id").to_pylist(), table.column("text").to_pylist()))
+    renderings = {}
+    for model, root in (("27b", args.out27b), ("12b", args.out12b)):
+        seen = {s: Counter() for s in ranked}
+        for path in sorted(glob.glob(f"{root}/**/*.parquet", recursive=True)):
+            table = _read_parquet(path, ["id", "text_nl", "ended"])
+            for i, out, ended in zip(*(table.column(c).to_pylist() for c in ("id", "text_nl", "ended"))):
+                source = segments.get(i)
+                if not ended or source is None:
+                    continue
+                for english in ranked:
+                    if english in source:
+                        got = _rendering(english, source, out)
+                        if got:
+                            seen[english][got] += 1
+        renderings[model] = seen
+    table = [{"english": s, "rows": rows[s], "share_of_flan_rows": rows[s] / total, "tasks": len(tasks[s]),
+              "nl_27b": renderings["27b"][s].most_common(3), "nl_12b": renderings["12b"][s].most_common(3)}
+             for s in ranked]
+    json.dump({"flan_rows": total, "min_tasks": args.min_tasks, "templates": table},
+              open(f"{args.out}/top{args.top}.json", "w"), indent=1, ensure_ascii=False)
+
+    def cell(pairs):
+        if not pairs:
+            return "(not seen)"
+        return "; ".join(f"`{t}` ({n})".replace("|", "\\|") for t, n in pairs)
+
+    lines = [f"# The {args.top} most frequent template strings of F's FLAN rows", "",
+             f"Over the {total:,} FLAN rows of F's 4 host mixes: labels and first sentences at the start of a line (and",
+             "right after such a label), found in at least 3 tasks; rows = FLAN rows that have the string there. The",
+             "renderings are how 27B and 12B translated the string inside a segment that starts a line with it (the",
+             "segment starts with it, or its line has the same index in source and output); most frequent first, with",
+             "counts. 27B: the pilot and its measurement shards; 12B: the pilot and the run so far.", "",
+             "| English | rows | share | 27B | 12B |", "|---|---|---|---|---|"]
+    for t in table:
+        english = t["english"].replace("|", "\\|")
+        lines.append(f"| `{english}` | {t['rows']:,} | {100 * t['share_of_flan_rows']:.1f}% | {cell(t['nl_27b'])} | {cell(t['nl_12b'])} |")
+    open(f"{args.out}/top{args.top}.md", "w").write("\n".join(lines) + "\n")
+    print(f"TEMPLATES {len(table)} of {len(rows):,} candidates -> {args.out}/top{args.top}.md", flush=True)
 
 
 def _identify(texts):
@@ -739,6 +952,15 @@ def assemble(args):
         for h, p, x, y in zip(*(table.column(c).to_pylist() for c in ("host", "position", "inputs", "targets"))):
             english[(h, p)] = (x, y)
     translation = {i: translated[i][0] for i in ids}
+    plan_summary = json.loads(open(f"{args.plan}/plan.json").read())
+    template_segments = plan_summary.get("template_segments", {})
+    phrasing = {}
+    if template_segments:
+        # A plan with protected template strings is assembled with Yeb's phrasing table or not at all
+        if not args.templates_nl:
+            raise SystemExit("the plan protects template strings: --templates-nl (templates_nl.json) is required")
+        phrasing = read_phrasing_table(args.templates_nl, set(template_segments))
+    variant_rows = {t: Counter() for t in template_segments}
     rows = {h: {"position": [], "source": [], "inputs": [], "targets": []} for h in range(args.world)}
     report = {h: Counter() for h in range(args.world)}
     for k in range(len(columns["host"])):
@@ -759,11 +981,16 @@ def assemble(args):
         else:
             instruction = [(kind, value) for kind, value in json.loads(columns["instruction"][k])]
             answer = [(kind, value) for kind, value in json.loads(columns["answer"][k])]
-            bad = [failed[v] for kind, v in instruction + answer if kind == "S" and v in failed]
+            used = {v for kind, v in instruction if kind == "T"}
+            # Each template string once per example: a variant of the table, or its machine translation
+            template_text = {t: choose_variant(h, p, t, phrasing[t]) if t in phrasing else translation[template_segments[t]]
+                             for t in used}
+            bad = [failed[v] for kind, v in instruction + answer if kind == "S" and v in failed] + \
+                  [failed[template_segments[t]] for t in used if t not in phrasing and template_segments[t] in failed]
             if bad:
                 report[h][f"dropped:segment_{bad[0]}"] += 1
                 continue
-            out = (render(instruction, translation), render(answer, translation))
+            out = (render(instruction, translation, template_text), render(answer, translation, template_text))
             if answer_lost(x, y, *out):
                 report[h]["dropped:answer_not_in_instruction"] += 1
                 continue
@@ -771,13 +998,16 @@ def assemble(args):
                 report[h]["dropped:empty"] += 1
                 continue
             report[h]["translated"] += 1
+            for t in used:
+                variant_rows[t][template_text[t] if t in phrasing else "(machine translation)"] += 1
         for key, value in (("position", p), ("source", columns["source"][k]), ("inputs", out[0]), ("targets", out[1])):
             rows[h][key].append(value)
     for h in range(args.world):
         pq.write_table(pa.table(rows[h]), f"{args.out}/w{h}.parquet", compression="zstd")
     summary = {"segments": len(ids), "segments_repaired": dict(repaired), "segments_unusable": dict(Counter(failed.values())),
-               "hosts": {h: dict(sorted(report[h].items())) for h in range(args.world)}}
-    json.dump(summary, open(f"{args.out}/report.json", "w"), indent=1)
+               "hosts": {h: dict(sorted(report[h].items())) for h in range(args.world)},
+               "template_variants": {t: dict(c.most_common()) for t, c in variant_rows.items()}}
+    json.dump(summary, open(f"{args.out}/report.json", "w"), indent=1, ensure_ascii=False)
     print(f"ASSEMBLE {json.dumps(summary)}", flush=True)
 
 
@@ -796,12 +1026,21 @@ def main(argv=None):
     p.add_argument("--out", required=True)
     p.add_argument("--world", type=int, default=4)
     p.add_argument("--processes", type=int, default=64)
+    p.add_argument("--templates", default=None, help="templates/top30.json: template strings to protect from MT")
     p = sub.add_parser("sample", help="a plan of N random examples, for the pilot")
     p.add_argument("--plan", required=True)
     p.add_argument("--out", required=True)
     p.add_argument("--n", type=int, default=300)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--world", type=int, default=4)
+    p = sub.add_parser("templates", help="the most frequent fixed template strings and their renderings")
+    p.add_argument("--english", nargs="+", required=True)
+    p.add_argument("--plan", required=True)
+    p.add_argument("--out27b", required=True, help="Directory of 27B shards (searched recursively)")
+    p.add_argument("--out12b", required=True, help="Directory of 12B shards (searched recursively)")
+    p.add_argument("--out", required=True)
+    p.add_argument("--top", type=int, default=30)
+    p.add_argument("--min-tasks", type=int, default=3)
     p = sub.add_parser("assemble", help="the translations back into examples")
     p.add_argument("--english", nargs="+", required=True)
     p.add_argument("--plan", required=True)
@@ -809,8 +1048,9 @@ def main(argv=None):
     p.add_argument("--out", required=True)
     p.add_argument("--world", type=int, default=4)
     p.add_argument("--processes", type=int, default=64)
+    p.add_argument("--templates-nl", default=None, help="templates_nl.json, Yeb's Dutch variants of the template strings")
     args = parser.parse_args(argv)
-    {"extract": extract, "plan": plan, "sample": sample, "assemble": assemble}[args.step](args)
+    {"extract": extract, "plan": plan, "sample": sample, "templates": templates, "assemble": assemble}[args.step](args)
 
 
 if __name__ == "__main__":

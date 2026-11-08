@@ -36,15 +36,28 @@ import flan_nl  # noqa: E402
 TOKENIZE_BATCH = 2000
 
 
+def in_position_order(table, columns):
+    """The rows of a mix as tuples of columns, in position order. Not Table.sort_by: a mix holds more than 2 GB of
+    text, past what arrow's string offsets take in one array (ArrowInvalid: offset overflow, 8 Nov)."""
+    positions = table.column("position").to_pylist()
+    values = [table.column(c).to_pylist() for c in columns]
+    rows = [None] * len(positions)
+    for k, p in enumerate(positions):
+        if not 0 <= p < len(rows) or rows[p] is not None:
+            raise RuntimeError(f"positions of the mix are not 0..{len(rows) - 1} once each: {p}")
+        rows[p] = tuple(v[k] for v in values)
+    return rows
+
+
 def read_f_mix(path):
     """F's mix in position order: [(position, text, inputs, targets, source)] and its build id."""
     import pyarrow.parquet as pq
     from build_decay_mix import METADATA_KEY
 
-    table = pq.read_table(path, columns=["position", "text", "inputs", "targets", "source"]).sort_by("position")
+    columns = ["position", "text", "inputs", "targets", "source"]
+    table = pq.read_table(path, columns=columns)
     build = pq.ParquetFile(path).schema_arrow.metadata[METADATA_KEY].decode()
-    columns = [table.column(c).to_pylist() for c in ("position", "text", "inputs", "targets", "source")]
-    return list(zip(*columns)), build
+    return in_position_order(table, columns), build
 
 
 def flan_tokens(tokenizer, inputs, targets):
@@ -129,9 +142,8 @@ def build(args, tokenizer):
     bdm.write_mix(partial, sequence, web_texts, pool_rows, order, build_id)
     bdm.verify_order(partial, tokenizer, len(sequence))
     # The web rows of the file, in sequence order, are F's byte for byte
-    written = pq.read_table(partial, columns=["position", "text", "source"]).sort_by("position")
-    web_written = [t for t, s in zip(written.column("text").to_pylist(), written.column("source").to_pylist())
-                   if s == bdm.WEB_SOURCE]
+    written = in_position_order(pq.read_table(partial, columns=["position", "text", "source"]), ["text", "source"])
+    web_written = [t for t, s in written if s == bdm.WEB_SOURCE]
     if web_written != [t for _, t, _, _, s in rows if s == bdm.WEB_SOURCE]:
         raise RuntimeError(f"{partial}: the web rows differ from F's")
     partial.rename(path)

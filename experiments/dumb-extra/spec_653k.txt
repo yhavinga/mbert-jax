@@ -1,0 +1,28 @@
+# The fine-tunes of protocol.md for the six 653,000-step models, on the 4 workers of a v4-32 (dumbx.sh).
+# WORKER NAME CKPT TASK LR OUT; each line runs seeds 42 43 44. Names as in gs://t5-dutch-english-usc2/mbert/masking/dumb,
+# so the DBRD and SICK-NL results of the same models line up with these (summarize.py).
+# Balanced on the estimate of commands.txt (squadnl ~51 minutes per line, a token task ~9): ~2 hours per worker.
+0 653000 gs://t5-dutch-english-usc2/mbert/culturax-nl-230m-chunk1024/ckpt_keep/653000 squadnl 5e-5 gs://t5-dutch-english-usc2/mbert/dumb-extra/squadnl
+0 mix-653000 gs://t5-dutch-english-usc2/mbert/culturax-nl-230m-chunk1024-mix/ckpt_keep/653000 squadnl 5e-5 gs://t5-dutch-english-usc2/mbert/dumb-extra/squadnl
+0 653000 gs://t5-dutch-english-usc2/mbert/culturax-nl-230m-chunk1024/ckpt_keep/653000 conll2002 5e-5 gs://t5-dutch-english-usc2/mbert/dumb-extra/conll2002
+0 653000 gs://t5-dutch-english-usc2/mbert/culturax-nl-230m-chunk1024/ckpt_keep/653000 pos-lassysmall 5e-5 gs://t5-dutch-english-usc2/mbert/dumb-extra/pos-lassysmall
+1 mixheads-653000 gs://t5-dutch-english-usc2/mbert/culturax-nl-230m-chunk1024-mixheads/ckpt_keep/653000 squadnl 5e-5 gs://t5-dutch-english-usc2/mbert/dumb-extra/squadnl
+1 mc4-653000 gs://t5-dutch-english-usc2/mbert/mc4-nl-230m-chunk1024/ckpt_keep/653000 squadnl 5e-5 gs://t5-dutch-english-usc2/mbert/dumb-extra/squadnl
+1 mixheads-653000 gs://t5-dutch-english-usc2/mbert/culturax-nl-230m-chunk1024-mixheads/ckpt_keep/653000 conll2002 5e-5 gs://t5-dutch-english-usc2/mbert/dumb-extra/conll2002
+1 mc4-653000 gs://t5-dutch-english-usc2/mbert/mc4-nl-230m-chunk1024/ckpt_keep/653000 conll2002 5e-5 gs://t5-dutch-english-usc2/mbert/dumb-extra/conll2002
+2 fw2-653000 gs://t5-dutch-english-usc2/mbert/fineweb2-nl-230m-chunk1024/ckpt_keep/653000 squadnl 5e-5 gs://t5-dutch-english-usc2/mbert/dumb-extra/squadnl
+2 mix-653000 gs://t5-dutch-english-usc2/mbert/culturax-nl-230m-chunk1024-mix/ckpt_keep/653000 conll2002 5e-5 gs://t5-dutch-english-usc2/mbert/dumb-extra/conll2002
+2 fw2-653000 gs://t5-dutch-english-usc2/mbert/fineweb2-nl-230m-chunk1024/ckpt_keep/653000 conll2002 5e-5 gs://t5-dutch-english-usc2/mbert/dumb-extra/conll2002
+2 653000 gs://t5-dutch-english-usc2/mbert/culturax-nl-230m-chunk1024/ckpt_keep/653000 pos-alpino 5e-5 gs://t5-dutch-english-usc2/mbert/dumb-extra/pos-alpino
+2 mix-653000 gs://t5-dutch-english-usc2/mbert/culturax-nl-230m-chunk1024-mix/ckpt_keep/653000 pos-lassysmall 5e-5 gs://t5-dutch-english-usc2/mbert/dumb-extra/pos-lassysmall
+2 mix-653000 gs://t5-dutch-english-usc2/mbert/culturax-nl-230m-chunk1024-mix/ckpt_keep/653000 pos-alpino 5e-5 gs://t5-dutch-english-usc2/mbert/dumb-extra/pos-alpino
+2 fw2-653000 gs://t5-dutch-english-usc2/mbert/fineweb2-nl-230m-chunk1024/ckpt_keep/653000 pos-lassysmall 5e-5 gs://t5-dutch-english-usc2/mbert/dumb-extra/pos-lassysmall
+2 fw2-653000 gs://t5-dutch-english-usc2/mbert/fineweb2-nl-230m-chunk1024/ckpt_keep/653000 pos-alpino 5e-5 gs://t5-dutch-english-usc2/mbert/dumb-extra/pos-alpino
+3 fw2mix-653000 gs://t5-dutch-english-usc2/mbert/fineweb2-nl-230m-chunk1024-mix/ckpt_keep/653000 squadnl 5e-5 gs://t5-dutch-english-usc2/mbert/dumb-extra/squadnl
+3 fw2mix-653000 gs://t5-dutch-english-usc2/mbert/fineweb2-nl-230m-chunk1024-mix/ckpt_keep/653000 conll2002 5e-5 gs://t5-dutch-english-usc2/mbert/dumb-extra/conll2002
+3 mixheads-653000 gs://t5-dutch-english-usc2/mbert/culturax-nl-230m-chunk1024-mixheads/ckpt_keep/653000 pos-lassysmall 5e-5 gs://t5-dutch-english-usc2/mbert/dumb-extra/pos-lassysmall
+3 mixheads-653000 gs://t5-dutch-english-usc2/mbert/culturax-nl-230m-chunk1024-mixheads/ckpt_keep/653000 pos-alpino 5e-5 gs://t5-dutch-english-usc2/mbert/dumb-extra/pos-alpino
+3 mc4-653000 gs://t5-dutch-english-usc2/mbert/mc4-nl-230m-chunk1024/ckpt_keep/653000 pos-lassysmall 5e-5 gs://t5-dutch-english-usc2/mbert/dumb-extra/pos-lassysmall
+3 mc4-653000 gs://t5-dutch-english-usc2/mbert/mc4-nl-230m-chunk1024/ckpt_keep/653000 pos-alpino 5e-5 gs://t5-dutch-english-usc2/mbert/dumb-extra/pos-alpino
+3 fw2mix-653000 gs://t5-dutch-english-usc2/mbert/fineweb2-nl-230m-chunk1024-mix/ckpt_keep/653000 pos-lassysmall 5e-5 gs://t5-dutch-english-usc2/mbert/dumb-extra/pos-lassysmall
+3 fw2mix-653000 gs://t5-dutch-english-usc2/mbert/fineweb2-nl-230m-chunk1024-mix/ckpt_keep/653000 pos-alpino 5e-5 gs://t5-dutch-english-usc2/mbert/dumb-extra/pos-alpino

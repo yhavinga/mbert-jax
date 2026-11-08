@@ -70,18 +70,20 @@ DUTCH = "nl"
 
 # The revision of culturax-nl-230m-chunk1024's staging (stage.py) and of count_tokens.py
 CULTURAX = {"repo": "uonlp/CulturaX", "revision": "6a8734bc69fefcbb7735f4f9250f43e4cd7a442e", "files": 128}
-# Per host the CulturaX files (nl/nl_part_<n>.parquet) of culturax-nl-230m-chunk1024: data_files of its data state
-# process_<host>.json at step 300,000 (gs://t5-dutch-english-usc2/mbert/culturax-nl-230m-chunk1024/ckpt_data_state/),
-# the split stage.py made from split_dataset_by_node
+# Per worker number the CulturaX files (nl/nl_part_<n>.parquet) of culturax-nl-230m-chunk1024, as stage.py split them:
+# split_dataset_by_node by the worker number of the hostname (recomputed so on 2026-11-08, as count_tokens.py's
+# long_run_file_order does). They are the 4 sets of data_files of its data states at step 300,000
+# (gs://t5-dutch-english-usc2/mbert/culturax-nl-230m-chunk1024/ckpt_data_state/300000/), whose process indices were
+# other worker numbers by then: process_<k>.json has the files of worker (k + 2) % 4
 CULTURAX_FILES = (
+    (6, 9, 14, 16, 26, 29, 33, 34, 35, 39, 40, 43, 56, 57, 63, 68, 70, 83, 84, 88, 92, 97, 100, 101, 105, 109, 111, 112,
+     116, 121, 124, 125),
+    (2, 7, 10, 12, 13, 15, 24, 25, 28, 30, 41, 42, 44, 62, 64, 65, 69, 73, 78, 82, 86, 90, 91, 93, 94, 96, 102, 104, 108,
+     115, 126, 127),
     (0, 1, 4, 20, 21, 22, 23, 31, 32, 38, 45, 46, 47, 48, 51, 53, 54, 55, 58, 59, 66, 71, 75, 77, 81, 85, 98, 106, 110,
      114, 118, 119),
     (3, 5, 8, 11, 17, 18, 19, 27, 36, 37, 49, 50, 52, 60, 61, 67, 72, 74, 76, 79, 80, 87, 89, 95, 99, 103, 107, 113, 117,
      120, 122, 123),
-    (2, 7, 10, 12, 13, 15, 24, 25, 28, 30, 41, 42, 44, 62, 64, 65, 69, 73, 78, 82, 86, 90, 91, 93, 94, 96, 102, 104, 108,
-     115, 126, 127),
-    (6, 9, 14, 16, 26, 29, 33, 34, 35, 39, 40, 43, 56, 57, 63, 68, 70, 83, 84, 88, 92, 97, 100, 101, 105, 109, 111, 112,
-     116, 121, 124, 125),
 )
 # Their documents per host, long_run_hosts of gs://t5-dutch-english-usc2/mbert/token-counts/summary.json (from
 # stage.py's split by worker number): the plan checks the split against them

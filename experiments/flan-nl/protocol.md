@@ -40,17 +40,29 @@ through the trainer's route, and its web rows are checked to be F's byte for byt
 
 The translation (`flan_nl.py`, `translate.py`):
 
-- Model: TranslateGemma 12B (`google/translategemma-12b-it` at revision `d1b225e1caa17f1ddc7e62065d8637d0923f34e2`),
+- Model: TranslateGemma 27B (`google/translategemma-27b-it` at revision `7d10f0b72f89a2d0f268cea30727d8b77c0d25c2`),
   its language model converted to MaxText 0.2.5 (`convert.py`), run by MaxText's `MaxEngine` (prefill, insert,
-  generate) with continuous batching of our own (`decode_all` in `translate.py`) on the 4 chips of each host, greedy
-  decoding, a stop at `<end_of_turn>` or `<eos>`, four length classes of segments with their own cache shapes.
-  27B (`google/translategemma-27b-it` at `7d10f0b72f89a2d0f268cea30727d8b77c0d25c2`, en-nl MetricX 1.67 against 2.01
-  for 12B in the TranslateGemma report) was the first choice, to be used if its projected run on the 4 workers was at
-  most 10 hours. Measured on a v4 host on 8 Nov: 27B 53 ms per decode step at 160 slots x 576 and 38 ms per prefill of
-  256 tokens; 12B 38 ms at 256 x 512, 34 ms at 96 x 1,472, 18.5 ms per prefill of 256 tokens. Over the 1.81 M distinct
-  segments (220 M source tokens, ~55 M per worker) that projects to ~18 hours for 27B and ~9 hours for 12B, so 12B.
-  The 27B pilot of 300 examples (quality) and its measurements stay in `gs://t5-dutch-english-usc2/mbert/flan-nl/pilot/`
-  and `out/27b/`; the 12B pilot is in `pilot/out/12b/` and `pilot/nl12b/`.
+  generate) with continuous batching of our own (`decode_all` in `translate.py`) on the 4 chips of each host, bf16,
+  greedy decoding, a stop at `<end_of_turn>` or `<eos>`, five length classes of segments (up to 32, 128, 256, 384 and
+  512 source tokens) each with its own cache shape and as many slots as fit (8 Nov: 384 x 224 up to 80 x 1,472,
+  28.9 GiB per chip at the most, 49-65 ms per step). The run's plan is `plan2/` (with the template strings below).
+  The first rule was 27B if its projected run was at most 10 hours, else 12B; measured on 8 Nov it projected to ~18
+  hours (12B ~9), and a 12B run started. Yeb then chose 27B regardless of its time (quality before speed): on the 743
+  segments both pilots share, 12B made meaning errors that 27B did not ("rapist of a 12-year-old girl" became "12-jarige
+  jongen had misbruikt", "Bridal Shower" "afscheidsfeest", answer options rewritten, input/output anglicisms). The
+  12B run was stopped at about a third; its shards stay in `translations/12b/` (plan `plan/`), its logs in `logs/`.
+  The pilots (300 examples each, plan `plan/`) are in `pilot/out/27b`, `pilot/nl` (27B) and `pilot/out/12b`,
+  `pilot/nl12b` (12B).
+- Template strings: the 31 fixed strings of FLAN's templates in `templates_nl.json` (the 30 most frequent labels and
+  opening sentences at line starts over F's FLAN rows, `templates_top30.md`, and "Tail:"), found at a line start, after
+  `<sep>` or right after another of them, are not machine translated but replaced by Dutch variants Yeb chose (drafted
+  with Gemini, which his rule allows; Claude and GPT never write training data). Per example: its register, u or je,
+  from its machine-translated text (u/uw against je/jij/jouw as whole words, else by sha256 of the example's id); among
+  the variants of that register and the neutral ones, the one whose words the translated text uses, else one by
+  sha256 of (example id, string), the same for every occurrence in the example. "Head:" and "Tail:" follow the pair the
+  translation names in the example (beginzin/eindzin, inleidende zin/afsluitende zin, kop/staart, begin/einde, Head/Tail
+  left in English), else Beginzin/Eindzin or Kop/Staart by sha256; the sentence "Head and Tail, separated with <sep>."
+  is translated in context. Rows per variant, register and pair are in `nl/report.json`.
 - Prompt: the model's chat template, a user turn `{type: text, source_lang_code: en, target_lang_code: nl, text}`.
 - Segments: the instruction and the answer are translated, each distinct string once (yes/no and the like repeat).
   Multiple-choice options (labelled lists A/B/C, a/b/c, 1/2/3, i/ii/iii, `Option1:`, and bullet lists after a header

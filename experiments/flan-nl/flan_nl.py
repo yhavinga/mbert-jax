@@ -844,6 +844,8 @@ def sample(args):
     segments = pa.concat_tables(parts).sort_by("id")
     pq.write_table(examples, f"{args.out}/examples.parquet", compression="zstd")
     pq.write_table(segments, f"{args.out}/segments-w0.parquet", compression="zstd")
+    # The assembly reads the protected template strings from it
+    open(f"{args.out}/plan.json", "w").write(open(f"{args.plan}/plan.json").read())
     print(f"sample: {examples.num_rows} examples, {segments.num_rows} segments, "
           f"{sum(segments.column('tokens').to_pylist()):,} tokens -> {args.out}", flush=True)
 

@@ -5,7 +5,8 @@ GPT-NL: only the collections that are originally Dutch by provenance (INCLUDED),
 `language` is nl. Left out besides: empty documents, and exact duplicates (xxh64 of the text) within GPT-NL and of a
 CulturaX nl document, so that no text is in the shares twice. A seeded random sample of the rest, no reweighting
 between collections. CulturaX: each host's own 32 files of culturax-nl-230m-chunk1024 (CULTURAX_FILES), so a host's
-CulturaX documents are some of those the same host had in that run.
+CulturaX documents are some of those the same host had in that run, except the documents of the trainer's held-out
+file (--eval-file, the first 40,000 of nl_part_00097), which are not trained on.
 
   count  On a worker: its part of the included GPT-NL files (the largest first, each to the host with the fewest bytes),
          read by range requests. Per document, in the file's order: its tokens (column `text`, as the lengths parquets
@@ -339,13 +340,16 @@ def gptnl_selection(tokens: np.ndarray, seed: int, hosts: int, target: int) -> l
     return picks
 
 
-def culturax_selection(seed: int, files: tuple[int, ...], tokens: list[np.ndarray], target: int):
+def culturax_selection(seed: int, files: tuple[int, ...], tokens: list[np.ndarray], target: int, allowed=None):
     """A host's CulturaX documents: the rows of its files in the order of a draw per row of each whole file
-    (default_rng([seed, 1, file]).random(rows)), taken until target tokens. Returns (file, row), sorted."""
+    (default_rng([seed, 1, file]).random(rows)), taken until target tokens; rows not allowed are passed over.
+    Returns (file, row), sorted."""
     if list(files) != sorted(set(files)):
         raise ValueError(f"the files {files} are not sorted and distinct")
     draws = np.concatenate([np.random.default_rng([seed, 1, f]).random(len(t)) for f, t in zip(files, tokens)])
     order = np.argsort(draws, kind="stable")
+    if allowed is not None:
+        order = order[np.concatenate(allowed)[order]]
     chosen = np.sort(order[:take_until(np.concatenate(tokens)[order], target)])
     offsets = np.cumsum([0] + [len(t) for t in tokens])
     file_of = np.searchsorted(offsets, chosen, side="right") - 1
@@ -371,6 +375,7 @@ def _codes(column) -> tuple[list[str], np.ndarray]:
 def cmd_plan(args) -> None:
     import pyarrow as pa
     import pyarrow.parquet as pq
+    import xxhash
 
     seed, hosts = args.seed, HOSTS
     files = gptnl_files()
@@ -403,8 +408,13 @@ def cmd_plan(args) -> None:
         raise ValueError(f"the CulturaX files of CULTURAX_FILES hold {host_documents} documents per host, the long run's "
                          f"hosts {CULTURAX_HOST_DOCUMENTS}")
     culturax_hashes = np.concatenate([c["xxh64"] for c in culturax])
+    # The trainer's --eval-file is CulturaX documents: none of them goes into training
+    heldout = np.array([xxhash.xxh64_intdigest(t.encode("utf-8"))
+                        for t in pq.read_table(args.heldout, columns=["text"]).column("text").to_pylist()], dtype=np.uint64)
+    allowed = [~np.isin(c["xxh64"], heldout) for c in culturax]
     print(f"GPT-NL: {len(files)} files, {len(tokens):,} documents, {int(tokens.sum()):,} tokens; CulturaX: "
-          f"{len(culturax_hashes):,} documents", flush=True)
+          f"{len(culturax_hashes):,} documents, {sum(int((~a).sum()) for a in allowed):,} of them in the "
+          f"{len(heldout):,} of {args.heldout}", flush=True)
 
     eligible, dropped = eligible_documents(dutch, tokens, hashes, culturax_hashes)
     candidates = np.flatnonzero(eligible)
@@ -423,7 +433,7 @@ def cmd_plan(args) -> None:
         culturax_target = -(-gptnl_tokens * (100 - GPTNL_PERCENT) // GPTNL_PERCENT)
         host_files = CULTURAX_FILES[k]
         cx_file, cx_row = culturax_selection(seed, host_files, [culturax[f]["tokens"] for f in host_files],
-                                             culturax_target)
+                                             culturax_target, [allowed[f] for f in host_files])
         cx_tokens = np.concatenate([culturax[f]["tokens"][cx_row[cx_file == f]] for f in host_files])
         cx_bytes = np.concatenate([culturax[f]["utf8_bytes"][cx_row[cx_file == f]] for f in host_files])
         documents = len(p) + len(cx_row)
@@ -441,6 +451,7 @@ def cmd_plan(args) -> None:
                       "by_collection": by_collection},
             "culturax": {"documents": len(cx_row), "tokens": int(cx_tokens.sum()), "utf8_bytes": int(cx_bytes.sum()),
                          "of_documents": host_documents[k], "of_tokens": int(sum(culturax[f]["tokens"].sum() for f in host_files)),
+                         "heldout_passed_over": sum(int((~allowed[f]).sum()) for f in host_files),
                          "files": [culturax_path(f) for f in host_files]},
             "gptnl_token_percent": round(100 * gptnl_tokens / int(everything.sum()), 4),
             "selection": selection.name, "sha256": sha256(selection),
@@ -687,6 +698,7 @@ def main(argv=None) -> None:
     p = sub.add_parser("plan")
     p.add_argument("--gptnl-lengths", required=True, help="directory of the lengths parquets of count")
     p.add_argument("--culturax-counts", required=True, help="directory of count_tokens.py's counts/*.npz of CulturaX nl")
+    p.add_argument("--heldout", required=True, help="the trainer's --eval-file, whose documents are not trained on")
     p.add_argument("--out-dir", required=True, help="where the selections cxgptnl-w<rank>.npz go")
     p.add_argument("--plan", default=str(PLAN_PATH), help="where the plan goes; mix reads it at PLAN_PATH")
     p.add_argument("--seed", type=int, default=42)

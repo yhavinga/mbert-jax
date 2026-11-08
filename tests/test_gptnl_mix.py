@@ -99,6 +99,9 @@ def _world(tmp_path, monkeypatch):
                  (gptnl_mix.CULTURAX["repo"], gptnl_mix.CULTURAX["revision"]): "culturax"}[(repo, revision)]
         return open(hub / where / path, "rb")
 
+    # The trainer's held-out file: documents of a CulturaX file of host 3
+    heldout = culturax[gptnl_mix.culturax_path(3)][10:15]
+    pq.write_table(pa.table({"text": heldout}), tmp_path / "heldout.parquet")
     bucket = tmp_path / "gcs"
     bucket.mkdir()
 
@@ -117,7 +120,7 @@ def _world(tmp_path, monkeypatch):
     monkeypatch.setattr(gptnl_mix, "SHARE_FILES", 3)
     monkeypatch.setattr(gptnl_mix, "PLAN_PATH", tmp_path / "plan.json")
     return SimpleNamespace(gptnl=gptnl, culturax=culturax, bucket=bucket, duplicate=second, empty=third,
-                           in_culturax=fourth)
+                           in_culturax=fourth, heldout=heldout)
 
 
 def _count(tmp_path, rank, *extra):
@@ -127,6 +130,7 @@ def _count(tmp_path, rank, *extra):
 
 def _plan(tmp_path):
     gptnl_mix.main(["plan", "--gptnl-lengths", str(tmp_path / "gcs"), "--culturax-counts", str(tmp_path / "cx_counts"),
+                    "--heldout", str(tmp_path / "heldout.parquet"),
                     "--out-dir", str(tmp_path / "selections"), "--plan", str(tmp_path / "plan.json")])
     return json.loads((tmp_path / "plan.json").read_text())
 
@@ -232,6 +236,14 @@ def test_culturax_rows_follow_a_draw_per_row_of_the_whole_file():
     assert sorted(rows_alone.tolist()) == sorted(np.argsort(draws, kind="stable")[:len(rows_alone)].tolist())
     with pytest.raises(ValueError, match="not sorted"):
         gptnl_mix.culturax_selection(42, (9, 4), tokens, 2000)
+    # Rows not allowed are passed over, the others keep their order
+    allowed = [np.arange(1000) % 2 == 0, np.ones(500, dtype=bool)]
+    files_a, rows_a = gptnl_mix.culturax_selection(42, (4, 9), tokens, 2000, allowed)
+    assert not ((files_a == 4) & (rows_a % 2 == 1)).any()
+    draws = np.concatenate([np.random.default_rng([42, 1, f]).random(len(t)) for f, t in zip((4, 9), tokens)])
+    order = [i for i in np.argsort(draws, kind="stable") if np.concatenate(allowed)[i]]
+    chosen = sorted(order[:len(rows_a)])
+    assert [(4, i) if i < 1000 else (9, i - 1000) for i in chosen] == list(zip(files_a.tolist(), rows_a.tolist()))
 
 
 def test_the_tokenizer_check_refuses_other_counts(tmp_path, monkeypatch):
@@ -284,6 +296,8 @@ def test_counted_plans_and_mixed_shares_hold_each_chosen_document_once(tmp_path,
         assert len(gptnl) == share["gptnl"]["documents"] and len(culturax) == share["culturax"]["documents"]
         host_culturax = {t for f in gptnl_mix.CULTURAX_FILES[rank] for t in world.culturax[gptnl_mix.culturax_path(f)]}
         assert set(culturax) <= host_culturax, "a CulturaX document of another host's files"
+        assert not set(texts) & set(world.heldout), "a document of the held-out file"
+        assert share["culturax"]["heldout_passed_over"] == (5 if rank == 3 else 0)
         gptnl_tokens = sum(len(t.split()) for t in gptnl)
         culturax_tokens = sum(len(t.split()) for t in culturax)
         assert gptnl_tokens == share["gptnl"]["tokens"] >= 240 and culturax_tokens == share["culturax"]["tokens"]

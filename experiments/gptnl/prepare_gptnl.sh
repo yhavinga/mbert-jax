@@ -61,8 +61,10 @@ case $STEP in
     mkdir -p $WORK/gptnl_lengths $WORK/culturax_counts
     gsutil -m -q rsync $G/lengths $WORK/gptnl_lengths
     gsutil -m -q rsync $TC/culturax/counts $WORK/culturax_counts
-    "${PY[@]}" plan --gptnl-lengths $WORK/gptnl_lengths --culturax-counts $WORK/culturax_counts --out-dir $WORK/plan \
-      --plan $WORK/plan/cxgptnl_plan.json --seed 42
+    # The trainer's held-out file, as setup_fineweb2.sh checked it: its documents are left out of the shares
+    [ "$(md5sum ~/heldout.parquet | cut -d' ' -f1)" = b2f579a876d06eef40c94270537bb7af ] || { echo "$(hostname): ~/heldout.parquet is not the long run's"; exit 1; }
+    "${PY[@]}" plan --gptnl-lengths $WORK/gptnl_lengths --culturax-counts $WORK/culturax_counts --heldout ~/heldout.parquet \
+      --out-dir $WORK/plan --plan $WORK/plan/cxgptnl_plan.json --seed 42
     gsutil -q cp $WORK/plan/cxgptnl-w0.npz $WORK/plan/cxgptnl-w1.npz $WORK/plan/cxgptnl-w2.npz $WORK/plan/cxgptnl-w3.npz \
       $WORK/plan/cxgptnl_plan.json $G/plan/
     ;;

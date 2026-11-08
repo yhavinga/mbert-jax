@@ -326,3 +326,25 @@ def test_a_tiny_fine_tune_reports_every_test_example(task, staged, tmp_path, mon
         # 9 test sentences on batches of 4: the last, incomplete one counts too
         assert results["test"]["sentences"] == 9 and results["test"]["words"] == sum(len(r["tokens"]) for r in test_rows)
     assert np.isfinite(results["test_loss"])
+
+
+# ---------------------------------------------------------------- the protocol's table and comparison
+
+def test_summary_compares_the_difference_of_means_with_the_larger_seed_range(tmp_path):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "experiments" / "dumb-extra"))
+    import summarize
+
+    numbers = {("S", "squadnl"): [0.80, 0.81, 0.82], ("mix", "squadnl"): [0.84, 0.845, 0.85],
+               ("S", "conll2002"): [0.70, 0.71, 0.72], ("mix", "conll2002"): [0.69, 0.725, 0.73],
+               ("mix-653000", "dbrd"): [0.95, 0.951, 0.952]}
+    for (name, task), values in numbers.items():
+        for seed, value in zip((42, 43, 44), values):
+            key = "test_accuracy" if task == "dbrd" else "test_metric"
+            (tmp_path / f"{name}--{task}--seed{seed}.json").write_text(json.dumps({key: value}))
+    (tmp_path / "S--pos-alpino--seed42.json").write_text(json.dumps({"test_metric": 0.9}))
+    out = summarize.main(["--results", str(tmp_path), "--reference", "S", "--compare", "mix"])
+    assert out["tasks"]["mix-653000--dbrd"]["mean"] == pytest.approx(0.951)
+    assert not out["tasks"]["S--pos-alpino"]["complete"] and out["tasks"]["S--squadnl"]["complete"]
+    verdicts = {row["task"]: row["beats"] for row in out["comparison"]}
+    # squadnl: +0.035 against a larger range of 0.02; conll2002: +0.005 against 0.04
+    assert verdicts == {"squadnl": "mix", "conll2002": "neither"}

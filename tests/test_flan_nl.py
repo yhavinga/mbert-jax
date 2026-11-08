@@ -257,3 +257,58 @@ def test_a_shard_with_translations_of_other_segments_is_refused():
     shards = tr.shards_of([1, 2], ["a", "b"], 2)
     with pytest.raises(RuntimeError, match="not those"):
         tr.translate_pending(shards, set(), lambda i, t: ({"id": [2, 1]}, 1.0), lambda *a: None)
+
+
+class FakeDevice:
+    """The device side of decode_all without a model: prompt [a, n] continues with n tokens 1000 a + k, then <end_of_turn>,
+    then noise, as a real slot keeps generating past its end."""
+
+    def __init__(self, slots):
+        self.programs = [None] * slots
+        self.positions = [0] * slots
+        self.prefills = 0
+
+    @staticmethod
+    def completion(prompt):
+        a, n = prompt[0], prompt[1]
+        return [1000 * a + k for k in range(n)] + [tr.EOS_IDS[1]]
+
+    def prefill(self, tokens):
+        self.prefills += 1
+        return list(tokens), np.int32(self.completion(tokens)[0])
+
+    def insert(self, prefix, slot):
+        self.programs[slot], self.positions[slot] = self.completion(prefix), 1
+
+    def generate(self):
+        out = []
+        for s, program in enumerate(self.programs):
+            position = self.positions[s]
+            out.append(program[position] if program is not None and position < len(program) else 7)
+            self.positions[s] += 1
+        return np.asarray(out, np.int32)
+
+    @staticmethod
+    def fetch(arrays):
+        return np.asarray(arrays)
+
+
+@pytest.mark.parametrize("slots, sync_every", [(1, 1), (3, 4), (8, 16), (40, 8)])
+def test_decode_all_gives_every_prompt_its_own_completion(slots, sync_every):
+    rng = np.random.default_rng(slots)
+    prompts = [[a, int(rng.integers(0, 30))] + [5] * int(rng.integers(0, 6)) for a in range(1, 26)]
+    prompts.append([99, 60])  # longer than max_decode
+    device = FakeDevice(slots)
+    outputs = tr.decode_all(prompts, slots, device, max_decode=40, sync_every=sync_every)
+    assert device.prefills == len(prompts)
+    for prompt, (tokens, ended) in zip(prompts, outputs):
+        expected = FakeDevice.completion(prompt)[:-1]
+        if len(expected) + 1 <= 40:
+            assert (tokens, ended) == (expected, True)
+        else:
+            assert (tokens, ended) == (expected[:40], False)
+
+
+def test_a_completion_that_ends_at_once_is_empty():
+    outputs = tr.decode_all([[1, 0], [2, 3]], 1, FakeDevice(1), max_decode=8, sync_every=2)
+    assert outputs == [([], True), ([2000, 2001, 2002], True)]

@@ -5,8 +5,8 @@ Usage (translate.sh, on each worker, as a TPU of its own 4 chips):
     python translate.py --segments <plan>/segments-w0.parquet --out gs://.../out/w0 --ckpt gs://.../0/items \\
         --tokenizer /dev/shm/flan_nl/tokenizer-27b --length-class short
 
-The model is MaxText's gemma3 with the converted checkpoint, run by MaxText's OfflineEngine: a KV cache of fixed shape
-(slots x max_target_length), prompts padded to a few prefill lengths and packed, continuous batching over the slots,
+The model is MaxText's gemma3 with the converted checkpoint in MaxText's MaxEngine: a KV cache of fixed shape
+(slots x max_target_length), prompts padded to a few prefill lengths, continuous batching over the slots (decode_all),
 greedy decoding, a stop at <end_of_turn> or <eos>. The tensor axis of the mesh is the host's 4 chips. Segments are
 taken in shards of consecutive ids (similar lengths, as the plan sorts them); a shard is written to the bucket at once
 when it is done, so a restart skips every shard that is there. A segment that hits the decode limit is written with
@@ -113,27 +113,10 @@ def make_decode_cache_sharded():
     maxengine.MaxEngine._nnx_init_cache_dict = init_cache_dict
 
 
-def make_packed_prefill_complete():
-    """MaxText 0.2.5's packed prefill (MaxEngine.prefill_concat) returns no "token_logp", which its insert_partial reads
-    for every prompt (KeyError in the pilot of 8 Nov). The value is the log-probability of each prompt's first token,
-    which prefill_concat does compute, in the ResultTokens it returns; stacked per prompt it has the shape of "tokens"."""
-    import jax.numpy as jnp
-    from maxtext.inference.maxengine import maxengine
-
-    original = maxengine.MaxEngine.prefill_concat
-
-    def prefill_concat(self, **kwargs):
-        cache, results, first_tokens = original(self, **kwargs)
-        if "token_logp" not in results:
-            results["token_logp"] = jnp.stack([t.log_prob for t in first_tokens])
-        return cache, results, first_tokens
-
-    maxengine.MaxEngine.prefill_concat = prefill_concat
-
-
 def make_engine(args, shapes):
+    """MaxText's MaxEngine with the converted checkpoint: (engine, params)."""
     from maxtext.configs import pyconfig
-    from maxtext.inference import offline_engine
+    from maxtext.inference.maxengine import maxengine
 
     max_prefill = shapes["prefill_lengths"][-1]
     config = pyconfig.initialize(
@@ -144,12 +127,84 @@ def make_engine(args, shapes):
         use_multimodal=False, attention="dot_product", dtype="bfloat16", weight_dtype="bfloat16",
         ici_fsdp_parallelism=1, ici_tensor_parallelism=4, per_device_batch_size=shapes["slots"] / 4,
         max_prefill_predict_length=max_prefill, max_target_length=max_prefill + shapes["max_decode"],
-        decode_sampling_strategy="greedy", return_log_prob=True, tokenizer_type="huggingface",
+        decode_sampling_strategy="greedy", return_log_prob=False, tokenizer_type="huggingface",
         tokenizer_path=args.tokenizer)
-    return offline_engine.OfflineEngine(config=config, params=None, enable_batch_prefill=True,
-                                        min_decode_steps=args.min_decode_steps, eos_ids=EOS_IDS,
-                                        prefill_lengths=shapes["prefill_lengths"],
-                                        batch_prefill_max_batch_size=args.pack)
+    engine = maxengine.MaxEngine(config)
+    return engine, engine.load_params()
+
+
+class EngineSlots:
+    """The device side of decode_all: MaxEngine's prefill, insert and generate on one decode state."""
+
+    def __init__(self, engine, params, prefill_lengths):
+        self.engine, self.params, self.prefill_lengths = engine, params, prefill_lengths
+        self.state = engine.init_decode_state()
+
+    def prefill(self, tokens):
+        import jax.numpy as jnp
+
+        length = next(n for n in self.prefill_lengths if n >= len(tokens))
+        padded = np.zeros(length, np.int32)
+        padded[:len(tokens)] = tokens
+        prefix, first = self.engine.prefill(params=self.params, padded_tokens=jnp.asarray(padded), true_length=len(tokens))
+        return prefix, first.data[0, 0]
+
+    def insert(self, prefix, slot):
+        self.state = self.engine.insert(prefix, self.state, slot=slot)
+
+    def generate(self):
+        self.state, result = self.engine.generate(self.params, self.state)
+        return result.data[:, 0]
+
+    @staticmethod
+    def fetch(arrays):
+        import jax
+
+        return np.asarray(jax.device_get(arrays))
+
+
+def decode_all(prompts, slots, device, max_decode, sync_every):
+    """Greedy completions of prompts over a fixed number of slots: [(tokens without the stop token, ended)].
+
+    Continuous batching with the engine's own pieces: every free slot gets the next prompt (prefill, insert; the
+    prefill's token is the first of the completion), then sync_every generate steps run for all slots at once and come
+    back to the host in one transfer. A slot whose completion ends (a stop token, or max_decode tokens) is free for
+    the next prompt; the steps it ran past its end are dropped. MaxText's OfflineEngine does the same with a thread
+    per token and reached 344 tokens/s on a v4 host where these pieces allow several times that (8 Nov).
+    Prompts go longest first, so the last steps of a shard are spent on short ones.
+    """
+    queue = sorted(range(len(prompts)), key=lambda i: -len(prompts[i]))
+    queue.reverse()  # pop() from the end gives the longest first
+    outputs = [None] * len(prompts)
+    owner = [-1] * slots
+    tokens = [[] for _ in range(slots)]
+
+    def finished(s):
+        return bool(tokens[s]) and (tokens[s][-1] in EOS_IDS or len(tokens[s]) >= max_decode)
+
+    while queue or any(i >= 0 for i in owner):
+        firsts = []
+        for s in range(slots):
+            if owner[s] < 0 and queue:
+                i = queue.pop()
+                prefix, first = device.prefill(prompts[i])
+                device.insert(prefix, s)
+                owner[s], tokens[s] = i, []
+                firsts.append((s, first))
+        steps = [device.generate() for _ in range(sync_every)]
+        if firsts:
+            for (s, _), token in zip(firsts, device.fetch([f for _, f in firsts])):
+                tokens[s].append(int(token))
+        for step in device.fetch(steps):
+            for s in range(slots):
+                if owner[s] >= 0 and not finished(s):
+                    tokens[s].append(int(step[s]))
+        for s in range(slots):
+            if owner[s] >= 0 and finished(s):
+                ended = tokens[s][-1] in EOS_IDS
+                outputs[owner[s]] = (tokens[s][:-1] if ended else tokens[s], ended)
+                owner[s] = -1
+    return outputs
 
 
 def shards_of(ids, texts, shard_size):
@@ -184,22 +239,13 @@ def done_shards(out):
     return {Path(line).name for line in listed.stdout.split() if line.endswith(".parquet")}
 
 
-def translate_shard(engine, codec, tokenizer, ids, texts):
-    from maxtext.inference.offline_engine import InputData
-
+def translate_shard(device, codec, tokenizer, ids, texts, shapes, sync_every):
     prompts = [codec.encode(text) for text in texts]
-    data = [InputData(id=i, tokens=np.asarray(p, np.int32), true_length=len(p)) for i, p in zip(ids, prompts)]
     started = time.time()
-    results = engine.batch_inference(data)
+    outputs = decode_all(prompts, shapes["slots"], device, shapes["max_decode"], sync_every)
     seconds = time.time() - started
-    by_id = {int(r.index): r for r in results}
     rows = {"id": [], "text_nl": [], "ended": [], "tokens_in": [], "tokens_out": []}
-    for i, prompt in zip(ids, prompts):
-        r = by_id[i]
-        completion = [int(t) for t in r.token_ids[r.prompt_length:]]
-        ended = bool(completion) and completion[-1] in EOS_IDS
-        if ended:
-            completion = completion[:-1]
+    for i, prompt, (completion, ended) in zip(ids, prompts, outputs):
         rows["id"].append(i)
         rows["text_nl"].append(tokenizer.decode(completion, skip_special_tokens=True).strip())
         rows["ended"].append(ended)
@@ -219,8 +265,7 @@ def main(argv=None):
     parser.add_argument("--slots", type=int, default=None, help="Override the class's number of decode slots")
     parser.add_argument("--shard-size", type=int, default=4096, help="Segments per shard (default: 4096)")
     parser.add_argument("--max-shards", type=int, default=None, help="Stop after this many new shards (pilot)")
-    parser.add_argument("--pack", type=int, default=16, help="Prompts packed into one prefill (default: 16)")
-    parser.add_argument("--min-decode-steps", type=int, default=10)
+    parser.add_argument("--sync-every", type=int, default=8, help="Generate steps between transfers (default: 8)")
     args = parser.parse_args(argv)
 
     import jax
@@ -257,9 +302,9 @@ def main(argv=None):
     codec.check(texts[:3] + texts[-3:])
     make_result_tokens_a_pytree()
     make_decode_cache_sharded()
-    make_packed_prefill_complete()
     started = time.time()
-    engine = make_engine(args, shapes)
+    engine, params = make_engine(args, shapes)
+    device = EngineSlots(engine, params, shapes["prefill_lengths"])
     print(f"engine ready in {time.time() - started:.0f} s", flush=True)
     local = Path("/dev/shm/flan_nl/shards") / args.length_class
     local.mkdir(parents=True, exist_ok=True)
@@ -275,14 +320,14 @@ def main(argv=None):
             totals[key] += value
         print(f"SHARD {json.dumps({'class': args.length_class, 'shard': name, 'segments': len(rows['id']), 'tokens_in': n_in, 'tokens_out': n_out, 'seconds': round(seconds, 1), 'out_per_s': round(n_out / seconds), 'all_per_s': round((n_in + n_out) / seconds), 'not_ended': rows['ended'].count(False)})}", flush=True)
 
-    translate_pending(shards, done, lambda i, t: translate_shard(engine, codec, tokenizer, i, t), store, args.max_shards)
+    translate_pending(shards, done, lambda i, t: translate_shard(device, codec, tokenizer, i, t, shapes, args.sync_every), store, args.max_shards)
     print(f"DONE {json.dumps({'class': args.length_class, **totals, 'out_per_s': round(totals['tokens_out'] / max(totals['seconds'], 1e-9))})}", flush=True)
 
 
 if __name__ == "__main__":
-    # OfflineEngine's detokenization thread is no daemon and polls until the engine says it stopped: after an error in
-    # the main thread the process would hang there, holding the TPU and never reaching translate.sh's EXIT line (pilot
-    # of 8 Nov). So the process ends here, with the error's traceback and code, whatever the threads do.
+    # A thread that is no daemon (MaxText's OfflineEngine had one, fsspec's IO loop is another) would keep a failed
+    # process alive, holding the TPU and never reaching translate.sh's EXIT line (pilot of 8 Nov). So the process ends
+    # here, with the error's traceback and code, whatever the threads do.
     code = 0
     try:
         main()

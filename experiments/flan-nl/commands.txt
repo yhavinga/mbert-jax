@@ -1,0 +1,62 @@
+# Arm F-nl of the FLAN-decay proof on mbert-corpus (v4-32, us-central2-b, 4 workers), from /Users/yeb/Developer/yhavinga/hammond.
+# Protocol: protocol.md, copied to $R before any run of F-nl. Code: branch flan-nl of github.com/yhavinga/mbert-jax at
+# COMMIT_NL (translation and mix; scripts in $B), the trainer at F's commit F_COMMIT (start_flan_nl.sh checks it out in
+# ~/mbert-flan). Everything of the translation lives in /dev/shm/flan_nl on the workers (the boot disks have ~9 GB free);
+# a reboot empties it and setup.sh rebuilds it.
+# One thing at a time on the TPU: translate.sh refuses while anything holds /dev/accel*; stop a hung one with
+# pkill -9 -f translate.py. Do not touch mbert-mix.
+COMMIT_NL=<the commit of this file on flan-nl>
+F_COMMIT=bd6ddca909168bd4fb1dc9cd1cc748bb861a53c5
+R=gs://t5-dutch-english-usc2/mbert/flan-nl
+B=$R/scripts
+S=gs://t5-dutch-english-usc2/mbert/culturax-nl-230m-chunk1024/ckpt_keep/653000
+PY='$HOME/mbert-dumb/.venv/bin/python'
+SSH='gcloud compute tpus tpu-vm ssh mbert-corpus --zone us-central2-b --project t5-dutch-english --quiet'
+CODE=/dev/shm/flan_nl/code
+VENV=/dev/shm/flan_nl/venv/bin/python
+
+# 0. From the Mac, in a checkout of flan-nl at COMMIT_NL: scripts and protocol into the bucket
+gsutil -m cp experiments/flan-nl/*.sh experiments/flan-nl/*.py experiments/flan-nl/protocol.md experiments/flan-nl/commands.txt $B/ && gsutil cp experiments/flan-nl/protocol.md $R/protocol.md
+
+# 1. Environment on every worker, and on worker 0 the conversion of TranslateGemma 27B into $R/translategemma-27b-maxtext
+# (~2 minutes of install; on worker 0 1 minute of download and 6 of conversion). Log ~/logs/flan_nl_setup.log, ends in EXIT.
+# The HF token is there from F's setup (flan-decay/commands.txt, step 1).
+$SSH --worker=all --command "mkdir -p $CODE ~/logs && gsutil -q cp '$B/*' $CODE/ && W=\$(hostname | sed 's/.*-w-//') && ARG= && { [ \$W = 0 ] && ARG=convert || true; } && (setsid nohup bash -c \"bash $CODE/setup.sh \$ARG > ~/logs/flan_nl_setup.log 2>&1; echo EXIT \\\$? >> ~/logs/flan_nl_setup.log\" > /dev/null 2>&1 < /dev/null &)" < /dev/null
+$SSH --worker=all --command 'tail -n 2 ~/logs/flan_nl_setup.log' < /dev/null
+# The safetensors on worker 0 are not needed after the conversion (52 GB of RAM):
+$SSH --worker=0 --command 'rm -f /dev/shm/flan_nl/hf-27b/*.safetensors' < /dev/null
+
+# 2. The FLAN rows of F's mix of every host (seconds): $R/en/w<N>.parquet
+$SSH --worker=all --command "W=\$(hostname | sed 's/.*-w-//') && $VENV $CODE/flan_nl.py extract --rank \$W --list ~/flan_decay_files.txt --out /dev/shm/flan_nl/en-w\$W.parquet && gsutil -q cp /dev/shm/flan_nl/en-w\$W.parquet $R/en/w\$W.parquet" < /dev/null
+
+# 3. The plan on worker 0 (~2 minutes): task filters, pieces, distinct segments by worker -> $R/plan/
+$SSH --worker=0 --command "mkdir -p /dev/shm/flan_nl/plan /dev/shm/flan_nl/en && for w in 0 1 2 3; do gsutil -q cp $R/en/w\$w.parquet /dev/shm/flan_nl/en/w\$w.parquet; done && TOKENIZERS_PARALLELISM=false $VENV -u $CODE/flan_nl.py plan --english /dev/shm/flan_nl/en/w{0,1,2,3}.parquet --tokenizer /dev/shm/flan_nl/tokenizer-27b --out /dev/shm/flan_nl/plan --processes 96 > ~/logs/flan_nl_plan.log 2>&1; echo EXIT \$? >> ~/logs/flan_nl_plan.log; gsutil -m -q cp /dev/shm/flan_nl/plan/* $R/plan/" < /dev/null
+gsutil cat $R/plan/plan.json
+
+# 4. Pilot on worker 0: 300 random examples to translate (seed 0), translated, assembled, 15 pairs shown
+$SSH --worker=0 --command "mkdir -p /dev/shm/flan_nl/pilot && $VENV $CODE/flan_nl.py sample --plan /dev/shm/flan_nl/plan --out /dev/shm/flan_nl/pilot --n 300 --seed 0 && gsutil -m -q cp /dev/shm/flan_nl/pilot/* $R/pilot/ && SEGMENTS=$R/pilot/segments-w0.parquet OUT=$R/pilot/out/27b/w0 NAME=flan_nl_pilot bash $CODE/translate.sh" < /dev/null
+$SSH --worker=0 --command "grep -a '^SHARD\|^DONE\|^EXIT\|Error' ~/logs/flan_nl_pilot.log" < /dev/null
+$SSH --worker=0 --command "mkdir -p /dev/shm/flan_nl/pilot/nl /dev/shm/flan_nl/pilot/out && gsutil -m -q rsync -r $R/pilot/out/27b /dev/shm/flan_nl/pilot/out && $VENV $CODE/flan_nl.py assemble --english /dev/shm/flan_nl/en/w{0,1,2,3}.parquet --plan /dev/shm/flan_nl/pilot --translations /dev/shm/flan_nl/pilot/out --out /dev/shm/flan_nl/pilot/nl --processes 8 && gsutil -m -q cp -r /dev/shm/flan_nl/pilot/nl $R/pilot/" < /dev/null
+
+# 5. The full translation, every worker its quarter, the short class then the long one (shards in $R/out/27b/w<N>/<class>/).
+# The same command resumes after a crash or a reboot (after step 1 again): stored shards are skipped.
+$SSH --worker=all --command "bash $CODE/translate.sh" < /dev/null
+# Progress and the end (each log ends in EXIT 0):
+$SSH --worker=all --command "grep -a '^SHARD' ~/logs/flan_nl_translate.log | tail -n 1; grep -a '^DONE\|^EXIT\|Error' ~/logs/flan_nl_translate.log" < /dev/null
+for w in 0 1 2 3; do echo w$w $(gsutil ls $R/out/27b/w$w/short/ | wc -l) $(gsutil ls $R/out/27b/w$w/long/ | wc -l); done
+
+# 6. Assembly on worker 0 (~10 minutes): the Dutch rows of every host and what was dropped why -> $R/nl/
+$SSH --worker=0 --command "mkdir -p /dev/shm/flan_nl/out /dev/shm/flan_nl/nl && gsutil -m -q rsync -r $R/out/27b /dev/shm/flan_nl/out && $VENV -u $CODE/flan_nl.py assemble --english /dev/shm/flan_nl/en/w{0,1,2,3}.parquet --plan /dev/shm/flan_nl/plan --translations /dev/shm/flan_nl/out --out /dev/shm/flan_nl/nl --processes 96 > ~/logs/flan_nl_assemble.log 2>&1; echo EXIT \$? >> ~/logs/flan_nl_assemble.log; gsutil -m -q cp /dev/shm/flan_nl/nl/* $R/nl/" < /dev/null
+gsutil cat $R/nl/report.json
+
+# 7. The Dutch mix of every host (CPU, the trainer's venv; ~20 minutes): ~/flan_decay_nl/mix-<build>.parquet,
+# ~/flan_decay_nl_files.txt, the manifest in $R/mix/w<N>.json
+$SSH --worker=all --command "(PY=$PY setsid nohup bash -c 'bash $CODE/build_mix.sh > ~/logs/flan_nl_mix.log 2>&1; echo EXIT \$? >> ~/logs/flan_nl_mix.log' > /dev/null 2>&1 < /dev/null &)" < /dev/null
+$SSH --worker=all --command 'tail -n 3 ~/logs/flan_nl_mix.log' < /dev/null
+for w in 0 1 2 3; do gsutil cat $R/mix/w$w.json | python3 -c "import json, sys; m = json.load(sys.stdin); f = m['flan']; print('w$w', m['rows'], f['f_rows'], f['rows'], round(m['flan_token_share'], 4), round(m['f_flan_token_share'], 4))"; done
+
+# 8. Arm F-nl (not started by this sub-project; ~1.5 hours like F), when the TPU is free, after the same smoke test as F
+# (flan-decay/commands.txt, step 3, with start_flan_nl.sh and RUN=flan-Fnl-smoke):
+# $SSH --worker=all --command "gsutil -q cp $B/start_flan_nl.sh ~/ && COMMIT=$F_COMMIT PY=$PY bash ~/start_flan_nl.sh $S uniform15" < /dev/null
+# Then DUMB (flan-decay/commands.txt, step 7, with flan-Fnl=gs://t5-dutch-english-usc2/mbert/flan-decay/flan-Fnl/ckpt/20000)
+# and the zero-shot eval (step 6, with Fnl=<that step dir>), and the rule of protocol.md, "Decision rule".

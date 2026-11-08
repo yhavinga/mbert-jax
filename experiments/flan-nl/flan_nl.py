@@ -379,8 +379,13 @@ def render(pieces, translation):
 
 # ---------------------------------------------------------------------------------------------------------- checks
 
+# The translator writes typographic quotes and dashes where FLAN has plain ones, and not always the same way twice
+_TYPOGRAPHY = str.maketrans({"‘": "'", "’": "'", "‚": "'", "“": '"', "”": '"', "„": '"',
+                             "‐": "-", "‑": "-", "‒": "-", "–": "-", "—": "-"})
+
+
 def _normalize(text):
-    text = unicodedata.normalize("NFKC", text).casefold()
+    text = unicodedata.normalize("NFKC", text).casefold().translate(_TYPOGRAPHY)
     return re.sub(r"\s+", " ", text).strip()
 
 
@@ -400,15 +405,46 @@ def answer_lost(inputs_en, targets_en, inputs_nl, targets_nl):
     return contains(inputs_en, targets_en) and not contains(inputs_nl, targets_nl)
 
 
-# Phrases with which a translator comments instead of translating; only counted when the source has no such phrase
+# Phrases with which a translator talks about the translation instead of giving it. Not "Let op:" or "Opmerking:":
+# those translate "Note that ..." of FLAN's own instructions (pilot of 8 Nov). Only counted when the source has none.
 _COMMENTARY = re.compile(
     r"(here is the translation|here's the translation|translation:|translated text|hier is de vertaling|"
-    r"vertaling:|de vertaling is|opmerking:|\(opmerking|noot:|\(noot|note:|\(note|let op:|toelichting:|uitleg:|"
-    r"explanation:|alternatie(?:f|ve)(?: vertaling)?:|als ai|as an ai|ik kan (?:dit|deze|de) .{0,30}niet vertalen|"
-    r"i cannot translate|i can't translate|ik ben een vertaler)", re.IGNORECASE)
+    r"vertaling:|de vertaling is|vertaald:|noot van de vertaler|opmerking van de vertaler|vertalersnoot|"
+    r"\((?:opmerking|noot|note):|alternatie(?:f|ve)(?: vertaling)?:|als ai|as an ai|"
+    r"ik kan (?:dit|deze|de) .{0,30}niet vertalen|i cannot translate|i can't translate)", re.IGNORECASE)
 DUTCH_LANGUAGES = {"nl", "af"}  # langid takes short Dutch for Afrikaans now and then; a translator does not write it
 LANGID_LANGUAGES = ["nl", "en", "de", "fr", "es", "it", "pt", "af"]
 MIN_LANGID_WORDS = 5
+# English words that Dutch does not have: langid alone takes names and short Dutch for English (pilot of 8 Nov), so
+# an output is only "not Dutch" when it also has English in it
+_ENGLISH_WORDS = {"the", "and", "to", "that", "for", "with", "it", "are", "this", "on", "by", "from", "at", "not",
+                  "have", "has", "you", "your", "which", "they", "their", "would", "can", "what", "who", "there",
+                  "been", "were", "these", "those", "should", "could", "about", "into", "than", "then", "also", "its"}
+# TranslateGemma now and then ends a sentence with the Devanagari danda instead of a period ("rundvee।" for
+# "cattle.", pilot of 8 Nov); as a cached translation of a frequent answer it would take every example with it
+DANDA = "।"
+_SCRIPTS = ("DEVANAGARI", "BENGALI", "GURMUKHI", "GUJARATI", "TAMIL", "TELUGU", "KANNADA", "MALAYALAM", "SINHALA",
+            "THAI", "LAO", "TIBETAN", "MYANMAR", "KHMER", "CJK", "HIRAGANA", "KATAKANA", "HANGUL", "ARABIC", "HEBREW",
+            "CYRILLIC", "GREEK", "ARMENIAN", "GEORGIAN", "ETHIOPIC")
+
+
+def repair_translation(source, output):
+    """(output, repaired): the danda put back as the period it stands for, or left out where the source ends without
+    one. The only repair; everything else that is wrong drops the example."""
+    if DANDA not in output or DANDA in source:
+        return output, False
+    output = output.replace(DANDA, ".")
+    if output.endswith(".") and not source.rstrip().endswith("."):
+        output = output[:-1].rstrip()
+    return output, True
+
+
+def _foreign_script(source, output):
+    for ch in set(output) - set(source):
+        name = unicodedata.name(ch, "")
+        if ord(ch) > 0x24F and any(script in name for script in _SCRIPTS):
+            return True
+    return False
 
 
 def check_translation(source, output, ended, identify_language):
@@ -423,11 +459,18 @@ def check_translation(source, output, ended, identify_language):
     match = _COMMENTARY.search(output)
     if match and not _COMMENTARY.search(source) and "translat" not in source.lower():
         return "commentary"
-    # Several translations offered instead of one ("niet overweg kunnen met / geen goede band met", pilot of 8 Nov)
-    if " / " in output and "/" not in source:
+    # Several translations offered instead of one ("niet overweg kunnen met / geen goede band met", "hut; cabine",
+    # "Begeleider/adviseur", pilot of 8 Nov)
+    if (" / " in output and "/" not in source) or \
+            (len(source.split()) <= 4 and any(c in output and c not in source for c in ";/")):
         return "alternatives"
-    if len(_WORD.findall(output)) >= MIN_LANGID_WORDS and identify_language(output) not in DUTCH_LANGUAGES:
-        return "not_dutch"
+    if _foreign_script(source, output):
+        return "foreign_script"
+    words = _WORD.findall(output)
+    if len(words) >= MIN_LANGID_WORDS and identify_language(output) not in DUTCH_LANGUAGES:
+        english = sum(w.lower() in _ENGLISH_WORDS for w in words)
+        if english >= 2 or english >= 0.15 * len(words):
+            return "not_dutch"
     return None
 
 
@@ -642,6 +685,11 @@ def assemble(args):
     if missing:
         raise SystemExit(f"{len(missing):,} of {len(segments):,} segments have no translation, e.g. {sorted(missing)[:5]}")
     ids = sorted(segments)
+    repaired = 0
+    for i in ids:
+        out, fixed = repair_translation(segments[i], translated[i][0])
+        translated[i] = (out, translated[i][1])
+        repaired += fixed
     # Language ID is the slow part: in processes, in chunks
     with concurrent.futures.ProcessPoolExecutor(args.processes) as pool:
         chunk = 2000
@@ -655,7 +703,8 @@ def assemble(args):
         why = check_translation(segments[i], out, ended, lambda _: language[i])
         if why:
             failed[i] = why
-    print(f"assemble: {len(ids):,} segments, {len(failed):,} unusable: {dict(Counter(failed.values()))}", flush=True)
+    print(f"assemble: {len(ids):,} segments, {repaired:,} with the danda repaired, {len(failed):,} unusable: "
+          f"{dict(Counter(failed.values()))}", flush=True)
 
     examples = _read_parquet(f"{args.plan}/examples.parquet")
     columns = {c: examples.column(c).to_pylist() for c in examples.column_names}
@@ -696,7 +745,7 @@ def assemble(args):
             rows[h][key].append(value)
     for h in range(args.world):
         pq.write_table(pa.table(rows[h]), f"{args.out}/w{h}.parquet", compression="zstd")
-    summary = {"segments": len(ids), "segments_unusable": dict(Counter(failed.values())),
+    summary = {"segments": len(ids), "segments_danda_repaired": repaired, "segments_unusable": dict(Counter(failed.values())),
                "hosts": {h: dict(sorted(report[h].items())) for h in range(args.world)}}
     json.dump(summary, open(f"{args.out}/report.json", "w"), indent=1)
     print(f"ASSEMBLE {json.dumps(summary)}", flush=True)

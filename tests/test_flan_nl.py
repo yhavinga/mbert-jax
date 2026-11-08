@@ -148,6 +148,33 @@ def test_generic_checks_of_a_translation():
     assert fn.check_translation("Note: bring a towel.", "Opmerking: neem een handdoek mee.", True, dutch) is None
     # Too short for a language ID: names and single words pass
     assert fn.check_translation("Sinister Foxx", "Sinister Foxx", True, english) is None
+    # langid's English for names and for a Dutch sentence is not enough: the output must have English in it
+    assert fn.check_translation("Jonathan Luke Ke Huy Quan", "Jonathan Luke Ke Huy Quan", True, english) is None
+    assert fn.check_translation("What did Russell Simmons think of West's apology?",
+                                "Wat vond Russell Simmons van Wests excuses?", True, english) is None
+    # "Let op:" translates FLAN's own "Note that"; a translator's note does not
+    assert fn.check_translation("Note that URLs in the text have been replaced with [Link].",
+                                "Let op: de URL's in de tekst zijn vervangen door [Link].", True, dutch) is None
+    assert fn.check_translation("The cat sat on the mat today.", "De kat zat vandaag op de mat. (Opmerking: letterlijk)",
+                                True, dutch) == "commentary"
+    assert fn.check_translation("cabin", "hut; cabine", True, dutch) == "alternatives"
+    assert fn.check_translation("Counselor", "Begeleider/adviseur", True, dutch) == "alternatives"
+    assert fn.check_translation("Not similar", "Niet vergelijkbaarक", True, dutch) == "foreign_script"
+    assert fn.check_translation("Dood Ari - Part 1", "Dood Ari – Deel 1", True, dutch) is None
+
+
+def test_the_danda_is_repaired_and_counted():
+    assert fn.repair_translation("cattle.", "rundvee।") == ("rundvee.", True)
+    assert fn.repair_translation("Not similar", "Niet vergelijkbaar।") == ("Niet vergelijkbaar", True)
+    assert fn.repair_translation("It rains. It pours.", "Het regent। Het giet।") == ("Het regent. Het giet.", True)
+    assert fn.repair_translation("cattle.", "rundvee.") == ("rundvee.", False)
+    assert fn.repair_translation("। stays", "। blijft") == ("। blijft", False)
+
+
+def test_typographic_quotes_and_dashes_count_as_plain_ones():
+    assert not fn.answer_lost("Choose: Cars & Other Vehicles, Home", "Cars & Other Vehicles",
+                              "Kies: Auto's en andere voertuigen, Huis", "Auto’s en andere voertuigen")
+    assert not fn.answer_lost("Is it Kill Ari - Part 1?", "Kill Ari - Part 1", "Is het Dood Ari - Deel 1?", "Dood Ari – Deel 1")
 
 
 def _mix_rows():

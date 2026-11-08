@@ -3,7 +3,7 @@
 
 Usage (translate.sh, on each worker, as a TPU of its own 4 chips):
     python translate.py --segments <plan>/segments-w0.parquet --out gs://.../out/w0 --ckpt gs://.../0/items \\
-        --tokenizer /dev/shm/flan_nl/tokenizer-12b --model gemma3-12b --length-class small
+        --tokenizer /dev/shm/flan_nl/tokenizer-27b --model gemma3-27b --length-class small
 
 The model is MaxText's gemma3 with the converted checkpoint in MaxText's MaxEngine: a KV cache of fixed shape
 (slots x max_target_length), prompts padded to a few prefill lengths, continuous batching over the slots (decode_all),
@@ -272,7 +272,7 @@ def main(argv=None):
     parser.add_argument("--out", required=True, help="Bucket directory of this worker's shards of this length class")
     parser.add_argument("--ckpt", required=True, help="The MaxText parameters, <checkpoint>/0/items")
     parser.add_argument("--tokenizer", required=True, help="TranslateGemma's tokenizer directory")
-    parser.add_argument("--model", default="gemma3-12b", choices=sorted(SLOTS))
+    parser.add_argument("--model", default="gemma3-27b", choices=sorted(SLOTS))
     parser.add_argument("--length-class", required=True, choices=sorted(LENGTH_CLASSES))
     parser.add_argument("--slots", type=int, default=None, help="Override the class's number of decode slots")
     parser.add_argument("--shard-size", type=int, default=4096, help="Segments per shard (default: 4096)")

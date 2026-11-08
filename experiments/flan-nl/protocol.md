@@ -60,8 +60,8 @@ The translation (`flan_nl.py`, `translate.py`):
   paragraphs, then lines, then sentences, the parts translated and joined; the plan counts the examples cut.
 - Tasks left out (the lists `DROPPED_TASKS` in `flan_nl.py`): code, SQL and formal languages; English grammar,
   acceptability, spelling, punctuation and case (CoLA, BLiMP, JFLEG, `fix_punct`, `true_case`, `word_segment`, ...);
-  word games, letters and strings (rhymes, character counts, lists of random letter strings, ...); POS tagging, NER
-  and other token-level tasks (and next or missing English words, LAMBADA); translation and tokenization; tasks about
+  word games, letters and strings (rhymes, character counts, lists of random letter strings, ...); POS tagging (also
+  the four NIv2 hybridqa tasks that ask for POS tags), NER and other token-level tasks (and next or missing English words, LAMBADA); translation and tokenization; tasks about
   English words (WiC, XL-WiC, the English-language Q&A, overlapping words); relations between bare words (odd man out,
   the BARD analogies, hypernyms, meronyms, antonyms, semantic relations of word pairs: a word translated out of
   context loses the sense the answer rests on). The assembly applies the lists again, so a task added after the plan
@@ -76,9 +76,9 @@ The translation (`flan_nl.py`, `translate.py`):
   "/" after a source of at most 4 words), has letters of a script the source does not have (Devanagari, CJK, Cyrillic,
   ...), or is not Dutch (`langid` 1.1.6 over nl, en, de, fr, es, it, pt, af says neither nl nor af, from 5 words on,
   and the output has English function words in it: names and short Dutch alone fooled `langid` in the pilot); a
-  sentence of more than 512 tokens; a Dutch example of more than 1,024 tokens as the trainer counts them. One repair,
-  counted: the Devanagari danda that TranslateGemma now and then writes for a period becomes the period (or nothing
-  where the source ends without one). Every count is in the plan (`plan/plan.json`), the assembly (`nl/report.json`)
+  sentence of more than 512 tokens; a Dutch example of more than 1,024 tokens as the trainer counts them. Two repairs,
+  counted: the Devanagari danda that TranslateGemma now and then writes for a period becomes the period, and a final
+  period the source does not have is left out (12B ends short answers with one: "Yes" became "Ja."). Every count is in the plan (`plan/plan.json`), the assembly (`nl/report.json`)
   and the mix manifests (`mix/w<N>.json`).
 - No DBRD or SICK-NL data: the pool is F's, which excludes the SICK tasks and any task named after SICK, DBRD,
   Belebele or FLORES.

@@ -125,6 +125,8 @@ def test_task_filters():
     assert fn.task_drop_reason("task560_alt_translation_en_entk") == "translation"
     assert fn.task_drop_reason("super_glue/wic:1.0.2") == "english_words"
     assert fn.task_drop_reason("task142_odd-man-out_classification_no_category") == "word_relations"
+    assert fn.task_drop_reason("task382_hybridqa_answer_generation") == "token_level"
+    assert fn.task_drop_reason("task344_hybridqa_answer_generation") is None
     assert fn.task_drop_reason("task1155_bard_analogical_reasoning_trash_or_treasure") == "word_relations"
     assert fn.task_drop_reason("glue/sst2:2.0.0") is None and fn.task_drop_reason("task1312_amazonreview_polarity_classification") is None
     assert "task1543_conll2002_parts_of_speech_tagging_answer_generation" in fn.DUTCH_TASKS
@@ -167,12 +169,17 @@ def test_generic_checks_of_a_translation():
     assert fn.check_translation("Dood Ari - Part 1", "Dood Ari – Deel 1", True, dutch) is None
 
 
-def test_the_danda_is_repaired_and_counted():
-    assert fn.repair_translation("cattle.", "rundvee।") == ("rundvee.", True)
-    assert fn.repair_translation("Not similar", "Niet vergelijkbaar।") == ("Niet vergelijkbaar", True)
-    assert fn.repair_translation("It rains. It pours.", "Het regent। Het giet।") == ("Het regent. Het giet.", True)
-    assert fn.repair_translation("cattle.", "rundvee.") == ("rundvee.", False)
-    assert fn.repair_translation("। stays", "। blijft") == ("। blijft", False)
+def test_the_two_repairs_are_made_and_named():
+    assert fn.repair_translation("cattle.", "rundvee\u0964") == ("rundvee.", ["danda"])
+    assert fn.repair_translation("Not similar", "Niet vergelijkbaar\u0964") == ("Niet vergelijkbaar", ["danda", "final_period"])
+    assert fn.repair_translation("It rains. It pours.", "Het regent\u0964 Het giet\u0964") == ("Het regent. Het giet.", ["danda"])
+    assert fn.repair_translation("cattle.", "rundvee.") == ("rundvee.", [])
+    assert fn.repair_translation("\u0964 stays", "\u0964 blijft") == ("\u0964 blijft", [])
+    assert fn.repair_translation("Yes", "Ja.") == ("Ja", ["final_period"])
+    assert fn.repair_translation("the snake", "de slang.") == ("de slang", ["final_period"])
+    assert fn.repair_translation("Wait for it...", "Wacht maar...") == ("Wacht maar...", [])
+    assert fn.repair_translation("Is it done?", "Is het klaar?") == ("Is het klaar?", [])
+    assert fn.repair_translation("Answer:", "Antwoord.") == ("Antwoord.", [])
 
 
 def test_typographic_quotes_and_dashes_count_as_plain_ones():

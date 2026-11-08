@@ -91,6 +91,9 @@ DROPPED_TASKS = {
         "task585_preposition_classification", "task388_torque_token_classification", "task610_conllpp_ner",
         "task963_librispeech_asr_next_word_prediction", "task964_librispeech_asr_text_auto_completion",
         "task965_librispeech_asr_missing_word_prediction", "task603_wikitext-103_fill_in_the_blank", "lambada:1.0.0",
+        # POS tags of the words of an English question, under a QA name
+        "task345_hybridqa_answer_generation", "task346_hybridqa_classification",
+        "task347_hybridqa_incorrect_answer_generation", "task382_hybridqa_answer_generation",
     },
     # Translation, tokenization, or text in other languages
     "translation": {
@@ -445,14 +448,19 @@ _SCRIPTS = ("DEVANAGARI", "BENGALI", "GURMUKHI", "GUJARATI", "TAMIL", "TELUGU", 
 
 
 def repair_translation(source, output):
-    """(output, repaired): the danda put back as the period it stands for, or left out where the source ends without
-    one. The only repair; everything else that is wrong drops the example."""
-    if DANDA not in output or DANDA in source:
-        return output, False
-    output = output.replace(DANDA, ".")
-    if output.endswith(".") and not source.rstrip().endswith("."):
+    """(output, [repairs]): the two repairs, each counted; everything else that is wrong drops the example.
+
+    "danda": the danda put back as the period it stands for. "final_period": a period at the end that the source does
+    not have, which 12B adds to short answers ("Yes" -> "Ja.", "the snake" -> "de slang.", pilot of 8 Nov), so the
+    answers keep F's form."""
+    repairs = []
+    if DANDA in output and DANDA not in source:
+        output = output.replace(DANDA, ".")
+        repairs.append("danda")
+    if output.endswith(".") and not output.endswith("..") and not source.rstrip().endswith((".", "!", "?", ":", ";")):
         output = output[:-1].rstrip()
-    return output, True
+        repairs.append("final_period")
+    return output, repairs
 
 
 def _foreign_script(source, output):
@@ -702,11 +710,11 @@ def assemble(args):
     if missing:
         raise SystemExit(f"{len(missing):,} of {len(segments):,} segments have no translation, e.g. {sorted(missing)[:5]}")
     ids = sorted(segments)
-    repaired = 0
+    repaired = Counter()
     for i in ids:
         out, fixed = repair_translation(segments[i], translated[i][0])
         translated[i] = (out, translated[i][1])
-        repaired += fixed
+        repaired.update(fixed)
     # Language ID is the slow part: in processes, in chunks
     with concurrent.futures.ProcessPoolExecutor(args.processes) as pool:
         chunk = 2000
@@ -720,7 +728,7 @@ def assemble(args):
         why = check_translation(segments[i], out, ended, lambda _: language[i])
         if why:
             failed[i] = why
-    print(f"assemble: {len(ids):,} segments, {repaired:,} with the danda repaired, {len(failed):,} unusable: "
+    print(f"assemble: {len(ids):,} segments, repaired {dict(repaired)}, {len(failed):,} unusable: "
           f"{dict(Counter(failed.values()))}", flush=True)
 
     examples = _read_parquet(f"{args.plan}/examples.parquet")
@@ -767,7 +775,7 @@ def assemble(args):
             rows[h][key].append(value)
     for h in range(args.world):
         pq.write_table(pa.table(rows[h]), f"{args.out}/w{h}.parquet", compression="zstd")
-    summary = {"segments": len(ids), "segments_danda_repaired": repaired, "segments_unusable": dict(Counter(failed.values())),
+    summary = {"segments": len(ids), "segments_repaired": dict(repaired), "segments_unusable": dict(Counter(failed.values())),
                "hosts": {h: dict(sorted(report[h].items())) for h in range(args.world)}}
     json.dump(summary, open(f"{args.out}/report.json", "w"), indent=1)
     print(f"ASSEMBLE {json.dumps(summary)}", flush=True)

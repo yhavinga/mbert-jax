@@ -376,9 +376,13 @@ def test_a_council_document_records_the_context_rules(idioms):
     assert passages and all("open_before" in p["fails"] for p in passages)
 
 
-def test_the_open_line_needs_eight_words():
+def test_an_open_line_ends_in_a_word_that_never_ends_a_sentence():
     assert sp.open_before("Het college heeft het voorstel besproken met de bewoners en")
+    assert sp.open_before("technische toelichting voorafgaand aan de vergaderingen van de")
     assert not sp.open_before("Kop zonder punt")
+    assert not sp.open_before("**Resultaat 1:** **We geven uitvoering aan de lokale speerpunten.**")
+    assert not sp.open_before("|10 12 Merlering 932|Col2|")
+    assert not sp.open_before("van de")  # too short to tell
     assert not sp.open_before("Het college heeft het voorstel besproken met de bewoners.")
 
 

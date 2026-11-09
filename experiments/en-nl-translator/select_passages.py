@@ -344,14 +344,19 @@ def extraction_errors(text, wordset):
     return fails
 
 
-# The paragraph before a passage ended without a sentence end: the passage opens in the middle of its sentence. Short
-# lines without one are headings ("Inleiding"), so only a line of this many words counts.
-OPEN_MIN_WORDS = 8
-SENTENCE_CLOSE = re.compile(r"[.!?…:;][\"'”’)\]]*$")
+# The paragraph before a passage ends in a word that never ends a sentence ("... voorafgaand aan de vergaderingen van
+# de"): the passage opens in the middle of its sentence. A line without a stop is no evidence of its own: on the pilot
+# those were mostly headings in bold or italic, table rows, captions and footnote marks before a clean start.
+OPEN_MIN_WORDS = 3
+OPEN_END_WORDS = frozenset("""de het een van en of in op te met voor aan door om bij naar als dat die is zijn er niet
+    ook nog tot over uit zal zullen kan kunnen wordt worden werd heeft hebben had wel maar dan waar wat hij zij ze we
+    wij ik u je deze dit zich hun haar onze mijn uw zo omdat terwijl want dus nu moet moeten mag wil willen zou zouden
+    tussen tegen onder zonder na via per ten ter""".split())
 
 
 def open_before(paragraph):
-    return len(paragraph.split()) >= OPEN_MIN_WORDS and not SENTENCE_CLOSE.search(paragraph.rstrip())
+    words = paragraph.split()
+    return len(words) >= OPEN_MIN_WORDS and words[-1] in OPEN_END_WORDS
 
 
 def name_conflict(text):
@@ -647,6 +652,9 @@ class Builder:
                 text = "\n".join(paras)
                 fails, measures = self.checks(source, text)
                 fails += self.context_fails(paragraphs, labels, first, last)
+                # the paragraphs around it, for reading the context rules (annotate writes them)
+                before = paragraphs[first[3] - 1] if first[4] and first[3] > 0 else None
+                after = paragraphs[last[3] + 1] if last[5] and last[3] + 1 < len(paragraphs) else None
                 hits = self.matcher.find(text)
                 n_words = len(words_of(text))
                 passages.append({
@@ -655,6 +663,7 @@ class Builder:
                     "words": n_words, "idioms": hits, "idiom_score": round(100 * len(hits) / max(n_words, 1), 4),
                     "speaker": meta.get("speaker"), "party": meta.get("party"),
                     "date": doc.get("date"), "content_type": list(doc.get("content_type") or []),
+                    "before": before, "after": after,
                 })
         texts = [p["text"] for p in passages]
         for p, n in zip(passages, self.count(texts)):
@@ -897,19 +906,18 @@ def build_passages(args, report):
 
 def annotate(args):
     """The passages of an earlier selection (--pids, a pid a line) rebuilt from the same row groups with this
-    version's filters: annotated.parquet with pid, source, text and fails."""
+    version's filters: annotated.parquet with pid, source, text, fails and the paragraphs before and after it."""
     import pyarrow as pa
     import pyarrow.parquet as pq
 
     wanted = {line.strip() for line in open(args.pids, encoding="utf-8") if line.strip()}
     report = {"args": vars(args), "sources": {}}
     passages, _, _ = build_passages(args, report)
-    rows = [{"pid": p["pid"], "source": p["source"], "text": p["text"], "fails": p["fails"]}
-            for v in passages.values() for p in v if p["pid"] in wanted]
+    columns = ("pid", "source", "text", "fails", "before", "after")
+    rows = [{c: p[c] for c in columns} for v in passages.values() for p in v if p["pid"] in wanted]
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    pq.write_table(pa.table({c: [r[c] for r in rows] for c in ("pid", "source", "text", "fails")}),
-                   out / "annotated.parquet")
+    pq.write_table(pa.table({c: [r[c] for r in rows] for c in columns}), out / "annotated.parquet")
     print(f"ANNOTATE {len(rows)} of {len(wanted)} passages found -> {out / 'annotated.parquet'}")
 
 

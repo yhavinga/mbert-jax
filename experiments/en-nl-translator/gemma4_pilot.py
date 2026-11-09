@@ -196,7 +196,10 @@ def nemotron_chains(rows, count):
         if not is_lmarena(row):
             continue
         messages = row.get("messages") or []
-        turns = [{"role": m.get("role"), "text": m.get("content")} for m in messages]
+        # Every lmarena conversation starts with a system message whose content is '' (measured on 407 of 407): leave
+        # such an empty system message out instead of rejecting the conversation for an empty turn.
+        turns = [{"role": m.get("role"), "text": m.get("content")} for m in messages
+                 if not (m.get("role") == "system" and not (m.get("content") or "").strip())]
         if any(t["role"] not in NEMOTRON_LABELS or not isinstance(t["text"], str) or not t["text"].strip()
                for t in turns):
             continue

@@ -101,3 +101,17 @@ def test_translate_chains_gives_every_turn_the_context_of_its_own_chain():
     assert items == [("q2", [{"label": "Gebruiker", "source": "q1", "translation": "P[q1|0|None]"},
                              {"label": "Assistent", "source": "r1", "translation": "C[r1|1|Assistent]"}], "Gebruiker")]
     assert n[2]["nl_context"] == "C[q2|2|Gebruiker]" and n[2]["context_tokens_in"] == 10
+
+
+def test_nemotron_chains_skip_an_empty_system_message():
+    # Every lmarena conversation of Nemotron Chat v3 starts with {"role": "system", "content": ""}; that turn is left
+    # out, the conversation stays.
+    pytest.importorskip("langid")
+    row = {"uuid": "c1", "metadata": {"seed_dataset": "lmarena-ai/arena-human-preference-55k"},
+           "messages": [{"role": "system", "content": ""},
+                        {"role": "user", "content": "Can you tell me how a bicycle gear works in simple words?"},
+                        {"role": "assistant", "content": "Sure. A gear changes how far the wheel turns for each push."},
+                        {"role": "user", "content": "And why is a low gear easier when you ride up a hill?"},
+                        {"role": "assistant", "content": "Because each push moves the wheel less, so it needs less force."}]}
+    chats = gp.nemotron_chains([row], words)
+    assert [t["label"] for t in chats[0]["turns"]] == ["Gebruiker", "Assistent", "Gebruiker", "Assistent"]

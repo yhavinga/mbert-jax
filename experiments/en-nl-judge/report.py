@@ -2,7 +2,8 @@
 """Summaries of the judge's scores, for Yeb.
 
     python report.py sanity --scores <dir of score shards> --out <dir>      sanity.json and sanity.md
-    python report.py scan --pairs <dir> --scores <dir> --out europarl-scan.md [--meta meta.json]
+    python report.py scan --pairs <dir> --scores <dir> --out europarl-scan.md --manifest <pairs>/manifest.json \
+        [--sanity-md sanity.md] [--compare-md compare.md]
     python report.py compare --reference ref.json --scores <dir of the sanity scores>
 
 sanity: per kind of pair (the originals and each deterministic error of data.py) the number of rows, the spread of
@@ -17,10 +18,13 @@ per class 10 random paragraphs (fixed seed) with score, sitting date, speaker an
 import argparse
 import json
 import random
+import sys
 from collections import Counter
 from pathlib import Path
 
 import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 CLASS_EDGES = [k / 10 for k in range(11)]
 
@@ -137,6 +141,9 @@ def scan_markdown(rows, meta, seed, per_class):
     hist = histogram(scores)
     lines = [f"# {meta.get('title', 'Scan van de beoordelaar')}", ""]
     lines += [f"- {line}" for line in meta.get("intro", [])]
+    for heading, text in meta.get("sections", []):
+        lines += ["", f"## {heading}", "", text.rstrip()]
+    lines += ["", "## Deze scan", ""]
     lines += [f"- Paren: {len(rows):,}; gescoord {len(scored):,}; niet gescoord: "
               f"{dict(skipped) if skipped else 'geen'}.",
               f"- Score = P(yes) / (P(yes) + P(no)) van het eerste antwoordtoken. Gemiddeld {fmt(total['mean'])}, "
@@ -186,6 +193,38 @@ def scan_markdown(rows, meta, seed, per_class):
     return "\n".join(lines) + "\n"
 
 
+def europarl_meta(manifest, sanity_md, compare_md):
+    """Title, introduction and the sections before the scan's own numbers: where the pairs come from, the model, the
+    prompt word for word, the sanity check and the comparison with transformers."""
+    import judge
+
+    counts, periods = manifest["counts"], manifest["by_period"]
+    intro = [
+        "Bron: Multilingual Parallel Direct Europarl (Amponsah-Kaakyire et al., MoTra 2021), "
+        "github.com/UDS-SFB-B6-Datasets/Multilingual-Parallel-Direct-Europarl, commit "
+        f"`{manifest.get('repo_commit')}`, `proceedings/xml/{{en,nl}}` ({manifest['sittings_en']} zittingen).",
+        "Koppeling zoals `scripts/utils.py`: een alinea met `sl=\"en\"` in het EN-bestand gaat naar de alinea van het "
+        "NL-bestand met dezelfde interventie-id, dezelfde index onder de `sl=\"en\"`-alinea's van die interventie en "
+        "hetzelfde aantal daarvan. Zonder het langdetect-filter van utils.py; tekst is de hele alinea.",
+        f"Engelse alinea's met `sl=\"en\"`: {counts['en_paragraphs']:,}; gekoppeld {counts['paired']:,} "
+        f"(1999–2003: {periods['1999-2003']['paired']:,}; 2004–2012: {periods['2004-2012']['paired']:,}); zonder "
+        f"NL-alinea {counts.get('no_nl_paragraph', 0):,}. Vanaf medio 2011 koppelt de regel niets: de NL-bestanden "
+        "markeren alles `sl=\"nl\"` en bevatten de onvertaalde toespraken.",
+        f"Beoordelaar: `google/gemma-4-31B-it` @ `{judge.REVISION[:7]}`, omgezet naar MaxText 0.2.5, bf16, op een "
+        "v6e-8; één forward pass per paar. Score = P(yes) / (P(yes) + P(no)) van het eerste antwoordtoken, opgeteld "
+        "over de schrijfwijzen (yes, Yes, YES, ...). Er is geen drempel gekozen.",
+    ]
+    prompt = judge.TEMPLATE_PREFIX + judge.QUESTION + judge.TEMPLATE_SUFFIX
+    sections = [["Prompt (letterlijk; {en} en {nl} zijn de alinea's)", f"````\n{prompt}\n````"]]
+    if sanity_md:
+        sections.append(["Sanity-check (500 alinea's en hun deterministische fouten, data.py sanity)", sanity_md])
+    if compare_md:
+        sections.append(["Controle van de omzetting: TPU (MaxText, bf16) tegen transformers (CPU, float32)",
+                         compare_md])
+    return {"title": "Europarl-direct en→nl: scan met Gemma 4 31B als beoordelaar", "intro": intro,
+            "sections": sections}
+
+
 def scan_command(args):
     pairs = {r["id"]: r for r in read_dir(args.pairs, columns=["id", "en", "nl"])}
     rows = read_dir(args.scores)
@@ -194,7 +233,9 @@ def scan_command(args):
     missing = len(pairs) - len(rows)
     if missing:
         raise SystemExit(f"{missing} pairs of {args.pairs} have no score in {args.scores}")
-    meta = json.loads(Path(args.meta).read_text()) if args.meta else {}
+    meta = europarl_meta(json.loads(Path(args.manifest).read_text()),
+                         Path(args.sanity_md).read_text() if args.sanity_md else None,
+                         Path(args.compare_md).read_text() if args.compare_md else None)
     Path(args.out).write_text(scan_markdown(rows, meta, args.seed, args.per_class))
     print(f"{args.out}: {len(rows):,} pairs")
 
@@ -230,7 +271,9 @@ def main(argv=None):
     p.add_argument("--pairs", required=True)
     p.add_argument("--scores", required=True)
     p.add_argument("--out", required=True)
-    p.add_argument("--meta", default=None, help="JSON with title and intro lines")
+    p.add_argument("--manifest", required=True, help="manifest.json of data.py motra")
+    p.add_argument("--sanity-md", default=None)
+    p.add_argument("--compare-md", default=None)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--per-class", type=int, default=10)
     p = sub.add_parser("compare")

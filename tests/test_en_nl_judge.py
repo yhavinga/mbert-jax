@@ -266,3 +266,16 @@ def test_scan_markdown_samples_per_class():
     md = report.scan_markdown(rows, {"title": "T", "intro": ["x"]}, seed=0, per_class=3)
     assert md.count("**0.") == 30
     assert "| 0.9–1.0 | 10 | 0.100 |" in md
+
+
+def test_europarl_meta_has_source_counts_and_prompt():
+    manifest = {"repo_commit": "abc", "sittings_en": 798, "counts": {"en_paragraphs": 10, "paired": 8,
+                                                                     "no_nl_paragraph": 2},
+                "by_period": {"1999-2003": {"paired": 3}, "2004-2012": {"paired": 5}}}
+    meta = report.europarl_meta(manifest, "| sanity |", None)
+    rows = [{"id": "x", "score": 0.5, "skipped": None, "answer_mass": 1.0, "top_token": "yes", "year": 2001,
+             "date": "2001-01-01", "speaker": "S", "nationality": None, "en_words": 3, "nl_words": 3, "en": "E",
+             "nl": "N"}]
+    md = report.scan_markdown(rows, meta, seed=0, per_class=1)
+    assert "commit `abc`" in md and "gekoppeld 8" in md and "| sanity |" in md
+    assert judge.QUESTION in md and "<channel|>" in md

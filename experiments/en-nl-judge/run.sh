@@ -43,4 +43,6 @@ JUDGE_JAX_CACHE=$SHM/jax_cache JUDGE_JAX_CACHE_GCS=$JUDGE/jax_cache "$PY" -u "$C
 if [ -n "$REF_PID" ]; then
   wait "$REF_PID" || { echo "the reference failed: ~/logs/judge_reference.log"; exit 1; }
 fi
+echo "== reports $(date -u +%T)"
+bash "$CODE/reports.sh"
 echo "== run done $(date -u +%T)"

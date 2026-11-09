@@ -1,5 +1,139 @@
 # Overdracht: pilot, LoRA-smoke-test en hoofdset van de en→nl-vertaler (stand 9 nov 2026)
 
+## Aanvullende run: passages van 385–511 tokens (9 nov, nacht; Yebs akkoord ~23:15 CET)
+
+`M=gs://t5-dutch-english-usc2/mbert/translator/mainset`, `L=$M/run-long`. In de minipilot liep 384–511 tokens 0 van
+248 keer vast; de hoofdrun ging alleen tot 384. Deze run vertaalt de passages van 385–511 Gemma-tokens (na de twee
+bewerkingen) die door dezelfde drempels komen, op mbert-corpus, pas na `EXIT 0` van de hoofdrun.
+
+### Wat loopt
+
+Stand 9 nov 22:35 UTC: de keten `translator_longrun.sh` draait losgekoppeld op co1 (tag `11092234`), log
+`~/Developer/yhavinga/mbert-ops/logs/translator_longrun.log`. Hij wacht: de regel
+`wait: translator_mainrun.log has no EXIT yet` komt elke 180 s terug tot `translator_mainrun.log` op `EXIT <code>`
+eindigt. Bij `EXIT 0` (en `$M/run/stages/summary.done`) zet hij `$L/stages/wait.done`, controleert of de TPU van alle
+4 workers vrij is en zet de code klaar; bij een andere `EXIT` stopt hij met `FAILED`. Daarna:
+1. proefrun op 16 passages (`$M/run-long-dry/`, de 8 langste en 8 andere, 392–511 tokens, ook 1 eval): `nl_en` →
+   `back` → `en_nl` → `measures` → `qe` → `summary`, poll 60 s;
+2. dezelfde stappen voor de echte run (`$L/`), poll 180 s. Logs per worker `~/logs/tlr_<dry|long>_<stap>_11092234.log`
+   (vertaallogs ook in `<run>/logs/`); markers in `<run>/stages/*.done`.
+
+Afwijkingen van de hoofdrun: geen contextbeurten; `back-segments --max-tokens 512` (Engels boven 512 tokens zou in
+klasse `xxlong` vallen, die in de minipilot ontspoorde; zo'n paar blijft zonder terugvertaling en chrF en staat in
+`back/back_segments.json` onder `too_long`); code op de workers in `/dev/shm/translator/longrun/code/` (kopie van
+`gs://t5-dutch-english-usc2/mbert/translator/scripts/longrun/`, commit `e378f1e`), niet die van de hoofdrun.
+
+### "Klaar" betekent
+
+- `translator_longrun.log` eindigt op `DONE translator long run: ...` en `EXIT 0`; `$L/stages/` heeft `wait nl_en back
+  en_nl measures qe summary` en `$M/run-long-dry/stages/` `nl_en back en_nl measures qe summary` (`.done`).
+- `$L/pairs/pairs.parquet`: dezelfde 26 kolommen als `$M/run/pairs/pairs.parquet`, plus `length_class` (`long`; in de
+  tabel van de hoofdrun ontbreekt de kolom, daar is alles ≤ 384 tokens, dus `short`). Samenvoegen:
+  `pa.concat_tables([hoofdrun, lang], promote_options="default")` (getoetst op de proefrun van de hoofdrun: de oude
+  kolommen gelijk, `length_class` erbij). Verder `$L/pairs/summary.md`, `summary.json`; kopieën op co1 in
+  `~/Developer/yhavinga/mbert-ops/translator-longrun/` (`summary.md`, `selection.md`).
+- mbert-corpus vrij: `sudo lsof -t /dev/accel* /dev/vfio/*` leeg op alle workers, geen `translate.py` of `metricx_qe.py`.
+
+### ETA
+
+Per worker 7.770 passages, ~3,43 M brontokens, alle in klasse `xlong` (80 slots). Geschat op de hoofdrun (klasse
+`long` ~1.260 uitvoertokens/s per worker) en ~3,5 min laden per klasse: wachten ≤ 3 min, proefrun ~30 min, `nl_en`
+~45 min, `back` ~5 min, `en_nl` ~55 min, `measures` ~10 min, `qe` ~15–30 min, `summary` ~5 min: samen ~3 uur na
+`EXIT 0` van de hoofdrun. De hoofdrun stond om 22:34 UTC in `en_nl`, klasse `medium`; zijn `DONE` verwacht ~00:30–01:00
+UTC, deze run dus `DONE` ~03:30–04:15 UTC (04:30–05:15 CET).
+
+### Bij een fout
+
+De keten stopt bij de eerste fout met `FAILED: <wat>` en daarna `EXIT 1`; processen op de workers lopen door.
+1. Lees de regel `FAILED` en het log van die stap op de worker (`~/logs/tlr_<dry|long>_<stap>_<tag>.log`).
+2. Eindigde de hoofdrun niet op `EXIT 0`, dan start deze run niet: eerst de hoofdrun herstellen (zijn overdracht
+   hieronder), daarna deze keten opnieuw starten.
+3. Wacht tot geen worker nog rekent; stop een hangend proces alleen met `pkill -9 -f '[t]ranslate.py'` (of
+   `[m]etricx_qe.py`) op die worker.
+4. Herstart met hetzelfde commando (hieronder). Afgeronde stappen slaat hij over (`<run>/stages/*.done`), `translate.py`
+   zijn afgeronde shards. `back` weigert als `/dev/shm/translator/longrun/run-long/back` (of `.../run-long-dry/back`)
+   op w0 al bestaat: die map eerst met een zichtbaar `rm -rf` van precies dat pad weghalen.
+5. Ontspoort de proefrun (`decode_loop`, niet afgelopen) of `en_nl` op `xlong`: niet doorzetten zonder Yeb; de
+   minipilot testte alleen nl→en.
+
+### Commando's
+
+- Keten (co1): `setsid nohup bash -c 'bash ~/Developer/yhavinga/mbert-ops/scripts/translator_longrun.sh >
+  ~/Developer/yhavinga/mbert-ops/logs/translator_longrun.log 2>&1; echo EXIT $? >>
+  ~/Developer/yhavinga/mbert-ops/logs/translator_longrun.log' > /dev/null 2>&1 < /dev/null &` (flock op
+  `~/Developer/yhavinga/mbert-ops/translator_longrun.lock`). Kopie in
+  `gs://t5-dutch-english-usc2/hammond/scratch-scripts/translator_longrun.sh`. Omgeving: `FULL`, `DRY`, `MAINLOG`,
+  `POLL`, `POLL_DRY`, `TAG`. De `EXIT`-regel schrijft de wrapper, niet het script.
+- Elke ssh via `~/Developer/yhavinga/mbert-ops/translator-longrun/vm.sh` (`timeout 900`, de ssh-vlaggen,
+  `< /dev/null`); de stukjes voor de workers in `.../translator-longrun/remote/chain/`.
+- Selectie (al gedaan, w3, CPU, ~1 min): `mainset.py final --select pool pool-fineweb repaired --scores ... --hosts
+  ... --block-texts <testsets> --n 66000 --n-eval 1320 --min-tokens 384 --max-tokens 511 --exclude <de passages.parquet
+  van $M/run/select> --no-context --seed en-nl-translator/mainset-long/0`, dan `mainset.py subset --n 16`
+  (`.../translator-longrun/remote/select_body.sh`, log `~/logs/tlr_select_11092231.log` op w3).
+
+### Selectie (`$L/select/`: `passages.parquet`, `segments-w<k>.parquet`, `report.json`, `selection.md`)
+
+Gevraagd hoogstens ~25% van het totaal: `--n 66000` (train, verdeeld 40/20/7,5/7,5/25) en `--n-eval 1320` (dezelfde
+verhouding als de 4.000 van de hoofdrun). De pool heeft bij elke bron minder: elke bron is (vrijwel) leeg gehaald.
+
+| bron | train | eval | kandidaten train/eval | gevraagd train | idioomrijk (train) |
+|---|---:|---:|---:|---:|---:|
+| Handelingen | 9.885 | 216 | 9.886 / 216 | 26.400 | 5.878 |
+| raad | 8.395 | 165 | 9.377 / 180 | 13.200 | 1.480 |
+| dpc | 2.346 | 44 | 2.351 / 45 | 4.950 | 447 |
+| rechtspraak | 1.578 | 40 | 1.582 / 40 | 4.950 | 729 |
+| FineWeb-2 | 8.252 | 156 | 8.716 / 184 | 16.500 | 2.558 |
+| **samen** | **30.456** | **621** | | 66.000 | |
+
+31.077 passages, 13,73 M tokens (gemiddeld 442, 385–511). Met de hoofdrun is 13,3% van de train-passages lang
+(30.456 van 229.472), niet 25%: de pool had per bron 25% lang tussen 384 en 768, en het deel boven 511 blijft buiten
+(`too_long`: Handelingen 16.490, raad 7.292, dpc 2.344, rechtspraak 3.757, FineWeb-2 7.011).
+
+Regels, zoals de hoofdrun: bronscore ≥ 0,5, herkomst ≥ 0,5 (FineWeb-2), de regels van stap 0, de herstelde koppen
+(raad: 141 passages uit `repaired`, 239 met een herstelde kop) en de lege regel tussen alinea's, de 13-grammen van de
+testsets, het documentmaximum (Handelingen 15, raad 5, anders 3). Nieuw (`mainset.py final`):
+- `--exclude`: de 202.993 passages van de hoofdrun (train en eval) zijn geen kandidaat en gaan eerst door de chooser,
+  zodat duplicaten, 13-grammen en het documentmaximum voor beide runs samen gelden (overgeslagen: 874 documentmaximum,
+  139 13-gram, 21 exact). Een document houdt zijn kant: de pool-splitsing is per document, en de code stopt als een
+  poolpassage een andere kant heeft dan haar document in de hoofdrun.
+- FineWeb-2: onderwerp- en hostplafond zijn een aandeel van wat de pool kan geven (min(gevraagd, kandidaten)), niet
+  van het gevraagde aantal: host ≤ 43, onderwerp ≤ 1.307 (ronde 5 liet het onderwerp los voor 1.077 passages). Samen
+  met de hoofdrun: nrc.nl 293 van 58.252 (0,50%), ad.nl 0,46%, nu.nl 0,45%.
+- Geen contextvoorbeelden, seed `en-nl-translator/mainset-long/0`.
+
+Gecontroleerd op w3 tegen `$M/run/select/`: 0 gedeelde pids, 0 gelijke teksten (ook niet met de 37.640
+contextbeurten), 0 documenten met een andere kant; 18.183 passages komen uit documenten die de hoofdrun ook gebruikte
+(binnen het documentmaximum).
+
+### Opruiming
+
+- **De opruiming na de hoofdrun (hieronder) moet wachten tot deze run `EXIT 0` heeft**: `run_translate.sh` leest per
+  klasse `/dev/shm/translator/segments/`, en `qe` gebruikt `/dev/shm/translator/metricx` (anders haalt hij de 25 GB
+  opnieuw van HF).
+- Daarna, op alle workers: `rm -rf /dev/shm/translator/longrun/run-long /dev/shm/translator/longrun/run-long-dry`;
+  op w3 ook `rm -rf /dev/shm/translator/longrun/sel` (de invoer van de selectie, ~0,4 GB); `/dev/shm/translator/longrun/code`
+  mag blijven tot de fine-tune.
+- In de bucket weggehaald (9 nov 22:31 UTC, met zichtbaar commando): de eerste selectie in `$L/select` en
+  `$M/run-long-dry/select`, gemaakt met het hostplafond op het gevraagde aantal (FineWeb-2 8.417, host tot 82); nog door
+  niets gebruikt. Opnieuw gemaakt met commit `e378f1e`.
+
+### Verkeer
+
+Tussen regio's niets; alles in `gs://t5-dutch-english-usc2` en op mbert-corpus. Naar w3: de pool, de bronscores,
+`repaired`, `fineweb-hosts.parquet`, de testsets en `passages.parquet` en `context-turns.parquet` van de hoofdrun
+(~0,4 GB, binnen us-central2). Naar co1, klein: `selection.md` en `report.json` van de selectie (6 en 16 kB) en de
+proefrun van de hoofdrun (`$M/run-dry/`, ~0,2 MB) om `pairs.py` te toetsen. Van co1 naar de bucket: de code
+(`$R/scripts/longrun/`) en de keten.
+
+### Open punten (aanvullende run)
+
+1. **Aandeel lang** 13,3% in plaats van ~25%: de pool heeft niet meer passages van 385–511 tokens. Meer vraagt een
+   nieuwe pool (meer row groups) of de passages van 512–768 (`xxlong` eerst repareren).
+2. **FineWeb-2-onderwerp K** (cultuur, sport, media) is 28,9% van de lange FineWeb-2-passages (de pool); samen met de
+   hoofdrun ~23,7%.
+3. **en→nl op `xlong`** is niet eerder getest (de minipilot deed alleen nl→en); de proefrun is de eerste toets.
+4. **Engels boven 512 tokens** krijgt geen terugvertaling (zie boven); het aantal staat na `back` in het log.
+
 ## Hoofdrun: selectie, minipilot en de keten van stap 1 en 2 (9 nov, avond; Yebs akkoord ~17:00 CET)
 
 `R=gs://t5-dutch-english-usc2/mbert/translator`, `M=$R/mainset`, `RUN=$M/run`. Besluiten: ontwerp §3 stap 0–2, §7 punt 6
@@ -80,7 +214,8 @@ Al gedaan op 9 nov 19:23 UTC op alle workers, toen niets ze meer nodig had (`pil
 `$R/judge/gemma-4-31b-it-maxtext/`), `rm -rf /dev/shm/translator/mainset`, en de eigen werkmappen
 `/dev/shm/translator/mainrun/{test,run-dry,repaired,pool,pool-fineweb,hosts}`.
 
-Na `EXIT 0` van de keten, op alle workers (alles staat in de bucket):
+Na `EXIT 0` van de keten én van de aanvullende run (`translator_longrun.sh`, zie boven; die gebruikt
+`/dev/shm/translator/segments` en `/dev/shm/translator/metricx` ook), op alle workers (alles staat in de bucket):
 - `rm -rf /dev/shm/translator/mainrun/run` (lokale kopieën van selectie, shards, paren, QE).
 - `rm -rf /dev/shm/translator/metricx` (MetricX-24-XXL, ~25 GB per worker; `metricx_qe.py` haalt hem opnieuw van HF).
 - `rm -rf /dev/shm/translator/segments /dev/shm/translator/tpu_logs` (segmentkopieën van `run_translate.sh`, libtpu-logs).

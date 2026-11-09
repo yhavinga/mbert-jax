@@ -137,3 +137,8 @@ F1 92.50 against 91.86, +0.64 against 0.41); `mixheads-653000` beats it on `squa
 on `conll2002` (+0.33 against 0.72). POS: no model differs from `653000` by more than the larger range, except
 `fw2-653000` on LassySmall (-0.22 against 0.20, computed on word counts). BLiMP-NL: `653000` 94.60, `mix-653000`
 93.74, `mixheads-653000` 93.52 (of 8,400 pairs).
+
+The 300k references (amendment above; 36 fine-tunes, done 2026-11-09 10:01, `summary-300k.json`): against `300000`
+(SQuAD-NL 79.00, CoNLL-2002 85.66, POS 97.02 / 97.14), neither `fw2-300000` nor `fw2rh3-300000` differs by more than
+the larger seed range on `squadnl` or `conll2002`; `fw2rh3-300000` is below it on both POS treebanks (-0.23 against
+0.18, -0.68 against 0.25) and `fw2-300000` on Alpino (-0.28 against 0.25), all on word counts.

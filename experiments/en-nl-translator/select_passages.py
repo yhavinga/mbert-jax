@@ -57,15 +57,21 @@ from pathlib import Path
 
 HANDELINGEN = ("yhavinga/dutch-handelingen-modern", "abdba14ac9271b6d43ccefe6143202b7bdd4e900")
 PROPELLA = ("tvosch/GPT-NL-propella-annotations", "db7f5947be4445e396aa0dd0df52ab6c1f418efc")
+FINEWEB = ("HuggingFaceFW/fineweb-2", "af9c13333eb981300149d5ca60a8e9d659b276b9")
 SOURCES = {
     "handelingen": {"repo": HANDELINGEN, "files": [f"data/train-{i:05d}-of-00008.parquet" for i in range(8)],
                     "columns": ["id", "chamber", "date", "title", "turns"]},
     "raad": {"repo": PROPELLA, "files": ["openraadsinformatie/train-00000-of-00001.parquet"]},
     "dpc": {"repo": PROPELLA, "files": ["dienst_publiek_en_communicatie/train-00000-of-00001.parquet"]},
     "rechtspraak": {"repo": PROPELLA, "files": ["de_rechtspraak/train-00000-of-00001.parquet"]},
+    # Yeb, 9 Nov (design §7 point 7): FineWeb-2's Dutch web text as a quarter of the targets
+    "fineweb": {"repo": FINEWEB, "files": [f"data/nld_Latn/train/{a:03d}_{b:05d}.parquet" for a in range(5)
+                                           for b in range(9)],
+                "columns": ["id", "text", "url"]},
 }
 PROPELLA_COLUMNS = ["doc_id", "text", "content_quality", "content_integrity", "content_type", "content_ratio"]
-SHARES = {"handelingen": 0.5, "raad": 0.3, "dpc": 0.1, "rechtspraak": 0.1}
+# The main set's shares (Yeb, 9 Nov); the pilot had 50/30/10/10 without FineWeb-2
+SHARES = {"handelingen": 0.40, "raad": 0.20, "dpc": 0.075, "rechtspraak": 0.075, "fineweb": 0.25}
 GOOD_QUALITY = {"good", "excellent"}
 GOOD_INTEGRITY = {"complete", "mostly_complete"}
 NOT_CONTENT = {"boilerplate", "structured_data"}
@@ -535,6 +541,32 @@ def context_of(t, turns):
     return out[::-1]
 
 
+# FineWeb-2 (Yeb, 9 Nov): only pages of a .nl or .be domain, and none whose address marks a language version of a
+# multilingual site (/nl/, /nl-nl/, lang=nl, /dutch/, en.example.nl): those are often translated
+LANGUAGE_CODES = frozenset("""nl nl-nl nl_nl nl-be nl_be nld dut dutch nederlands vlaams en en-gb en-us en_gb en_us eng
+    english de de-de de_de deu deutsch fr fr-fr fr-be fr_fr fr_be fra francais français es es-es it pt pl tr ar zh ja
+    ru da sv no fi cs hu ro el uk ko""".split())
+LANGUAGE_QUERY = re.compile(r"[?&](?:lang|language|locale|hl|lng|taal)=", re.I)
+
+
+def fineweb_url(url):
+    """None when the page's address is fine, else why not: domain (no .nl or .be) or language (a language path,
+    parameter or subdomain)"""
+    from urllib.parse import urlsplit
+
+    try:
+        parts = urlsplit(url or "")
+    except ValueError:
+        return "domain"
+    host = (parts.hostname or "").lower()
+    if not host.endswith((".nl", ".be")):
+        return "domain"
+    if host.split(".")[0] in LANGUAGE_CODES or LANGUAGE_QUERY.search("?" + parts.query) or any(
+            segment.lower() in LANGUAGE_CODES for segment in parts.path.split("/") if segment):
+        return "language"
+    return None
+
+
 def blocks_of(source, doc, wordset):
     """[(block id, [paragraphs], meta)] of a document: the turns of a debate, or the document itself"""
     if source == "handelingen":
@@ -679,7 +711,7 @@ class Builder:
     def document(self, source, doc):
         """(passages, counters) of one document"""
         counters = collections.Counter()
-        doc_id = str(doc["id"] if source == "handelingen" else doc["doc_id"])
+        doc_id = str(doc["id"] if source in ("handelingen", "fineweb") else doc["doc_id"])
         rng = random.Random(f"{source}/{doc_id}")
         passages = []
         turns = []
@@ -759,6 +791,8 @@ def row_groups(source, n, seed, fs):
     """n row groups of the source's files, spread evenly from a random offset: [(file, row group, rows)]"""
     import pyarrow.parquet as pq
 
+    if n <= 0:  # a source left out of this selection
+        return []
     repo, revision = SOURCES[source]["repo"]
     groups = []
     for name in SOURCES[source]["files"]:
@@ -790,6 +824,11 @@ def read_docs(source, groups, fs):
             if source == "handelingen":
                 if doc["chamber"] != "tweede_kamer":
                     counters["docs_other_chamber"] += 1
+                    continue
+            elif source == "fineweb":
+                reason = fineweb_url(doc["url"])
+                if reason:
+                    counters[f"docs_url_{reason}"] += 1
                     continue
             else:
                 types = set(doc["content_type"] or [])

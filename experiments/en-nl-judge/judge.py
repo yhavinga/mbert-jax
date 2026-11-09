@@ -61,7 +61,7 @@ SOURCE_QUESTION = (
 # then those of the source prompt alone (attention is causal), and every further answer is read at a fixed distance
 # from the end of the prompt.
 TOPICS = (
-    ("A", "Politics, parliament and public administration"),
+    ("A", "Elections, political parties and the organisation of government itself"),
     ("B", "Law and justice"),
     ("C", "Economy, finance and business"),
     ("D", "Health and care"),
@@ -77,7 +77,10 @@ TOPICS = (
     ("N", "International affairs, migration and integration"),
     ("O", "Daily life, consumers and other topics"),
 )
-TOPIC_QUESTION = ("Which topic fits this Dutch text best? Answer with one letter.\n"
+# The question asks for the subject matter: on the pilot, a first version with "Politics, parliament and public
+# administration" as A put 62% of the Handelingen there, the setting rather than the subject
+TOPIC_QUESTION = ("What is this Dutch text about? Choose the subject matter, not the setting: that it is a debate, a "
+                  "council meeting or a ruling is no subject. Answer with one letter.\n"
                   + "\n".join(f"{letter}. {name}" for letter, name in TOPICS))
 ORIGIN_QUESTION = ("Does this Dutch text read as written originally in Dutch? Answer no if it reads as a translation from "
                    "another language. Answer with one word: yes or no.")

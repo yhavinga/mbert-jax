@@ -160,7 +160,8 @@ def test_blocked_ngrams_keep_test_texts_out():
 
 
 def test_quotas_add_up():
-    assert sp.quotas(2000) == {"handelingen": 1000, "raad": 600, "dpc": 200, "rechtspraak": 200}
+    # the main set's shares (Yeb, 9 Nov); the pilot had 1000/600/200/200 without FineWeb-2
+    assert sp.quotas(2000) == {"handelingen": 800, "raad": 400, "dpc": 150, "rechtspraak": 150, "fineweb": 500}
     assert sum(sp.quotas(4001).values()) == 4001
 
 
@@ -449,3 +450,25 @@ def test_a_debate_gives_its_passages_a_context_and_a_share_are_examples(idioms):
     report, rows = sp.mark_context_examples(chosen, {"h-tk-2": doc}, seed=0)
     assert report["examples"] == round(sp.CONTEXT_SHARE * len(chosen))
     assert all(r["text"] and r["tokens"] > 0 for r in rows)
+
+
+
+@pytest.mark.parametrize("url, reason", [
+    ("https://www.gemeente.nl/nieuws/artikel-1", None),
+    ("https://www.voorbeeld.be/blog/2023/01/een-titel", None),
+    ("https://www.example.com/nl/pagina", "domain"),
+    ("https://www.bedrijf.nl/nl/over-ons", "language"),
+    ("https://www.bedrijf.nl/nl-nl/over-ons", "language"),
+    ("https://www.bedrijf.be/fr/a-propos", "language"),
+    ("https://www.bedrijf.nl/pagina?id=3&lang=nl", "language"),
+    ("https://shop.nl/dutch/artikel", "language"),
+    ("https://en.universiteit.nl/news", "language"),
+    ("https://www.tv.nl/programma/en-route", None),  # a word with a hyphen is no language path
+    ("not a url", "domain"),
+])
+def test_fineweb_urls(url, reason):
+    assert sp.fineweb_url(url) == reason
+
+
+def test_the_shares_add_up_with_fineweb():
+    assert abs(sum(sp.SHARES.values()) - 1) < 1e-9 and sp.SHARES["fineweb"] == 0.25

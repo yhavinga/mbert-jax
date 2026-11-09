@@ -115,4 +115,25 @@ the same the other way round)? `summarize.py` prints this per task. No automatic
 
 ## Amendments
 
-None yet.
+2026-11-09, before step 4 started (09:07 CET), after the fine-tunes of step 3 had started: BLiMP-NL also runs on
+`fw2rh3-300000` (FineWeb-2 with rehydration, `fineweb2-nl-230m-chunk1024-rh3/ckpt_keep/300000`) and `flan-Fnl` (the
+decay with Dutch FLAN, `flan-decay/flan-Fnl/ckpt/20000`), 17 models in all. They do not enter the question above.
+
+2026-11-09: step 5 ran with the JSON results (not the logs) in the session's scratchpad instead of `/tmp/dx`, because
+macOS removes files in `/tmp` after 3 days. Same `summarize.py` arguments.
+
+2026-11-09, after the results of step 3 were known and before these runs: the four fine-tune tasks, with the same
+settings and seeds, also for three 300,000-step models, `300000` (CulturaX, 15%), `fw2-300000` and `fw2rh3-300000`
+(`spec_300k.txt`). They are the references of the GPT-NL proof G (`cxgptnl-300000`, 300,000 steps), which gets the same
+fine-tunes and BLiMP-NL once it is done. Reported with the same comparison (difference of means against the larger
+seed range), against `300000`; descriptive, no consequence, and outside the question above, which the 653,000-step
+models answer.
+
+## Result (2026-11-09)
+
+All 72 fine-tunes and 17 BLiMP-NL runs complete (`summary.json` next to the results). The question: `mix-653000` beats
+`653000` on `squadnl` (F1 84.58 against 83.18, +1.40 against a larger seed range of 1.26) and on `conll2002` (entity
+F1 92.50 against 91.86, +0.64 against 0.41); `mixheads-653000` beats it on `squadnl` (85.13, +1.95 against 1.17), not
+on `conll2002` (+0.33 against 0.72). POS: no model differs from `653000` by more than the larger range, except
+`fw2-653000` on LassySmall (-0.22 against 0.20, computed on word counts). BLiMP-NL: `653000` 94.60, `mix-653000`
+93.74, `mixheads-653000` 93.52 (of 8,400 pairs).

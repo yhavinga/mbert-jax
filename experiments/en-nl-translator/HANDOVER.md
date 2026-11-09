@@ -8,7 +8,20 @@ aanvulling van de coördinator na overleg met Yeb: FineWeb-2 hoogstens 0,5% per 
 
 ### Wat loopt
 
-(STAND)
+Stand 9 nov 19:25 UTC: de keten `translator_mainrun.sh` draait losgekoppeld op co1 (gestart 19:08 UTC, tag
+`11091908`), log `~/Developer/yhavinga/mbert-ops/logs/translator_mainrun.log`. Afgerond (`$RUN/stages/*.done`):
+`wait`, `prep`, `pilot`, `decide`, `select` (door dezelfde keten met `STOP_AFTER=select`, log
+`translator_mainrun_pre.log`, tag `11091630`). Nu stap 1 (`nl_en`) op alle 4 workers van mbert-corpus: log per worker
+`~/logs/tmr_nl_en_11091908.log` (kopie na afloop in `$RUN/logs/`), shards in `$RUN/nl-en/w<k>/<klasse>/`. De eerste
+shards kwamen goed binnen: `tiny` (contextbeurten, 1.798–1.799 segmenten per worker, 0 niet afgelopen, Engels in orde)
+en `small` shard-00006 (1.662 segmenten in ~134 s, ~1.280 uitvoertokens/s, 0 niet afgelopen).
+
+Daarna doet de keten vanzelf: `back` (w0) → `en_nl` (alle workers, `~/logs/tmr_en_nl_11091908.log`, `$RUN/en-nl/`) →
+`measures` (w0) → `qe` (alle workers, `~/logs/tmr_qe_11091908.log`, `$RUN/qe/`) → `summary` (w0, `$RUN/pairs/`).
+Een proefrun van al deze stappen (40 + 4 passages tot 128 tokens, `$M/run-dry/`, log `translator_mainrun_dry.log`)
+liep vóór de start foutloos door (33 min, `DONE`, `EXIT 0`).
+
+mbert-mix niet aangeraakt; de andere agent (worktree `translate-generic`, us-east1-d) niet aangeraakt.
 
 ### "Klaar" betekent
 
@@ -22,7 +35,14 @@ aanvulling van de coördinator na overleg met Yeb: FineWeb-2 hoogstens 0,5% per 
 
 ### ETA's
 
-(ETA)
+Geschat op de eerste shards, de stapgroottes (per worker 60.158 segmenten, 9,38 M brontokens: tiny 1.798, small
+26.238, medium 22.556, long 9.566) en de decodeerstappen van FLAN-nl; laden plus compileren ~3,5 min per klasse:
+- stap 1 (`nl_en`) klaar ~21:15–22:15 UTC;
+- `back` ~5 min; stap 2 (`en_nl`) klaar ~00:00–01:15 UTC (10 nov);
+- `measures` ~10 min, `qe` ~30 min (de XXL-gewichten staan al in `/dev/shm/translator/metricx` van de proefrun),
+  `summary` ~5 min: `DONE` ~01:00–02:15 UTC (02:00–03:15 CET).
+Let op: in de oude planning moest mbert-corpus om 00:30 CET vrij zijn voor G's extra evals; deze keten houdt hem tot
+~02:15 UTC bezet (Yebs akkoord van ~17:00 CET voor vannacht).
 
 ### Bij een fout
 
@@ -53,17 +73,33 @@ De keten stopt bij de eerste fout met `FAILED: <wat>` en `EXIT 1`; de processen 
   TranslateGemma draait in FLAN-nl's venv `/dev/shm/flan_nl/venv`, de rest in `/dev/shm/translator/venv`, de
   bronscore in `/dev/shm/judge/venv`.
 
-### Opruiming achteraf (pas als niets het meer nodig heeft; met zichtbare commando's, letterlijke paden)
+### Opruiming (met zichtbare commando's, letterlijke paden)
 
-Op alle workers, na `EXIT 0` van de keten:
-- `rm -rf /dev/shm/judge` (venv, tokenizer, logs, en op w3 de lokale checkpointkopie van Gemma 4 31B; het checkpoint
-  blijft in `$R/judge/gemma-4-31b-it-maxtext/`). Nodig tot en met stap `pilot` (bronscore van de herstelde passages).
-- `rm -rf /dev/shm/translator/mainset` (de werkmappen van de voorbereiding van 9 nov middag).
-- `rm -rf /dev/shm/translator/mainrun/run /dev/shm/translator/mainrun/test /dev/shm/translator/mainrun/repaired
-  /dev/shm/translator/mainrun/pool /dev/shm/translator/mainrun/pool-fineweb /dev/shm/translator/mainrun/hosts`
-  (kopieën; alles staat in de bucket). `/dev/shm/translator/mainrun/code` mag blijven tot de fine-tune.
-- `rm -rf /dev/shm/translator/metricx` (MetricX-24-XXL, 25 GB per worker; `metricx_qe.py` haalt hem opnieuw van HF).
+Al gedaan op 9 nov 19:23 UTC op alle workers, toen niets ze meer nodig had (`pilot` en `finish_mainset.sh` klaar):
+`rm -rf /dev/shm/judge` (op w3 met de lokale kopie van Gemma 4 31B; het checkpoint blijft in
+`$R/judge/gemma-4-31b-it-maxtext/`), `rm -rf /dev/shm/translator/mainset`, en de eigen werkmappen
+`/dev/shm/translator/mainrun/{test,run-dry,repaired,pool,pool-fineweb,hosts}`.
+
+Na `EXIT 0` van de keten, op alle workers (alles staat in de bucket):
+- `rm -rf /dev/shm/translator/mainrun/run` (lokale kopieën van selectie, shards, paren, QE).
+- `rm -rf /dev/shm/translator/metricx` (MetricX-24-XXL, ~25 GB per worker; `metricx_qe.py` haalt hem opnieuw van HF).
+- `rm -rf /dev/shm/translator/segments /dev/shm/translator/tpu_logs` (segmentkopieën van `run_translate.sh`, libtpu-logs).
+- `/dev/shm/translator/mainrun/code` en `/dev/shm/translator/jax_cache` mogen blijven tot de fine-tune.
 - Niet: `/dev/shm/flan_nl` (TranslateGemma, FLAN-nl), `/dev/shm/translator/venv`, `/dev/shm/translator/resources`.
+- In de bucket staat de proefrun `gs://t5-dutch-english-usc2/mbert/translator/mainset/run-dry/` (klein); weghalen
+  alleen met Yebs akkoord: `gsutil -m rm -r gs://t5-dutch-english-usc2/mbert/translator/mainset/run-dry`.
+
+### Verkeer
+
+- Tussen regio's: niets. Alles in `gs://t5-dutch-english-usc2` en op mbert-corpus (us-central2).
+- Van HF naar de VM's: voor het herstel van `heading_glued` de row groups van de pool opnieuw (w1: Handelingen 40,
+  raad 100, dpc 32, rechtspraak 24, FineWeb-2 240, alleen de nodige kolommen); de kolommen `id` en `url` van de 240
+  FineWeb-2-row-groups (w2); MetricX-24-XXL en de mT5-tokenizer (~25 GB per worker, alle 4, in de proefrun).
+- Naar co1, eenmalig en klein: `rejected.parquet` van beide pools (2,0 en 0,5 MB, om de vorm van `heading_glued` te
+  zien), beide `report.json` (41 en 33 kB), drie scriptkopieën van w0 (~0,1 MB), `selection.md` (6 kB), de
+  `summary.md` van de proefrun (2 kB), en via `gsutil cat` `report.json` van de selectie en `minipilot-check.json`.
+- Van co1 naar de bucket: de code (`$R/scripts/mainrun/`) en de ketenscripts
+  (`gs://t5-dutch-english-usc2/hammond/scratch-scripts/`).
 
 ### Uitkomsten tot de start (details: `$RUN/select/selection.md`, `report.json`; kopie op co1 in `translator-mainrun/`)
 
@@ -100,6 +136,26 @@ Op alle workers, na `EXIT 0` van de keten:
    volkskrant.nl 208, hln.be 186, gelderlander.nl 172, trouw.nl 154, telegraaf.nl 151, bndestem.nl 149. Ontdubbeld
    over alles (ook FineWeb-2 tegen de andere bronnen) en tegen de 13-grammen van de testsets: 368 13-gram-overlap,
    220 exacte duplicaten. Stap 1: 240.633 segmenten, 33,1 M tokens in passages en 4,4 M in contextbeurten.
+
+### Open punten (hoofdrun)
+
+1. **`xxlong`** (512–768 tokens) gaf in de minipilot 166 van 253 ontspoorde vertalingen; 384–512 (`xlong`) 0 van 248.
+   Oorzaak niet gezocht (de motorinstelling van de nieuwe klasse, niet het schuifvenster). Of de 384–512-passages
+   alsnog mee moeten (aanvullende run), is aan Yeb; de regel van de opdracht hield alles boven 384 buiten de run.
+2. **Aantallen**: 199.016 train in plaats van 200.000 (Handelingen −905, dpc −79), niet uit andere bronnen aangevuld,
+   zodat de verdeling klopt.
+3. **Idioomrijk** bij raad, dpc en rechtspraak maar 11–16% (de pool had niet meer); FineWeb-2 42%.
+4. **FineWeb-2-onderwerpen** K 22,9% en O 15,4% (> 15%), omdat de pool zonder lange passages te klein was.
+5. **Herstelde koppen**: 1.824 van de 8.147 herstelde raadspassages vielen eerder alleen op `mid_capital` (een
+   gemarkeerde kop met een leesteken erin, "_1._ _Kop_ Een …"); ze zijn meegenomen als dezelfde fout. De 610 + 11
+   poolpassages die de bewerking nu ook herstelt, houden de bronscore van hun onherstelde tekst. Gemma scoorde alle
+   passages met één regelovergang tussen alinea's, niet met de lege regel van de bewerking.
+6. **Paarfilters**: `newline_doubled` is een harde afval (zoals bij de replay), apart geteld; door de lege regels in de
+   bron kwam het in de proefrun niet voor. MetricX-QE alleen en→nl (de richting van het trainingspaar);
+   invoer boven 1.536 mT5-tokens wordt afgekapt en per worker geteld in `tmr_qe_*.log` (`truncated`).
+7. `selection.md` van deze run noemt nog "~25% lang (384–384 …)"; de tekst is na de selectie in de code verbeterd,
+   de cijfers kloppen.
+8. In de oude planning moest mbert-corpus om 00:30 CET vrij zijn voor G's extra evals; zie de ETA's.
 
 
 ## Hoofdset tot vlak vóór het vertalen (9 nov, 13:45–15:30 UTC; opdracht "hoofdset voorbereiden")

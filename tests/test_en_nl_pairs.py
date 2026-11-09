@@ -114,3 +114,11 @@ def test_relative_buckets_match_t5():
     for bidirectional in (True, False):
         got = [int(x) for x in mx.relative_buckets(rel, bidirectional, 32, 128)]
         assert got == [reference_bucket(int(r), bidirectional) for r in range(-300, 301)]
+
+
+def test_measures_record_the_structure_of_both_directions():
+    row = pairs.measure("Een zin.\nNog een zin.", "A sentence.\n\nAnother sentence.", "Een zin.\nNog een zin.")
+    # nl -> en doubled the newline; en -> nl went back to one, which is a difference of its own
+    assert row["structure"] == ["newline_doubled"] and row["back_structure"] == ["paragraph_break", "line_break"]
+    row = pairs.measure("Een **vette** zin.", "A **bold** sentence.", None)
+    assert row["structure"] == [] and row["back_structure"] is None

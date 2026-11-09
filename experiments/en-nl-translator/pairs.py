@@ -15,6 +15,8 @@ here: Yeb sets them on the pilot):
 - sentences_nl, sentences_en: sentence counts (select_passages.split_sentences)
 - numbers_missing: numbers of the Dutch that the English lacks (missing_numbers: separators, times, number words up
   to twenty and months in dates aside)
+- structure: structure.differences of the Dutch original and its English (formatting kept: [], or the categories that
+  differ; ["newline_doubled"] for TranslateGemma's empty line where the original has a single newline)
 - chrf: chrF (sacrebleu, chrF2) of the back-translation against the original
 - the back-translation's own ended and decode_loop, for reading
 MetricX-24 QE comes from metricx_qe.py.
@@ -34,6 +36,7 @@ for _path in (HERE.parent / "flan-nl", HERE.parents[1] / "scripts", HERE):
 
 import publish  # noqa: E402
 import select_passages as sp  # noqa: E402
+import structure  # noqa: E402
 
 MAX_BACK_TOKENS = 512  # translate.py's longest class
 ENGLISH_ABBREVIATIONS = sp.ABBREVIATIONS | frozenset("mrs ms e.g i.e no vs u.s u.k para sec fig approx pp".split())
@@ -170,11 +173,13 @@ def measure(nl, en, back):
         "len_ratio": round(max(len(nl), len(en)) / max(min(len(nl), len(en)), 1), 4),
         "sentences_nl": sentences_nl, "sentences_en": sentences_en,
         "numbers_missing": missing,
-        "chrf": None, "back_decode_loop": None,
+        "structure": structure.differences(nl, en),
+        "chrf": None, "back_decode_loop": None, "back_structure": None,
     }
     if back is not None:
         row["chrf"] = round(sacrebleu.sentence_chrf(back, [nl]).score, 3)
         row["back_decode_loop"] = bool(back) and publish.decode_loop(back, en)
+        row["back_structure"] = structure.differences(en, back)
     return row
 
 

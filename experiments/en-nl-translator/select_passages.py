@@ -954,7 +954,8 @@ def select(args):
         with open(path, encoding="utf-8") as f:
             for line in f:
                 blocked |= ngrams(line)
-    chooser = Chooser(parse_per_source(args.max_per_doc, 3), blocked)
+    max_per_doc = parse_per_source(args.max_per_doc, 3)
+    chooser = Chooser(max_per_doc, blocked)
     report["blocked_ngrams"] = len(blocked)
     chosen, chosen_eval, rejected = [], [], []
     for source in SOURCES:
@@ -966,10 +967,16 @@ def select(args):
         ok = [p for p in allp if not p["fails"]]
         train = [p for p in ok if p["split"] == "train"]
         evalp = [p for p in ok if p["split"] == "eval"]
+        # the most the document cap allows: per document at most max_per_doc of its passages
+        per_doc = collections.Counter(p["doc_id"] for p in train)
+        capacity = sum(min(max_per_doc[source], k) for k in per_doc.values())
         picked, info = choose(train, want[source], chooser, rng, source)
+        info["capacity"] = capacity
+        info["documents_with_passages"] = len(per_doc)
         if len(picked) < want[source]:
-            raise SystemExit(f"{source}: only {len(picked)} passages for {want[source]} (pool {len(train)}): "
-                             f"read more row groups")
+            raise SystemExit(f"{source}: only {len(picked)} passages for {want[source]} (pool {len(train)} in "
+                             f"{len(per_doc)} documents, at most {capacity} by the cap of {max_per_doc[source]} a "
+                             f"document; skipped {dict(chooser.skipped)}): read more row groups or raise the cap")
         picked_eval, info_eval = choose(evalp, want_eval[source], chooser, rng, source) if want_eval[source] \
             else ([], {})
         if len(picked_eval) < want_eval[source]:

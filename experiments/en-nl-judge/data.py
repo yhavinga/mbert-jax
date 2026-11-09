@@ -8,6 +8,7 @@
 pilot: the 2,000 pairs of the translator's pilot (mbert/translator/pilot/pairs.parquet with qe.parquet), scored as the
 training pair of the fine-tune: the English source is the synthetic English (nl->en by TranslateGemma 27B), the Dutch
 translation is the Dutch original. chrF (back-translation against the original) and MetricX-24-QE are carried along.
+The id is the pair's pid (the passage id that pairs30.md shows); its numeric id, the key of qe.parquet, is row_id.
 
 motra: Multilingual Parallel Direct Europarl (Amponsah-Kaakyire et al., MoTra 2021), proceedings/xml/{en,nl}, one
 file per sitting. A paragraph with sl="en" in an intervention of the English file is paired with the Dutch file's
@@ -258,17 +259,19 @@ def pilot_command(args):
     qe = pq.read_table(args.qe)
     print("pairs.parquet:", table.schema.to_string(show_schema_metadata=False).replace("\n", "; "))
     print("qe.parquet:", qe.schema.to_string(show_schema_metadata=False).replace("\n", "; "))
-    need = {"id", "nl", "en", "chrf"}
+    need = {"id", "pid", "nl", "en", "chrf"}
     if not need <= set(table.column_names) or not {"id", "qe_en_nl", "qe_nl_en"} <= set(qe.column_names):
         raise SystemExit(f"pairs.parquet needs {sorted(need)}, qe.parquet id, qe_en_nl, qe_nl_en")
     rows = table.to_pylist()
     scores = {r["id"]: r for r in qe.to_pylist()}
-    if len(scores) != qe.num_rows or len({r["id"] for r in rows}) != len(rows):
+    if len(scores) != qe.num_rows or len({r["id"] for r in rows}) != len(rows) or \
+            len({r["pid"] for r in rows}) != len(rows):
         raise SystemExit("duplicate ids")
     missing = [r["id"] for r in rows if r["id"] not in scores]
     if missing:
         raise SystemExit(f"{len(missing)} pairs without QE, e.g. {missing[:3]}")
-    out = {"id": [r["id"] for r in rows], "en": [r["en"] for r in rows], "nl": [r["nl"] for r in rows]}
+    out = {"id": [r["pid"] for r in rows], "row_id": [r["id"] for r in rows], "en": [r["en"] for r in rows],
+           "nl": [r["nl"] for r in rows]}
     for c in PILOT_KEEP:
         if c in table.column_names:
             out[c] = [r[c] for r in rows]

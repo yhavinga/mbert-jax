@@ -267,7 +267,8 @@ def done_shards(out):
 
 # The columns of the input shards that the score shards carry along (all but the texts)
 PASSTHROUGH = ("id", "kind", "source_id", "date", "year", "intervention_id", "paragraph", "paragraphs", "speaker",
-               "speaker_id", "nationality", "mode", "role", "sl", "source", "half", "chrf", "qe_en_nl", "qe_nl_en")
+               "speaker_id", "nationality", "mode", "role", "sl", "row_id", "source", "half", "chrf", "qe_en_nl",
+               "qe_nl_en")
 
 
 def sync_compilation_cache():

@@ -70,18 +70,19 @@ mkdir -p ~/jax_cache
 if [ "$step" != all ] && gsutil -q ls "$O/jax_cache/" > /dev/null 2>&1; then gsutil -m -q rsync -r "$O/jax_cache" ~/jax_cache || true; fi
 case $step in
 all)
-  bash "$C/setup_generic.sh"
+  # The setup downloads from Hugging Face; the steps after it work offline
+  HF_HUB_OFFLINE=0 bash "$C/setup_generic.sh"
   if ! gsutil -q stat "$B/judge/gemma-4-31b-it-maxtext/done.txt"; then
     mkdir -p /dev/shm/judge/code && gsutil -q cp "$B/judge/scripts/setup.sh" /dev/shm/judge/code/setup.sh
     echo "== convert $(date -u +%T)"
-    bash /dev/shm/judge/code/setup.sh convert
+    HF_HUB_OFFLINE=0 bash /dev/shm/judge/code/setup.sh convert
   fi
   # The checks run on the CPU beside the TPU work (MaxText 0.2.5 for the decode check: en-nl-judge's venv where the
   # conversion made one, else setup_generic.sh release); their log goes to the bucket when they pass
   if ! gsutil -q stat "$O/logs/checks.log"; then
     (
       [ -e "$SHM/venv-025" ] || { [ -x /dev/shm/judge/venv/bin/python ] && ln -s /dev/shm/judge/venv "$SHM/venv-025"; } \
-        || bash "$C/setup_generic.sh" release
+        || HF_HUB_OFFLINE=0 bash "$C/setup_generic.sh" release
       bash "$0" checks && gsutil -q cp ~/logs/tg_checks.log "$O/logs/checks.log"
     ) > ~/logs/tg_checks.log 2>&1 &
   fi

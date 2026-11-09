@@ -107,8 +107,8 @@ models:
   # Gemma 4 31B-it (google/gemma-4-31B-it @ 842da37), converted by MaxText 0.2.5's to_maxtext (en-nl-judge). Its 4 KV
   # heads of the global layers allow at most 4-way tensor parallelism, so one process takes 4 chips: half a v6e-8.
   # Weights 61.4 GB, 15.4 GB a chip; KV of a token 50 local layers x 16 heads x 256 x 2 x 2 + 10 global x 4 x 512 x 2
-  # x 2 = 0.90 MB, 0.23 MB a chip; ~15 GB a chip left of a v6e chip's 32 GB, of which ~80% for the cache: ~53k
-  # slot-tokens.
+  # x 2 = 0.90 MB, 0.23 MB a chip; ~15 GB a chip left of a v6e chip's 32 GB. Not yet measured: the slots hold ~45k
+  # slot-tokens (~10 GB a chip), ~70% of what is left, as margin for the first, unattended run.
   gemma4-31b:
     maxtext_model: gemma4-31b
     hf_repo: google/gemma-4-31B-it
@@ -124,4 +124,4 @@ models:
     # closes an empty thought channel; the template trims the user text. Checked against apply_chat_template.
     turn: {prefix: "<bos><|turn>user\n", suffix: "<turn|>\n<|turn>model\n<|channel>thought\n<channel|>", check: true}
     length_classes: *translategemma_classes
-    slots: {tiny: 224, small: 96, medium: 64, long: 44, xlong: 32}
+    slots: {tiny: 192, small: 80, medium: 52, long: 36, xlong: 28}

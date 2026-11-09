@@ -11,6 +11,10 @@ of such paragraphs: the key {date}:{intervention}:{index}:{count} of the repo's 
 there is no langdetect filter (a translation that is not Dutch is for the judge to find) and the text is all of the
 paragraph's text (itertext), not only p.text before a first child element. An intervention id that occurs twice in
 one file pairs nothing (its keys are ambiguous; utils.py keeps the last one, its write_to_tsv drops duplicate keys).
+From mid-2011 on this pairs nothing, as in utils.py: the Dutch files mark every paragraph sl="nl", and both files hold
+the untranslated verbatim speeches (checked on 9 Nov on 2011-07-05, 2011-09-15, 2012-01-17 and 2012-09-12: paired by
+position within an intervention, the "Dutch" side equalled the English side in 1,446 of 1,570 paragraphs, and the rest
+were mostly other languages), so there is no translation to pair.
 Output: shard-NNNNN.parquet in sitting order, manifest.json with the counts.
 
 sanity: 500 paragraphs as they are and deterministic errors made from them (no text is written by anyone; every

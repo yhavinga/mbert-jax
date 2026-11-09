@@ -46,8 +46,9 @@ QUESTION = (
 )
 
 # Padded prompt lengths; a batch holds token_budget // length rows (a multiple of the batch axis), so a step costs
-# about the same at every length and the number of compiled shapes stays small.
-LENGTHS = (128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096)
+# about the same at every length. Few lengths, because every shape compiles the 60 unscanned layers anew, for minutes,
+# and a spot VM may be gone before that; padding to the next power of two wastes ~25% of a step instead.
+LENGTHS = (256, 512, 1024, 2048, 4096)
 PAD_ID = 0
 
 
@@ -184,7 +185,9 @@ class Judge:
             async_checkpointing=False, skip_jax_distributed_system=True, scan_layers=False, use_multimodal=False,
             attention="dot_product", dtype="bfloat16", weight_dtype="bfloat16", ici_fsdp_parallelism=fsdp,
             ici_tensor_parallelism=tensor, per_device_batch_size=1, max_target_length=max(LENGTHS),
-            max_prefill_predict_length=max(LENGTHS))
+            max_prefill_predict_length=max(LENGTHS),
+            # pyconfig points JAX's compilation cache at this directory (its default is ~/jax_cache)
+            jax_cache_dir=os.environ.get("JUDGE_JAX_CACHE", "/dev/shm/judge/jax_cache"))
         devices = maxtext_utils.create_device_mesh(self.config, jax.devices())
         self.mesh = jax.sharding.Mesh(devices, self.config.mesh_axes)
         self.rules = self.config.logical_axis_rules
@@ -207,15 +210,24 @@ class Judge:
             return logp_yes, logp_no, top_ids, top_logp
 
         self._step = step
+        self.shapes = set()
 
     def run(self, prompts, length, rows):
         import jax
         from flax.linen import partitioning as nn_partitioning
 
         tokens, positions, segments = pack(prompts, length, rows)
+        started = time.time()
         with jax.set_mesh(self.mesh), nn_partitioning.axis_rules(self.rules):
             out = self._step(self.model, tokens, positions, segments)
         logp_yes, logp_no, top_ids, top_logp = (np.asarray(jax.device_get(x)) for x in out)
+        if (length, rows) not in self.shapes:
+            # The first step of a shape includes its compilation; the cache goes to the bucket at once, so that a
+            # preempted VM's successor need not compile it again
+            self.shapes.add((length, rows))
+            print("COMPILE " + json.dumps({"length": length, "rows": rows,
+                                           "seconds": round(time.time() - started, 1)}), flush=True)
+            sync_compilation_cache()
         n = len(prompts)
         return logp_yes[:n], logp_no[:n], top_ids[:n], top_logp[:n]
 
@@ -401,6 +413,7 @@ def main(argv=None):
 
         jax.config.update("jax_compilation_cache_dir", cache)
         jax.config.update("jax_persistent_cache_min_compile_time_secs", 5)
+        jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
     {"score": score_command, "probe": probe_command}[args.command](args)
 
 

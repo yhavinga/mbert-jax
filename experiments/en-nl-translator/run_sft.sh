@@ -36,6 +36,7 @@ mkdir -p ~/logs "$OUT"
 # EnSiTa's TranslateGemma recipe (arXiv 2609.29511, Table 3) where MaxText has the knob: rank 16, alpha 16, attention
 # and MLP, lr 1e-5, cosine to 0 with 10% warmup, weight decay 0.01, clipping 1.0, sequences of 1024. Not available:
 # LoRA dropout (MaxText passes 0.0 to qwix) and 8-bit AdamW (adamw in float32 state; the LoRA parameters are few).
+# jax_cache_dir: MaxText's default is ~/jax_cache on the nearly full boot disk.
 # scan_layers=false: the converted checkpoints are unscanned, as translate.py reads them. num_vocab_tiling=8: the loss
 # in 8 chunks of the batch-sequence axis (Gemma's 262,144-token vocabulary); without it 12B with float32 weights and 3
 # sequences per chip needs 46.65 GB of HLO temporaries per chip, with it the run fits (9 Nov).
@@ -50,7 +51,7 @@ ARGS=(run_name=$NAME model_name=gemma3-$MODEL load_parameters_path=$CKPT/0/items
   learning_rate=1e-5 learning_rate_final_fraction=0.0 warmup_steps_fraction=0.1 adam_b2=0.999
   adam_weight_decay=0.01 gradient_clipping_threshold=1.0 eval_interval=-1 checkpoint_period=100000
   enable_goodput_recording=false monitor_goodput=false log_period=1 skip_jax_distributed_system=true
-  num_vocab_tiling=8 "$@")
+  num_vocab_tiling=8 jax_cache_dir=$SHM/jax_cache "$@")
 if [ "$MULTIHOST" = 1 ]; then
   ENV="export TOKENIZERS_PARALLELISM=false HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 HF_DATASETS_CACHE=$SHM/hf-datasets"
   PRE="echo multi-host: jax.distributed.initialize in sft_lora.py"
@@ -65,9 +66,14 @@ export TOKENIZERS_PARALLELISM=false HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 HF_DA
   PRE="timeout 600 $PY -c \"import jax; assert (jax.device_count(), jax.process_count()) == (4, 1), (jax.device_count(), jax.process_count()); print('devices', jax.devices())\" || { echo 'preflight failed: not 4 chips of one process'; exit 2; }"
   FLAGS=""
 fi
+# MaxText 0.2.5 sets XLA_FLAGS to dump every jit_train_step to /tmp/xla_dump whenever XLA_FLAGS is empty, also with
+# dump_hlo false (configs/types.py, validate_and_set_hlo_dump_defaults): 3-5 GB per worker on the boot disk, which
+# filled it on 9 Nov. A flag that changes nothing keeps it from doing so.
+NODUMP="export XLA_FLAGS=--xla_dump_hlo_as_text=false"
 cat > ~/run_$NAME.sh <<EOS
 set -uo pipefail
 $ENV
+$NODUMP
 $PRE
 echo "\$(date +%H:%M:%S) $(hostname): $NAME, $MODEL, $DATA"
 $PY -u $CODE/sft_lora.py --out $OUT --steps $STEPS $FLAGS -- $(printf '%q ' "${ARGS[@]}")

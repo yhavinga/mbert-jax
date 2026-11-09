@@ -213,6 +213,12 @@ def main(argv=None):
     short = {k: summary[k] for k in ("model", "devices", "steps", "steps_done", "times", "throughput", "peak_gib_max")}
     print(f"SUMMARY {json.dumps(short | {'loss_first_last': [summary['loss'][:3], summary['loss'][-3:]]}, default=str)}",
           flush=True)
+    if jax.process_count() > 1:
+        # Process 0 writes the adapter after the others are done; a process that exits first takes the coordination
+        # service down under it (EXIT 134 on worker 0, 9 Nov)
+        from jax.experimental import multihost_utils
+
+        multihost_utils.sync_global_devices("sft_lora files written")
 
 
 if __name__ == "__main__":

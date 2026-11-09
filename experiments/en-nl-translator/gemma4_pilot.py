@@ -508,7 +508,7 @@ def report(args):
           "`qe_en_nl_g4`, `qe_nl_en` (TranslateGemma nl→en), `qe_nl_en_g4`. chrF: sacrebleu chrF2 per zin.", ""]
 
     # Per source
-    L += ["### Per bron (mediaan MetricX-QE en→nl, TranslateGemma / Gemma 4)", "", "| bron | n | en→nl | nl→en |",
+    L += ["### Per bron (mediaan MetricX-QE, TranslateGemma / Gemma 4)", "", "| bron | n | en→nl | nl→en |",
           "|---|---|---|---|"]
     for source in sorted({r["source"] for r in both}):
         sub = [r for r in both if r["source"] == source]

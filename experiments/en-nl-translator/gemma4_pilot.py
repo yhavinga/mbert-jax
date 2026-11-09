@@ -299,7 +299,7 @@ def context_run(args):
           flush=True)
     started = time.time()
     shapes = dict(CONTEXT_SHAPES)
-    engine_args = argparse.Namespace(model=args.model, ckpt=args.ckpt, work_dir=args.work_dir)
+    engine_args = argparse.Namespace(model=args.model, ckpt=args.ckpt, work_dir=args.work_dir, tokenizer=args.tokenizer)
     engine, params = tr.make_engine(engine_args, shapes, model["chips"])
     device = tr.EngineSlots(engine, params, shapes["prefill_lengths"])
     print(f"engine ready in {time.time() - started:.0f} s", flush=True)

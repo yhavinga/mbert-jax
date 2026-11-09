@@ -192,6 +192,7 @@ def paragraphs_of(source, text, wordset):
 # Prefixes that stand before a hyphen in correct spelling (co-produceren, semi-publieke)
 HYPHEN_PREFIXES = frozenset("""co ex anti pre post pro semi vice super mini multi non inter para pseudo quasi neo
     oud niet""".split())
+BROKEN_AT_SPACE = re.compile(r"(?<![\w-])([^\W\d_]{2,})-\s+([a-zà-ÿ]{2,})")
 # Syllables that begin a word and never stand before a hyphen in modern spelling ("be-sloten", "ge-legd")
 BROKEN_SYLLABLES = frozenset("be ge ver ont her".split())
 
@@ -208,6 +209,9 @@ def hyphen_artifacts(text, wordset):
         if any((part not in wordset or part in BROKEN_SYLLABLES) and part not in HYPHEN_PREFIXES
                for part in lw.split("-")):
             found.append(w)
+    # a line break kept as hyphen and space ("enthousias- merend"); "mbo- en hbo-" is no word joined
+    found += [m.group(0) for m in BROKEN_AT_SPACE.finditer(text)
+              if (m.group(1) + m.group(2)).lower() in wordset and m.group(1).lower() not in wordset]
     return found
 
 
@@ -222,14 +226,16 @@ _LETTER = r"[^\W\d_]"
 # A sentence that starts in the middle: a paragraph (or the passage) that opens with a lowercase letter; "'s" and "'t"
 # ("'s-Hertogenbosch", "'t Hart") are no exception to sentence case but are lowercase by spelling
 OPENING = "\"'“‘„«(["
-LOWER_START = re.compile(r"^(?!'[st][\s-])[\"'“‘„«(]*[a-zà-ÿ]")
+LOWER_START = re.compile(r"^(?!'[st][\s-])[\"'“‘„«(]*(?:[a-zà-ÿ]|\.\.\.|…)")
 # (A rechtspraak passage may open with an anonymized party, "[appellant] betoogt", which counts as a capital.)
 # A paragraph that opens with a page, section or list number glued to the text: "27 Ik ben", "4.1.1 Op dit moment",
 # "2/7 De ontwikkeling", "3.Als de brug", "2015 - Ik denk", "24) De stelling"; "3 helikopters aan boord" is a sentence
 NUMBER_START = re.compile(r"^\(?\d+(?:[./]\d+)*(?:[.)]?\s+(?:[-–]\s+)?[A-ZÀ-Ý]|[.)]?[A-Za-zÀ-ÿ])")
 # The code-formatted bullets of a PDF's conversion ("`o` De waarde", "`-` Het vastgoed")
 CODE_BULLET = re.compile(r"(?m)^`[^`\n]{1,3}`")
-# Speech broken off: a passage that ends in an ellipsis ("Ik vind dat u...", "geef ik …"), not on a sentence end
+# Speech broken off: a passage that ends in an ellipsis ("Ik vind dat u...", "geef ik …"), not on a sentence end (an
+# ellipsis inside, "gevoel voor... Hoe is het", is how the Handelingen write an interruption, no extraction error;
+# one at the start is sentence_start)
 CUT_OFF = re.compile(r"(?:\.\.\.|…)[\"'”’)]*\s*$")
 # A sentence end and then a lowercase word: two lines of different sentences, or columns, run into one
 _ABBREVIATION_END = ABBREVIATIONS | frozenset("""incl excl evt bijv resp febr sept okt nov dec afb ca enz etc ivm mbt
@@ -244,6 +250,7 @@ LOWER_AFTER_END = re.compile(r"(?<![\w.])(?![IVXLC]+\.)([^\W\d_]{2,})\.[\"'”�
 # a lowercase word ("wasCrone") or ends in a speaker's title ("GentMevrouw")
 CAMEL = re.compile(r"(?<![\w'’-])(?:[a-zà-ÿ]{3,}[A-ZÀ-Ý][a-zà-ÿ]{2,}|[^\W\d_]*[a-zà-ÿ]{2}(?:Mevrouw|Voorzitter|"
                    r"Minister|Staatssecretaris|Wethouder|Burgemeester|De heer))[^\W\d_]*(?![\w'’-])")
+GLUED_DIGITS = re.compile(r"(?<![\w.,/-])\d+(?!(?:ste|de|e|tjes|jes|er|ers|en)\b)[a-zà-ÿ]{4,}\b")
 GLUED_PUNCT = re.compile(r"[a-zà-ÿ]{2,}(?:[!?;]|[.,:](?=[A-ZÀ-Ý][a-zà-ÿ]))[A-ZÀ-Ý]")
 # A capitalized function word after a word or number without punctuation between: a heading, label or page number
 # glued to the text ("Burgernet Op 1 juli", "VVD 88 De onderbesteding", "Wethouder Wilcken Het GBH", "jongvee 5.4 De
@@ -253,12 +260,16 @@ _FUNCTION_CAPS = """De Het Een Er Ik Je Jij U Wij We Zij Ze Hij Dit Deze Dat Die
     Daardoor Dus Toch Ook Zo Nu Als Om Op In Voor Met Bij Uit Door Naar Na Aan Over Onder Tot Tijdens Sinds Volgens
     Wat Wie Waar Wanneer Hoe Welke Waarom Maar En Of Want Omdat Indien Tevens Verder Bovendien Echter Hierbij
     Hierdoor Alle Elke Iedere Geen Niet Ondanks Doordat Zodat Terwijl Nadat Voordat Kortom Bijvoorbeeld Vanaf Vanuit
-    Binnen Per Zonder""".split()
+    Binnen Per Zonder Behalve Naast Ondertussen Inmiddels Daarna Vervolgens Uiteindelijk Eerst Hoewel Zoals Toen Nog
+    Alleen Vooral Zelfs Immers Overigens Gelukkig Helaas Momenteel Hiermee Daarmee Waarbij Iedereen Niemand Sommige
+    Beide""".split()
+_NAME_PARTICLES = "De|Den|Der|Van|Ten|Ter|Het|In|Op|Uit|Aan"
 # At the start of a line, the words before the capital are a heading glued to its paragraph ("Conclusie In en in de
 # directe omgeving", "_Overgangsrecht_ Per 1 januari"); farther in, a label, page number or another column.
 HEADING_MAX_WORDS = 10
-MID_CAPITAL = re.compile(rf"(?<=[\w)%])[ \t]+(?:{'|'.join(_FUNCTION_CAPS)})[ \t]+"
-                         rf"(?!(?:de|den|der|het|'t|ten|ter|van|la|le)\b)(?=[a-zà-ÿ0-9])")
+MID_CAPITAL = re.compile(rf"(?<=[\w)%])[ \t]+(?:(?:{_NAME_PARTICLES})[ \t]+(?!(?:de|den|der|het|'t|ten|ter|van|la|le)\b)"
+                         rf"|(?!(?:{_NAME_PARTICLES})\b)(?:{'|'.join(_FUNCTION_CAPS)})[ \t]+)(?=[a-zà-ÿ0-9])")
+FOOTNOTE = re.compile(r"(?<=[\w.,;:)\"”’])\[\s?\d{1,3}\]|(?<=[.)\"”])[ivxl]{2,7}(?=\s|\d)")
 # Running heads and page numbers inside the text: "Pagina **26** van **45**", "Raadsvergadering 15 mei 2025 2 Je",
 # "- 13 De heer", a bare number between two sentences ("besproken. 12 Het college")
 _MONTH = r"(?:januari|februari|maart|april|mei|juni|juli|augustus|september|oktober|november|december)"
@@ -320,7 +331,8 @@ def extraction_errors(text, wordset):
         fails.append("cut_off")
     if any(m.group(1).lower() not in _ABBREVIATION_END for m in LOWER_AFTER_END.finditer(text)):
         fails.append("lower_after_end")
-    if any(m.group(0).lower() not in wordset for m in CAMEL.finditer(text)) or GLUED_PUNCT.search(text):
+    if any(m.group(0).lower() not in wordset for m in CAMEL.finditer(text)) or GLUED_PUNCT.search(text) \
+            or GLUED_DIGITS.search(text):
         fails.append("glued")
     glued_heading = mid = False
     for m in MID_CAPITAL.finditer(text):
@@ -337,6 +349,8 @@ def extraction_errors(text, wordset):
     if PAGE_MARK.search(text) or any(m.group(1).lower() not in _ABBREVIATION_END | {"lid", "sub"}
                                      for m in LOOSE_NUMBER.finditer(text)):
         fails.append("page_mark")
+    if FOOTNOTE.search(text):
+        fails.append("footnote")
     if any(re.search(r"[^\W\d_]{4,}", m.group(1)) for m in REPEATED.finditer(text)):
         fails.append("repeated")
     if split_words(text, wordset) or spaced_letters(text):

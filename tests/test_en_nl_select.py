@@ -318,6 +318,14 @@ WORDS = {"wanneer", "neer", "zienswijzen", "zen", "fiets", "transformatie", "for
     ("Hij kan pas instemmen wan neer de zienswij zen gehonoreerd worden.", "split_word"),
     ("Zij komen per fi ets naar het stadhuis.", "split_word"),
     ("Wethouder Korstman zegt t oe a mbi t i en i v ea u nader te onderbouwen.", "split_word"),
+    ("...Tynke Straathof! De publieksjury was duidelijk in haar oordeel.", "sentence_start"),
+    ("... en eigenlijk gelooft hij alleen in zichzelf.", "sentence_start"),
+    ("Dat droeg bij aan de groei van kennis.[5] Waar consultatie werd beoogd, ging het mis.", "footnote"),
+    ("Het is bedoeld voor kwetsbare[2] jongeren in de wijk.", "footnote"),
+    ('Dat volgt uit de verklaring (...)."lxvii 5.25. APS heeft beslag laten leggen.', "footnote"),
+    ("De woningen aan de Benthehof 80straat zijn het zwaarst belast.", "glued"),
+    ("Meer files na de lockdown. Meer files na lockdown Door de versoepelingen nam het verkeer toe.", "mid_capital"),
+    ("Alle sprinters toegankelijk Behalve met informatie houdt zij zich bezig met treinen.", "heading_glued"),
 ])
 def test_extraction_rules_fire(text, rule):
     assert rule in sp.extraction_errors(text, WORDS), sp.extraction_errors(text, WORDS)
@@ -337,6 +345,10 @@ def test_extraction_rules_fire(text, rule):
     "Het gaat om mbo- en hbo-opleidingen in de gemeente.",
     "Ik denk dat dat klopt, en die die het weten zeggen het ook.",
     "Ik vind dat u... nee, laat ik het anders zeggen. Dat is beter.",
+    "Het medisch gevoel voor... Hoe is het ook al weer? Dat weet ik niet.",
+    "Het gaat om mbo- en hbo-opleidingen, in- of uitvoer en de 2de en 21ste plaats.",
+    "Zij woont aan de Mickbaan 2 in de gemeente en had 3 kinderen.",
+    "Mevrouw Van der Graaf sprak met de heer De Jong over Het Parool.",
 ])
 def test_extraction_rules_leave_good_text(text):
     assert sp.extraction_errors(text, WORDS) == []
@@ -347,6 +359,9 @@ def test_hyphenation_now_also_catches_capitals_and_broken_syllables():
              "e-mail", "coproductie", "productie"}
     text = "Het was be-sloten na de Aanwij-zing; sociaal-democratische partijen, per e-mail, co-productie."
     assert sp.hyphen_artifacts(text, words) == ["be-sloten", "Aanwij-zing"]
+    words |= {"enthousiasmerend", "mbo", "hbo-opleidingen"}
+    assert sp.hyphen_artifacts("Treed enthousias- merend op voor mbo- en hbo-opleidingen.", words) == \
+        ["enthousias- merend"]
 
 
 PROSE = "Dit is een gewone zin van ruim acht woorden die netjes eindigt."

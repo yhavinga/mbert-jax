@@ -667,8 +667,9 @@ def test_split_documents_resume_after_a_kill_with_the_next_batch(tmp_path):
     assert saved["state"]["pieces_read"] > 0
 
 
-def _write_shares(tmp_path, documents_per_host):
-    """Per host two parquet files of documents of 3 to 10 words and the list --data-files-list reads."""
+def _write_shares(tmp_path, documents_per_host, blocked_every=None):
+    """Per host two parquet files of documents of 3 to 10 words and the list --data-files-list reads. With
+    blocked_every a column url too, in which every blocked_every-th document is a page of www.hebban.nl."""
     import pyarrow as pa
     import pyarrow.parquet as pq
 
@@ -679,7 +680,11 @@ def _write_shares(tmp_path, documents_per_host):
         for part, size in enumerate((n // 2, n - n // 2)):
             texts = [" ".join(f"w{w}" for w in rng.randint(0, VOCAB_WORDS, size=rng.randint(3, 11))) for _ in range(size)]
             path = tmp_path / f"part{part}-w{host}of{len(documents_per_host)}.parquet"
-            pq.write_table(pa.table({"text": texts}), path)
+            columns = {"text": texts}
+            if blocked_every:
+                columns["url"] = [f"https://www.hebban.nl/recensie/{i}" if i % blocked_every == 1 else f"https://example.nl/{i}"
+                                  for i in range(size)]
+            pq.write_table(pa.table(columns), path)
             paths.append(str(path))
         listed = tmp_path / f"files_w{host}.txt"
         listed.write_text("\n".join(paths) + "\n")
@@ -687,14 +692,14 @@ def _write_shares(tmp_path, documents_per_host):
     return lists
 
 
-def _last_batches_of_passes(files_list, rows_per_host, passes):
+def _last_batches_of_passes(files_list, rows_per_host, passes, url_blocklist=None):
     """Indices of the batches that end a pass of the trainer's loader on these files, for the first passes."""
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
     from mmbjax.training import EpochTrackingDataLoader
 
     loader = EpochTrackingDataLoader(dataset_name="fake", tokenizer=_make_tokenizer(), max_length=MAX_LENGTH,
                                      batch_size=rows_per_host, seed=42, shuffle_buffer_size=10000,
-                                     data_files=Path(files_list).read_text().split())
+                                     data_files=Path(files_list).read_text().split(), url_blocklist=url_blocklist)
     ends, iterator, index = [], iter(loader), 0
     next(iterator)
     while len(ends) < passes:
@@ -743,6 +748,75 @@ def test_shares_of_other_sizes_run_every_step_through_passes_and_resume_in_the_t
     for host in ("host0", "host1"):
         for name in ("tokens_read", "documents_completed", "pieces_read", "epoch"):
             assert resumed_data[host][name] == whole_data[host][name], (host, name)
+
+
+FINAL_RUN_ARGS = ["--skip-nonfinite-updates", "--url-blocklist", "hebban.nl", "--system-metrics-every", "2",
+                  "--log-every", "1"]
+
+
+def test_final_run_resumes_exactly_in_its_second_pass_with_its_own_seed_and_without_blocked_pages(tmp_path):
+    """The options of the final run (WSD, apply_if_finite, the URL blocklist) over two passes of shares of other
+    sizes: stopped in the middle of host 0's second pass, the resume goes on with the batches of the uninterrupted
+    run, each host's pass 2 has seed 43, and every pass leaves out the pages of www.hebban.nl."""
+    lists = _write_shares(tmp_path, [61, 64], blocked_every=5)
+    ends = [_last_batches_of_passes(files, 4, 2, url_blocklist=("hebban.nl",)) for files in lists]
+    steps = max(ends[0][1], ends[1][1]) + 3
+    spec = dict(route="packed", data="local_files", per_device=2, files_lists=lists, max_steps=steps,
+                extra_args=["--lr-schedule", "wsd", "--decay-steps", "6", *FINAL_RUN_ARGS])
+
+    whole, whole_logs = _run(tmp_path, "whole", 2, 2, checkpoint_dir=str(tmp_path / "ckpt_whole"), **spec)
+    _assert_identical_across_hosts_and_chips(whole)
+    for process_id, (log, n) in enumerate(zip(whole_logs, [61, 64])):
+        assert f"Pass 2 of shard {process_id}/2 with seed 43" in log
+        assert f"Pass 3 of shard {process_id}/2 with seed 44" in log
+        blocked = sum(len(range(1, size, 5)) for size in (n // 2, n - n // 2))
+        assert log.count(f" {blocked} documents of blocked hosts left out of this pass") == 2, process_id
+    assert "| Skipped: 0" in whole_logs[0] and "NONFINITE" not in whole_logs[0]
+
+    stop = ends[0][0] + 1 + (ends[0][1] - ends[0][0]) // 2
+    ckpt = str(tmp_path / "ckpt")
+    stopped, _ = _run(tmp_path, "stopped", 2, 2, checkpoint_dir=ckpt, **{**spec, "extra_args": spec["extra_args"] + ["--stop-at-step", str(stop)]})
+    assert stopped[0]["state_step"] == stop
+    resumed, logs = _run(tmp_path, "resumed", 2, 2, checkpoint_dir=ckpt, **spec)
+    _assert_identical_across_hosts_and_chips(resumed)
+    assert resumed[0]["restored"]["step"] == stop and resumed[0]["state_step"] == steps
+    for process_id in range(2):
+        assert "Data state restored" in logs[process_id]
+        assert _raw_batches(tmp_path, "resumed", process_id) == _raw_batches(tmp_path, "whole", process_id)[stop:]
+    # The same parameters as the uninterrupted run up to float rounding: the masks after a resume are drawn anew
+    assert _max_abs_diff(_params(tmp_path, "resumed"), _params(tmp_path, "whole")) < 0.05
+    saved = json.loads((Path(ckpt + "_data_state") / str(stop) / "process_0.json").read_text())
+    assert saved["identity"]["url_blocklist"] == ["hebban.nl"]
+
+
+def test_a_cooldown_branch_continues_the_main_run_from_a_copy_of_its_checkpoint(tmp_path):
+    """start_branch.sh: the step directory and data state of the main run, copied into the branch's own
+    --checkpoint-dir, resume as the branch's own checkpoint. The branch reads the batches the main run read after
+    that step, its optimizer goes on counting (Adam's moments are the main run's), and its rate follows its own
+    schedule: the main run's peak up to the branch point, then the branch's cooldown."""
+    import shutil
+
+    lists = _write_shares(tmp_path, [80, 80], blocked_every=5)
+    base = dict(route="packed", data="local_files", per_device=2, files_lists=lists, checkpoint_every=4)
+    # Main run: tak 2's schedule (cooldown from step 8 of 12), stopped at its cooldown start, as the final run
+    main_ckpt = tmp_path / "main_ckpt"
+    main, _ = _run(tmp_path, "main", 2, 2, max_steps=12, checkpoint_dir=str(main_ckpt), **base,
+                   extra_args=["--lr-schedule", "wsd", "--decay-steps", "4", "--stop-at-step", "8", *FINAL_RUN_ARGS])
+    assert main[0]["state_step"] == 8
+    # Tak 1: cooldown from step 4 of 6, from the main run's checkpoint 4
+    branch_ckpt = tmp_path / "branch_ckpt"
+    branch_ckpt.mkdir()
+    shutil.copytree(main_ckpt / "4", branch_ckpt / "4")
+    shutil.copytree(Path(str(main_ckpt) + "_data_state") / "4", Path(str(branch_ckpt) + "_data_state") / "4")
+    branch, logs = _run(tmp_path, "branch", 2, 2, max_steps=6, checkpoint_dir=str(branch_ckpt), **base,
+                        extra_args=["--lr-schedule", "wsd", "--decay-steps", "2", *FINAL_RUN_ARGS])
+    _assert_identical_across_hosts_and_chips(branch)
+    assert branch[0]["restored"]["step"] == 4 and branch[0]["state_step"] == 6
+    assert 6 in branch[0]["optimizer_counts"], branch[0]["optimizer_counts"]
+    for process_id in range(2):
+        assert "Data state restored" in logs[process_id]
+        assert _raw_batches(tmp_path, "branch", process_id) == _raw_batches(tmp_path, "main", process_id)[4:6]
+    assert "Cooldown: 1-sqrt over the last 2 of 6 steps, from step 4" in logs[0]
 
 
 def test_packed_resume_without_data_state_refuses_to_repeat_data(tmp_path):

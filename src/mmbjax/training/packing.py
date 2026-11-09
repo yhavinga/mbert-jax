@@ -7,6 +7,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
+from .url_blocklist import url_is_blocked
+
 # Set HuggingFace Hub timeout before any HF imports - TPU networks can be slow
 os.environ.setdefault('HF_HUB_DOWNLOAD_TIMEOUT', '120')
 
@@ -755,6 +757,7 @@ def create_packed_dataloader(
     dataset_format: str = "text",
     # This host's own parquet files on local disk, instead of streaming and sharding dataset_name
     data_files: Optional[List[str]] = None,
+    url_blocklist: Optional[Tuple[str, ...]] = None,
 ):
     """Create Grain dataset iterator with sequence packing and epoch restart.
 
@@ -781,6 +784,8 @@ def create_packed_dataloader(
         stopping_strategy: "first_exhausted" or "all_exhausted"
         dataset_format: Dataset format - "text" or "inputs_targets" (single-dataset mode only)
         data_files: Parquet files of this host (single-dataset mode only)
+        url_blocklist: Host names whose documents (by the column url of data_files) are left out, with their
+            subdomains (url_blocklist.py)
 
     Returns:
         EpochTrackingDataLoader with sequence packing and epoch tracking
@@ -819,6 +824,7 @@ def create_packed_dataloader(
         stopping_strategy=stopping_strategy,
         dataset_format=dataset_format,
         data_files=data_files,
+        url_blocklist=url_blocklist,
     )
 
 
@@ -924,6 +930,7 @@ class EpochTrackingDataLoader:
         # Dataset format parameter
         dataset_format: str = "text",
         data_files: Optional[List[str]] = None,
+        url_blocklist: Optional[Tuple[str, ...]] = None,
     ):
         """Initialize the epoch-tracking data loader.
 
@@ -947,10 +954,17 @@ class EpochTrackingDataLoader:
             dataset_format: Dataset format - "text" or "inputs_targets" (single-dataset mode)
             data_files: Parquet files of this host, instead of streaming and sharding
                 dataset_name. Their order is shuffled with the seed, as a stream's files are.
+            url_blocklist: Host names whose documents are left out of data_files, by the column url: the
+                stream is filtered before its shuffle, so it is that of files without those documents.
         """
         # Determine mode
         self.multi_dataset_mode = dataset_configs is not None
         self.data_files = data_files
+        if url_blocklist and data_files is None:
+            raise ValueError("url_blocklist needs data_files: it reads the column url of local parquet files")
+        self.url_blocklist = tuple(url_blocklist) if url_blocklist else None
+        # Of the pass being read: a resume reads the pass up to its index again, so this ends at the pass's total
+        self._blocked_this_pass = 0
 
         if self.multi_dataset_mode:
             self.dataset_configs = dataset_configs
@@ -1003,6 +1017,10 @@ class EpochTrackingDataLoader:
         if self.data_files is not None:
             # Already this host's part of the data: nothing to shard
             stream_dataset = load_dataset("parquet", data_files=self.data_files, split="train", streaming=True)
+            if self.url_blocklist:
+                # Before the shuffle: its buffer then holds what files without these documents would give
+                self._blocked_this_pass = 0
+                stream_dataset = stream_dataset.filter(self._keep_url, input_columns="url")
             return stream_dataset.shuffle(seed=epoch_seed, buffer_size=self.shuffle_buffer_size)
 
         # Single-dataset mode (original behavior)
@@ -1041,6 +1059,12 @@ class EpochTrackingDataLoader:
         
         return stream_dataset
     
+    def _keep_url(self, url: Optional[str]) -> bool:
+        if url_is_blocked(url, self.url_blocklist):
+            self._blocked_this_pass += 1
+            return False
+        return True
+
     def _create_pipeline(self):
         """Create a fresh packed data pipeline for one epoch.
 
@@ -1303,6 +1327,9 @@ class EpochTrackingDataLoader:
     def __iter__(self):
         """Iterate through batches, auto-restarting on epoch boundaries."""
         while self.num_epochs is None or self.epoch < self.num_epochs:
+            # Each pass its own order: the seed of its file order, shuffle buffer and window of pieces
+            print(f"[EpochTrackingDataLoader] Pass {self.epoch + 1} of shard {self.shard_index}/{self.shard_count} "
+                  f"with seed {self.base_seed + self.epoch}", flush=True)
             self._current_iter = iter(self._create_pipeline())
             restored = self._restore_state is not None
             if restored:
@@ -1330,10 +1357,12 @@ class EpochTrackingDataLoader:
             self._documents_of_finished_epochs = self.documents_read
             self._document_sources = []  # Counted now; left in place they would count twice
             self.epoch += 1
+            blocked = (f", {self._blocked_this_pass:,} documents of blocked hosts left out of this pass"
+                       if self.url_blocklist else "")
             print(f"[EpochTrackingDataLoader] Completed epoch {self.epoch} "
                   f"(shard {self.shard_index}/{self.shard_count}): "
                   f"{self.documents_read:,} documents read so far, "
-                  f"{self.pieces_read:,} pieces handed to training", flush=True)
+                  f"{self.pieces_read:,} pieces handed to training{blocked}", flush=True)
         
         # If num_epochs is set, we stop here
         print(f"[EpochTrackingDataLoader] Finished {self.num_epochs} epochs")

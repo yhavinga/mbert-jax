@@ -59,6 +59,7 @@ from mmbjax.training import (
     create_packed_dataloader,
     create_packed_dataset_streaming,
 )
+from mmbjax.training.url_blocklist import parse_blocklist
 
 
 def is_coordinator():
@@ -256,6 +257,8 @@ def data_state_identity(args, rows_per_host, data_files, masking="uniform15"):
     # Only when it isn't the default: data states saved before --masking existed have no such key
     if masking != "uniform15":
         identity["masking"] = masking
+    if getattr(args, "url_blocklist", None):
+        identity["url_blocklist"] = list(parse_blocklist(args.url_blocklist))
     return identity
 
 
@@ -444,9 +447,37 @@ def parse_args():
     parser.add_argument(
         "--lr-schedule",
         type=str,
-        choices=["inverse_sqrt", "linear", "cosine", "constant"],
+        choices=["inverse_sqrt", "linear", "cosine", "constant", "wsd"],
         default="inverse_sqrt",
-        help="Learning rate schedule type (default: inverse_sqrt)"
+        help="Learning rate schedule type; wsd: warmup, the peak until --decay-steps before --max-steps, then a "
+             "cooldown to --min-lr at --max-steps (default: inverse_sqrt)"
+    )
+    parser.add_argument(
+        "--decay-steps",
+        type=int,
+        default=None,
+        help="wsd only: steps of the cooldown, which ends at --max-steps (default: none, required with wsd)"
+    )
+    parser.add_argument(
+        "--decay-shape",
+        type=str,
+        choices=["1-sqrt", "linear"],
+        default="1-sqrt",
+        help="wsd only: the cooldown's shape, 1 - sqrt(fraction of the cooldown) as in Hägele et al. 2024 "
+             "(arXiv:2405.18392), or linear (default: 1-sqrt)"
+    )
+    parser.add_argument(
+        "--skip-nonfinite-updates",
+        action="store_true",
+        help="optax.apply_if_finite around the optimizer: a step whose gradients are not finite changes neither "
+             "the parameters nor the optimizer state. A finite step is the same as without it"
+    )
+    parser.add_argument(
+        "--max-consecutive-nonfinite",
+        type=int,
+        default=50,
+        help="With --skip-nonfinite-updates: stop the run with an error after this many skipped steps in a row, "
+             "with healthy parameters (default: 50)"
     )
     parser.add_argument(
         "--layer-norm-lr-factor",
@@ -624,6 +655,13 @@ def parse_args():
              "Replaces streaming: on the v4-32 HF reads timed out up to 4 of the 5 retries that are fatal when exhausted"
     )
     parser.add_argument(
+        "--url-blocklist",
+        type=str,
+        default=None,
+        help="With --data-files-list: comma-separated host names, e.g. hebban.nl, whose documents are left out, "
+             "with those of their subdomains, by the files' column url (default: none)"
+    )
+    parser.add_argument(
         "--allow-data-restart",
         action="store_true",
         help="Packing mode: accept a resume from a checkpoint without data state; that host's data starts over"
@@ -709,6 +747,20 @@ def parse_args():
         parser.error(f"--masking {args.masking} needs --use-packing on one plain-text dataset, with --masking-mode standard")
     if args.per_layer_norms_every % args.log_every != 0:
         parser.error("--per-layer-norms-every must be a multiple of --log-every: other steps aren't logged")
+    if args.lr_schedule == "wsd":
+        if args.decay_steps is None or not 0 < args.decay_steps <= args.max_steps - args.warmup_steps:
+            parser.error("--lr-schedule wsd needs --decay-steps between 1 and --max-steps minus --warmup-steps")
+    elif args.decay_steps is not None:
+        parser.error("--decay-steps is for --lr-schedule wsd only")
+    if args.url_blocklist:
+        if not args.data_files_list:
+            parser.error("--url-blocklist needs --data-files-list: it reads the column url of local parquet files")
+        try:
+            parse_blocklist(args.url_blocklist)
+        except ValueError as error:
+            parser.error(str(error))
+    if args.max_consecutive_nonfinite < 1:
+        parser.error("--max-consecutive-nonfinite must be at least 1")
     return args
 
 
@@ -885,6 +937,59 @@ def compute_per_layer_gradient_norms(gradients):
     return {name: jnp.sqrt(square) for name, square in squares.items()}
 
 
+# max_consecutive_errors of apply_if_finite: past it optax would apply a non-finite update. Far above any
+# --max-consecutive-nonfinite, and within the int32 of its counter.
+NONFINITE_NEVER_APPLIED = 2**30
+
+
+def wsd_schedule(peak, warmup_steps, total_steps, decay_steps, end_value, shape="1-sqrt"):
+    """Warmup-stable-decay: linear warmup from 0 to peak, peak until total_steps - decay_steps, then the cooldown
+    to end_value at total_steps, and end_value after it.
+
+    The cooldown of Hägele et al. 2024 (arXiv:2405.18392, "Scaling Laws and Compute-Optimal Training Beyond Fixed
+    Training Durations"), with 1-sqrt the factor 1 - sqrt(fraction of the cooldown done) and linear 1 - fraction,
+    here from the peak to end_value instead of to 0. The warmup is that of optax.warmup_cosine_decay_schedule, so a
+    run on this schedule has the learning rates of a cosine run up to the end of the warmup. Runs with the same
+    peak and warmup that differ in total_steps and decay_steps agree on every step before the earlier cooldown,
+    which is what lets a cooldown branch start from a checkpoint of the longer run.
+    """
+    if not 0 < decay_steps <= total_steps - warmup_steps:
+        raise ValueError(f"decay_steps {decay_steps} must be between 1 and total_steps - warmup_steps "
+                         f"({total_steps} - {warmup_steps})")
+    if shape not in ("1-sqrt", "linear"):
+        raise ValueError(f"cooldown shape {shape} is not 1-sqrt or linear")
+    decay_start = total_steps - decay_steps
+
+    def cooldown(count):
+        # join_schedules passes the steps since the boundary
+        fraction = jnp.clip(count / decay_steps, 0.0, 1.0)
+        done = jnp.sqrt(fraction) if shape == "1-sqrt" else fraction
+        # Each half from its own end, so that in float32 the first cooldown step has the stable phase's rate and the
+        # last one end_value, both to the last bit
+        return jnp.where(done < 0.5, peak - (peak - end_value) * done, end_value + (peak - end_value) * (1.0 - done))
+
+    return optax.join_schedules(
+        schedules=[
+            optax.linear_schedule(init_value=0.0, end_value=peak, transition_steps=warmup_steps),
+            optax.constant_schedule(peak),
+            cooldown,
+        ],
+        boundaries=[warmup_steps, decay_start],
+    )
+
+
+def nonfinite_counts(opt_state):
+    """(skipped steps in a row, skipped steps in all) of the apply_if_finite in opt_state, or None without it."""
+    found = [node for node in jax.tree_util.tree_leaves(
+        opt_state, is_leaf=lambda node: isinstance(node, optax.ApplyIfFiniteState))
+        if isinstance(node, optax.ApplyIfFiniteState)]
+    if not found:
+        return None
+    if len(found) > 1:
+        raise ValueError(f"{len(found)} apply_if_finite states in the optimizer state, expected one")
+    return int(found[0].notfinite_count), int(found[0].total_notfinite)
+
+
 def create_train_state(
     model,
     learning_rate: float,
@@ -896,6 +1001,9 @@ def create_train_state(
     min_lr: float = 1e-7,
     gradient_accumulation_steps: int = 1,
     optimizer_type: str = "adamw",
+    decay_steps: Optional[int] = None,
+    decay_shape: str = "1-sqrt",
+    skip_nonfinite_updates: bool = False,
 ):
     """Create training state with proper optimizer.
 
@@ -910,7 +1018,24 @@ def create_train_state(
         min_lr: Minimum learning rate (prevents decay to zero)
         gradient_accumulation_steps: Number of micro-batches to accumulate before update
         optimizer_type: "adamw" or "muon" (Muon uses less memory, good for large models)
+        decay_steps: wsd only, the steps of the cooldown that ends at num_train_steps
+        decay_shape: wsd only, "1-sqrt" or "linear"
+        skip_nonfinite_updates: wrap the optimizer in optax.apply_if_finite (see finish below)
     """
+
+    def finish(optimizer):
+        """The optimizer of the branches below, around which the step skip and the accumulation go.
+
+        apply_if_finite looks at the gradients it is given: when one is NaN or inf, the update is zeros and the inner
+        state (Adam's moments and count) stays as it was; otherwise the inner optimizer runs as without it. Its
+        max_consecutive_errors would apply non-finite updates after that many in a row; the trainer stops itself
+        earlier (--max-consecutive-nonfinite), so that number is never reached.
+        """
+        if skip_nonfinite_updates:
+            optimizer = optax.apply_if_finite(optimizer, max_consecutive_errors=NONFINITE_NEVER_APPLIED)
+        if gradient_accumulation_steps > 1:
+            optimizer = optax.MultiSteps(optimizer, every_k_schedule=gradient_accumulation_steps)
+        return optimizer
 
     # Create the selected learning rate schedule
     if lr_schedule_type == "inverse_sqrt":
@@ -959,6 +1084,9 @@ def create_train_state(
             decay_steps=num_train_steps,
             end_value=min_lr,
         )
+
+    elif lr_schedule_type == "wsd":
+        lr_schedule = wsd_schedule(learning_rate, warmup_steps, num_train_steps, decay_steps, min_lr, decay_shape)
 
     elif lr_schedule_type == "constant":
         # Constant LR after warmup (useful for debugging)
@@ -1037,11 +1165,7 @@ def create_train_state(
             ),
         )
 
-        # Wrap with MultiSteps for gradient accumulation
-        if gradient_accumulation_steps > 1:
-            optimizer = optax.MultiSteps(optimizer, every_k_schedule=gradient_accumulation_steps)
-
-        return optimizer, (lr_schedule, None)
+        return finish(optimizer), (lr_schedule, None)
 
     # AdamW optimizer with optional separate learning rate for layer norms
     if layer_norm_lr_factor != 1.0:
@@ -1090,12 +1214,8 @@ def create_train_state(
             multi_optimizer,
         )
 
-        # Wrap with MultiSteps for gradient accumulation
-        if gradient_accumulation_steps > 1:
-            optimizer = optax.MultiSteps(optimizer, every_k_schedule=gradient_accumulation_steps)
-
         # For logging purposes, return both schedules
-        return optimizer, (lr_schedule, ln_lr_schedule)
+        return finish(optimizer), (lr_schedule, ln_lr_schedule)
     else:
         # Standard optimizer without special layer norm treatment
         optimizer = optax.chain(
@@ -1107,11 +1227,7 @@ def create_train_state(
             ),
         )
 
-        # Wrap with MultiSteps for gradient accumulation
-        if gradient_accumulation_steps > 1:
-            optimizer = optax.MultiSteps(optimizer, every_k_schedule=gradient_accumulation_steps)
-
-        return optimizer, (lr_schedule, None)
+        return finish(optimizer), (lr_schedule, None)
 
 
 def wants_per_layer_norms(optimizer_step, micro_step, gradient_accumulation_steps, every):
@@ -1490,6 +1606,10 @@ def main(args):
             "masking": args.masking,
             "init_from": args.init_from,
             "gradient_clipping": 1.0,
+            "decay_steps": args.decay_steps,
+            "decay_shape": args.decay_shape if lr_schedule_type == "wsd" else None,
+            "skip_nonfinite_updates": args.skip_nonfinite_updates,
+            "url_blocklist": args.url_blocklist,
 
             # Dataset
             "dataset": args.dataset,
@@ -1585,6 +1705,12 @@ def main(args):
         print(f"  Learning rate: {learning_rate}")
         print(f"  LR schedule: {lr_schedule_type}")
         print(f"  Warmup steps: {warmup_steps}")
+        if lr_schedule_type == "wsd":
+            print(f"  Cooldown: {args.decay_shape} over the last {args.decay_steps} of {num_train_steps} steps, "
+                  f"from step {num_train_steps - args.decay_steps}")
+        if args.skip_nonfinite_updates:
+            print(f"  Non-finite gradients: step skipped (optax.apply_if_finite), the run stops after "
+                  f"{args.max_consecutive_nonfinite} in a row")
         print(f"  Min LR: {min_lr}")
         print(f"  Weight decay: {weight_decay}")
         if optimizer_type == "adamw" and layer_norm_lr_factor != 1.0:
@@ -1606,6 +1732,9 @@ def main(args):
         min_lr=min_lr,
         gradient_accumulation_steps=gradient_accumulation_steps,
         optimizer_type=optimizer_type,
+        decay_steps=args.decay_steps,
+        decay_shape=args.decay_shape,
+        skip_nonfinite_updates=args.skip_nonfinite_updates,
     )
 
     # Unpack schedules
@@ -1753,6 +1882,17 @@ def main(args):
         data_files = Path(args.data_files_list).read_text().split() if args.data_files_list else None
         if data_files and dataset_configs:
             raise ValueError("--data-files-list replaces --dataset; it can't be combined with --datasets-config")
+        url_blocklist = parse_blocklist(args.url_blocklist) if args.url_blocklist else None
+        if url_blocklist:
+            import pyarrow.parquet as pq
+
+            # Here and not in the loader's read threads, where a missing column would surface far from its cause
+            without_url = [path for path in data_files if "url" not in pq.read_schema(path).names]
+            if without_url:
+                raise ValueError(f"--url-blocklist reads the column url, which {len(without_url)} of the "
+                                 f"--data-files-list files lack, e.g. {without_url[0]}")
+            if is_coordinator():
+                print(f"  URL blocklist: documents of {', '.join(url_blocklist)} and their subdomains are left out")
 
         packed_dataloader = create_packed_dataloader(
             dataset_name=args.dataset if not dataset_configs else None,
@@ -1769,6 +1909,7 @@ def main(args):
             shuffle_buffer_size=args.shuffle_buffer_size,
             stopping_strategy=args.stopping_strategy,
             data_files=data_files,
+            url_blocklist=url_blocklist,
         )
         if is_coordinator():
             print(f"  ✓ Packing enabled: documents will be packed into {max_length}-token sequences")
@@ -1958,6 +2099,9 @@ def main(args):
     system_input_seconds = 0.0
     system_window_start_step = start_optimizer_step
 
+    # Steps skipped by apply_if_finite so far, resumes included: the counts are in the optimizer state
+    skipped_steps = nonfinite_counts(state.opt_state)[1] if args.skip_nonfinite_updates else 0
+
     # Progress bar shows optimizer steps (not micro-steps); in a log file only every 30 s
     pbar = tqdm(total=num_train_steps, desc="Training", initial=start_optimizer_step,
                 mininterval=0.1 if sys.stderr.isatty() else 30) if is_coordinator() else None
@@ -2045,6 +2189,19 @@ def main(args):
                         window_tokens = sum(int(t) for t in pending_tokens)
                         tokens_seen += window_tokens
                         pending_tokens = []
+                        if args.skip_nonfinite_updates:
+                            # Replicated counts, so every host comes to the same decision at the same step
+                            in_a_row, skipped = nonfinite_counts(state.opt_state)
+                            if skipped != skipped_steps and is_coordinator():
+                                print(f"NONFINITE step={optimizer_step} skipped={skipped} in_a_row={in_a_row}: "
+                                      f"{skipped - skipped_steps} step(s) with non-finite gradients left the "
+                                      f"parameters and optimizer state unchanged", flush=True)
+                            skipped_steps = skipped
+                            if in_a_row >= args.max_consecutive_nonfinite:
+                                raise RuntimeError(
+                                    f"{in_a_row} steps in a row up to optimizer_step {optimizer_step} had non-finite "
+                                    f"gradients and were skipped; the parameters are still those before them. "
+                                    f"Resume from the last checkpoint, e.g. with --compute-dtype float32")
 
                     # Logging (only on coordinator, using optimizer_step)
                     if optimizer_step % log_every == 0 and is_coordinator():
@@ -2102,7 +2259,8 @@ def main(args):
                             print(f"\nStep {optimizer_step:4d} | Loss: {loss_value:.4f} | Acc: {accuracy_value:.1f}% | "
                                   f"PPL: {perplexity_value:.1f} | LR: {lr_value:.2e} | "
                                   f"Grad: {grad_norm_value:.2f} | Ratio: {update_ratio_value:.2e} | "
-                                  f"Tok/s: {tokens_per_sec:.0f} | Step: {step_seconds:.3f}s | Input: {input_seconds_per_step:.3f}s", flush=True)
+                                  f"Tok/s: {tokens_per_sec:.0f} | Step: {step_seconds:.3f}s | Input: {input_seconds_per_step:.3f}s"
+                                  + (f" | Skipped: {skipped_steps}" if args.skip_nonfinite_updates else ""), flush=True)
 
                         if wandb is not None:
                             wandb_log = {
@@ -2125,6 +2283,8 @@ def main(args):
                             }
                             if ln_lr_schedule:
                                 wandb_log["train/layer_norm_lr"] = ln_lr_value
+                            if args.skip_nonfinite_updates:
+                                wandb_log["train/skipped_steps"] = skipped_steps
 
                             # Add per-layer gradient norms if available
                             if "layer_grad_norms" in metrics:

@@ -157,8 +157,8 @@ def _max_ulp(a, b):
 def test_finite_steps_are_the_same_with_and_without_apply_if_finite(tm, layer_norm_lr_factor):
     """The same updates when every gradient is finite. One step is byte for byte that of the plain optimizer. Over 30
     steps (warmup, peak, cooldown, some clipped) at most 2 units in the last place differ: optax compiles the inner
-    update inside a lax.cond, and XLA may round a fused branch in the last bit otherwise (measured on the CPU: 1 to 3
-    of the 49 numbers, by 1 ulp). Adam's step count, and so the learning rate, stays the same."""
+    update inside a lax.cond, and XLA may round a fused branch in the last bit otherwise (measured on the CPU with jit: 1
+    of the 52 numbers, by 1 ulp). Adam's step count, and so the learning rate, stays the same."""
     params = _tiny_params()
     one_plain, one_plain_state = _run_steps(_optimizer(tm, False, layer_norm_lr_factor), params, _gradients, 1)
     one_skip, one_skip_state = _run_steps(_optimizer(tm, True, layer_norm_lr_factor), params, _gradients, 1)

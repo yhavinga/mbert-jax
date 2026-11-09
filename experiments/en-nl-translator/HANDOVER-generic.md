@@ -208,7 +208,9 @@ zoals in §4.
 - **Keeper.** Schrijft nu de pid van de run in `~/logs/tg_run.pid` op de VM (polls via `kill -0`, niet `pgrep -f`).
   Op co1: pid van de keeper in `~/logs/tg_keeper_euw4.pid`. Om 23:28 `tg_run.log` op de VM opzij gezet
   (`tg_run.context-tokenizer.log`) en de keeper opnieuw gestart (§4); `post` haalt `context.parquet` en `qe.parquet` uit
-  de bucket en draait alleen nog merge, preflight en report. Klaar zien: zoals in §5.
+  de bucket en draait alleen nog merge, preflight en report. Run `EXIT 0` om 23:29:12, keeper `run ended in EXIT 0`;
+  `gemma4-vs-tg27b.md` staat in de bucket en één keer op co1 in `~/Developer/yhavinga/mbert-ops/translator-pilot/`. De
+  VM `translate-generic` staat nog (READY); de hoofdsessie beslist.
 
 **Data verplaatst in deze stap**: niets tussen regio's of naar co1. Van co1 naar europe-west4: de scripts (~90 KB) en
 testscripts van enkele KB naar de VM. De VM haalde torch 2.9.1 (CPU) van download.pytorch.org; de MetricX-gewichten

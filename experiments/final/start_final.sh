@@ -60,8 +60,9 @@ pgrep -f '[g]ptnl_mix.py|[b]locklist_scan.py' > /dev/null && { echo "$(hostname)
 [[ $ROWS =~ ^[0-9]+$ ]] || { echo "$(hostname): no dataset_num_rows in the plan of $VARIANT"; exit 1; }
 [ "$(md5sum ~/heldout.parquet | cut -d' ' -f1)" = b2f579a876d06eef40c94270537bb7af ] || { echo "$(hostname): held-out file is not the long run's"; exit 1; }
 if [ -n "$BRANCH_STEP" ]; then
-  # Without the copied checkpoint this would train from scratch under a branch's name
-  gsutil -q stat "$OUT/ckpt_data_state/$BRANCH_STEP/process_0.json" && gsutil ls "$OUT/ckpt/" | grep -q "/$BRANCH_STEP/\$" \
+  # Without the copied checkpoint this would train from scratch under a branch's name. The copy itself rotates out of
+  # ckpt/ after three newer checkpoints, so a resume needs its data state and any checkpoint
+  gsutil -q stat "$OUT/ckpt_data_state/$BRANCH_STEP/process_0.json" && gsutil ls "$OUT/ckpt/" | grep -q '/[0-9]*/$' \
     || { echo "$(hostname): no checkpoint $BRANCH_STEP with data state in $OUT; run start_branch.sh"; exit 1; }
 fi
 pkill -f "[s]ync_$RUN.sh" || true

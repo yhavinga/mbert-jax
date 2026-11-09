@@ -1053,10 +1053,13 @@ def _pct(k, n):
 def selection_md(report):
     """The final selection in Dutch, for Yeb"""
     th = report["thresholds"]
+    max_tokens = report["args"]["max_tokens"]
+    length = (f"~25% lang (384–{max_tokens} tokens na de bewerkingen)" if max_tokens > 384 else
+              f"alleen passages tot {max_tokens} tokens na de bewerkingen (de minipilot hield de lange buiten de run)")
     lines = ["# Hoofdset en→nl-vertaler: definitieve selectie", "",
-             f"Gegenereerd door `mainset.py final`. Bronscore ≥ {th['source']}; FineWeb-2 ook herkomst ≥ {th['origin']}; "
-             f"per bron de verdeling 40/20/7,5/7,5/25, ~25% lang (384–{report['args']['max_tokens']} tokens na de "
-             f"bewerkingen), de helft idioomrijk (`idiom_class`), 20% van de Handelingen met contextbeurten; FineWeb-2 "
+             f"Gegenereerd door `mainset.py final`. Bronscore ≥ {th['source']:g}; FineWeb-2 ook herkomst ≥ "
+             f"{th['origin']:g}; per bron de verdeling 40/20/7,5/7,5/25, {length}, de helft idioomrijk (`idiom_class`), "
+             f"20% van de Handelingen met contextbeurten; FineWeb-2 "
              f"hoogstens {100 * th['topic_cap']:g}% per onderwerp en {100 * th['host_cap']:g}% per host. Seed "
              f"`{report['seed']}`. Bewerkingen vóór stap 1: een kop tussen `_…_` vast aan de alinea naar een eigen regel, "
              f"en een lege regel tussen alinea's.", ""]

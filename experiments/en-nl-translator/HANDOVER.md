@@ -1,5 +1,107 @@
 # Overdracht: pilot, LoRA-smoke-test en hoofdset van de en→nl-vertaler (stand 9 nov 2026)
 
+## Hoofdrun: selectie, minipilot en de keten van stap 1 en 2 (9 nov, avond; Yebs akkoord ~17:00 CET)
+
+`R=gs://t5-dutch-english-usc2/mbert/translator`, `M=$R/mainset`, `RUN=$M/run`. Besluiten: ontwerp §3 stap 0–2, §7 punt 6
+en 7 (bronscore ≥ 0,5, lege regel tussen alinea's, `heading_glued` met `_…_` herstellen), §9 (context), plus de
+aanvulling van de coördinator na overleg met Yeb: FineWeb-2 hoogstens 0,5% per host.
+
+### Wat loopt
+
+(STAND)
+
+### "Klaar" betekent
+
+- `~/Developer/yhavinga/mbert-ops/logs/translator_mainrun.log` op co1 eindigt op `DONE translator main run: ...` en
+  `EXIT 0`; `$RUN/stages/` heeft `wait prep pilot decide select nl_en back en_nl measures qe summary` (`.done`).
+- `$RUN/pairs/pairs.parquet` (elk paar: `nl` origineel na de bewerkingen, `en` synthetisch, `back` terugvertaling,
+  `hard_fails`, `structure`, `chrf`, `qe_en_nl`, `kind` passage/context, `split` train/eval), `$RUN/pairs/summary.md`
+  en `summary.json`; kopieën op co1: `~/Developer/yhavinga/mbert-ops/translator-mainrun/summary.md` en `selection.md`.
+- mbert-corpus vrij: `sudo lsof -t /dev/accel* /dev/vfio/*` leeg op alle workers, geen `translate.py`, `judge.py`,
+  `metricx_qe.py`.
+
+### ETA's
+
+(ETA)
+
+### Bij een fout
+
+De keten stopt bij de eerste fout met `FAILED: <wat>` en `EXIT 1`; de processen op de andere workers lopen door
+(losgekoppeld). Dan:
+1. Lees de regel `FAILED` en het log van die stap op de worker (`~/logs/tmr_<stap>_<tag>.log`; de vertaal- en
+   judge-logs ook in `$RUN/logs/` en `$M/logs/`).
+2. Wacht tot geen worker nog rekent (`sudo lsof -t /dev/accel* /dev/vfio/*` leeg); stop een hangend proces alleen met
+   `pkill -9 -f '[t]ranslate.py'` (of `[m]etricx_qe.py`, `[j]udge.py`) op die worker.
+3. Herstart de keten met hetzelfde commando (hieronder). Afgeronde stappen slaat hij over (`$RUN/stages/*.done`);
+   `translate.py`, `judge.py` en de QE-stap slaan hun afgeronde shards over. Een CPU-stap (`select`, `back`) weigert
+   als zijn lokale map al bestaat (`/dev/shm/translator/mainrun/run/select` of `.../back`): die map eerst met een
+   zichtbaar `rm -rf` van precies dat pad weghalen.
+4. Gaat een stap op de TPU herhaald mis op `xxlong` (512–768 tokens, 56 slots, alleen in de minipilot getest): de
+   selectie met `--max-tokens 512` opnieuw maken is een besluit voor Yeb, niet voor de keten.
+
+### Commando's
+
+- Keten (co1): `setsid nohup bash ~/Developer/yhavinga/mbert-ops/scripts/translator_mainrun.sh >
+  ~/Developer/yhavinga/mbert-ops/logs/translator_mainrun.log 2>&1 < /dev/null &` (flock op
+  `~/Developer/yhavinga/mbert-ops/translator_mainrun.lock`; een tweede start stopt meteen). Kopie in
+  `gs://t5-dutch-english-usc2/hammond/scratch-scripts/translator_mainrun.sh`. Omgeving: `RUN`, `N`, `N_EVAL`,
+  `MAX_TOKENS`, `STOP_AFTER`, `POLL` (s, standaard 300).
+- Elke ssh gaat via `~/Developer/yhavinga/mbert-ops/translator-mainrun/vm.sh` (`timeout 900`, de ssh-vlaggen,
+  `< /dev/null`); de stukjes die de keten op de workers draait, schrijft hij naar
+  `~/Developer/yhavinga/mbert-ops/translator-mainrun/remote/chain/`.
+- Code op de workers: `/dev/shm/translator/mainrun/code/` (kopie van `$R/scripts/mainrun/`, deze branch).
+  TranslateGemma draait in FLAN-nl's venv `/dev/shm/flan_nl/venv`, de rest in `/dev/shm/translator/venv`, de
+  bronscore in `/dev/shm/judge/venv`.
+
+### Opruiming achteraf (pas als niets het meer nodig heeft; met zichtbare commando's, letterlijke paden)
+
+Op alle workers, na `EXIT 0` van de keten:
+- `rm -rf /dev/shm/judge` (venv, tokenizer, logs, en op w3 de lokale checkpointkopie van Gemma 4 31B; het checkpoint
+  blijft in `$R/judge/gemma-4-31b-it-maxtext/`). Nodig tot en met stap `pilot` (bronscore van de herstelde passages).
+- `rm -rf /dev/shm/translator/mainset` (de werkmappen van de voorbereiding van 9 nov middag).
+- `rm -rf /dev/shm/translator/mainrun/run /dev/shm/translator/mainrun/test /dev/shm/translator/mainrun/repaired
+  /dev/shm/translator/mainrun/pool /dev/shm/translator/mainrun/pool-fineweb /dev/shm/translator/mainrun/hosts`
+  (kopieën; alles staat in de bucket). `/dev/shm/translator/mainrun/code` mag blijven tot de fine-tune.
+- `rm -rf /dev/shm/translator/metricx` (MetricX-24-XXL, 25 GB per worker; `metricx_qe.py` haalt hem opnieuw van HF).
+- Niet: `/dev/shm/flan_nl` (TranslateGemma, FLAN-nl), `/dev/shm/translator/venv`, `/dev/shm/translator/resources`.
+
+### Uitkomsten tot de start (details: `$RUN/select/selection.md`, `report.json`; kopie op co1 in `translator-mainrun/`)
+
+1. **`heading_glued`** (`select_passages.py repair`, w1, CPU, 634 s; `$RUN/repaired/`). Uit dezelfde row groups en met
+   dezelfde seed opnieuw opgebouwd (zelfde pids), alleen documenten met een gemarkeerde kop (`_…_` aan het begin van
+   een regel, gevolgd door een hoofdletter): raad 5.063 documenten, dpc, rechtspraak en Handelingen 0, FineWeb-2 1.
+   Van de raadspassages met een herstelde kop slagen er 8.147 daarna voor alle regels van stap 0 (8.018 train, 129
+   eval): 6.323 vielen eerder op `heading_glued`, de rest alleen op `mid_capital`, omdat de kop een leesteken bevat
+   ("_1._ _Grondexploitaties_ Een …"). Een kop zonder markering blijft afgekeurd (unit-tests). Gemma 4 31B scoorde ze
+   op w2–w3 (`$RUN/source-scores-repaired/`). Ze kregen de idioomklasse van de pool (drempels uit `report.json` van de
+   pool). In de selectie: 2.238 train en 34 eval uit het herstel (het documentmaximum van de raad, 5, sloeg in de hele selectie 1.766
+   passages over),
+   plus 610 + 11 poolpassages met een gemarkeerde kop vóór een gewoon woord met hoofdletter, die de regel niet ving
+   en die de bewerking nu ook op een eigen regel zet.
+2. **FineWeb-2-herkomst** (train, bronscore ≥ 0,5: 82.099 passages): bij drempel 0,1 vallen er 14.367 af (17,5%),
+   bij 0,5 15.060 (18,3%), bij 0,9 16.127 (19,6%); de score is bijna binair. Drempel 0,5.
+3. **Minipilot** (501 lange passages, na beide bewerkingen; w0–w1): 166 met `decode_loop` (33%), waarvan 27 niet
+   afgelopen, 0 met Nederlandse resten. Besluit volgens de regel (> 2%): alleen passages tot 384 tokens. Maar:
+   384–511 brontokens 0 van 248, 512–767 166 van 253 (512–575: 54/78, 576–639: 22/73, 640–703: 53/59, 704–767: 37/43).
+   De fout begint precies bij de grens van de nieuwe klasse `xxlong` (prefill 768/896, 56 slots, cache 2.048); in
+   `xlong` gingen vertalingen met prompt plus uitvoer tot 1.216 tokens goed, dus het schuifvenster van 1.024 van
+   Gemma 3 is niet de grens. Het lijkt een fout in de motorinstelling van `xxlong`, niet het gedrag van het model op
+   lange tekst ("youyouyou…", "The. The. The."). Niet uitgezocht. Gevolg: 384–512 had waarschijnlijk mee gekund;
+   dat is een besluit voor Yeb (een aanvullende run voor 384–512 kost ~1–2 uur).
+4. **Selectie** (`mainset.py final`, `--max-tokens 384`, seed `en-nl-translator/mainset-final/0`): 199.016 train
+   (Handelingen 79.095, raad 40.000, dpc 14.921, rechtspraak 15.000, FineWeb-2 50.000) en 3.977 eval
+   (1.582/800/295/300/1.000). Handelingen en dpc zijn te kort (905 en 79), omdat hun pool zonder lange passages op
+   is; niet aangevuld uit andere bronnen. Idioomrijk: Handelingen 41.023 (52%), raad 5.325 (13%), dpc 2.342 (16%),
+   rechtspraak 1.683 (11%), FineWeb-2 21.064 (42%); de pool had niet meer. Context: 16.082 Handelingen-passages
+   (20,3%) met 37.640 contextbeurten (een beurt met bronscore < 0,5 of > 384 tokens beëindigt de context; 1.269
+   voorbeelden hielden geen beurt over). FineWeb-2: onderwerp K (cultuur, sport, media) 22,9% en O (dagelijks leven)
+   15,4%, boven de 15%: zonder lange passages is de pool te klein (51.312 kandidaten voor 50.000; ronde 5 liet de
+   onderwerpgrens los voor 4.153 passages). Grootste hosts: nu.nl, nrc.nl, ad.nl elk 250 (0,5%), nos.nl 230,
+   volkskrant.nl 208, hln.be 186, gelderlander.nl 172, trouw.nl 154, telegraaf.nl 151, bndestem.nl 149. Ontdubbeld
+   over alles (ook FineWeb-2 tegen de andere bronnen) en tegen de 13-grammen van de testsets: 368 13-gram-overlap,
+   220 exacte duplicaten. Stap 1: 240.633 segmenten, 33,1 M tokens in passages en 4,4 M in contextbeurten.
+
+
 ## Hoofdset tot vlak vóór het vertalen (9 nov, 13:45–15:30 UTC; opdracht "hoofdset voorbereiden")
 
 Geen vertaling, geen drempels, geen fine-tune. `R=gs://t5-dutch-english-usc2/mbert/translator`, `M=$R/mainset`.

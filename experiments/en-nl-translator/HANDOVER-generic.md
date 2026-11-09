@@ -146,3 +146,42 @@ Gestopt volgens de rem: er bleef alleen wachten over (op een spot-VM, daarna ~1 
 - `sft_data.py` gebruikt `user_text` nog niet (andere branch); zie §1.
 - Een TPU-test van de twee omwegen tegen 0.2.5 (beide actief) staat niet in de keten; de unit-tests en de CPU-controle
   dekken de voorwaarden.
+
+## 5. Aanvulling 9 nov, 20:00 UTC: de eerste run (19:40) faalde, gerepareerd in `4c8245f`, pilot loopt
+
+- **Oorzaak, bevestigd.** De keeper kreeg om 19:40 de VM `translate-generic` (europe-west4-a). Setup, checks
+  (`PROMPTS`: 0 verschillen, 35 tests geslaagd; `checks.log` staat in de bucket) slaagden; beide vertaalprocessen
+  stopten na ~30 s in `done_shards`: `gsutil ls ... failed: need to run as root or suid`. Op de v6e-image is `gsutil`
+  een snap (`/snap/bin/gsutil -> google-cloud-cli.gsutil`). Gemeten in de venv-fork met `TPU_VISIBLE_CHIPS=0,1,2,3`:
+  `NoNewPrivs` is 0 voor en na `import jax`, en 1 na `jax.devices()`; `gsutil ls` geeft daarna exit 1 met precies die
+  melding, `google.cloud.storage` in hetzelfde proces werkt. Bash (de keten) heeft `NoNewPrivs: 0`.
+- **Fix.** `translate.py` lijst (`done_shards(out, client=None)`) en uploadt (`upload(path, url, client=None)`, met
+  `DEFAULT_RETRY`) via `google.cloud.storage`; geen subprocess meer. Zelfde gedrag: de `.parquet`-namen direct onder
+  `out/`, leeg = geen. `maxtext[tpu]` brengt het pakket mee (0.2.5: `google-cloud-storage>=3.14.1`, dus ook de
+  FLAN-nl-venv op de v4's; daar niet gedraaid). Tests met een nep-client in `tests/test_flan_nl.py` (51 geslaagd), ruff
+  schoon.
+- **`/dev/shm`, bevestigd.** `/dev/shm/translate-generic` was om 19:45 weg; de journal van systemd-logind toont om
+  19:45:10 "Removed session 4" (de losgekoppelde run), `Linger=no`, en `logind.conf` zonder `RemoveIPC`-regel (de
+  standaard is `yes`: bij het einde van de laatste sessie van een gebruiker verwijdert logind diens POSIX-shared-memory,
+  dus diens bestanden in `/dev/shm`). `run_gemma4_pilot.sh` begint nu met `sudo -n loginctl enable-linger "$(id -un)"`;
+  op deze VM om 19:50 ook met de hand gezet (`Linger=yes`).
+- **Ook gerepareerd.** `all` draaide `post` na een mislukte `translate` (`bash "$0" translate && ...` stopt `set -e`
+  niet); nu stopt de keten daar.
+- **Herstart.** Setup met de hand 19:50 (EXIT 0, ~3 min); oude logs op de VM verplaatst naar
+  `~/logs/{tg_run,gemma4_en_nl,gemma4_nl_en}.gsutil-snap.log`; scripts naar `gs://t5-dutch-english/mbert/translator/scripts/`;
+  keeper om 19:53 opnieuw gestart op co1 (`~/logs/tg_keeper_euw4.log`, eindigt nu op een eigen `EXIT`-regel). Translate
+  begon 19:53:59.
+- **Eerste shards.** en→nl `tiny/shard-00000` (4 segmenten, 59 s met compilatie) om 19:57:29; nl→en `small/shard-00003`
+  (256 segmenten, 99 s met compilatie) en `shard-00004` (172 segmenten, 9,8 s; 1.168 uitvoertokens/s), daarna
+  `shard-00000`. Engine laden: 40–110 s per lengteklasse.
+
+**Klaar zien.** Op co1 eindigt `~/logs/tg_keeper_euw4.log` op `run ended in EXIT 0` en `EXIT 0`; mislukt: `run failed:
+...` en `EXIT 2` (dan op de VM `~/logs/tg_run.log` en `~/logs/gemma4_{en_nl,nl_en,context,qe}.log`). In de bucket:
+`gsutil -q stat gs://t5-dutch-english/mbert/translator/gemma4-pilot/gemma4-vs-tg27b.md && echo klaar`. Daarna één
+kopie: `gsutil cp gs://t5-dutch-english/mbert/translator/gemma4-pilot/gemma4-vs-tg27b.md
+~/Developer/yhavinga/mbert-ops/translator-pilot/`.
+
+**Data verplaatst in deze stap**: niets tussen regio's of naar co1 (alleen lijsten). Van co1 naar europe-west4:
+`translate.py` en `run_gemma4_pilot.sh` (45 KB) naar de scripts in de bucket en een testscript van 1 KB naar de VM. De
+setup haalde opnieuw Handelingen, Nemotron-bereiken en tokenizers van HF en `pairs.parquet` (1,4 MB) uit us-central2,
+zoals in §4.

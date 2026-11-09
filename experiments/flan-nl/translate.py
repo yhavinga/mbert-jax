@@ -32,7 +32,6 @@ import argparse
 import json
 import os
 import random
-import subprocess
 import sys
 import time
 import traceback
@@ -491,13 +490,39 @@ def translate_pending(shards, done, translate, store, max_shards=None):
     return stored
 
 
-def done_shards(out):
-    listed = subprocess.run(["gsutil", "ls", f"{out}/"], capture_output=True, text=True)
-    if listed.returncode != 0:
-        if "matched no objects" in listed.stderr or "One or more URLs matched no objects" in listed.stderr:
-            return set()
-        raise RuntimeError(f"gsutil ls {out}/ failed: {listed.stderr.strip()}")
-    return {Path(line).name for line in listed.stdout.split() if line.endswith(".parquet")}
+# The bucket through the Python client, not gsutil: on the v6e image gsutil is a snap, and a snap refuses to start
+# ("need to run as root or suid") under a process with no_new_privs, which this one has once libtpu is up (pilot of
+# 9 Nov). google-cloud-storage comes with maxtext[tpu].
+def gcs_client():
+    from google.cloud import storage
+
+    return storage.Client()
+
+
+def split_gs(url):
+    if not url.startswith("gs://"):
+        raise ValueError(f"not a gs:// URL: {url}")
+    bucket, _, name = url[len("gs://"):].partition("/")
+    if not bucket:
+        raise ValueError(f"no bucket in {url}")
+    return bucket, name
+
+
+def done_shards(out, client=None):
+    """The shard files directly under the bucket directory out (as gsutil ls out/ listed them); none if it is empty."""
+    bucket, prefix = split_gs(out.rstrip("/"))
+    blobs = (client or gcs_client()).list_blobs(bucket, prefix=f"{prefix}/" if prefix else "", delimiter="/")
+    return {Path(blob.name).name for blob in blobs if blob.name.endswith(".parquet")}
+
+
+def upload(path, url, client=None):
+    from google.cloud.storage.retry import DEFAULT_RETRY
+
+    bucket, name = split_gs(url)
+    if not name or name.endswith("/"):
+        raise ValueError(f"no object name in {url}")
+    # Retried as gsutil cp retried: writing the same shard again under its name is harmless
+    (client or gcs_client()).bucket(bucket).blob(name).upload_from_filename(str(path), retry=DEFAULT_RETRY)
 
 
 def translate_shard(device, codec, tokenizer, ids, texts, shapes, sync_every, contexts=None, eos_ids=EOS_IDS,
@@ -600,12 +625,13 @@ def main(argv=None):
     print(f"engine ready in {time.time() - started:.0f} s", flush=True)
     local = Path(args.work_dir) / "shards" / args.length_class
     local.mkdir(parents=True, exist_ok=True)
+    client = gcs_client()
     totals = {"segments": 0, "tokens_in": 0, "tokens_out": 0, "seconds": 0.0}
 
     def store(name, rows, seconds):
         path = local / name
         pq.write_table(pa.table(rows), path, compression="zstd")
-        subprocess.run(["gsutil", "-q", "cp", str(path), f"{args.out}/{name}"], check=True)
+        upload(path, f"{args.out}/{name}", client)
         path.unlink()
         n_in, n_out = sum(rows["tokens_in"]), sum(rows["tokens_out"])
         for key, value in (("segments", len(rows["id"])), ("tokens_in", n_in), ("tokens_out", n_out), ("seconds", seconds)):

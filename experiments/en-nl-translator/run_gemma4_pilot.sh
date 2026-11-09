@@ -16,6 +16,10 @@
 # global layers), as translate_models.yml says. Results go to $B/gemma4-pilot/; a second start of translate skips the
 # shards that are there. The bucket is that of the VM's region (the checkpoint is there; nothing crosses regions).
 set -euo pipefail
+# systemd-logind (RemoveIPC=yes, the default) deletes a user's files in /dev/shm when the last session of that user
+# ends: the end of a detached run, or of every ssh between two steps, wiped /dev/shm/translate-generic (venv and all)
+# on 9 Nov. A lingering user never ends that way.
+sudo -n loginctl enable-linger "$(id -un)"
 SHM=/dev/shm/translate-generic
 C=$SHM/code
 D=$SHM/data
@@ -87,7 +91,10 @@ all)
     ) > ~/logs/tg_checks.log 2>&1 &
   fi
   if ! gsutil -q stat "$O/logs/translate.done"; then
-    bash "$0" translate && echo done | gsutil -q cp - "$O/logs/translate.done"
+    # Not "translate && cp": a failed command left of && does not stop set -e, and post then ran after a failed
+    # translate (9 Nov)
+    bash "$0" translate
+    echo done | gsutil -q cp - "$O/logs/translate.done"
   fi
   bash "$0" post
   ;;

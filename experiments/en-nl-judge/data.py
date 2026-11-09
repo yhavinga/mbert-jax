@@ -119,13 +119,13 @@ def motra_command(args):
         chunk = rows[k:k + args.shard_size]
         pq.write_table(pa.table({c: [r[c] for r in chunk] for c in columns}),
                        out / f"shard-{k // args.shard_size:05d}.parquet", compression="zstd")
-    manifest = {"sittings_en": len(en_files), "sittings_without_nl_file": sum(nl is None for _, nl in jobs),
+    manifest = {"repo_commit": args.commit, "sittings_en": len(en_files), "sittings_without_nl_file": sum(nl is None for _, nl in jobs),
                 "counts": dict(totals), "by_period": {k: dict(v) for k, v in sorted(by_period.items())},
                 "by_year": dict(sorted(Counter(r["year"] for r in rows).items())),
                 "dates_with_unpaired_en": dict(sorted(missing.items())), "shard_size": args.shard_size,
                 "shards": (len(rows) + args.shard_size - 1) // args.shard_size}
     (out / "manifest.json").write_text(json.dumps(manifest, indent=1))
-    print(json.dumps({k: manifest[k] for k in ("sittings_en", "sittings_without_nl_file", "counts", "by_period")},
+    print(json.dumps({k: manifest[k] for k in ("repo_commit", "sittings_en", "sittings_without_nl_file", "counts", "by_period")},
                      indent=1))
 
 
@@ -246,6 +246,7 @@ def main(argv=None):
     p.add_argument("--out", required=True)
     p.add_argument("--shard-size", type=int, default=10000)
     p.add_argument("--processes", type=int, default=32)
+    p.add_argument("--commit", default=None, help="The commit of the repo checkout, for the manifest")
     p = sub.add_parser("sanity")
     p.add_argument("--pairs", required=True)
     p.add_argument("--out", required=True)

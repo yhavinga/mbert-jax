@@ -270,19 +270,32 @@ PASSTHROUGH = ("id", "kind", "source_id", "date", "year", "intervention_id", "pa
                "speaker_id", "nationality", "mode", "role", "sl")
 
 
+def sync_compilation_cache():
+    """The local compilation cache to the bucket, so that a new spot VM need not compile again."""
+    local, remote = os.environ.get("JUDGE_JAX_CACHE"), os.environ.get("JUDGE_JAX_CACHE_GCS")
+    if local and remote:
+        subprocess.run(["gsutil", "-m", "-q", "rsync", "-r", local, remote], check=True)
+
+
 def score_command(args):
+    """Every --pairs directory into its --out directory, in that order, with one model."""
     import pyarrow as pa
     import pyarrow.parquet as pq
 
-    shards = sorted(Path(args.pairs).glob("shard-*.parquet"))
-    if not shards:
-        raise SystemExit(f"no shard-*.parquet in {args.pairs}")
-    done = done_shards(args.out)
-    pending = [s for s in shards if s.name not in done]
-    print(f"{len(shards)} shards in {args.pairs}, {len(shards) - len(pending)} done before in {args.out}", flush=True)
+    if len(args.pairs) != len(args.out):
+        raise SystemExit("give one --out per --pairs")
+    jobs = []
+    for pairs, out in zip(args.pairs, args.out):
+        shards = sorted(Path(pairs).glob("shard-*.parquet"))
+        if not shards:
+            raise SystemExit(f"no shard-*.parquet in {pairs}")
+        done = done_shards(out)
+        pending = [s for s in shards if s.name not in done]
+        print(f"{len(shards)} shards in {pairs}, {len(shards) - len(pending)} done before in {out}", flush=True)
+        jobs.extend((shard, out) for shard in pending)
     if args.max_shards is not None:
-        pending = pending[:args.max_shards]
-    if not pending:
+        jobs = jobs[:args.max_shards]
+    if not jobs:
         return
     started = time.time()
     judge = Judge(args.ckpt, Tokenizer(args.tokenizer), args.fsdp, args.tensor)
@@ -290,7 +303,7 @@ def score_command(args):
     local = Path("/dev/shm/judge/out_shards")
     local.mkdir(parents=True, exist_ok=True)
     totals = {"pairs": 0, "scored": 0, "seconds": 0.0}
-    for shard in pending:
+    for shard, out_dir in jobs:
         table = pq.read_table(shard)
         en, nl = table.column("en").to_pylist(), table.column("nl").to_pylist()
         t0 = time.time()
@@ -302,14 +315,15 @@ def score_command(args):
         out.update(cols)
         path = local / shard.name
         pq.write_table(pa.table(out), path, compression="zstd")
-        subprocess.run(["gsutil", "-q", "cp", str(path), f"{args.out}/{shard.name}"], check=True)
+        subprocess.run(["gsutil", "-q", "cp", str(path), f"{out_dir}/{shard.name}"], check=True)
         path.unlink()
+        sync_compilation_cache()
         scored = sum(s is None for s in cols["skipped"])
         tokens = sum(cols["prompt_tokens"])
         totals["pairs"] += len(en)
         totals["scored"] += scored
         totals["seconds"] += seconds
-        print("SHARD " + json.dumps({"shard": shard.name, "pairs": len(en), "scored": scored,
+        print("SHARD " + json.dumps({"out": out_dir, "shard": shard.name, "pairs": len(en), "scored": scored,
                                      "skipped": len(en) - scored, "prompt_tokens": tokens,
                                      "seconds": round(seconds, 1), "pairs_per_s": round(scored / seconds, 1),
                                      "tokens_per_s": round(tokens / seconds)}), flush=True)
@@ -368,13 +382,15 @@ def main(argv=None):
     sub = parser.add_subparsers(dest="command", required=True)
     for name in ("score", "probe"):
         p = sub.add_parser(name)
-        p.add_argument("--pairs", required=True)
+        p.add_argument("--pairs", required=True, action="append" if name == "score" else "store",
+                       help="score: a directory of shard-NNNNN.parquet, repeatable; probe: one parquet file")
         p.add_argument("--ckpt", required=True, help="The MaxText parameters, <checkpoint>/0/items")
         p.add_argument("--tokenizer", required=True, help="Directory with the model's tokenizer.json")
         p.add_argument("--fsdp", type=int, default=8)
         p.add_argument("--tensor", type=int, default=1)
         p.add_argument("--token-budget", type=int, default=32768, help="Padded tokens per step (default: 32768)")
-    sub.choices["score"].add_argument("--out", required=True, help="Bucket directory of the score shards")
+    sub.choices["score"].add_argument("--out", required=True, action="append",
+                                      help="Bucket directory of the score shards, one per --pairs")
     sub.choices["score"].add_argument("--max-shards", type=int, default=None)
     sub.choices["probe"].add_argument("--reference", default=None, help="hf_reference.py's JSON")
     args = parser.parse_args(argv)

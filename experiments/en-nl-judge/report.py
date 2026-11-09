@@ -3,6 +3,7 @@
 
     python report.py sanity --scores <dir of score shards> --out <dir>      sanity.json and sanity.md
     python report.py scan --pairs <dir> --scores <dir> --out europarl-scan.md [--meta meta.json]
+    python report.py compare --reference ref.json --scores <dir of the sanity scores>
 
 sanity: per kind of pair (the originals and each deterministic error of data.py) the number of rows, the spread of
 the scores and their counts per score class, and per error the AUC of the score against the originals: the chance
@@ -198,6 +199,27 @@ def scan_command(args):
     print(f"{args.out}: {len(rows):,} pairs")
 
 
+def compare_command(args):
+    """The TPU's scores of the reference rows next to those of transformers on the CPU (float32)."""
+    reference = json.loads(Path(args.reference).read_text())
+    tpu = {r["id"]: r for r in read_dir(args.scores)}
+    lines = ["| id | kind | tokens | score CPU | score TPU | logp yes CPU / TPU | logp no CPU / TPU | top CPU / TPU |",
+             "|---|---|---:|---:|---:|---:|---:|---|"]
+    worst = {"score": 0.0, "logp_yes": 0.0, "logp_no": 0.0}
+    for ref in reference["rows"]:
+        mine = tpu[ref["id"]]
+        for key in worst:
+            worst[key] = max(worst[key], abs(ref[key] - mine[key]))
+        lines.append(f"| `{ref['id']}` | {ref['kind']} | {len(ref['prompt_ids'])} | {ref['score']:.4f} | "
+                     f"{mine['score']:.4f} | {ref['logp_yes']:.3f} / {mine['logp_yes']:.3f} | "
+                     f"{ref['logp_no']:.3f} / {mine['logp_no']:.3f} | `{ref['top'][0][0]}` / `{mine['top_token']}` |")
+    lines += ["", "Largest differences: " + ", ".join(f"{k} {v:.4f}" for k, v in worst.items())]
+    text = "\n".join(lines) + "\n"
+    if args.out:
+        Path(args.out).write_text(text)
+    print(text)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Reports of the en-nl judge")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -211,8 +233,12 @@ def main(argv=None):
     p.add_argument("--meta", default=None, help="JSON with title and intro lines")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--per-class", type=int, default=10)
+    p = sub.add_parser("compare")
+    p.add_argument("--reference", required=True)
+    p.add_argument("--scores", required=True)
+    p.add_argument("--out", default=None)
     args = parser.parse_args(argv)
-    {"sanity": sanity_command, "scan": scan_command}[args.command](args)
+    {"sanity": sanity_command, "scan": scan_command, "compare": compare_command}[args.command](args)
 
 
 if __name__ == "__main__":

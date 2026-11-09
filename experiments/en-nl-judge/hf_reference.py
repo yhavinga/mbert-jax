@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """The judge's numbers from transformers on the CPU: a check of the MaxText conversion and of the prompt ids.
 
-    python hf_reference.py --model /dev/shm/judge/hf-31b --pairs probe.parquet --out ref.json
+    python hf_reference.py --model /dev/shm/judge/hf-31b --sanity /dev/shm/judge/sanity --out ref.json
 
-Per row: the ids of the chat template (transformers' apply_chat_template of one user message with judge.user_text),
-which must equal judge.prompt_text tokenized; and from Gemma4ForConditionalGeneration in float32, the log probabilities
-of yes and no for the next token, the score, and the 5 most likely tokens. judge.py probe compares its own numbers
-with these.
+The rows: every kind of the first --sources paragraphs (by id) of the sanity set, which the TPU scores too, so that
+report.py compare can set the two side by side. Per row: the ids of the chat template (transformers'
+apply_chat_template of one user message with judge.user_text), which must equal judge.prompt_text tokenized by
+transformers and by judge.Tokenizer; and from Gemma4ForConditionalGeneration in float32 the log probabilities of yes
+and no for the next token, the score, and the 5 most likely tokens.
 """
 
 import argparse
@@ -24,7 +25,9 @@ import judge  # noqa: E402
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Reference scores of the judge from transformers on the CPU")
     parser.add_argument("--model", required=True, help="Local snapshot of google/gemma-4-31B-it")
-    parser.add_argument("--pairs", required=True, help="Parquet with en and nl")
+    parser.add_argument("--sanity", required=True, help="Directory of the sanity set (data.py sanity)")
+    parser.add_argument("--sources", type=int, default=2, help="Paragraphs whose rows are taken (default: 2)")
+    parser.add_argument("--threads", type=int, default=96, help="CPU threads; the TPU's host process needs some")
     parser.add_argument("--out", required=True)
     parser.add_argument("--dtype", default="float32", choices=["float32", "bfloat16"])
     args = parser.parse_args(argv)
@@ -33,14 +36,17 @@ def main(argv=None):
     import torch
     from transformers import AutoTokenizer, Gemma4ForConditionalGeneration
 
-    torch.set_num_threads(os.cpu_count())
-    table = pq.read_table(args.pairs)
-    en, nl = table.column("en").to_pylist(), table.column("nl").to_pylist()
+    torch.set_num_threads(min(args.threads, os.cpu_count()))
+    table = pq.read_table(Path(args.sanity) / "shard-00000.parquet").to_pylist()
+    sources = sorted({r["source_id"] for r in table})[:args.sources]
+    chosen = [r for r in table if r["source_id"] in sources]
+    en, nl = [r["en"] for r in chosen], [r["nl"] for r in chosen]
     tok = AutoTokenizer.from_pretrained(args.model)
-    vocab = judge.Tokenizer(args.model).vocab
+    fast = judge.Tokenizer(args.model)
+    vocab = fast.vocab
     yes_ids, no_ids = judge.answer_ids(vocab)
     rows = []
-    for a, b in zip(en, nl):
+    for r, a, b in zip(chosen, en, nl):
         messages = [{"role": "user", "content": judge.user_text(a, b)}]
         text = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         if text != judge.prompt_text(a, b):
@@ -52,7 +58,9 @@ def main(argv=None):
         mine = tok(judge.prompt_text(a, b), add_special_tokens=False)["input_ids"]
         if mine != ids:
             raise SystemExit("judge.prompt_text tokenized differs from the chat template's ids")
-        rows.append({"prompt_ids": ids})
+        if fast.encode_batch([judge.prompt_text(a, b)])[0] != ids:
+            raise SystemExit("judge.Tokenizer (tokenizers) gives other ids than transformers")
+        rows.append({"id": r["id"], "kind": r["kind"], "prompt_ids": ids})
     print(f"{len(rows)} prompts: the template renders judge.prompt_text and its ids match", flush=True)
 
     started = time.time()

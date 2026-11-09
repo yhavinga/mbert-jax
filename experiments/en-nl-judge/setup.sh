@@ -76,15 +76,20 @@ fi
 # Only the conversion reads bf16 safetensors, which numpy cannot; the judge itself has no torch
 VIRTUAL_ENV=$VENV UV_TORCH_BACKEND=cpu uv pip install -q torch==2.9.1
 [ -s "$HF/model.safetensors.index.json" ] || download "$PY"
-# A half-written checkpoint from an earlier attempt would be mixed with this one: orbax refuses an existing step
-gsutil -q ls "$CKPT/" > /dev/null 2>&1 && { echo "$(hostname): $CKPT exists without done.txt; remove it first (gsutil -m rm -r $CKPT)"; exit 1; }
-echo "$(hostname): converting at $(date +%H:%M:%S)"
-# MaxText's own converter: lazy loading, unscanned layers, no vision tower. The tensor names of this snapshot
-# (model.language_model.layers.N...) are the ones its Gemma 4 mapping asks for.
-JAX_PLATFORMS=cpu "$PY" -u -m maxtext.checkpoint_conversion.to_maxtext model_name=gemma4-31b scan_layers=false \
-  use_multimodal=false skip_jax_distributed_system=True hardware=cpu "base_output_directory=$CKPT" \
-  run_name=gemma4_31b_conversion "--hf_model_path=$HF" --lazy_load_tensors=True --save_dtype=bfloat16
-# orbax writes commit_success.txt last, so its absence means an unfinished save
-gsutil -q stat "$CKPT/0/commit_success.txt" || { echo "$(hostname): no $CKPT/0/commit_success.txt after the conversion"; exit 1; }
+# Written to /dev/shm first and then copied: a preempted VM leaves at most a partial copy in the bucket, which the next
+# rsync completes, and done.txt is written only after a complete one (orbax renames its temporary directory to 0/ on
+# a local file system when the save is complete, so 0/items exists only for a whole checkpoint)
+LOCAL_CKPT=$SHM/ckpt
+if [ ! -d "$LOCAL_CKPT/0/items" ]; then
+  echo "$(hostname): converting at $(date +%H:%M:%S)"
+  # MaxText's own converter: lazy loading, unscanned layers, no vision tower. The tensor names of this snapshot
+  # (model.language_model.layers.N...) are the ones its Gemma 4 mapping asks for.
+  JAX_PLATFORMS=cpu "$PY" -u -m maxtext.checkpoint_conversion.to_maxtext model_name=gemma4-31b scan_layers=false \
+    use_multimodal=false skip_jax_distributed_system=True hardware=cpu "base_output_directory=$LOCAL_CKPT" \
+    run_name=gemma4_31b_conversion "--hf_model_path=$HF" --lazy_load_tensors=True --save_dtype=bfloat16
+fi
+[ -d "$LOCAL_CKPT/0/items" ] || { echo "$(hostname): no $LOCAL_CKPT/0/items after the conversion"; exit 1; }
+echo "$(hostname): $(du -sh "$LOCAL_CKPT" | cut -f1) converted; copying to $CKPT at $(date +%H:%M:%S)"
+gsutil -m -q rsync -r "$LOCAL_CKPT" "$CKPT"
 echo "$REPO@$REVISION converted by MaxText $MAXTEXT_PIN on $(hostname) at $(date -u +%FT%TZ)" | gsutil -q cp - "$CKPT/done.txt"
 echo "$(hostname): $CKPT done at $(date +%H:%M:%S)"

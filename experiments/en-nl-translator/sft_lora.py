@@ -74,6 +74,9 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="LoRA SFT with MaxText's train_sft, measured")
     parser.add_argument("--out", required=True, help="Local output directory")
     parser.add_argument("--steps", default="auto", help="'auto' (one epoch, counted) or a number")
+    parser.add_argument("--maxtext-output", default=None,
+                        help="MaxText's base_output_directory (default: OUT/maxtext). A multi-host job needs a shared "
+                             "one (gs://): Orbax's final save waits for every process's commit in the same directory")
     parser.add_argument("--distributed", action="store_true",
                         help="One job over several hosts: jax.distributed.initialize() here, before anything touches "
                              "the TPU (pass skip_jax_distributed_system=True to MaxText)")
@@ -103,7 +106,7 @@ def main(argv=None):
     from maxtext.utils import lora_utils, maxtext_utils
 
     sft_yml = Path(maxtext.__file__).parent / "configs" / "post_train" / "sft.yml"
-    base = ["sft_lora.py", str(sft_yml), *overrides, f"base_output_directory={out}/maxtext",
+    base = ["sft_lora.py", str(sft_yml), *overrides, f"base_output_directory={args.maxtext_output or out / 'maxtext'}",
             f"metrics_file={out}/metrics.txt"]
     config = pyconfig.initialize_pydantic(base + ["steps=1"])
     main_process = jax.process_index() == 0

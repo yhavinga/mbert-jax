@@ -54,7 +54,9 @@ ARGS=(run_name=$NAME model_name=gemma3-$MODEL load_parameters_path=$CKPT/0/items
 if [ "$MULTIHOST" = 1 ]; then
   ENV="export TOKENIZERS_PARALLELISM=false HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 HF_DATASETS_CACHE=$SHM/hf-datasets"
   PRE="echo multi-host: jax.distributed.initialize in sft_lora.py"
-  FLAGS="--distributed"
+  # Orbax's final save of a multi-host job waits for every process's commit in one directory: a local /dev/shm per
+  # host never completes (9 Nov), so MaxText's output goes to the bucket
+  FLAGS="--distributed --maxtext-output $ROOT/runs/$NAME/maxtext"
 else
   # A host of the v4-32 as a TPU of its own (translate.sh): without these JAX takes the slice from the TPU metadata
   ENV="export TPU_CHIPS_PER_PROCESS_BOUNDS=2,2,1 TPU_PROCESS_BOUNDS=1,1,1 TPU_VISIBLE_CHIPS=0,1,2,3 TPU_PROCESS_PORT=8476

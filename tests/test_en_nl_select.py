@@ -472,3 +472,77 @@ def test_fineweb_urls(url, reason):
 
 def test_the_shares_add_up_with_fineweb():
     assert abs(sum(sp.SHARES.values()) - 1) < 1e-9 and sp.SHARES["fineweb"] == 0.25
+
+
+# Yeb, 9 Nov (design §7 point 7): a marked heading glued to its paragraph goes to a line of its own, an unmarked one
+# stays rejected; before step 1 an empty line between paragraphs
+@pytest.mark.parametrize("text, repaired, n", [
+    ("_Overgangsrecht_ Per 1 januari 2015 vervangt de toeslag de oude.",
+     "_Overgangsrecht_\nPer 1 januari 2015 vervangt de toeslag de oude.", 1),
+    ("Een zin vooraf.\n_Landelijke ontwikkelingen_ De landelijke ontwikkelingen gaan door.",
+     "Een zin vooraf.\n_Landelijke ontwikkelingen_\nDe landelijke ontwikkelingen gaan door.", 1),
+    ("_1._ _Grondexploitaties_ Een extern bureau maakte een analyse.",
+     "_1._ _Grondexploitaties_\nEen extern bureau maakte een analyse.", 1),
+    ("_Waarom is weerstandsvermogen van belang?_ Informatie daarover is belangrijk.",
+     "_Waarom is weerstandsvermogen van belang?_\nInformatie daarover is belangrijk.", 1),
+])
+def test_a_marked_heading_goes_to_a_line_of_its_own(text, repaired, n):
+    assert sp.repair_headings(text) == (repaired, n)
+    assert "heading_glued" not in sp.extraction_errors(sp.repair_headings(text)[0], WORDS)
+
+
+@pytest.mark.parametrize("text", [
+    "Structurele exploitatieruimte Zoals in de begroting staat, is er ruimte.",  # no mark: stays rejected
+    "_De Volkskrant_ schreef gisteren dat het kabinet valt.",  # the italic span is the sentence's subject
+    "Volgens _De Volkskrant_ Valt het kabinet.",  # not at the start of the paragraph
+    "_Dit hele citaat staat cursief in de bron._",  # no text after it
+    "_2.5. Het Jaar van de Mijnen draagt het verhaal van de mijnstreek over aan de_ _volgende generaties_ In de "
+    "Canon staat het niet.",  # longer than a heading
+    "Een gewone zin met snake_case_namen erin.",
+])
+def test_no_repair_without_a_marked_heading_at_the_start(text):
+    assert sp.repair_headings(text) == (text, 0)
+
+
+def test_an_unmarked_glued_heading_stays_rejected():
+    text = "Structurele exploitatieruimte Zoals in de begroting staat, is er ruimte."
+    assert "heading_glued" in sp.extraction_errors(sp.repair_headings(text)[0], WORDS)
+
+
+def test_paragraphs_get_an_empty_line_between_them():
+    assert sp.paragraph_breaks("Eerste alinea.\nTweede alinea.\nDerde.") == "Eerste alinea.\n\nTweede alinea.\n\nDerde."
+    assert sp.paragraph_breaks("Eén alinea zonder meer.") == "Eén alinea zonder meer."
+    # a repaired heading is a paragraph of its own
+    repaired, _ = sp.repair_headings("Vooraf.\n_Kop_ De tekst gaat door.")
+    assert sp.paragraph_breaks(repaired) == "Vooraf.\n\n_Kop_\n\nDe tekst gaat door."
+    # applied twice it changes nothing more
+    assert sp.paragraph_breaks(sp.paragraph_breaks("A b c.\nD e f.")) == "A b c.\n\nD e f."
+
+
+def test_the_builder_keeps_a_passage_whose_marked_heading_it_repairs(idioms):
+    words = set(sp.words_of(PROSE.lower())) | {"per", "januari", "vervangt", "toeslag", "oude", "overgangsrecht"}
+    long = " ".join([PROSE] * 5)
+    text = f"_Overgangsrecht_ Per 1 januari vervangt de toeslag de oude. {long}"
+    doc = {"doc_id": "r9", "text": text, "content_type": []}
+    plain, _ = builder(idioms, words).document("raad", dict(doc))
+    assert plain and all("heading_glued" in p["fails"] and p["fails_before_repair"] is None for p in plain)
+    b = builder(idioms, words)
+    b.repair = True
+    fixed, _ = b.document("raad", dict(doc))
+    assert [p["pid"] for p in fixed] == [p["pid"] for p in plain]  # the same windows
+    first = fixed[0]
+    assert first["fails"] == [] and "heading_glued" in first["fails_before_repair"]
+    assert first["headings_repaired"] == 1 and first["text"].startswith("_Overgangsrecht_\nPer 1 januari")
+    # an unmarked heading is not repaired: the passage keeps failing
+    b2 = builder(idioms, words)
+    b2.repair = True
+    unmarked, _ = b2.document("raad", {**doc, "text": text.replace("_Overgangsrecht_", "Overgangsrecht")})
+    assert all("heading_glued" in p["fails"] and p["headings_repaired"] == 0 for p in unmarked)
+
+
+def test_only_documents_with_a_marked_heading_are_rebuilt():
+    assert sp.holds_marked_heading("raad", {"text": "Inleiding.\n\n_Kop_ De tekst."})
+    assert sp.holds_marked_heading("rechtspraak", {"text": "1.1.  _Kop_ Het hof oordeelt."})
+    assert not sp.holds_marked_heading("raad", {"text": "Een tekst met _cursief_ midden in de zin."})
+    assert sp.holds_marked_heading("handelingen", {"turns": [{"text": "Geen kop."}, {"text": "_Kop_ Ik zeg."}]})
+    assert not sp.holds_marked_heading("handelingen", {"turns": [{"text": None}]})

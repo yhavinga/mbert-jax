@@ -5,6 +5,12 @@ back-translate, from the Handelingen of the Tweede Kamer and three collections o
     python select_passages.py idioms --kaikki kaikki-dutch.jsonl --out idioms.json
     python select_passages.py select --out <dir> --n 2000 --n-eval 0 --idioms idioms.json \\
         --wordlist opentaal-wordlist.txt --tokenizer <TranslateGemma tokenizer> --processes 64
+    python select_passages.py repair --pool <pool> [<pool> ...] --out <dir> --idioms idioms.json \
+        --wordlist opentaal-wordlist.txt --tokenizer <TranslateGemma tokenizer> --processes 64
+
+repair: the passages a pool left out for a marked heading glued to its paragraph ("_Overgangsrecht_ Per 1 januari",
+heading_glued) that pass every rule once the heading stands on a line of its own (repair_headings; Yeb, 9 Nov).
+Before step 1 every passage gets an empty line between its paragraphs (paragraph_breaks).
 
 Sources (SOURCES), read straight from Hugging Face, only the row groups and columns needed:
 - handelingen: yhavinga/dutch-handelingen-modern, rows with chamber == tweede_kamer; a passage stays inside one turn
@@ -368,6 +374,36 @@ def extraction_errors(text, wordset):
     return fails
 
 
+# Yeb, 9 Nov (design §7 point 7): a heading marked as italic (_..._) that the extraction glued to the start of its
+# paragraph ("_Overgangsrecht_ Per 1 januari") goes to a line of its own and the passage stays; an unmarked heading
+# ("Structurele exploitatieruimte Zoals ...") stays rejected by heading_glued. One or more spans of at most
+# HEADING_MAX_WORDS words in all, then a capital: a lowercase word after the span makes it part of the sentence
+# ("_De Volkskrant_ schreef").
+MARKED_HEADING = re.compile(r"^((?:_(?![\s_])[^_\n]+?(?<![\s_])_[ \t]+)+)(?=[A-ZÀ-Ý])")
+# A document that can hold such a heading at all (the cheap test before building its passages)
+MARKED_HEADING_ANYWHERE = re.compile(r"(?:^|\s)_(?![\s_])[^_\n]+?(?<![\s_])_[ \t]+[A-ZÀ-Ý]")
+
+
+def repair_headings(text):
+    """(text, n): every paragraph (a line) that opens with a marked heading glued to it, split after the heading,
+    which stands on a line of its own; n is the number of headings moved"""
+    out, n = [], 0
+    for line in text.split("\n"):
+        m = MARKED_HEADING.match(line)
+        if m and len(m.group(1).split()) <= HEADING_MAX_WORDS:
+            out += [m.group(1).rstrip(), line[m.end():]]
+            n += 1
+        else:
+            out.append(line)
+    return "\n".join(out), n
+
+
+def paragraph_breaks(text):
+    """The paragraphs of a passage (a line each) with an empty line between them, as in markdown (Yeb, 9 Nov, design §7
+    point 7: before step 1, so that the source has the empty lines TranslateGemma writes)"""
+    return "\n\n".join(line for line in text.split("\n") if line.strip())
+
+
 # The paragraph before a passage ends in a word that never ends a sentence ("... voorafgaand aan de vergaderingen van
 # de"): the passage opens in the middle of its sentence. A line without a stop is no evidence of its own: on the pilot
 # those were mostly headings in bold or italic, table rows, captions and footnote marks before a clean start.
@@ -584,7 +620,10 @@ def blocks_of(source, doc, wordset):
 class Builder:
     """Passages of documents, with every filter's verdict and the idiom score (one per process)"""
 
-    def __init__(self, tokenizer_dir, wordlist, idioms):
+    # repair: a passage that fails gets its marked headings repaired (repair_headings) and is checked again
+    repair = False
+
+    def __init__(self, tokenizer_dir, wordlist, idioms, repair=False):
         import langid
         from tokenizers import Tokenizer
 
@@ -595,6 +634,7 @@ class Builder:
             self.wordset = {line.strip().lower() for line in f if line.strip()}
         with open(idioms, encoding="utf-8") as f:
             self.matcher = IdiomMatcher(json.load(f))
+        self.repair = repair
 
     def count(self, texts):
         return [len(e.ids) for e in self.tokenizer.encode_batch(texts, add_special_tokens=False)] if texts else []
@@ -744,6 +784,13 @@ class Builder:
                 text = "\n".join(paras)
                 fails, measures = self.checks(source, text)
                 fails += self.context_fails(paragraphs, labels, first, last)
+                fails_before, repaired = None, 0
+                if self.repair and fails:
+                    fixed, repaired = repair_headings(text)
+                    if repaired:
+                        fails_before, text = fails, fixed
+                        fails, measures = self.checks(source, text)
+                        fails += self.context_fails(paragraphs, labels, first, last)
                 # the paragraphs around it, for reading the context rules (annotate writes them)
                 before = paragraphs[first[3] - 1] if first[4] and first[3] > 0 else None
                 after = paragraphs[last[3] + 1] if last[5] and last[3] + 1 < len(paragraphs) else None
@@ -757,6 +804,7 @@ class Builder:
                     "date": doc.get("date"), "content_type": list(doc.get("content_type") or []),
                     "before": before, "after": after, "turn_paragraph": first[3],
                     "context": context_of(int(block_id[1:]), turns) if source == "handelingen" else [],
+                    "fails_before_repair": fails_before, "headings_repaired": repaired,
                 })
         texts = [p["text"] for p in passages]
         for p, n in zip(passages, self.count(texts)):
@@ -770,9 +818,9 @@ class Builder:
 _BUILDER = None
 
 
-def _init(tokenizer_dir, wordlist, idioms):
+def _init(tokenizer_dir, wordlist, idioms, repair=False):
     global _BUILDER
-    _BUILDER = Builder(tokenizer_dir, wordlist, idioms)
+    _BUILDER = Builder(tokenizer_dir, wordlist, idioms, repair)
 
 
 def _work(task):
@@ -874,22 +922,28 @@ class Chooser:
         for p in keyed:
             if len(chosen) == n:
                 break
-            if self.per_doc[(p["source"], p["doc_id"])] >= self.max_per_doc[p["source"]]:
-                self.skipped["per_doc_cap"] += 1
-                continue
-            norm = normalized(p["text"])
-            if norm in self.seen_texts:
-                self.skipped["exact_duplicate"] += 1
-                continue
-            grams = ngrams(p["text"])
-            if grams & self.seen_ngrams:
-                self.skipped["ngram_overlap"] += 1
-                continue
-            self.seen_texts.add(norm)
-            self.seen_ngrams |= grams
-            self.per_doc[(p["source"], p["doc_id"])] += 1
-            chosen.append(p)
+            if self.admit(p):
+                chosen.append(p)
         return chosen
+
+    def admit(self, p):
+        """Whether p may join the passages chosen so far (its document's cap, exact and 13-gram duplicates); if so it
+        counts as chosen"""
+        if self.per_doc[(p["source"], p["doc_id"])] >= self.max_per_doc[p["source"]]:
+            self.skipped["per_doc_cap"] += 1
+            return False
+        norm = normalized(p["text"])
+        if norm in self.seen_texts:
+            self.skipped["exact_duplicate"] += 1
+            return False
+        grams = ngrams(p["text"])
+        if grams & self.seen_ngrams:
+            self.skipped["ngram_overlap"] += 1
+            return False
+        self.seen_texts.add(norm)
+        self.seen_ngrams |= grams
+        self.per_doc[(p["source"], p["doc_id"])] += 1
+        return True
 
 
 def mark_context_examples(chosen, docs, seed):
@@ -1014,8 +1068,9 @@ def parse_per_source(text, default):
     return out
 
 
-def build_passages(args, report):
-    """{source: [passage with its fails]} of the documents of args.row_groups, and the counters per source"""
+def build_passages(args, report, keep_doc=None, repair=False):
+    """{source: [passage with its fails]} of the documents of args.row_groups, and the counters per source; keep_doc
+    (source, doc) limits the documents built, repair repairs marked headings (Builder)"""
     import concurrent.futures
     import multiprocessing
 
@@ -1036,6 +1091,9 @@ def build_passages(args, report):
         if max_docs[source] and len(docs) > max_docs[source]:
             docs = random.Random(f"{args.seed}/{source}/docs").sample(docs, max_docs[source])
             counters["docs_sampled"] = len(docs)
+        if keep_doc is not None:
+            docs = [d for d in docs if keep_doc(source, d)]
+            counters["docs_built"] = len(docs)
         report["sources"][source] = {"row_groups": len(groups), "documents": dict(counters)}
         print(f"{source}: {len(groups)} row groups, {dict(counters)} ({time.time() - started:.0f} s)", flush=True)
         for k in range(0, len(docs), args.docs_per_task):
@@ -1046,7 +1104,7 @@ def build_passages(args, report):
     counters = collections.defaultdict(collections.Counter)
     ctx = multiprocessing.get_context("spawn")
     with concurrent.futures.ProcessPoolExecutor(args.processes, mp_context=ctx, initializer=_init,
-                                                initargs=(args.tokenizer, args.wordlist, args.idioms)) as pool:
+                                                initargs=(args.tokenizer, args.wordlist, args.idioms, repair)) as pool:
         for source, found, c in pool.map(_work, tasks):
             passages[source] += found
             counters[source].update(c)
@@ -1070,6 +1128,86 @@ def annotate(args):
     out.mkdir(parents=True, exist_ok=True)
     pq.write_table(pa.table({c: [r[c] for r in rows] for c in columns}), out / "annotated.parquet")
     print(f"ANNOTATE {len(rows)} of {len(wanted)} passages found -> {out / 'annotated.parquet'}")
+
+
+def holds_marked_heading(source, doc):
+    if source == "handelingen":
+        return any(MARKED_HEADING_ANYWHERE.search(t.get("text") or "") for t in doc["turns"] or [])
+    return bool(MARKED_HEADING_ANYWHERE.search(doc["text"] or ""))
+
+
+def repair(args):
+    """The passages that a pool left out for a marked heading glued to its paragraph and that pass every rule once it
+    is repaired (Yeb, 9 Nov, design §7 point 7): rebuilt from the row groups of each --pool selection (its report.json:
+    row groups, seed, split, the idioms left out of the score, the idiom class thresholds), only from documents that
+    hold a marked heading. Written to --out as passages.parquet (training side) and eval.parquet, with the pool's
+    columns, fails_before_repair and headings_repaired; they need a source score before they can be chosen."""
+    import argparse as ap
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    if any(out.glob("*.parquet")):
+        raise SystemExit(f"{out} has parquet files already: a new run goes to a new directory")
+    resources = {"wordlist": sha256(args.wordlist), "idioms": sha256(args.idioms)}
+    rows, summary = {"train": [], "eval": []}, {}
+    started = time.time()
+    for pool in args.pool:
+        pool_report = json.loads((Path(pool) / "report.json").read_text())
+        if pool_report["resources"] != resources:
+            raise SystemExit(f"{pool}: built with other word lists {pool_report['resources']} than {resources}")
+        a = pool_report["args"]
+        build_args = ap.Namespace(row_groups=a["row_groups"], max_docs=a["max_docs"], seed=a["seed"],
+                                  tokenizer=args.tokenizer, wordlist=args.wordlist, idioms=args.idioms,
+                                  processes=args.processes, docs_per_task=a["docs_per_task"])
+        report = {"sources": {}}
+        passages, counters, _, _ = build_passages(build_args, report, keep_doc=holds_marked_heading, repair=True)
+        left_out = {i for i, _ in pool_report["idioms"]["left_out_list"]}
+        for source, allp in passages.items():
+            if not allp:
+                continue
+            tried = [p for p in allp if p["fails_before_repair"]]
+            kept = [p for p in tried if not p["fails"]]
+            for p in kept:
+                p["idioms"] = [i for i in p["idioms"] if i not in left_out]
+                p["idiom_score"] = round(100 * len(p["idioms"]) / max(p["words"], 1), 4)
+                p["split"] = split_of(source, p["doc_id"], a["eval_permille"])
+                p["length_class"] = length_class(p)
+                choice = pool_report["sources"][source]["choice" if p["split"] == "train" else "choice_eval"]
+                threshold = choice.get(p["length_class"], {}).get("idiom_class_threshold")
+                p["idiom_class"] = threshold is not None and p["idiom_score"] >= threshold
+                p["half"] = None
+                p["context_example"] = False
+                p["context_turns"], p["context_tokens"] = [], []
+                rows[p["split"]].append(p)
+            summary[source] = {
+                "pool": str(pool), "documents": report["sources"][source]["documents"],
+                "passages_built": len(allp), "failed_before_repair": len(tried) + sum(
+                    1 for p in allp if p["fails"] and not p["fails_before_repair"]),
+                "with_a_marked_heading_repaired": len(tried),
+                "pass_after_repair": len(kept), "pass_train": sum(p["split"] == "train" for p in kept),
+                "kept_had_heading_glued": sum("heading_glued" in p["fails_before_repair"] for p in kept),
+                "kept_failed_before_on": dict(collections.Counter(f for p in kept for f in p["fails_before_repair"])),
+                "still_fail_on": dict(collections.Counter(f for p in tried if p["fails"] for f in p["fails"])),
+                "headings_repaired": sum(p["headings_repaired"] for p in kept),
+                "length_classes": dict(collections.Counter(p["length_class"] for p in kept)),
+                "idiom_class": sum(p["idiom_class"] for p in kept)}
+            print(f"REPAIR {source}: {json.dumps(summary[source], ensure_ascii=False)}", flush=True)
+    columns = ["pid", "source", "doc_id", "split", "half", "idiom_class", "length_class", "context_example",
+               "context_turns", "context_tokens", "turn_paragraph", "text", "tokens", "paragraphs", "piece", "words",
+               "idiom_score", "idioms", "oov", "digits", "punct", "capitalized", "lang", "speaker", "party", "date",
+               "content_type", "fails_before_repair", "headings_repaired"]
+    for split, name in (("train", "passages.parquet"), ("eval", "eval.parquet")):
+        part = sorted(rows[split], key=lambda p: p["pid"])
+        if part:
+            pq.write_table(pa.table({c: [p.get(c) for p in part] for c in columns}), out / name, compression="zstd")
+    (out / "report.json").write_text(json.dumps({"args": vars(args), "resources": resources, "sources": summary,
+                                                 "seconds": round(time.time() - started)}, indent=1,
+                                                ensure_ascii=False))
+    print(f"REPAIRED {len(rows['train'])} training and {len(rows['eval'])} eval passages in "
+          f"{time.time() - started:.0f} s -> {out}")
 
 
 def select(args):
@@ -1218,6 +1356,14 @@ def main(argv=None):
         p.add_argument("--seed", type=int, default=0)
     p = sub.choices["annotate"]
     p.add_argument("--pids", required=True, help="A file with a pid a line")
+    p = sub.add_parser("repair", help="The passages a pool left out for a marked heading glued to its paragraph that "
+                       "pass once it is repaired")
+    p.add_argument("--pool", required=True, nargs="+", help="The pool's selections (their report.json)")
+    p.add_argument("--out", required=True)
+    p.add_argument("--idioms", required=True)
+    p.add_argument("--wordlist", required=True)
+    p.add_argument("--tokenizer", required=True, help="TranslateGemma's tokenizer directory (tokenizer.json)")
+    p.add_argument("--processes", type=int, default=32)
     p = sub.choices["select"]
     p.add_argument("--n", type=int, required=True, help="Training-side passages (2,000 for the pilot)")
     p.add_argument("--n-eval", type=int, default=0, help="Eval passages, from other documents (4,000 later)")
@@ -1239,7 +1385,7 @@ def main(argv=None):
         Path(args.out).write_text(json.dumps(idioms, ensure_ascii=False))
         print(f"{len(idioms)} idioms, {collections.Counter(i['pos'] for i in idioms)}")
         return
-    {"select": select, "annotate": annotate}[args.command](args)
+    {"select": select, "annotate": annotate, "repair": repair}[args.command](args)
 
 
 if __name__ == "__main__":

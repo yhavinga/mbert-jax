@@ -71,6 +71,9 @@ echo "\$(date +%H:%M:%S) $(hostname): $NAME, $MODEL, $DATA"
 $PY -u $CODE/sft_lora.py --out $OUT --steps $STEPS $FLAGS -- $(printf '%q ' "${ARGS[@]}")
 EOS
 COPY="gsutil -q cp ~/logs/$NAME.log $ROOT/runs/$NAME/$NAME-w$WORKER.log"
-[ "$WORKER" = 0 ] && COPY="$COPY; gsutil -m -q cp $OUT/summary.json $OUT/adapter.json $OUT/adapter.npz $OUT/metrics.txt $ROOT/runs/$NAME/ 2> /dev/null"
+# sft_lora.py writes its files on the job's process 0: this worker alone, or worker 0 of a multi-host job
+if [ "$MULTIHOST" != 1 ] || [ "$WORKER" = 0 ]; then
+  COPY="$COPY; gsutil -m -q cp $OUT/summary.json $OUT/adapter.json $OUT/adapter.npz $OUT/metrics.txt $ROOT/runs/$NAME/"
+fi
 setsid nohup bash -c "bash ~/run_$NAME.sh > ~/logs/$NAME.log 2>&1; echo EXIT \$? >> ~/logs/$NAME.log; $COPY" > /dev/null 2>&1 < /dev/null &
 echo "started $NAME on $(hostname): ~/logs/$NAME.log, output in $OUT"

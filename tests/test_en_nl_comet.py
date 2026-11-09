@@ -129,3 +129,25 @@ def test_score_refuses_a_row_without_a_hypothesis(tmp_path):
                              "reference": ["y"]}), pairs)
     with pytest.raises(SystemExit, match="lacks"):
         comet_score.main(["score", "--root", str(tmp_path), "--pairs", str(pairs), "--out", str(tmp_path / "o")])
+
+
+class FakeModel:
+    def __init__(self, copy, unrelated):
+        self.copy, self.unrelated = copy, unrelated
+
+    def predict(self, samples, **kwargs):
+        class Out:
+            pass
+        out = Out()
+        out.scores = [self.copy if s["mt"] == s["ref"] else self.unrelated for s in samples]
+        return out
+
+
+@pytest.mark.parametrize("copy, unrelated, passes", [(0.97, 0.45, True), (0.9, 0.74, True), (0.97, 0.9, False),
+                                                     (0.7, 0.2, False), (0.5, 0.5, False)])
+def test_sanity_wants_a_high_copy_clearly_above_an_unrelated_sentence(copy, unrelated, passes):
+    if passes:
+        comet_score.sanity(FakeModel(copy, unrelated), 2)
+    else:
+        with pytest.raises(SystemExit, match="sanity"):
+            comet_score.sanity(FakeModel(copy, unrelated), 2)

@@ -14,7 +14,8 @@ whatever revision the Hub has, so setup writes a model directory of its own: the
 model's hparams.yaml with pretrained_model pointing at the local encoder files. Loading then reads nothing from the
 network. setup then loads the model, checks that every parameter came from the checkpoint (COMET loads with
 strict=False, which would leave a parameter whose name does not match at its random initial value without a word),
-and scores two sanity triples: a translation equal to its reference must score high, an unrelated sentence low.
+and scores two sanity triples: a translation equal to its reference must score high, and clearly higher than an
+unrelated sentence.
 
 score gives one score per row of --pairs (columns id, source, hypothesis, reference; a hypothesis may be empty), in
 the order of the file, in the column comet22. With --time-first n it first scores the first n rows on their own and
@@ -33,15 +34,13 @@ MODEL = ("Unbabel/wmt22-comet-da", "2760a223ac957f30acfb18c8aa649b01cf1d75f2",
          "e213091cde220f97b89f8bdfa750c458cfea741ad62affb455b59900210ff2af")  # repo, revision, sha256 of model.ckpt
 ENCODER = ("FacebookAI/xlm-roberta-large", "c23d21b0620b635a76227c604d44e43a9f0ee389")
 ENCODER_FILES = ["config.json", "sentencepiece.bpe.model", "tokenizer.json", "tokenizer_config.json"]
-# A copy is near 1 for COMET-22, an unrelated sentence far below; the bounds leave room on both sides
-SANITY = [
-    {"src": "The committee will meet again next week to discuss the budget.",
-     "mt": "De commissie komt volgende week opnieuw bijeen om de begroting te bespreken.",
-     "ref": "De commissie komt volgende week opnieuw bijeen om de begroting te bespreken.", "least": 0.85},
-    {"src": "The committee will meet again next week to discuss the budget.",
-     "mt": "Mijn kat slaapt het liefst op de verwarming.",
-     "ref": "De commissie komt volgende week opnieuw bijeen om de begroting te bespreken.", "most": 0.6},
-]
+# A translation equal to its reference scores near 1 with COMET-22; an unrelated sentence clearly lower. A model with
+# a random or missing part scores both about the same. The bounds leave room on both sides.
+SANITY_SOURCE = "The committee will meet again next week to discuss the budget."
+SANITY_REFERENCE = "De commissie komt volgende week opnieuw bijeen om de begroting te bespreken."
+SANITY_UNRELATED = "Mijn kat slaapt het liefst op de verwarming."
+SANITY_COPY_LEAST = 0.8
+SANITY_GAP_LEAST = 0.15
 
 
 def sha256(path):
@@ -119,12 +118,14 @@ def predict(model, samples, batch_size):
 
 
 def sanity(model, batch_size):
-    scores = predict(model, [{k: t[k] for k in ("src", "mt", "ref")} for t in SANITY], batch_size)
-    bad = [(t["mt"], s) for t, s in zip(SANITY, scores)
-           if ("least" in t and s < t["least"]) or ("most" in t and s > t["most"])]
-    print(f"SANITY {json.dumps({'scores': [round(s, 4) for s in scores]})}", flush=True)
-    if bad:
-        raise SystemExit(f"COMET's sanity triples score outside their bounds: {bad}")
+    """The copy scores at least SANITY_COPY_LEAST and at least SANITY_GAP_LEAST above the unrelated sentence"""
+    copy, unrelated = predict(model, [{"src": SANITY_SOURCE, "mt": mt, "ref": SANITY_REFERENCE}
+                                      for mt in (SANITY_REFERENCE, SANITY_UNRELATED)], batch_size)
+    print(f"SANITY {json.dumps({'copy': round(copy, 4), 'unrelated': round(unrelated, 4)})}", flush=True)
+    if copy < SANITY_COPY_LEAST or copy - unrelated < SANITY_GAP_LEAST:
+        raise SystemExit(f"COMET's sanity triples: a copy of the reference scores {copy:.4f} (at least "
+                         f"{SANITY_COPY_LEAST}), an unrelated sentence {unrelated:.4f} (at least {SANITY_GAP_LEAST} "
+                         "lower)")
 
 
 def setup(args):

@@ -54,3 +54,8 @@ gcloud compute tpus tpu-vm ssh mbert-mix --zone us-central2-b --worker=all --qui
 # 6. DUMB of $R/ckpt/300000 (copy it to $R/ckpt_keep/ first: the trainer keeps the last 3 checkpoints), the fixed
 # protocol as for X (protocol.md, "Evaluation"); results gs://t5-dutch-english-usc2/mbert/masking/dumb/cxgptnl-300000--{dbrd,sicknl}--seed{42,43,44}.json.
 gsutil -m cp -r $R/ckpt/300000 $R/ckpt_keep/
+
+# 7. The decision rule of protocol.md, exactly on the counts, once step 6's 6 results are there: decide_g.py reads them
+# and X's, F's and R's from the bucket (DBRD@1024, secondary, when G's 3 results are there). Tested on 2026-11-09 with
+# --g fw2rh3-300000 (R in place of G): the k, means, ranges and verdicts of R's own decision.
+python3 experiments/gptnl/decide_g.py --output decision-g.json

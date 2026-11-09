@@ -347,3 +347,52 @@ def test_a_second_mix_keeps_what_is_written_and_a_source_out_of_line_with_the_pl
     with pytest.raises(ValueError, match="bytes, the plan"):
         _mix(tmp_path, 2, out="share2b")
     assert not list((tmp_path / "share2b").glob("*.parquet")), "a share file was written from a source out of line"
+
+
+def test_rows_of_blocked_hosts_are_passed_over_like_the_held_out_ones(tmp_path, monkeypatch):
+    """The final run's plan: --exclude-culturax takes blocklist_scan.py's rows of every CulturaX file, and none of
+    them is drawn; the plan and the shares say how many were passed over."""
+    world = _world(tmp_path, monkeypatch)
+    for rank in range(4):
+        _count(tmp_path, rank)
+    scans = []
+    blocked_texts = set()
+    for rank, files in enumerate(gptnl_mix.CULTURAX_FILES):
+        entries = []
+        for f in files:
+            texts = world.culturax[gptnl_mix.culturax_path(f)]
+            rows = list(range(1, len(texts), 4))
+            blocked_texts.update(texts[r] for r in rows)
+            entries.append({"path": f"/home/x/culturax_nl/{gptnl_mix.culturax_path(f)}", "culturax_file": f,
+                            "rows": len(texts), "blocked": len(rows), "blocked_rows": rows})
+        scan = tmp_path / f"scan-w{rank}.json"
+        scan.write_text(json.dumps({"blocklist": ["hebban.nl"], "files": entries}))
+        scans.append(str(scan))
+    gptnl_mix.main(["plan", "--gptnl-lengths", str(tmp_path / "gcs"), "--culturax-counts", str(tmp_path / "cx_counts"),
+                    "--heldout", str(tmp_path / "heldout.parquet"), "--out-dir", str(tmp_path / "selections"),
+                    "--plan", str(tmp_path / "final_plan.json"), "--run", "final-test", "--name", "final",
+                    "--exclude-culturax", *scans])
+    plan = json.loads((tmp_path / "final_plan.json").read_text())
+    assert plan["run"] == "final-test" and plan["culturax_blocklist"]["hosts"] == ["hebban.nl"]
+    assert plan["culturax_blocklist"]["documents"] == len(blocked_texts)
+    for rank in range(4):
+        gptnl_mix.main(["mix", "--rank", str(rank), "--selection", str(tmp_path / "selections" / f"final-w{rank}.npz"),
+                        "--plan", str(tmp_path / "final_plan.json"), "--spill", str(tmp_path / f"spill{rank}"),
+                        "--out", str(tmp_path / f"final{rank}"), "--list", str(tmp_path / f"final{rank}.txt"),
+                        "--readers", "2", "--workers", "2"])
+        texts = {t for p in (tmp_path / f"final{rank}.txt").read_text().split() for t in pq.read_table(p).column("text").to_pylist()}
+        assert texts and not texts & blocked_texts, "a document of a blocked host in the share"
+        assert not texts & set(world.heldout)
+        share = plan["shares"][rank]
+        assert share["culturax"]["blocked_passed_over"]["documents"] == sum(
+            len(range(1, len(world.culturax[gptnl_mix.culturax_path(f)]), 4)) for f in gptnl_mix.CULTURAX_FILES[rank])
+        # The held-out documents are rows 10-14 of file 3; one of them (row 13) is also blocked, and counted there
+        overlap = len(set(range(10, 15)) & set(range(1, 120, 4))) if rank == 3 else 0
+        assert share["culturax"]["heldout_passed_over"] == (5 if rank == 3 else 0) - overlap
+
+    # A scan that misses a file is refused
+    with pytest.raises(ValueError, match="cover"):
+        gptnl_mix.main(["plan", "--gptnl-lengths", str(tmp_path / "gcs"), "--culturax-counts", str(tmp_path / "cx_counts"),
+                        "--heldout", str(tmp_path / "heldout.parquet"), "--out-dir", str(tmp_path / "sel2"),
+                        "--plan", str(tmp_path / "plan2.json"), "--exclude-culturax", *scans[:3]])
+

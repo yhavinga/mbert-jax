@@ -16,6 +16,9 @@ file (--eval-file, the first 40,000 of nl_part_00097), which are not trained on.
   plan   Where all lengths are: the documents of every share, drawn with --seed. The counts to --plan, to be committed
          as cxgptnl_plan.json next to this script, the rows per host to --out-dir as cxgptnl-w<rank>.npz (to the bucket;
          the plan has their sha256).
+         The final run (experiments/final/) runs plan with --steps 653000, its own --run, --name and --plan, and
+         --exclude-culturax with the blocklist scans of the staged CulturaX files (blocklist_scan.py): their rows of
+         blocked hosts are passed over as the held-out documents are.
   mix    On a worker: this host's documents, read from the Hugging Face files by range requests into --spill (on
          /dev/shm) in the order of their position in the share, then written as SHARE_FILES parquet files with the
          column `text` under --out, and the list for --data-files-list. A spill or a share file already written with the
@@ -96,7 +99,13 @@ HOSTS = 4
 # (CulturaX nl's packing fill, 0.9464 in token-counts/summary.json), over the hosts. Tokens as the lengths parquets
 # count them, without <s> and </s> (with them 0.3% more for CulturaX)
 STEPS = 330_000
-HOST_TOKENS = STEPS * 128 * MAX_LENGTH * 946 // (1000 * HOSTS)
+
+
+def host_tokens_of(steps: int) -> int:
+    return steps * 128 * MAX_LENGTH * 946 // (1000 * HOSTS)
+
+
+HOST_TOKENS = host_tokens_of(STEPS)
 GPTNL_PERCENT = 30
 # Files per share: ~200,000 documents and ~650 MB of text each, so a share file is one string array in memory
 SHARE_FILES = 64
@@ -374,12 +383,35 @@ def _codes(column) -> tuple[list[str], np.ndarray]:
     return encoded.dictionary.to_pylist(), encoded.indices.fill_null(-1).to_numpy(zero_copy_only=False).astype(np.int64)
 
 
+def blocked_culturax_rows(scans: list[str], rows: list[int]) -> tuple[dict[int, np.ndarray], list[str]]:
+    """Per CulturaX file number the rows a blocklist scan (experiments/final/blocklist_scan.py) found blocked, and its
+    blocklist. Every file must be in exactly one scan, with the rows of count_tokens.py's counts."""
+    blocked, blocklists = {}, set()
+    for path in scans:
+        scan = json.loads(Path(path).expanduser().read_text())
+        blocklists.add(tuple(scan["blocklist"]))
+        for f in scan["files"]:
+            number = f["culturax_file"]
+            if number is None or number in blocked:
+                raise ValueError(f"{path}: {f['path']} is no CulturaX file or is in two scans")
+            if f["rows"] != rows[number]:
+                raise ValueError(f"{path}: {f['path']} has {f['rows']} rows, count_tokens.py {rows[number]}")
+            blocked[number] = np.asarray(f["blocked_rows"], dtype=np.int64)
+    if sorted(blocked) != list(range(len(rows))):
+        raise ValueError(f"the scans cover {len(blocked)} of the {len(rows)} CulturaX files")
+    if len(blocklists) != 1:
+        raise ValueError(f"the scans have other blocklists: {sorted(blocklists)}")
+    return blocked, list(blocklists.pop())
+
+
 def cmd_plan(args) -> None:
     import pyarrow as pa
     import pyarrow.parquet as pq
     import xxhash
 
     seed, hosts = args.seed, HOSTS
+    steps = STEPS if args.steps is None else args.steps
+    host_tokens = HOST_TOKENS if args.steps is None else host_tokens_of(args.steps)
     files = gptnl_files()
     lengths_dir = Path(args.gptnl_lengths).expanduser()
     missing = [path for path, _ in files if not (lengths_dir / f"{stage_share.output_stem(path)}.parquet").exists()]
@@ -417,10 +449,17 @@ def cmd_plan(args) -> None:
     print(f"GPT-NL: {len(files)} files, {len(tokens):,} documents, {int(tokens.sum()):,} tokens; CulturaX: "
           f"{len(culturax_hashes):,} documents, {sum(int((~a).sum()) for a in allowed):,} of them in the "
           f"{len(heldout):,} of {args.heldout}", flush=True)
+    blocked_rows, blocklist = {}, None
+    if args.exclude_culturax:
+        blocked_rows, blocklist = blocked_culturax_rows(args.exclude_culturax, [len(c["tokens"]) for c in culturax])
+        for f, r in blocked_rows.items():
+            allowed[f][r] = False
+        print(f"CulturaX: {sum(len(r) for r in blocked_rows.values()):,} documents of {', '.join(blocklist)} passed over, "
+              f"{sum(int(culturax[f]['tokens'][r].sum()) for f, r in blocked_rows.items()):,} tokens", flush=True)
 
     eligible, dropped = eligible_documents(dutch, tokens, hashes, culturax_hashes)
     candidates = np.flatnonzero(eligible)
-    gptnl_target = HOST_TOKENS * GPTNL_PERCENT // 100
+    gptnl_target = host_tokens * GPTNL_PERCENT // 100
     picks = [candidates[p] for p in gptnl_selection(tokens[candidates], seed, hosts, gptnl_target)]
     selected_host = np.full(len(tokens), -1, dtype=np.int8)
     for k, p in enumerate(picks):
@@ -439,7 +478,7 @@ def cmd_plan(args) -> None:
         cx_tokens = np.concatenate([culturax[f]["tokens"][cx_row[cx_file == f]] for f in host_files])
         cx_bytes = np.concatenate([culturax[f]["utf8_bytes"][cx_row[cx_file == f]] for f in host_files])
         documents = len(p) + len(cx_row)
-        selection = out_dir / f"cxgptnl-w{k}.npz"
+        selection = out_dir / f"{args.name}-w{k}.npz"
         np.savez(selection, gptnl_file=file_index[p], gptnl_row=row_index[p], gptnl_tokens=tokens[p].astype(np.int32),
                  gptnl_bytes=utf8_bytes[p].astype(np.int64), cx_file=cx_file, cx_row=cx_row,
                  cx_tokens=cx_tokens.astype(np.int32), cx_bytes=cx_bytes, pos=positions(seed, k, documents))
@@ -453,7 +492,11 @@ def cmd_plan(args) -> None:
                       "by_collection": by_collection},
             "culturax": {"documents": len(cx_row), "tokens": int(cx_tokens.sum()), "utf8_bytes": int(cx_bytes.sum()),
                          "of_documents": host_documents[k], "of_tokens": int(sum(culturax[f]["tokens"].sum() for f in host_files)),
-                         "heldout_passed_over": sum(int((~allowed[f]).sum()) for f in host_files),
+                         "heldout_passed_over": sum(int((~allowed[f]).sum()) for f in host_files)
+                         - sum(len(blocked_rows.get(f, ())) for f in host_files),
+                         **({"blocked_passed_over": {"documents": sum(len(blocked_rows[f]) for f in host_files),
+                                                     "tokens": sum(int(culturax[f]["tokens"][blocked_rows[f]].sum()) for f in host_files)}}
+                            if blocked_rows else {}),
                          "files": [culturax_path(f) for f in host_files]},
             "gptnl_token_percent": round(100 * gptnl_tokens / int(everything.sum()), 4),
             "selection": selection.name, "sha256": sha256(selection),
@@ -474,8 +517,11 @@ def cmd_plan(args) -> None:
     licenses, license_code = _codes(table.column("license"))
     values, times = np.unique(license_code[selected_host >= 0], return_counts=True)
     plan = {
-        "run": "culturax-gptnl-nl-230m-chunk1024", "seed": seed, "hosts": hosts, "steps": STEPS,
-        "host_tokens": HOST_TOKENS, "gptnl_percent": GPTNL_PERCENT, "share_files": SHARE_FILES,
+        "run": args.run, "seed": seed, "hosts": hosts, "steps": steps,
+        "host_tokens": host_tokens, "gptnl_percent": GPTNL_PERCENT, "share_files": args.share_files,
+        **({"culturax_blocklist": {"hosts": blocklist, "documents": sum(len(r) for r in blocked_rows.values()),
+                                   "tokens": sum(int(culturax[f]["tokens"][r].sum()) for f, r in blocked_rows.items())}}
+           if blocked_rows else {}),
         "tokens_note": "without <s> and </s>, of yhavinga/dutch-llama-tokenizer as the trainer tokenizes (count_tokens.py "
                        "for CulturaX, gptnl_mix.py count for GPT-NL); tokens_with_specials as the trainer reads them",
         "dataset_num_rows": sum(s["documents"] for s in shares),
@@ -493,7 +539,7 @@ def cmd_plan(args) -> None:
     Path(args.plan).expanduser().write_text(json.dumps(plan, indent=1) + "\n")
     totals = [s["tokens"] for s in shares]
     print(f"token spread {(max(totals) - min(totals)) / (sum(totals) / len(totals)) * 100:.4f}%; "
-          f"{plan['dataset_num_rows']:,} documents; wrote {args.plan} and {out_dir}/cxgptnl-w*.npz", flush=True)
+          f"{plan['dataset_num_rows']:,} documents; wrote {args.plan} and {out_dir}/{args.name}-w*.npz", flush=True)
 
 
 # -------------------------------------------------------------------------------------------------- mix
@@ -586,7 +632,7 @@ def _groups(starts: np.ndarray) -> list[tuple[int, int, int]]:
 def cmd_mix(args) -> None:
     import pyarrow.parquet as pq
 
-    plan = json.loads(PLAN_PATH.read_text())
+    plan = json.loads(Path(args.plan).expanduser().read_text())
     hosts = plan["hosts"]
     if not 0 <= args.rank < hosts:
         raise ValueError(f"--rank {args.rank} is not one of the plan's {hosts} hosts")
@@ -703,12 +749,20 @@ def main(argv=None) -> None:
     p.add_argument("--culturax-counts", required=True, help="directory of count_tokens.py's counts/*.npz of CulturaX nl")
     p.add_argument("--heldout", required=True, help="the trainer's --eval-file, whose documents are not trained on")
     p.add_argument("--out-dir", required=True, help="where the selections cxgptnl-w<rank>.npz go")
-    p.add_argument("--plan", default=str(PLAN_PATH), help="where the plan goes; mix reads it at PLAN_PATH")
+    p.add_argument("--plan", default=str(PLAN_PATH), help="where the plan goes, to be committed for mix")
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--steps", type=int, default=None,
+                   help=f"steps of 128 x 1024 the shares are for, at a fill of 0.946 (default: {STEPS:,}, G's)")
+    p.add_argument("--share-files", type=int, default=SHARE_FILES, help="parquet files per share")
+    p.add_argument("--run", default="culturax-gptnl-nl-230m-chunk1024", help="the run the plan is for")
+    p.add_argument("--name", default="cxgptnl", help="the selections are <name>-w<rank>.npz")
+    p.add_argument("--exclude-culturax", nargs="*", default=None,
+                   help="blocklist scans (blocklist_scan.py) of all CulturaX files: their blocked rows are passed over")
     p.set_defaults(func=cmd_plan)
     m = sub.add_parser("mix")
     m.add_argument("--rank", type=int, required=True, help="this host's share, the worker number")
     m.add_argument("--selection", required=True, help="this host's cxgptnl-w<rank>.npz of plan")
+    m.add_argument("--plan", default=str(PLAN_PATH), help="the committed plan of that selection")
     m.add_argument("--spill", required=True, help="directory of the rows read, by position (/dev/shm)")
     m.add_argument("--out", required=True, help="directory of the share's parquet files")
     m.add_argument("--list", required=True, help="file to write the share's paths to, for --data-files-list")

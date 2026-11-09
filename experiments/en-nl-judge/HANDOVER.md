@@ -46,6 +46,20 @@ gsutil ls $J/scores/motra/ | wc -l                        # 13 shards when done
 europarl-scan.md; then copy pilot-scores.md and europarl-scan.md (small) to
 `~/Developer/yhavinga/mbert-ops/translator-judge/` on co1, and a small copy of `$J/scores/pilot/` there.
 
-## State
+## State (9 Nov, 12:46 UTC)
 
-(updated below as the run goes)
+- VM `en-nl-judge`, v6e-8 spot, europe-west4-a (third VM of the day; us-east1-d VMs were preempted after 5-8 minutes,
+  europe-west4-a once during the first compile). Keeper on co1: `NAME=en-nl-judge ZONE=europe-west4-a bash keeper.sh`,
+  log `~/logs/judge_keeper_euw4.log`; it ends when run.sh ends.
+- Conversion: works (MaxText's to_maxtext, 4.75 min on the host CPU, peak 101 GB RAM). Loading from the bucket 87 s;
+  compiling 53-58 s per shape (fsdp 8, unscanned).
+- Check against transformers (CPU, float32), 9 sanity rows: score difference at most 0.0002, log probabilities within
+  0.37 (bf16), same top token (`$J/reports/compare.md`). Prompt ids equal to apply_chat_template.
+- Sanity (`$J/reports/sanity.md`), AUC against all 500 originals / against the same paragraphs: english_kept
+  1.000/1.000, mismatch 1.000/1.000, sentence_dropped 0.973/0.971, number_changed 0.932/0.948, negation_removed
+  0.920/0.927. 119 of the 500 originals score below 0.1: the judge is strict (it rejects free but correct renderings,
+  a speaker prefix such as "namens de ECR-Fractie . -", and also catches real errors). Scores are nearly binary (0 or
+  1); logp_yes - logp_no in the score shards ranks more finely.
+- Pilot (`$J/reports/pilot-scores.md`, copy on co1): Spearman with chrF 0.198, with MetricX-QE en-nl -0.486, nl-en
+  -0.190 (n 2,000); 652 of 2,000 below 0.1.
+- Tempo: MoTra 64 pairs/s (20k prompt tokens/s); sanity and pilot ~55-70 pairs/s net of compiling.

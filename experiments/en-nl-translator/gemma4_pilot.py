@@ -338,6 +338,10 @@ def merge(args):
     nl_g4 = pm.read_shards(args.en_nl, "text_nl")
     rows = []
     for p in pairs:
+        # The pilot's pairs.parquet predates the structure check, so those two columns are computed here when absent.
+        for key, (src, tgt) in (("structure", ("nl", "en")), ("back_structure", ("en", "back"))):
+            if key not in p:
+                p[key] = structure.differences(p[src], p[tgt]) if p[tgt] else None
         e, e_ended, e_tokens = en_g4.get(p["id"], (None, None, None))
         n, n_ended, n_tokens = nl_g4.get(p["id"], (None, None, None))
         row = {k: p[k] for k in ("id", "pid", "source", "half", "nl", "en", "back", "ended", "back_ended",

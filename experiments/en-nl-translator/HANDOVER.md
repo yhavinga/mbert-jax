@@ -1,4 +1,128 @@
-# Overdracht: pilot en LoRA-smoke-test van de en→nl-vertaler (stand 9 nov 2026)
+# Overdracht: pilot, LoRA-smoke-test en hoofdset van de en→nl-vertaler (stand 9 nov 2026)
+
+## Hoofdset tot vlak vóór het vertalen (9 nov, 13:45–15:30 UTC; opdracht "hoofdset voorbereiden")
+
+Geen vertaling, geen drempels, geen fine-tune. `R=gs://t5-dutch-english-usc2/mbert/translator`, `M=$R/mainset`.
+Overzicht voor Yeb: `$M/mainset-prep.md` (kopie op co1: `~/Developer/yhavinga/mbert-ops/translator-pilot/mainset-prep.md`;
+nu zonder sectie 3, die vult `finish_mainset.sh` na de bronscore). Besluiten waar dit op rust: ontwerp §3 stap 0, §7
+punt 6 en 7, §9 (hammond `mbert/designs/en-nl-translator.md`, `63eaf66`) en de richtlijn "streng op de bron, mild op
+het paar".
+
+### Wat loopt (stand 15:30 UTC)
+
+- mbert-corpus, alle 4 workers, elk één los proces (single-host, mesh tensor 4): de bronscore van Gemma 4 31B op de pool,
+  run 1 `translator_source_main_1` (start 15:12 UTC; 37 shards van 2.000 rijen per worker; ~3,5 uur bij ~3.700
+  prompttokens/s per worker). Log `~/logs/translator_source_main_1.log` (`SHARD`-regel per shard, `EXIT` aan het eind,
+  kopie naar `$M/logs/`). Scores per shard in `$M/source-scores/w<k>/`.
+- Op elke worker een keten (`~/translator_source_chain.sh`, log `~/logs/translator_source_chain_1.log`): wacht op `EXIT 0`
+  van run 1 en op `$M/judge-in/fineweb-ready.txt`, en start dan run 2 `translator_source_main_2` (dezelfde taak, dezelfde
+  mappen; scoort alleen de FineWeb-2-shards `shard-1NNNN`). Eindigt run 1 niet op `EXIT 0`, dan start run 2 niet.
+- FineWeb-2 (`HuggingFaceFW/fineweb-2` @ `af9c133`, nld_Latn, ODC-By): selectie klaar (`$M/pool-fineweb/`, 93.000 +
+  1.860 eval uit 240 row groups; 53.868 van 240.000 documenten zonder .nl/.be-domein, 10.440 met een taalpad); de
+  shards staan als `shard-10000`–`shard-10011` in `$M/judge-in/w<k>/` en `fineweb-ready.txt` is gezet, dus run 2 start
+  vanzelf na run 1. Verwacht einde run 1 ~17:50 UTC, run 2 ~18:50 UTC (19:50 CET), ruim vóór 00:30 CET.
+- Niets anders van deze opdracht. mbert-mix en `en-nl-judge` (europe-west4) niet aangeraakt.
+
+"Klaar" betekent:
+- op alle 4 workers eindigen `translator_source_main_1.log` en `translator_source_main_2.log` op `EXIT 0`, en
+  `$M/source-scores/w<k>/` heeft evenveel shards als `$M/judge-in/w<k>/`;
+- `$M/mainset-prep.md` heeft sectie 3 (verdeling per bron, herkomst, onderwerpen, 5+5 voorbeelden per bron) en
+  `$M/minipilot-long/` bestaat; kopie van `mainset-prep.md` op co1;
+- mbert-corpus vrij: `sudo lsof -t /dev/accel* /dev/vfio/*` leeg op alle workers, geen `judge.py`.
+
+Hoofdsessie: `setsid nohup bash ~/Developer/yhavinga/mbert-ops/translator-mainset/finish_mainset.sh >
+~/logs/finish_mainset.log 2>&1 < /dev/null &` (pollt elke 180 s; maakt na afloop de minipilot en het verslag; verwijdert
+niets, start niets op de TPU's). Daarna opruimen, met zichtbare commando's (alles van deze opdracht, niets anders):
+`rm -rf /dev/shm/judge` op alle workers (venv, tokenizer, logs; op w3 ook de lokale checkpointkopie van 45 GB) en
+`rm -rf /dev/shm/translator/mainset` op alle workers. Het checkpoint blijft in `$R/judge/gemma-4-31b-it-maxtext/`.
+
+### Stappen en uitkomsten
+
+1. **Stap 0 v2** (`select_passages.py`). Regels, elk met unit-tests (`tests/test_en_nl_select.py`, ook voor goede tekst
+   die moet blijven staan): `encoding`, `soft_hyphen`, `hyphenation` (nu ook met hoofdletter, de lettergrepen
+   be/ge/ver/ont/her, en "enthousias- merend"), `sentence_start`, `cut_off`, `lower_after_end`, `glued` (camelCase met
+   kleine beginletter of aanspreektitel, leesteken zonder spatie, cijfers aan een woord), `heading_glued`,
+   `mid_capital`, `page_mark`, `footnote`, `repeated`, `split_word`, en de contextregels `open_before` en
+   `continues_after` (de alinea vóór en na de passage). Op de 2.000 pilotpassages (opnieuw opgebouwd met `annotate`):
+   **188 van de 288** door Gemma afgekeurde gevangen, **99 van de 1.692** goedgekeurde tegengehouden (46 daarvan door
+   `heading_glued`, 25 door `sentence_start`: echte zinsbeginnen midden in een zin die Gemma doorliet). Per regel en
+   per bron: `mainset-prep.md` §1. Bewust niet: een beletselteken midden in de tekst (zo schrijven de Handelingen een
+   interruptie), en een regel ervoor zonder punt als zodanig (dat waren vooral koppen en tabelrijen).
+2. **Pool** (`$M/pool/`: `passages.parquet`, `eval.parquet`, `context-turns.parquet`, `report.json`). Verdeling
+   40/20/7,5/7,5 van 200.000 (+ FineWeb-2 25%), met 30% marge op de afkeur van de pilot: Handelingen 106.667, raad 78.000,
+   dpc 21.196, rechtspraak 25.491; eval 2.134/1.560/424/510. Passages tot 768 tokens, per bron 25% lang (> 384), kolom
+   `length_class`; `half` (idioom/willekeurig), `idiom_class`, `doc_id`, `source`. `--max-per-doc handelingen=15,raad=5`
+   (anders 3): met 3 haalden de Handelingen het niet (alle 51.104 debatten gelezen; capaciteit staat nu in
+   `report.json`). Uitgesloten via 13-grammen: DBRD-test, SICK-NL-test, FLORES-200 devtest (uit Meta's tarball:
+   `facebook/flores` en `flores_plus` zijn afgeschermd voor Yebs token), WMT24++ en→nl_NL, NTREX-128 (`$M/testsets/`).
+3. **Context (§9)**. Elke Handelingen-passage heeft `context_turns`/`context_tokens`: de 1–3 beurten ervoor (ook de
+   voorzitter), elk door de bronfilters en ≤ 768 tokens, samen ≤ 1.024. 21.760 passages (20%, seed vast) zijn
+   `context_example`; hun 52.564 contextbeurten (`context-turns.parquet`) kosten **7.340.633 extra nl→en-tokens**
+   (+11,9% op de 61,5 M tokens van de vier bronnen) en krijgen dezelfde bronscore (split `context`).
+4. **Bronscore** (`judge.py` van `en-nl-judge`, hier gemerged en uitgebreid). Omgezet uit `google/gemma-4-31B-it` @
+   `842da37` naar `$R/judge/gemma-4-31b-it-maxtext/` (4,8 min op w3). Op v4: FSDP 4 vraagt 31,3 GB HBM aan tijdelijke
+   buffers (> 30,75): tensor 4 werkt (fsdp 2 × tensor 2 ook, trager). Taak `source_topic_origin`: één forward pass met
+   de bronvraag van `source-quality.md` (onveranderd, door causale attentie), daarna "leest als oorspronkelijk
+   Nederlands?" en een onderwerp uit 15 (A–O). Op de pilot: zelfde bronscore als de v6e-8 (mediaan log-odds-verschil
+   0,15; 5 van 2.000 wisselen rond 0,1). Tempo op de pilot: 10,7 passages/s per worker met alleen de bronvraag, 7,7 met
+   beide vervolgvragen (~3.700 prompttokens/s).
+5. **FLAN-nl-replay** (`$M/flan-eval/`, `$M/replay/`). Eerst 1.000 + 35 evaluatierijen uit F (status translate,
+   instructie 48–384 tokens, seed `en-nl-translator/flan-eval/1`; 2.626 segmenten). Daarna van 1.811.525 segmenten:
+   −2.626 evaluatierij, −1.267 niet afgelopen, −1.121.337 buiten 48–384 tokens Nederlands, −13 `decode_loop`, −120
+   `english_left`, −164.833 structuur (69.719 alleen `newline_doubled`) → **521.329 paren**.
+6. **Structuurcontrole** (`structure.py`, `pairs.py measures` schrijft `structure` en `back_structure`). Pilot: nl→en
+   326 paren met verschil, waarvan 287 alleen `newline_doubled`; en→nl 20 (15).
+
+### Commando's (elk ssh zoals hieronder in "Commando's"; scripts in `$R/scripts/mainset/`, op de workers in
+`/dev/shm/translator/mainset/code/`; de co1-kant in `~/Developer/yhavinga/mbert-ops/translator-mainset/remote/`)
+
+- Judge-omgeving per worker: `bash /dev/shm/judge/code/setup.sh` (us-central2 wordt herkend); omzetten:
+  `bash setup.sh convert` (staat al in de bucket).
+- Pool: `select_passages.py select --out <dir> --n 231354 --counts handelingen=106667,raad=78000,dpc=21196,rechtspraak=25491
+  --n-eval 4628 --eval-counts handelingen=2134,raad=1560,dpc=424,rechtspraak=510 --max-per-doc handelingen=15,raad=5
+  --row-groups handelingen=100,raad=100,dpc=32,rechtspraak=24 --block-texts <5 testsets> --processes 200` (w0, 12 min).
+- FineWeb-2: dezelfde met `--row-groups handelingen=0,raad=0,dpc=0,rechtspraak=0,fineweb=240 --max-docs fineweb=400000
+  --counts fineweb=93000 --eval-counts fineweb=1860`.
+- Shards: `mainset.py judge-shards --select <pool> --out <dir> [--first-shard 10000]`, naar `$M/judge-in/w<k>/`.
+- Bronscore per worker: `TASK=source_topic_origin FSDP=1 TENSOR=4 TOKEN_BUDGET=16384 SHARDS=$M/judge-in/w{w}
+  OUT=$M/source-scores/w{w} NAME=<nieuw> bash run_source_judge.sh` (hervat per shard).
+- Pilottoets: `select_passages.py annotate --pids <pilot-pids> --row-groups handelingen=8,raad=12,dpc=8,rechtspraak=6`,
+  daarna `mainset.py stage0-eval` (op co1, kleine bestanden).
+- Verslag: `finish_mainset.sh` (of `mainset.py minipilot` en `mainset.py report`, zie het script).
+
+### Open punten
+
+1. **Drempels** (Yeb): bronscore, herkomst (FineWeb-2) en eventueel onderwerp; er is er geen gekozen. De log-odds
+   staan erbij (`logp_yes`, `logp_no`, `origin_logp_*`, `topic_logps`).
+2. **`heading_glued`** houdt 46 van de 1.692 door Gemma goedgekeurde pilotpassages tegen (koppen die aan de alinea
+   vastzitten, vooral raad en dpc). Streng gekozen; Yeb kan de regel laten vallen (één regel in `extraction_errors`).
+3. **Alinea-scheiding**: passages zetten alinea's met één regelovergang onder elkaar; TranslateGemma maakt er bij nl→en
+   in 287 van de 2.000 pilotparen een lege regel van (`newline_doubled`). Vóór stap 1 beslissen: alinea's met een lege
+   regel scheiden (markdown), of `newline_doubled` als toegestaan verschil behandelen.
+4. **FineWeb-2** heeft geen pilot: de 30% afkeur is aangenomen. De 13-gramontdubbeling liep per selectie; tussen de
+   FineWeb-pool en de pool van de vier bronnen is niet ontdubbeld (overlap is onwaarschijnlijk, niet gemeten).
+5. **Context-voorbeelden** zijn gekozen uit passages die bij de eerste of tweede alinea van hun beurt beginnen; een
+   eerder deel van de eigen beurt is geen context. De contextbeurten zijn niet idioomgeselecteerd (zoals bedoeld).
+6. **Replay**: de structuurcontrole laat 521.329 van 686.162 paren over (24% af); ruim genoeg voor het aandeel van 20%.
+   De cursiefregel telt ook ontsnapte underscores (`\_\_\_`) mee.
+7. **Evaluatierijen**: de band 48–384 tokens voor de 1.000 + 35 FLAN-rijen is een eigen keuze (zelfde band als de
+   pilotpassages), zodat de classifier en Yeb geen piepkleine rijen krijgen.
+8. **Niet van deze opdracht, wel op mbert-corpus**: op alle workers draaien verweesde processen uit
+   `/dev/shm/translator/smoke-lora/venv` (`multiprocessing.resource_tracker` en `spawn_main`, PPID 1, gestart tussen
+   ~13:49 en ~15:06 UTC op alle workers tegelijk). Ze houden de TPU niet vast. Niet gestopt: herkomst onbekend.
+   Vóór 00:30 CET moet mbert-corpus zonder processen zijn; de hoofdsessie beslist.
+9. 9 van de 2.000 pilotteksten wijken bij `annotate` af door commit `9853d3c` (afkortingen in de zinsplitsing, van na
+   de pilotselectie); hun Gemma-score hoort bij de oude tekst.
+10. GPT-NL's verzonnen adressen ("Liamstraat 0", "DorMellering 8") vangt alleen `glued` als er cijfers aan vastzitten.
+
+Verkeer: tussen regio's niets (geen bucket-naar-bucket). Naar co1, eenmalig en klein: de bronscores van de pilot uit
+`gs://t5-dutch-english` (134 kB), `passages.parquet` en `pairs.parquet` van de pilot (0,5 en 1,4 MB), vier versies
+van `annotated.parquet` (~0,7 MB elk), vier pilot-scoreshards van v4 (~0,15 MB elk), `report.json` (22 kB) en
+`mainset-prep.md` (13 kB; `finish_mainset.sh` haalt hem nog één keer). Van co1 naar de bucket: de OpenTaal-lijst
+(5,1 MB, die co1 van GitHub haalde) en `stage0-eval.json`. Van HF naar de VM's: Gemma 4 31B (59 GB, w3; daarna van
+/dev/shm verwijderd), de testsets, de row groups van de bronnen en van FineWeb-2; van Meta naar w1: het FLORES-200-tarball.
+
+
 
 ## LoRA-smoke-test (9 nov, 12:45–14:30 CET): klaar
 

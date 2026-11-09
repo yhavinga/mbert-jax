@@ -161,13 +161,27 @@ def judge_shards(args):
             table = {c: [r.get(c) for r in chunk] for c in columns if c not in ("nl", "en")}
             table["nl"] = [r["text"] for r in chunk]
             table["en"] = [""] * len(chunk)
-            pq.write_table(pa.table(table), d / f"shard-{s:05d}.parquet", compression="zstd")
+            pq.write_table(pa.table(table), d / f"shard-{args.first_shard + s:05d}.parquet", compression="zstd")
         counts[f"w{k}"] = len(part)
     print(f"JUDGE-SHARDS {len(rows)} passages: {counts}")
 
 
 EVAL_BAND = (48, 384)  # the band of the pilot's BT passages (select_passages.MIN_TOKENS, SHORT_MAX)
-SHARES_MAINSET = (0.40, 0.20, 0.075, 0.075)  # Handelingen, raad, dpc, rechtspraak; FineWeb-2 0.25 (Yeb, 9 Nov)
+SHARES_MAINSET = {"handelingen": 0.40, "raad": 0.20, "dpc": 0.075, "rechtspraak": 0.075, "fineweb": 0.25}  # Yeb, 9 Nov
+ALL_SOURCES = tuple(SHARES_MAINSET)
+
+
+def read_pool(selects, columns=None):
+    """The passages (training and eval side) of one or more selections"""
+    import pyarrow.parquet as pq
+
+    rows = []
+    for select in selects:
+        for name in ("passages.parquet", "eval.parquet"):
+            path = Path(select) / name
+            if path.exists():
+                rows += pq.read_table(path, columns=columns).to_pylist()
+    return rows
 EVAL_SETS = (("classifier", 1000), ("yeb", 35))
 EVAL_SEED = "en-nl-translator/flan-eval/1"
 
@@ -341,6 +355,7 @@ RULES_NL = {
     "repeated": "een woordgroep die direct herhaald wordt (\"aan boord aan boord\")",
     "split_word": "een woord dat door een spatie in tweeën ligt (\"wan neer\" niet, \"zienswij zen\", \"fi ets\") "
                   "of losse letters (\"t oe a mbi\")",
+    "footnote": "een voetnootverwijzing waarvan de noot ontbreekt (\"behandeling.[5]\", \"kwetsbare[2]\", \"lxvii\")",
     "open_before": "de regel vóór de passage eindigt op een woord dat nooit een zin eindigt (\"... van de\")",
     "continues_after": "de regel na de passage begint met een kleine letter (de laatste zin loopt door)",
 }
@@ -370,12 +385,18 @@ def report(args):
 
     import structure
 
-    sel = json.loads((Path(args.select) / "report.json").read_text())
+    sels = [json.loads((Path(d) / "report.json").read_text()) for d in args.select]
+    src_report, sel_of = {}, {}
+    for sel in sels:
+        for source, r in sel["sources"].items():
+            if r.get("row_groups"):
+                src_report[source], sel_of[source] = r, sel
     stage0 = json.loads(Path(args.stage0).read_text())
     replay_report = json.loads((Path(args.replay) / "report.json").read_text())
     eval_report = json.loads((Path(args.eval_rows) / "eval-rows.json").read_text())
     testsets_manifest = json.loads(Path(args.testsets).read_text())
-    sources = ["handelingen", "raad", "dpc", "rechtspraak"]
+    pilot_sources = ["handelingen", "raad", "dpc", "rechtspraak"]
+    sources = [source for source in ALL_SOURCES if source in src_report]
     out = ["# Hoofdset en→nl-vertaler: voorbereiding tot vlak vóór het vertalen", "",
            f"Gegenereerd door `mainset.py report`. Bucket: `gs://t5-dutch-english-usc2/mbert/translator/mainset/`. "
            f"Geen vertaling, geen drempels, geen fine-tune.", ""]
@@ -402,32 +423,38 @@ def report(args):
     out += ["Per bron (een of meer regels):", "",
             _md_table(["bron", "afgekeurd door Gemma", "daarvan gevangen", "goedgekeurd", "daarvan tegengehouden"],
                       [[s, sides["rejected"][s], any_rule["rejected"][s], sides["accepted"][s],
-                        any_rule["accepted"][s]] for s in sources]), ""]
+                        any_rule["accepted"][s]] for s in pilot_sources]), ""]
 
     # the pool
     out += ["## 2. Kandidatenpool", "",
             "Doel (Yeb, 9 nov, ontwerp §7 punt 7): na het Gemma-bronfilter 200.000 passages, verdeeld als Handelingen "
             "40%, raadsinformatie 20%, dpc 7,5%, rechtspraak 7,5% en FineWeb-2 25%, met ~30% marge, gerekend met de "
-            "afkeurpercentages van de pilot (score < 0,1); passages tot 768 tokens, per bron 25% langer dan 384. Plus "
-            "4.000 evaluatiepassages uit andere documenten (splitsing per document), met dezelfde marge. Deze pool "
-            "heeft de vier bestaande bronnen; FineWeb-2 is de volgende stap (zie HANDOVER.md).", ""]
+            "afkeurpercentages van de pilot (score < 0,1; voor FineWeb-2, zonder pilot, 30% aangenomen); passages tot "
+            "768 tokens, per bron 25% langer dan 384 (lengteklasse `long`). Plus 4.000 evaluatiepassages uit andere "
+            "documenten (splitsing per document), met dezelfde marge.", ""]
     rates = {s: sides["rejected"][s] / (sides["rejected"][s] + sides["accepted"][s] + sides["between"][s])
-             for s in sources}
-    args_sel = sel["args"]
-    counts = dict(part.split("=") for part in args_sel["counts"].split(",")) if args_sel.get("counts") else {}
-    eval_counts = dict(part.split("=") for part in args_sel["eval_counts"].split(",")) \
-        if args_sel.get("eval_counts") else {}
+             for s in pilot_sources}
+    counts, eval_counts = {}, {}
+    for sel in sels:
+        a = sel["args"]
+        counts.update(dict(part.split("=") for part in a["counts"].split(",")) if a.get("counts") else {})
+        eval_counts.update(dict(part.split("=") for part in a["eval_counts"].split(",")) if a.get("eval_counts")
+                           else {})
     out += [_md_table(["bron", "aandeel", "nodig", "afkeur pilot", "pool = nodig × 1,3 / (1 − afkeur)", "eval nodig",
                        "eval-pool"],
-                      [[s, f"{100 * sh:g}%", _n(int(200000 * sh)), f"{100 * rates[s]:.1f}%", _n(int(counts.get(s, 0))),
-                        _n(int(4000 * sh)), _n(int(eval_counts.get(s, 0)))]
-                       for s, sh in zip(sources, SHARES_MAINSET)]), ""]
-    out += [f"Selectie: `select_passages.py select` met `--row-groups {args_sel['row_groups']}`, `--max-per-doc "
-            f"{args_sel['max_per_doc']}` (anders 3), `--eval-permille {args_sel['eval_permille']}`, seed "
-            f"{args_sel['seed']}, dezelfde bronnen en revisies als de pilot; {sel['seconds']} s.", ""]
+                      [[s, f"{100 * SHARES_MAINSET[s]:g}%".replace(".", ","), _n(int(200000 * SHARES_MAINSET[s])),
+                        f"{100 * rates[s]:.1f}%".replace(".", ",") if s in rates else "(30%)", _n(int(counts.get(s, 0))),
+                        _n(int(4000 * SHARES_MAINSET[s])), _n(int(eval_counts.get(s, 0)))] for s in sources]), ""]
+    for sel in sels:
+        a = sel["args"]
+        out += [f"Selectie `{a['out']}`: `select_passages.py select` met `--row-groups {a['row_groups']}`, "
+                f"`--max-per-doc {a['max_per_doc'] or '3'}` (anders 3), `--max-docs {a['max_docs'] or '-'}`, "
+                f"`--eval-permille {a['eval_permille']}`, seed {a['seed']}; {sel['seconds']} s. Overgeslagen bij het "
+                f"kiezen: {sel['skipped_while_choosing']}; geblokkeerde 13-grammen uit de testsets: "
+                f"{_n(sel.get('blocked_ngrams', 0))}.", ""]
     rows = []
     for s in sources:
-        r = sel["sources"][s]
+        r = src_report[s]
         d, c = r["documents"], r["counts"]
         rows.append([s, r["row_groups"], _n(d.get("docs_read", 0)), _n(d.get("docs_kept", 0)), _n(c.get("passages", 0)),
                      _n(r["passed"]), _n(r["passed_train"]), _n(r["passed_eval"]), _n(r["chosen"]),
@@ -436,15 +463,33 @@ def report(args):
     out += [_md_table(["bron", "row groups", "documenten", "na documentfilters", "passages", "door alle filters",
                        "train-kant", "eval-kant", "pool (train)", "pool (eval)", "waarvan lang (> 384 tokens)",
                        "waarvan idioomhelft", "capaciteit documentmaximum"], rows), "",
-            f"Overgeslagen bij het kiezen (alle bronnen): {sel['skipped_while_choosing']}. Geblokkeerde 13-grammen "
-            f"uit de testsets: {_n(sel.get('blocked_ngrams', 0))}. De idioomhelft is kleiner dan de helft waar de "
-            f"bron te weinig passages met een idioomtreffer heeft; de rest komt dan uit de willekeurige helft.", ""]
-    rules = [r for r in STEP0_FILTERS if r != "length"] + list(RULES_NL) + ["length"]
+            "De idioomhelft is kleiner dan de helft waar de bron te weinig passages met een idioomtreffer heeft; de "
+            "rest komt dan uit de willekeurige helft. FineWeb-2: alleen pagina's van een .nl- of .be-domein zonder "
+            "taalpad, -parameter of -subdomein (`docs_url_domain`, `docs_url_language` hieronder).", "",
+            "Documentfilters: " + "; ".join(f"{s} {src_report[s]['documents']}" for s in sources), ""]
+    rules = [r for r in STEP0_FILTERS if r != "length"] + list(RULES_NL) + ["footnote", "length"]
     rules = list(dict.fromkeys(rules))
     out += ["Afgevallen passages per filter (een passage kan op meer filters vallen):", "",
-            _md_table(["filter"] + sources, [[f"`{f}`"] + [_n(sel["sources"][s]["fails"].get(f, 0)) for s in sources]
-                                            for f in rules if any(sel["sources"][s]["fails"].get(f) for s in sources)]),
+            _md_table(["filter"] + sources, [[f"`{f}`"] + [_n(src_report[s]["fails"].get(f, 0)) for s in sources]
+                                            for f in rules if any(src_report[s]["fails"].get(f) for s in sources)]),
             ""]
+    context = sels[0].get("context")
+    if context:
+        out += ["### Context-voorbeelden van de Handelingen (ontwerp §9)", "",
+                f"Elke Handelingen-passage heeft in `context_turns`/`context_tokens` de 1–3 spreekbeurten vlak ervoor "
+                f"in hetzelfde agendapunt (ook de voorzitter), elk door de bronfilters en hoogstens 768 tokens, samen "
+                f"hoogstens 1.024. Van de {_n(context['handelingen_passages'])} Handelingen-passages hebben er "
+                f"{_n(context['with_context'])} een context; {_n(context['candidates'])} beginnen bovendien bij de "
+                f"eerste of tweede alinea van hun beurt. Daaruit zijn er {_n(context['examples'])} (20%, seed vast) "
+                f"gemarkeerd als context-voorbeeld (`context_example`); aantal contextbeurten per voorbeeld: "
+                f"{context['turns_per_example']}, contexttokens per voorbeeld p50 "
+                f"{context['context_tokens_per_example'].get('p50')}, p90 {context['context_tokens_per_example'].get('p90')}.",
+                "",
+                f"Extra voor de nl→en-run: {_n(context['context_turns'])} contextbeurten (`context-turns.parquet`, elke "
+                f"beurt één keer) met {_n(context['context_turn_tokens'])} tokens, naast "
+                f"{_n(context['passage_tokens_all'])} tokens van de passages van deze selectie "
+                f"(+{100 * context['context_turn_tokens'] / context['passage_tokens_all']:.1f}%). De contextbeurten "
+                f"krijgen dezelfde Gemma-bronscore (split `context`).", ""]
     out += ["Testsets als uitsluitlijst (alleen 13-gramblokkade, nooit als data):", "",
             _md_table(["set", "bron", "teksten"],
                       [[k, f"`{v.get('repo', v.get('url'))}`" + (f" @ `{v['revision'][:7]}`" if v.get("revision") else ""),
@@ -453,36 +498,53 @@ def report(args):
             "`openlanguagedata/flores_plus` zijn afgeschermd en Yebs token heeft er geen toegang toe.", ""]
 
     # source scores of the pool
-    out += ["## 3. Bronscore van Gemma 4 31B in de pool", ""]
-    pool = {}
-    for name in ("passages.parquet", "eval.parquet"):
-        path = Path(args.select) / name
-        if path.exists():
-            for r in pq.read_table(path, columns=["pid", "source", "split", "half", "text"]).to_pylist():
-                pool[r["pid"]] = r
+    out += ["## 3. Bronscore, herkomst en onderwerp (Gemma 4 31B) in de pool", "",
+            "Eén forward pass per passage (taak `source_topic_origin`): eerst de bronvraag van `source-quality.md` "
+            "(onveranderd; door de causale attentie zien de vervolgvragen hem niet), dan \"leest dit als oorspronkelijk "
+            "Nederlands?\" (ja/nee) en een onderwerp uit 15 vaste (A–O). Geen drempel gekozen. Log-odds = log P(yes) − "
+            "log P(no). Op de 2.000 pilotpassages gaf deze opzet dezelfde bronscore als de bronvraag alleen (mediaan "
+            "verschil in log-odds 0,14; 5 van 2.000 wisselen van kant rond 0,1) en als de run van de v6e-8.", ""]
+    pool = {r["pid"]: r for r in read_pool(args.select, ["pid", "source", "split", "half", "text", "length_class"])}
     scored = read_scores(args.scores) if args.scores else {}
     if not scored:
         out += ["Nog niet gescoord: deze sectie vult `mainset.py report --scores` na de run.", ""]
     else:
-        rows = []
-        for s in sources:
-            sc = [scored[p]["score"] for p in pool if pool[p]["source"] == s and p in scored
-                  and scored[p]["skipped"] is None]
-            lo = sorted(scored[p]["logp_yes"] - scored[p]["logp_no"] for p in pool if pool[p]["source"] == s
-                        and p in scored and scored[p]["skipped"] is None)
-            n = len(sc)
+        rows, topic_rows, origin_rows = [], [], []
+        groups = [(s, [p for p in pool if pool[p]["source"] == s]) for s in sources]
+        context_ids = [i for i in scored if scored[i].get("split") == "context"]
+        if context_ids:
+            groups.append(("handelingen (contextbeurten)", context_ids))
+        for label, ids in groups:
+            live = [scored[p] for p in ids if p in scored and scored[p]["skipped"] is None]
+            n = len(live)
             if not n:
                 continue
+            sc = [x["score"] for x in live]
+            lo = sorted(x["logp_yes"] - x["logp_no"] for x in live)
             bins = [sum(1 for x in sc if k / 10 <= x < (k + 1) / 10 or (k == 9 and x == 1.0)) for k in range(10)]
-            rows.append([s, _n(n), f"{sum(sc) / n:.3f}", f"{100 * sum(x < 0.1 for x in sc) / n:.1f}%",
+            rows.append([label, _n(n), _n(len(ids) - n), f"{sum(sc) / n:.3f}", f"{100 * sum(x < 0.1 for x in sc) / n:.1f}%",
                          f"{100 * sum(x < 0.5 for x in sc) / n:.1f}%", f"{100 * sum(x >= 0.9 for x in sc) / n:.1f}%",
                          f"{lo[int(0.05 * (n - 1))]:.1f} / {lo[n // 2]:.1f} / {lo[int(0.95 * (n - 1))]:.1f}"]
                         + [_n(b) for b in bins])
-        missing = len([p for p in pool if p not in scored])
-        out += [f"{_n(len(scored))} van {_n(len(pool))} poolpassages gescoord ({_n(missing)} zonder score). Geen "
-                f"drempel gekozen. Log-odds = log P(yes) − log P(no).", "",
-                _md_table(["bron", "passages", "gemiddeld", "< 0,1", "< 0,5", "≥ 0,9", "log-odds p5 / p50 / p95"]
-                          + [f"{k / 10:.1f}–{(k + 1) / 10:.1f}" for k in range(10)], rows), ""]
+            if live[0].get("origin_score") is not None:
+                og = [x["origin_score"] for x in live]
+                olo = sorted(x["origin_logp_yes"] - x["origin_logp_no"] for x in live)
+                origin_rows.append([label, f"{100 * sum(x < 0.1 for x in og) / n:.1f}%",
+                                    f"{100 * sum(x < 0.5 for x in og) / n:.1f}%",
+                                    f"{olo[int(0.05 * (n - 1))]:.1f} / {olo[n // 2]:.1f} / {olo[int(0.95 * (n - 1))]:.1f}"])
+            if live[0].get("topic"):
+                tc = collections.Counter(x["topic"] for x in live)
+                topic_rows.append([label] + [f"{100 * tc[letter] / n:.1f}" for letter in "ABCDEFGHIJKLMNO"])
+        out += [_md_table(["bron", "gescoord", "zonder score", "gemiddeld", "< 0,1", "< 0,5", "≥ 0,9",
+                           "log-odds p5 / p50 / p95"] + [f"{k / 10:.1f}–{(k + 1) / 10:.1f}" for k in range(10)], rows),
+                ""]
+        if origin_rows:
+            out += ["Herkomst (\"leest als oorspronkelijk Nederlands\"; de vraag is voor FineWeb-2 bedoeld, de andere "
+                    "bronnen staan erbij ter vergelijking):", "",
+                    _md_table(["bron", "< 0,1", "< 0,5", "log-odds p5 / p50 / p95"], origin_rows), ""]
+        if topic_rows:
+            out += ["Onderwerp (% per bron): " + "; ".join(f"{letter} = {name}" for letter, name in TOPIC_NAMES), "",
+                    _md_table(["bron"] + list("ABCDEFGHIJKLMNO"), topic_rows), ""]
         out += ["### Voorbeelden per bron (5 met score < 0,1 en 5 met score ≥ 0,9, willekeurig, seed 0; tekst na 700 "
                 "tekens afgekapt)", ""]
         for s in sources:
@@ -494,8 +556,18 @@ def report(args):
                 out += [f"#### {s}, {label}", ""]
                 for p in r.sample(group, min(5, len(group))):
                     x = scored[p]
-                    out += [f"**{x['score']:.4f}** (log-odds {x['logp_yes'] - x['logp_no']:.1f}) · `{p}` · "
-                            f"{pool[p]['split']}, {pool[p]['half']}", "", _quote(pool[p]["text"]), ""]
+                    extra = f" · herkomst {x['origin_score']:.3f}" if x.get("origin_score") is not None else ""
+                    extra += f" · onderwerp {x['topic']}" if x.get("topic") else ""
+                    out += [f"**{x['score']:.4f}** (log-odds {x['logp_yes'] - x['logp_no']:.1f}){extra} · `{p}` · "
+                            f"{pool[p]['split']}, {pool[p]['half']}, {pool[p]['length_class']}", "",
+                            _quote(pool[p]["text"]), ""]
+    if args.minipilot and (Path(args.minipilot) / "passages.parquet").exists():
+        mp = pq.read_table(Path(args.minipilot) / "passages.parquet", columns=["source", "tokens"]).to_pylist()
+        out += ["### Minipilot nl→en met lange passages (niet gedraaid)", "",
+                f"{len(mp)} lange passages (train-kant, bronscore ≥ {MINIPILOT_SCORE}, per bron naar de verdeling, "
+                f"seed `{MINIPILOT_SEED}`): {dict(collections.Counter(r['source'] for r in mp))}; "
+                f"{_n(sum(r['tokens'] for r in mp))} tokens. Invoer voor `translate.py` in "
+                f"`$M/minipilot-long/segments-w<k>.parquet`.", ""]
 
     # FLAN-nl replay
     st = replay_report["steps"]
@@ -538,7 +610,7 @@ def report(args):
                 per_cat.update(d)
                 only_doubled += d == [structure.NEWLINE_DOUBLED]
         rows.append([label, total, only_doubled, total - only_doubled,
-                     ", ".join(f"{s} {per_source[s]}" for s in sources),
+                     ", ".join(f"{s} {per_source[s]}" for s in pilot_sources),
                      ", ".join(f"{k} {v}" for k, v in per_cat.most_common())])
     out += [_md_table(["richting", "paren met verschil", "alleen newline_doubled", "overige", "per bron",
                        "per categorie"], rows), ""]
@@ -569,12 +641,14 @@ def minipilot(args):
     import select_passages as sp
 
     scores = read_scores(args.scores)
-    pool = [r for r in pq.read_table(Path(args.select) / "passages.parquet").to_pylist()
-            if r["length_class"] == "long" and r["pid"] in scores and scores[r["pid"]]["score"] >= MINIPILOT_SCORE]
-    total = sum(SHARES_MAINSET)
+    pool = [r for r in read_pool(args.select) if r["split"] == "train" and r["length_class"] == "long"
+            and r["pid"] in scores and scores[r["pid"]]["score"] >= MINIPILOT_SCORE]
+    present = [source for source in ALL_SOURCES if any(r["source"] == source for r in pool)]
+    total = sum(SHARES_MAINSET[source] for source in present)
     rng = random.Random(MINIPILOT_SEED)
     chosen = []
-    for source, share in zip(("handelingen", "raad", "dpc", "rechtspraak"), SHARES_MAINSET):
+    for source in present:
+        share = SHARES_MAINSET[source]
         part = sorted((r for r in pool if r["source"] == source), key=lambda r: r["pid"])
         k = round(args.n * share / total)
         if len(part) < k:
@@ -595,6 +669,11 @@ def minipilot(args):
 
 
 MINIPILOT_SCORE = 0.9
+TOPIC_NAMES = (("A", "verkiezingen, partijen, het bestuur zelf"), ("B", "recht"), ("C", "economie"), ("D", "zorg"),
+               ("E", "onderwijs, jeugd, gezin"), ("F", "milieu, energie, klimaat"), ("G", "ruimte, wonen, bouwen"),
+               ("H", "verkeer, vervoer"), ("I", "veiligheid, politie, defensie"), ("J", "werk, inkomen, sociaal"),
+               ("K", "cultuur, sport, media"), ("L", "wetenschap, techniek"), ("M", "landbouw, natuur, dieren, voedsel"),
+               ("N", "internationaal, migratie"), ("O", "dagelijks leven, overig"))
 MINIPILOT_SEED = "en-nl-translator/minipilot-long/0"
 
 
@@ -649,6 +728,8 @@ def main(argv=None):
     p.add_argument("--out", required=True)
     p.add_argument("--workers", type=int, default=4)
     p.add_argument("--rows", type=int, default=2000)
+    p.add_argument("--first-shard", type=int, default=0, help="The number of the first shard (a second selection's "
+                   "shards beside the first's, e.g. 10000)")
     p = sub.add_parser("eval-rows", help="The FLAN rows of F that §4 evaluates on, fixed with a seed")
     p.add_argument("--plan", required=True)
     p.add_argument("--english", required=True, nargs="+")
@@ -660,13 +741,14 @@ def main(argv=None):
     p.add_argument("--out", required=True)
     p.add_argument("--processes", type=int, default=64)
     p = sub.add_parser("minipilot", help="Long passages for a mini-pilot of nl->en")
-    p.add_argument("--select", required=True)
+    p.add_argument("--select", required=True, nargs="+")
     p.add_argument("--scores", required=True)
     p.add_argument("--out", required=True)
     p.add_argument("--n", type=int, default=500)
     p.add_argument("--workers", type=int, default=4)
     p = sub.add_parser("report", help="mainset-prep.md")
-    p.add_argument("--select", required=True)
+    p.add_argument("--select", required=True, nargs="+", help="The pool's selections (the four sources, FineWeb-2)")
+    p.add_argument("--minipilot", help="The directory of mainset.py minipilot")
     p.add_argument("--stage0", required=True)
     p.add_argument("--pilot-pairs", required=True)
     p.add_argument("--replay", required=True)

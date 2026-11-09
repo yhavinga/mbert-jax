@@ -50,8 +50,12 @@ N_NEMOTRON = 5
 # translation the context is about twice that), each at most TURN_MAX
 CONTEXT_MAX = 600
 TURN_MAX = 384
-# A short Nemotron conversation: at least two user turns, every turn at most TURN_MAX tokens, at most CHAT_MAX together
-CHAT_MAX = 1000
+# A short Nemotron conversation: at least two user turns, every turn at most NEMO_TURN_MAX tokens, at most CHAT_MAX
+# together. Assistant turns have a median of ~650 tokens, so the Handelingen limit of TURN_MAX (384) left none of 387
+# lmarena conversations; 800 keeps a Dutch turn under the engine's max_decode of 1024, and 1600 keeps the prompt (earlier
+# turns twice, source and translation) under its largest prefill of 4096.
+NEMO_TURN_MAX = 800
+CHAT_MAX = 1600
 # The engine of the trial: prompts up to 4096 tokens (earlier turns twice, source and translation), turns up to 1024
 CONTEXT_SHAPES = {"prefill_lengths": [512, 1024, 2048, 3072, 4096], "max_decode": 1024, "slots": 8}
 NEMOTRON_LABELS = {"system": "Systeem", "user": "Gebruiker", "assistant": "Assistent"}
@@ -199,7 +203,7 @@ def nemotron_chains(rows, count):
         if sum(t["role"] == "user" for t in turns) < 2 or turns[-1]["role"] != "assistant":
             continue
         lengths = [count(t["text"]) for t in turns]
-        if max(lengths) > TURN_MAX or sum(lengths) > CHAT_MAX:
+        if max(lengths) > NEMO_TURN_MAX or sum(lengths) > CHAT_MAX:
             continue
         if langid.classify(" ".join(t["text"] for t in turns))[0] != "en":
             continue

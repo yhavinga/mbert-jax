@@ -21,7 +21,8 @@ HAMMOND=$HOME/Developer/yhavinga/hammond
 POLL=${POLL:-60}
 log() { echo "$(date -u +%FT%TZ) $*"; }
 ssh_vm() {
-  timeout 900 gcloud compute tpus tpu-vm ssh "$NAME" --zone "$ZONE" --project t5-dutch-english --quiet \
+  # 180 s, not 900: a VM that is preempted between the state check and the ssh would hold the keeper for 15 minutes
+  timeout 180 gcloud compute tpus tpu-vm ssh "$NAME" --zone "$ZONE" --project t5-dutch-english --quiet \
     --ssh-flag="-o ConnectTimeout=30 -o ServerAliveInterval=30 -o ServerAliveCountMax=4" --command "$1"
 }
 state() {

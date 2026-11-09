@@ -51,6 +51,7 @@ import random
 import re
 import sys
 import time
+import unicodedata
 from pathlib import Path
 
 HANDELINGEN = ("yhavinga/dutch-handelingen-modern", "abdba14ac9271b6d43ccefe6143202b7bdd4e900")
@@ -104,7 +105,7 @@ SENTENCE_END = re.compile(r"(?<=[.!?…])(['\"”’)]*)\s+(?=[\"'“‘(]?[A-Z0
 PROSE_END = re.compile(r"[.!?…]['\"”’)]*$")
 BULLET = re.compile(r"^(?:[-•*–·▪>#]|\(?(?:\d{1,3}|[a-zA-Z]|[ivxIVX]{1,4})[.)]\s)")
 URL = re.compile(r"https?://|www\.|\S+@\S+\.\w+")
-HYPHENATED = re.compile(r"(?<![\w-])[a-zà-ÿ]+(?:-[a-zà-ÿ]+)+(?![\w-])")
+HYPHENATED = re.compile(r"(?<![\w-])[A-Za-zÀ-ÿ][a-zà-ÿ]*(?:-[a-zà-ÿ]+)+(?![\w-])")
 
 # Speaker labels of council minutes: a title or a name with a party, then a colon
 _PARTICLE = r"(?:[Vv]an|[Dd]e|[Dd]er|[Dd]en|[Tt]er|[Tt]en|[Hh]et|'t|[Oo]p|[Ii]n|[Ll]a|[Ll]e|[Dd]u|[Dd]a|[Vv]on|[Zz]u)"
@@ -191,14 +192,166 @@ def paragraphs_of(source, text, wordset):
 # Prefixes that stand before a hyphen in correct spelling (co-produceren, semi-publieke)
 HYPHEN_PREFIXES = frozenset("""co ex anti pre post pro semi vice super mini multi non inter para pseudo quasi neo
     oud niet""".split())
+# Syllables that begin a word and never stand before a hyphen in modern spelling ("be-sloten", "ge-legd")
+BROKEN_SYLLABLES = frozenset("be ge ver ont her".split())
 
 
 def hyphen_artifacts(text, wordset):
-    """Words that a line break hyphenated and the extraction kept ("voor-ge-legd", "be-ant-woord"): lowercase words
+    """Words that a line break hyphenated and the extraction kept ("voor-ge-legd", "be-sloten", "Aanwij-zing"): words
     with hyphens that the word list lacks, has without the hyphens, and with a piece that is no word (so not
-    sociaal-democratische or fractie-assistent)"""
-    return [w for w in HYPHENATED.findall(text) if w not in wordset and w.replace("-", "") in wordset
-            and any(part not in wordset and part not in HYPHEN_PREFIXES for part in w.split("-"))]
+    sociaal-democratische or fractie-assistent) or one of BROKEN_SYLLABLES"""
+    found = []
+    for w in HYPHENATED.findall(text):
+        lw = w.lower()
+        if lw in wordset or lw.replace("-", "") not in wordset:
+            continue
+        if any((part not in wordset or part in BROKEN_SYLLABLES) and part not in HYPHEN_PREFIXES
+               for part in lw.split("-")):
+            found.append(w)
+    return found
+
+
+# ---------------------------------------------------------------- extraction errors (stage 0 v2)
+# Yeb, 9 Nov: only well-formed source texts go into the translation. Gemma 4 31B rejected 288 of the pilot's 2,000
+# passages on their source alone (raad 33%, rechtspraak 24%, dpc 8%, Handelingen 2.5%); these rules catch what a
+# pattern can see of it. Each rule is a name in a passage's fails.
+
+# Mis-decoded text: UTF-8 read as cp1252 ("Ã©", "â€™") and the replacement character's own mis-decoding
+MOJIBAKE = re.compile(r"Ã[\u0080-¿]|â€|Â[ -¿]|ï¿½")
+_LETTER = r"[^\W\d_]"
+# A sentence that starts in the middle: a paragraph (or the passage) that opens with a lowercase letter; "'s" and "'t"
+# ("'s-Hertogenbosch", "'t Hart") are no exception to sentence case but are lowercase by spelling
+OPENING = "\"'“‘„«(["
+LOWER_START = re.compile(r"^(?!'[st][\s-])[\"'“‘„«(]*[a-zà-ÿ]")
+# (A rechtspraak passage may open with an anonymized party, "[appellant] betoogt", which counts as a capital.)
+# A paragraph that opens with a page, section or list number glued to the text: "27 Ik ben", "4.1.1 Op dit moment",
+# "2/7 De ontwikkeling", "3.Als de brug", "2015 - Ik denk", "24) De stelling"; "3 helikopters aan boord" is a sentence
+NUMBER_START = re.compile(r"^\(?\d+(?:[./]\d+)*(?:[.)]?\s+(?:[-–]\s+)?[A-ZÀ-Ý]|[.)]?[A-Za-zÀ-ÿ])")
+# The code-formatted bullets of a PDF's conversion ("`o` De waarde", "`-` Het vastgoed")
+CODE_BULLET = re.compile(r"(?m)^`[^`\n]{1,3}`")
+# Speech broken off: a passage that ends in an ellipsis ("Ik vind dat u...", "geef ik …"), not on a sentence end
+CUT_OFF = re.compile(r"(?:\.\.\.|…)[\"'”’)]*\s*$")
+# A sentence end and then a lowercase word: two lines of different sentences, or columns, run into one
+_ABBREVIATION_END = ABBREVIATIONS | frozenset("""incl excl evt bijv resp febr sept okt nov dec afb ca enz etc ivm mbt
+    tav zgn ong max min gem vlg vnl blz pag par art nr mln mld mrd red rv sr wv bw ct kg km mtr ha""".split())
+# (only after a full stop: a question inside a sentence goes on in lowercase, '"bent u erbij betrokken?" was het
+# antwoord'; nor after a Roman numeral of a list, "II. de Staat")
+LOWER_AFTER_END = re.compile(r"(?<![\w.])(?![IVXLC]+\.)([^\W\d_]{2,})\.[\"'”’)]*[ \t]+(?=[a-zà-ÿ]{2,})")
+# Words glued together by the extraction: a lowercase letter and a capitalized word in one token ("wasCrone",
+# "GentMevrouw"), unless the word list has the token (GroenLinks, ChristenUnie); and sentence punctuation without a
+# space before a capital ("Voorzitter!Duivesteijn", "dag.De")
+# Names of firms and parties start with a capital (GasTerra, PlusTeam, GemeenteBelangen); a glued token starts with
+# a lowercase word ("wasCrone") or ends in a speaker's title ("GentMevrouw")
+CAMEL = re.compile(r"(?<![\w'’-])(?:[a-zà-ÿ]{3,}[A-ZÀ-Ý][a-zà-ÿ]{2,}|[^\W\d_]*[a-zà-ÿ]{2}(?:Mevrouw|Voorzitter|"
+                   r"Minister|Staatssecretaris|Wethouder|Burgemeester|De heer))[^\W\d_]*(?![\w'’-])")
+GLUED_PUNCT = re.compile(r"[a-zà-ÿ]{2,}(?:[!?;]|[.,:](?=[A-ZÀ-Ý][a-zà-ÿ]))[A-ZÀ-Ý]")
+# A capitalized function word after a word or number without punctuation between: a heading, label or page number
+# glued to the text ("Burgernet Op 1 juli", "VVD 88 De onderbesteding", "Wethouder Wilcken Het GBH", "jongvee 5.4 De
+# minister") or columns run into each other ("voor extra Er zijn"). Not before a capitalized word or a name particle
+# ("de heer De Vries", "Het Parool", "mevrouw Van der Graaf").
+_FUNCTION_CAPS = """De Het Een Er Ik Je Jij U Wij We Zij Ze Hij Dit Deze Dat Die Daar Hier Daarom Daarnaast Daarbij
+    Daardoor Dus Toch Ook Zo Nu Als Om Op In Voor Met Bij Uit Door Naar Na Aan Over Onder Tot Tijdens Sinds Volgens
+    Wat Wie Waar Wanneer Hoe Welke Waarom Maar En Of Want Omdat Indien Tevens Verder Bovendien Echter Hierbij
+    Hierdoor Alle Elke Iedere Geen Niet Ondanks Doordat Zodat Terwijl Nadat Voordat Kortom Bijvoorbeeld Vanaf Vanuit
+    Binnen Per Zonder""".split()
+# At the start of a line, the words before the capital are a heading glued to its paragraph ("Conclusie In en in de
+# directe omgeving", "_Overgangsrecht_ Per 1 januari"); farther in, a label, page number or another column.
+HEADING_MAX_WORDS = 10
+MID_CAPITAL = re.compile(rf"(?<=[\w)%])[ \t]+(?:{'|'.join(_FUNCTION_CAPS)})[ \t]+"
+                         rf"(?!(?:de|den|der|het|'t|ten|ter|van|la|le)\b)(?=[a-zà-ÿ0-9])")
+# Running heads and page numbers inside the text: "Pagina **26** van **45**", "Raadsvergadering 15 mei 2025 2 Je",
+# "- 13 De heer", a bare number between two sentences ("besproken. 12 Het college")
+_MONTH = r"(?:januari|februari|maart|april|mei|juni|juli|augustus|september|oktober|november|december)"
+PAGE_MARK = re.compile(rf"\b[Pp]agina\s+\**\d+\**\s+(?:van|/)\s+\**\d+|\b\d{{1,2}}\s+{_MONTH}\s+(?:19|20)\d\d\s+"
+                       rf"\d{{1,3}}\s+(?=[A-Za-zÀ-ÿ])(?!uur\b|euro\b|procent\b|jaar\b|keer\b|maal\b)|"
+                       rf"(?:^|(?<=\s))[-–]\s?\d{{1,3}}\s?[-–]?\s+(?=[A-ZÀ-Ý])", re.M)
+# (after an abbreviation the number belongs to it: "art. 19 Woningwet", "nr. 28 De motie")
+LOOSE_NUMBER = re.compile(r"(?<![\w.])([^\W\d_]*)[.!?][\"'”’)]*\s+\d{1,3}\s+(?=[A-ZÀ-Ý])")
+# A run of words of a line or column repeated at once ("eisen gesteld eisen gesteld", "aan boord aan boord")
+REPEATED = re.compile(r"(?<!\w)((?:\w+\s+){1,5}\w+)\s+\1(?!\w)")
+# Words broken by a space ("wan neer", "zienswij zen", "fi ets") and letters spaced apart ("t oe a mbi t i", "H u is t
+# e H o ornkade"); short words that stand alone in Dutch
+SHORT_WORDS = frozenset("""u ik en de in op te of is al ze we je na nu zo er om ja ex co 't 'n s z'n m'n d'r""".split())
+TOKEN = re.compile(r"\S+")
+
+
+def split_words(text, wordset):
+    """Pairs of neighbouring lowercase words that the word list has as one word while it lacks one of the two"""
+    toks = [t for t in re.findall(r"[^\W\d_]+|[^\w\s]+|\d+|\s+", text)]
+    found = []
+    for k in range(len(toks) - 2):
+        a, space, b = toks[k], toks[k + 1], toks[k + 2]
+        if space != " " or not (a.isalpha() and b.isalpha() and a.islower() and b.islower()):
+            continue
+        if (a + b) in wordset and (a not in wordset or b not in wordset):
+            found.append(f"{a} {b}")
+    return found
+
+
+def spaced_letters(text):
+    """Runs of three or more tokens of one or two letters that are no Dutch word on their own, two of them lowercase
+    (capitals alone are a list: "(A, B, C en D)")"""
+    run = lower = 0
+    for t in TOKEN.findall(text):
+        w = t.strip(".,;:!?()\"'“”‘’")
+        if w.isalpha() and len(w) <= 2 and w.lower() not in SHORT_WORDS:
+            run += 1
+            lower += w.islower()
+            if run >= 3 and lower >= 2:
+                return True
+        else:
+            run = lower = 0
+    return False
+
+
+def extraction_errors(text, wordset):
+    """The names of the extraction rules a passage fails (text "\\n".join(paragraphs)), in a fixed order"""
+    paragraphs = text.split("\n")
+    fails = []
+    if "�" in text or MOJIBAKE.search(text) or any(
+            (unicodedata.category(c) in ("Cc", "Co", "Cs", "Cn") and c not in "\n\t") for c in text):
+        fails.append("encoding")
+    if "­" in text:
+        fails.append("soft_hyphen")
+    if any(LOWER_START.match(p) or NUMBER_START.match(p.lstrip(OPENING + "_*")) for p in paragraphs) \
+            or CODE_BULLET.search(text):
+        fails.append("sentence_start")
+    if CUT_OFF.search(text):
+        fails.append("cut_off")
+    if any(m.group(1).lower() not in _ABBREVIATION_END for m in LOWER_AFTER_END.finditer(text)):
+        fails.append("lower_after_end")
+    if any(m.group(0).lower() not in wordset for m in CAMEL.finditer(text)) or GLUED_PUNCT.search(text):
+        fails.append("glued")
+    glued_heading = mid = False
+    for m in MID_CAPITAL.finditer(text):
+        line_start = text.rfind("\n", 0, m.start()) + 1
+        before = text[line_start:m.start()]
+        if len(before.split()) <= HEADING_MAX_WORDS and not re.search(r"[.!?:;]", before):
+            glued_heading = True
+        else:
+            mid = True
+    if glued_heading:
+        fails.append("heading_glued")
+    if mid:
+        fails.append("mid_capital")
+    if PAGE_MARK.search(text) or any(m.group(1).lower() not in _ABBREVIATION_END | {"lid", "sub"}
+                                     for m in LOOSE_NUMBER.finditer(text)):
+        fails.append("page_mark")
+    if any(re.search(r"[^\W\d_]{4,}", m.group(1)) for m in REPEATED.finditer(text)):
+        fails.append("repeated")
+    if split_words(text, wordset) or spaced_letters(text):
+        fails.append("split_word")
+    return fails
+
+
+# The paragraph before a passage ended without a sentence end: the passage opens in the middle of its sentence. Short
+# lines without one are headings ("Inleiding"), so only a line of this many words counts.
+OPEN_MIN_WORDS = 8
+SENTENCE_CLOSE = re.compile(r"[.!?…:;][\"'”’)\]]*$")
+
+
+def open_before(paragraph):
+    return len(paragraph.split()) >= OPEN_MIN_WORDS and not SENTENCE_CLOSE.search(paragraph.rstrip())
 
 
 def name_conflict(text):
@@ -364,33 +517,36 @@ class Builder:
         return [len(e.ids) for e in self.tokenizer.encode_batch(texts, add_special_tokens=False)] if texts else []
 
     def pieces(self, paragraphs, labels, rng):
-        """[(text, tokens, alone)] or None for a barrier: prose paragraphs, long ones cut into sentence runs"""
+        """[(text, tokens, alone, paragraph index, starts it, ends it)] or None for a barrier: prose paragraphs, long ones
+        cut into sentence runs; a run starts (ends) its paragraph when it holds the paragraph's first (last) sentence"""
         counts = self.count(paragraphs)
         out = []
-        for para, n, label in zip(paragraphs, counts, labels):
+        for p, (para, n, label) in enumerate(zip(paragraphs, counts, labels)):
             if label:
                 out.append(None)  # a new speaker: a passage never runs over it
             if not is_prose(para):
                 out.append(None)
                 continue
             if n <= MAX_TOKENS:
-                out.append((para, n, False))
+                out.append((para, n, False, p, True, True))
                 continue
             sentences = split_sentences(para)
             sizes = self.count(sentences)
-            run, total, target = [], 0, rng.randint(2 * MIN_TOKENS, MAX_TOKENS)
-            for s, k in zip(sentences, sizes):
+            run, total, target, first = [], 0, rng.randint(2 * MIN_TOKENS, MAX_TOKENS), 0
+            for q, (s, k) in enumerate(zip(sentences, sizes)):
                 if run and total + k > target:
                     if total >= MIN_TOKENS:
-                        out.append((" ".join(run), total, True))
+                        out.append((" ".join(run), total, True, p, first == 0, False))
                     run, total, target = [], 0, rng.randint(2 * MIN_TOKENS, MAX_TOKENS)
                 if k > MAX_TOKENS:
                     out.append(None)
                     continue
+                if not run:
+                    first = q
                 run.append(s)
                 total += k
             if run and total >= MIN_TOKENS:
-                out.append((" ".join(run), total, True))
+                out.append((" ".join(run), total, True, p, first == 0, True))
             out.append(None)
         return out
 
@@ -416,9 +572,23 @@ class Builder:
                 i += 1
                 continue
             if total >= MIN_TOKENS:
-                out.append(([p[0] for p in pieces[i:j]], any(p[2] for p in pieces[i:j])))
+                out.append(([p[0] for p in pieces[i:j]], any(p[2] for p in pieces[i:j]), pieces[i], pieces[j - 1]))
             i = j
         return out
+
+    @staticmethod
+    def context_fails(paragraphs, labels, first, last):
+        """The rules on the paragraphs around a passage in its block: the one before ends without a sentence end
+        (open_before: the passage starts inside its sentence), or the one after starts in lowercase (continues_after:
+        the passage's last sentence goes on there). A speaker label is a clean border."""
+        fails = []
+        k = first[3]
+        if first[4] and k > 0 and not labels[k] and open_before(paragraphs[k - 1]):
+            fails.append("open_before")
+        k = last[3]
+        if last[5] and k + 1 < len(paragraphs) and not labels[k + 1] and LOWER_START.match(paragraphs[k + 1]):
+            fails.append("continues_after")
+        return fails
 
     def checks(self, source, text):
         """Every filter's verdict and the measures behind them"""
@@ -447,6 +617,7 @@ class Builder:
             fails.append("motion")
         if hyphen_artifacts(text, self.wordset):
             fails.append("hyphenation")
+        fails += extraction_errors(text, self.wordset)
         if source != "handelingen" and name_conflict(text):
             fails.append("name_conflict")
         if source == "raad" and INLINE_LABEL.search(text):
@@ -472,9 +643,10 @@ class Builder:
             counters["paragraphs"] += len(paragraphs)
             pieces = self.pieces(paragraphs, labels, rng)
             counters["prose_pieces"] += sum(p is not None for p in pieces)
-            for k, (paras, cut) in enumerate(self.windows(pieces, rng)):
+            for k, (paras, cut, first, last) in enumerate(self.windows(pieces, rng)):
                 text = "\n".join(paras)
                 fails, measures = self.checks(source, text)
+                fails += self.context_fails(paragraphs, labels, first, last)
                 hits = self.matcher.find(text)
                 n_words = len(words_of(text))
                 passages.append({
@@ -580,7 +752,8 @@ class Chooser:
     """Draws passages one source at a time, keeping the exact and 13-gram duplicates and the per-document cap out"""
 
     def __init__(self, max_per_doc, blocked_ngrams=()):
-        self.max_per_doc = max_per_doc
+        # an int for every source, or {source: int}
+        self.max_per_doc = max_per_doc if isinstance(max_per_doc, dict) else collections.defaultdict(lambda: max_per_doc)
         self.seen_texts, self.seen_ngrams = set(), set(blocked_ngrams)
         self.per_doc = collections.Counter()
         self.skipped = collections.Counter()
@@ -592,7 +765,7 @@ class Chooser:
         for p in keyed:
             if len(chosen) == n:
                 break
-            if self.per_doc[(p["source"], p["doc_id"])] >= self.max_per_doc:
+            if self.per_doc[(p["source"], p["doc_id"])] >= self.max_per_doc[p["source"]]:
                 self.skipped["per_doc_cap"] += 1
                 continue
             norm = normalized(p["text"])
@@ -635,6 +808,8 @@ def choose(pool, n, chooser, rng, source):
     random_half = chooser.take([p for p in pool if p["pid"] not in chosen_ids], n - len(idiom_half), rng, weight)
     for p in random_half:
         p["half"] = "random"
+    for p in idiom_half + random_half:
+        p["idiom_class"] = threshold is not None and p["idiom_score"] >= threshold
     return idiom_half + random_half, {"idiom_class_threshold": threshold, "idiom_class_size": len(top),
                                        "pool": len(pool), "pool_with_idiom": len(ranked)}
 
@@ -682,27 +857,16 @@ def parse_per_source(text, default):
     return out
 
 
-def select(args):
+def build_passages(args, report):
+    """{source: [passage with its fails]} of the documents of args.row_groups, and the counters per source"""
     import concurrent.futures
     import multiprocessing
 
-    import pyarrow as pa
-    import pyarrow.parquet as pq
     from huggingface_hub import HfFileSystem
 
-    out = Path(args.out)
-    out.mkdir(parents=True, exist_ok=True)
-    if any(out.glob("*.parquet")):
-        raise SystemExit(f"{out} has parquet files already: a new selection goes to a new directory")
     fs = HfFileSystem()
     n_groups = parse_per_source(args.row_groups, 0)
     max_docs = parse_per_source(args.max_docs, 0)
-    report = {"args": vars(args), "sources": {}, "thresholds": {
-        "min_tokens": MIN_TOKENS, "max_tokens": MAX_TOKENS, "max_paragraphs": MAX_PARAGRAPHS, "max_oov": MAX_OOV,
-        "max_digits": MAX_DIGITS, "max_punct": MAX_PUNCT, "max_capitalized": MAX_CAPITALIZED,
-        "idiom_class_factor": IDIOM_CLASS_FACTOR,
-        "raad_preferred_weight": RAAD_PREFERRED_WEIGHT, "ngram": NGRAM},
-        "resources": {"wordlist": sha256(args.wordlist), "idioms": sha256(args.idioms)}}
     started = time.time()
     tasks, groups_read = [], {}
     for source in SOURCES:
@@ -728,6 +892,42 @@ def select(args):
             counters[source].update(c)
     print(f"passages built ({time.time() - started:.0f} s): "
           f"{ {s: len(v) for s, v in passages.items()} }", flush=True)
+    return passages, counters, started
+
+
+def annotate(args):
+    """The passages of an earlier selection (--pids, a pid a line) rebuilt from the same row groups with this
+    version's filters: annotated.parquet with pid, source, text and fails."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    wanted = {line.strip() for line in open(args.pids, encoding="utf-8") if line.strip()}
+    report = {"args": vars(args), "sources": {}}
+    passages, _, _ = build_passages(args, report)
+    rows = [{"pid": p["pid"], "source": p["source"], "text": p["text"], "fails": p["fails"]}
+            for v in passages.values() for p in v if p["pid"] in wanted]
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    pq.write_table(pa.table({c: [r[c] for r in rows] for c in ("pid", "source", "text", "fails")}),
+                   out / "annotated.parquet")
+    print(f"ANNOTATE {len(rows)} of {len(wanted)} passages found -> {out / 'annotated.parquet'}")
+
+
+def select(args):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    if any(out.glob("*.parquet")):
+        raise SystemExit(f"{out} has parquet files already: a new selection goes to a new directory")
+    report = {"args": vars(args), "sources": {}, "thresholds": {
+        "min_tokens": MIN_TOKENS, "max_tokens": MAX_TOKENS, "max_paragraphs": MAX_PARAGRAPHS, "max_oov": MAX_OOV,
+        "max_digits": MAX_DIGITS, "max_punct": MAX_PUNCT, "max_capitalized": MAX_CAPITALIZED,
+        "idiom_class_factor": IDIOM_CLASS_FACTOR, "open_min_words": OPEN_MIN_WORDS,
+        "heading_max_words": HEADING_MAX_WORDS, "raad_preferred_weight": RAAD_PREFERRED_WEIGHT, "ngram": NGRAM},
+        "resources": {"wordlist": sha256(args.wordlist), "idioms": sha256(args.idioms)}}
+    passages, counters, started = build_passages(args, report)
     frequent, df = drop_frequent_idioms([p for v in passages.values() for p in v], args.max_idiom_share)
     kept = [(i, n) for i, n in df.most_common() if i not in dict(frequent)]
     report["idioms"] = {"max_share": args.max_idiom_share, "left_out": len(frequent), "kept_found": len(kept),
@@ -736,12 +936,18 @@ def select(args):
 
     rng = random.Random(args.seed)
     want, want_eval = quotas(args.n), quotas(args.n_eval) if args.n_eval else dict.fromkeys(SOURCES, 0)
+    # A pool larger than the shares, per source (the main set: a margin for the source check of Gemma 4 31B)
+    if args.counts:
+        want = parse_per_source(args.counts, 0)
+    if args.eval_counts:
+        want_eval = parse_per_source(args.eval_counts, 0)
     blocked = set()
     for path in args.block_texts or []:
         with open(path, encoding="utf-8") as f:
             for line in f:
                 blocked |= ngrams(line)
-    chooser = Chooser(args.max_per_doc, blocked)
+    chooser = Chooser(parse_per_source(args.max_per_doc, 3), blocked)
+    report["blocked_ngrams"] = len(blocked)
     chosen, chosen_eval, rejected = [], [], []
     for source in SOURCES:
         allp = passages[source]
@@ -790,7 +996,8 @@ def select(args):
     if any((p["source"], p["doc_id"]) in eval_docs for p in chosen):
         raise SystemExit("a document has both training and eval passages")
 
-    columns = ["id", "pid", "source", "doc_id", "split", "half", "text", "tokens", "paragraphs", "piece", "words",
+    columns = ["id", "pid", "source", "doc_id", "split", "half", "idiom_class", "text", "tokens", "paragraphs",
+               "piece", "words",
                "idiom_score", "idioms", "oov", "digits", "punct", "capitalized", "lang", "speaker", "party", "date",
                "content_type"]
 
@@ -817,26 +1024,36 @@ def main(argv=None):
     p = sub.add_parser("idioms", help="The idiom list from kaikki.org's Dutch extract")
     p.add_argument("--kaikki", required=True)
     p.add_argument("--out", required=True)
-    p = sub.add_parser("select", help="Choose the passages")
-    p.add_argument("--out", required=True)
+    for name in ("select", "annotate"):
+        p = sub.add_parser(name, help="Choose the passages" if name == "select" else
+                           "Every filter's verdict on the passages of an earlier selection (--pids)")
+        p.add_argument("--out", required=True)
+        p.add_argument("--idioms", required=True)
+        p.add_argument("--wordlist", required=True)
+        p.add_argument("--tokenizer", required=True, help="TranslateGemma's tokenizer directory (tokenizer.json)")
+        p.add_argument("--row-groups", default="handelingen=8,raad=12,dpc=8,rechtspraak=6",
+                       help="Row groups to read per source, spread over its files")
+        p.add_argument("--max-docs", default="",
+                       help="At most this many documents per source (random), e.g. raad=4000")
+        p.add_argument("--processes", type=int, default=32)
+        p.add_argument("--docs-per-task", type=int, default=50)
+        p.add_argument("--seed", type=int, default=0)
+    p = sub.choices["annotate"]
+    p.add_argument("--pids", required=True, help="A file with a pid a line")
+    p = sub.choices["select"]
     p.add_argument("--n", type=int, required=True, help="Training-side passages (2,000 for the pilot)")
     p.add_argument("--n-eval", type=int, default=0, help="Eval passages, from other documents (4,000 later)")
+    p.add_argument("--counts", default="", help="Training-side passages per source instead of --n by the shares, "
+                   "e.g. handelingen=133334,raad=117000,dpc=28261,rechtspraak=33987")
+    p.add_argument("--eval-counts", default="", help="Eval passages per source instead of --n-eval by the shares")
     p.add_argument("--eval-permille", type=int, default=20, help="Documents on the eval side, per mille")
-    p.add_argument("--idioms", required=True)
-    p.add_argument("--wordlist", required=True)
-    p.add_argument("--tokenizer", required=True, help="TranslateGemma's tokenizer directory (tokenizer.json)")
-    p.add_argument("--row-groups", default="handelingen=8,raad=12,dpc=8,rechtspraak=6",
-                   help="Row groups to read per source, spread over its files")
-    p.add_argument("--max-docs", default="", help="At most this many documents per source (random), e.g. raad=4000")
-    p.add_argument("--max-per-doc", type=int, default=3)
+    p.add_argument("--max-per-doc", default="", help="Passages per document, 3 unless given per source, e.g. "
+                   "handelingen=6")
     p.add_argument("--max-idiom-share", type=float, default=MAX_IDIOM_SHARE,
                    help="Idioms in more of the passing passages than this share do not count")
     p.add_argument("--block-texts", nargs="*", help="Text files (a text a line) whose 13-grams no passage may share")
     p.add_argument("--workers", type=int, default=4, help="Segment files for translate.py")
-    p.add_argument("--processes", type=int, default=32)
-    p.add_argument("--docs-per-task", type=int, default=50)
     p.add_argument("--rejected-per-filter", type=int, default=30)
-    p.add_argument("--seed", type=int, default=0)
     args = parser.parse_args(argv)
     if args.command == "idioms":
         with open(args.kaikki, encoding="utf-8") as f:
@@ -844,7 +1061,7 @@ def main(argv=None):
         Path(args.out).write_text(json.dumps(idioms, ensure_ascii=False))
         print(f"{len(idioms)} idioms, {collections.Counter(i['pos'] for i in idioms)}")
         return
-    select(args)
+    {"select": select, "annotate": annotate}[args.command](args)
 
 
 if __name__ == "__main__":

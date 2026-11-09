@@ -277,3 +277,116 @@ def test_hyphens_a_line_break_left_inside_words():
             "partijen co-produceren.")
     assert sp.hyphen_artifacts(text, words) == ["voor-ge-legd", "be-ant-woord"]
     assert "hyphenation" in builder([], words).checks("rechtspraak", text)[0]
+
+
+# ---------------------------------------------------------------- stage 0 v2: extraction errors
+
+WORDS = {"wanneer", "neer", "zienswijzen", "zen", "fiets", "transformatie", "formatie", "besloten", "sloten",
+         "aanwijzing", "zing", "groenlinks", "gemeente", "de", "het", "is", "een", "goed", "voorbeeld", "trans",
+         "e-mail", "sociaal", "democratische", "sociaaldemocratische"}
+
+
+@pytest.mark.parametrize("text, rule", [
+    ("Obliga�es worden geactiveerd tegen nominale waarde.", "encoding"),
+    ("De kosten zijn â€™ hoger dan verwacht.", "encoding"),
+    ("Een opsomming  met een symbool uit een PDF.", "encoding"),
+    ("Een regel met een\x0cpaginawissel erin.", "encoding"),
+    ("Als je burger­ participatie goed organiseert, hoeft dat niet.", "soft_hyphen"),
+    ("dit met het bestuur van de regeling besproken.", "sentence_start"),
+    ("Een zin.\nmaar de tweede regel loopt door.", "sentence_start"),
+    ("27 Ik ben met en namens onze fractie kritisch geweest.", "sentence_start"),
+    ("4.1.1 Op dit moment zijn we gestart met de uitwerking.", "sentence_start"),
+    ("2/7 De ontwikkeling van de techniek heeft een vlucht genomen.", "sentence_start"),
+    ("3.Als de brug klaar is, neemt het verkeer toe.", "sentence_start"),
+    ("2015 - Ik denk dat de crisis een oorzaak is.", "sentence_start"),
+    ("`o` De waarde van ons landschap is leidend.", "sentence_start"),
+    ("Ik vind dat u...", "cut_off"),
+    ("Het definitieve oordeel geef ik …", "cut_off"),
+    ("Dat is het salaris voor een deel. of de periode na het werk telt ook.", "lower_after_end"),
+    ("Ik wasCrone geen woordvoerder, maar ik was er wel bij.", "glued"),
+    ("Voorzitter! Waar wil zij eindigen? Van GentMevrouw Van Gent vraagt een toets.", "glued"),
+    ("Voorzitter!Duivesteijn De laatste motie begrijp ik als volgt.", "glued"),
+    ("Burgernet Op 1 juli 2010 is Burgernet in Rijswijk gestart.", "heading_glued"),
+    ("_Overgangsrecht_ Per 1 januari 2015 vervangt de toeslag de oude.", "heading_glued"),
+    ("Wij behandelen aanvragen. Het gaat om aanvragen voor extra Er zijn in 2020 meer bakken geplaatst.",
+     "mid_capital"),
+    ("Pagina **26** van **45** *Wijkbus* Vanaf 1 januari is de bus gestart.", "page_mark"),
+    ("Raadsvergadering 15 mei 2025 2 Je hebt als raadslid alles gegeven.", "page_mark"),
+    ("Hij denkt dat een gesprek helpt. - 7 Dan over wat de informateur voorstelt.", "page_mark"),
+    ("Het college is akkoord. 12 Het voorstel gaat naar de raad.", "page_mark"),
+    ("Alle zeevarenden moeten aan boord aan boord zijn.", "repeated"),
+    ("Hij kan pas instemmen wan neer de zienswij zen gehonoreerd worden.", "split_word"),
+    ("Zij komen per fi ets naar het stadhuis.", "split_word"),
+    ("Wethouder Korstman zegt t oe a mbi t i en i v ea u nader te onderbouwen.", "split_word"),
+])
+def test_extraction_rules_fire(text, rule):
+    assert rule in sp.extraction_errors(text, WORDS), sp.extraction_errors(text, WORDS)
+
+
+@pytest.mark.parametrize("text", [
+    "Dit is een gewone zin. Hij eindigt netjes. En de volgende ook!",
+    "[appellant] betoogt ten slotte dat de voorzieningenrechter het verkeerd zag.",
+    "'s-Hertogenbosch is een mooie stad en 't Hart woont er.",
+    "3 helikopters aan boord van het schip zijn gisteren doorzocht.",
+    "De heer De Vries en mevrouw Van der Graaf lazen Het Parool.",
+    "Zie art. 19 Woningwet en de motie op stuk nr. 28 van de heer Jansen.",
+    "Het kost 18,5 mld. aan bezuinigingen. Dat is veel.",
+    'Hij vroeg "bent u erbij betrokken?" was het antwoord niet duidelijk.',
+    "Het voorbeeld van GasTerra en de fractie van GroenLinks.",
+    "Er zijn vier clusters (A, B, C en D) in de wijk.",
+    "Het gaat om mbo- en hbo-opleidingen in de gemeente.",
+    "Ik denk dat dat klopt, en die die het weten zeggen het ook.",
+    "Ik vind dat u... nee, laat ik het anders zeggen. Dat is beter.",
+])
+def test_extraction_rules_leave_good_text(text):
+    assert sp.extraction_errors(text, WORDS) == []
+
+
+def test_hyphenation_now_also_catches_capitals_and_broken_syllables():
+    words = {"besloten", "sloten", "be", "aanwijzing", "zing", "sociaaldemocratische", "sociaal", "democratische",
+             "e-mail", "coproductie", "productie"}
+    text = "Het was be-sloten na de Aanwij-zing; sociaal-democratische partijen, per e-mail, co-productie."
+    assert sp.hyphen_artifacts(text, words) == ["be-sloten", "Aanwij-zing"]
+
+
+PROSE = "Dit is een gewone zin van ruim acht woorden die netjes eindigt."
+
+
+def test_context_rules_look_at_the_paragraphs_around_a_passage():
+    open_line = "Het college heeft het voorstel besproken met de bewoners van de wijk en"
+    paragraphs = [open_line, PROSE, PROSE, "nu verder in kleine letters.", "Kop zonder punt", PROSE]
+    labels = [False] * len(paragraphs)
+
+    def piece(k, starts=True, ends=True):
+        return (paragraphs[k], 30, not (starts and ends), k, starts, ends)
+
+    assert sp.Builder.context_fails(paragraphs, labels, piece(1), piece(2)) == ["open_before", "continues_after"]
+    assert sp.Builder.context_fails(paragraphs, labels, piece(5), piece(5)) == []  # after a heading, at the end
+    # a sentence run from inside a paragraph has a sentence of its own paragraph before and after it
+    assert sp.Builder.context_fails(paragraphs, labels, piece(1, starts=False), piece(2, ends=False)) == []
+    # a speaker label on the paragraph is a clean border
+    assert sp.Builder.context_fails(paragraphs, [False, True, False, True, False, False], piece(1), piece(2)) == []
+
+
+def test_a_council_document_records_the_context_rules(idioms):
+    words = set(sp.words_of(PROSE.lower()))
+    long = " ".join([PROSE] * 5)  # 60 words, a token a word here
+    text = "Het college heeft het voorstel besproken met de bewoners van de wijk en\n\n" + long
+    passages, _ = builder(idioms, words).document("raad", {"doc_id": "r1", "text": text, "content_type": []})
+    assert passages and all("open_before" in p["fails"] for p in passages)
+
+
+def test_the_open_line_needs_eight_words():
+    assert sp.open_before("Het college heeft het voorstel besproken met de bewoners en")
+    assert not sp.open_before("Kop zonder punt")
+    assert not sp.open_before("Het college heeft het voorstel besproken met de bewoners.")
+
+
+def test_max_per_doc_per_source_and_the_idiom_class():
+    chooser = sp.Chooser({"raad": 1, "dpc": 2, "handelingen": 3, "rechtspraak": 3})
+    pool = [passage(f"p{k}", f"tekst {k} met andere woorden", "d1", source="dpc", score=k / 10) for k in range(5)]
+    assert len(chooser.take(pool, 5, random.Random(0))) == 2
+    pool = [passage(f"q{k}", f"tekst nummer {k} met eigen woorden", f"d{k}", score=(k % 5) / 10) for k in range(100)]
+    chosen, info = sp.choose(pool, 20, sp.Chooser(3), random.Random(0), "dpc")
+    assert all(p["idiom_class"] for p in chosen if p["half"] == "idiom")
+    assert all(p["idiom_class"] == (p["idiom_score"] >= info["idiom_class_threshold"]) for p in chosen)

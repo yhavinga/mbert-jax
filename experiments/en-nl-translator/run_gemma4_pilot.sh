@@ -7,6 +7,11 @@
 #   bash run_gemma4_pilot.sh translate   en->nl on chips 0-3 and nl->en on chips 4-7 at the same time
 #   bash run_gemma4_pilot.sh post        merge; the context trial (chips 0-3) and MetricX-24-QE (chips 4-7) at the same
 #                                        time; the report
+#   bash run_gemma4_pilot.sh all         setup_generic.sh, the checkpoint (en-nl-judge's setup.sh convert, if this
+#                                        region has none), checks, translate, post: what a keeper starts on a new VM
+# Everything that is done is in the bucket, and a step skips it there: a preempted spot VM loses at most a shard, the
+# trial or MetricX in progress. The compilation cache (~/jax_cache, MaxText's jax_cache_dir) goes to the bucket after
+# each length class.
 # The v6e-8 is used as two TPUs of 4 chips: Gemma 4 31B allows at most 4-way tensor parallelism (4 KV heads in its
 # global layers), as translate_models.yml says. Results go to $B/gemma4-pilot/; a second start of translate skips the
 # shards that are there. The bucket is that of the VM's region (the checkpoint is there; nothing crosses regions).
@@ -26,6 +31,10 @@ O=$B/gemma4-pilot
 TOK=$SHM/tokenizer-gemma4
 CKPT=$B/judge/gemma-4-31b-it-maxtext/0/items
 CLASSES="tiny small medium long xlong"
+SHARD_SIZE=256
+# The logs of every VM's run go to the bucket under their own name: a preempted run's SHARD lines are the throughput of
+# the shards it stored
+RUN_ID=$(hostname | sed 's/.*-\([^-]*\)-w-0$/\1/')-$(date +%s)
 # MaxText sets XLA_FLAGS to dump HLO to /tmp/xla_dump whenever XLA_FLAGS is empty (run_sft.sh); a flag that changes
 # nothing keeps it from doing so
 export XLA_FLAGS=--xla_dump_hlo_as_text=false TOKENIZERS_PARALLELISM=false HF_HUB_OFFLINE=1
@@ -46,15 +55,36 @@ direction() {  # half source target segments log
     for class in $CLASSES; do
       "$PY" -u "$C/translate.py" --segments "$segments" --out "$O/$source-$target/w0/$class" --tokenizer "$TOK" \
         --model gemma4-31b --length-class "$class" --source-lang "$source" --target-lang "$target" \
-        --ckpt "$CKPT" --work-dir "$SHM/work-$source-$target" || exit $?
+        --ckpt "$CKPT" --work-dir "$SHM/work-$source-$target" --shard-size $SHARD_SIZE || exit $?
+      gsutil -m -q rsync -r ~/jax_cache "$O/jax_cache" || true
+      gsutil -q cp ~/logs/$log.log "$O/logs/$log-$RUN_ID.log" || true
     done
   ) > ~/logs/$log.log 2>&1 && code=0 || code=$?
   echo "EXIT $code" >> ~/logs/$log.log
-  gsutil -q cp ~/logs/$log.log "$O/logs/$log.log"
+  gsutil -q cp ~/logs/$log.log "$O/logs/$log-$RUN_ID.log"
   return $code
 }
 
-case ${1:-} in
+step=${1:-}
+mkdir -p ~/jax_cache
+if [ "$step" != all ] && gsutil -q ls "$O/jax_cache/" > /dev/null 2>&1; then gsutil -m -q rsync -r "$O/jax_cache" ~/jax_cache || true; fi
+case $step in
+all)
+  bash "$C/setup_generic.sh"
+  if ! gsutil -q stat "$B/judge/gemma-4-31b-it-maxtext/done.txt"; then
+    mkdir -p /dev/shm/judge/code && gsutil -q cp "$B/judge/scripts/setup.sh" /dev/shm/judge/code/setup.sh
+    echo "== convert $(date -u +%T)"
+    bash /dev/shm/judge/code/setup.sh convert
+  fi
+  [ -e "$SHM/venv-025" ] || { [ -x /dev/shm/judge/venv/bin/python ] && ln -s /dev/shm/judge/venv "$SHM/venv-025"; } || bash "$C/setup_generic.sh" release
+  if ! gsutil -q stat "$O/logs/checks.log"; then
+    bash "$0" checks > ~/logs/tg_checks.log 2>&1 && gsutil -q cp ~/logs/tg_checks.log "$O/logs/checks.log"
+  fi
+  if ! gsutil -q stat "$O/logs/translate.done"; then
+    bash "$0" translate && echo done | gsutil -q cp - "$O/logs/translate.done"
+  fi
+  bash "$0" post
+  ;;
 checks)
   [ -z "$(sudo lsof -t /dev/accel* /dev/vfio/* 2> /dev/null)" ] || echo "the TPU is in use: the checks run on the CPU anyway"
   echo "== decode, fork $(date -u +%T)"
@@ -96,11 +126,14 @@ post)
   [ -s "$D/context/chains.json" ] || JAX_PLATFORMS=cpu "$PY" -u "$C/gemma4_pilot.py" context-data --pairs "$D/pairs.parquet" \
     --handelingen "$D/handelingen" --nemotron "$D/nemotron/chat-ranges.jsonl" --tokenizer "$TOK" --out "$D/context"
   gsutil -q cp "$D/context/chains.json" "$O/context/chains.json"
+  gsutil -q stat "$O/context.parquet" && gsutil -q cp "$O/context.parquet" "$SHM/out/context.parquet"
+  gsutil -q stat "$O/qe.parquet" && gsutil -q cp "$O/qe.parquet" "$SHM/out/qe.parquet"
   echo "== context trial (chips 0-3) and MetricX (chips 4-7) $(date -u +%T)"
   (
     half 0
     if [ ! -s "$SHM/out/context.parquet" ]; then
       "$PY" -u "$C/gemma4_pilot.py" context-run --data "$D/context" --tokenizer "$TOK" --ckpt "$CKPT" --out "$SHM/out"
+      gsutil -q cp "$SHM/out/context.parquet" "$O/context.parquet"
     fi
   ) > ~/logs/gemma4_context.log 2>&1 & a=$!
   (
@@ -109,17 +142,18 @@ post)
       HF_HUB_OFFLINE=0 JAX_COMPILATION_CACHE_DIR=$SHM/jax_cache_metricx "$PY" -u "$C/metricx_qe.py" score \
         --pairs "$SHM/out/compare.parquet" --pair en:back --pair en:nl_g4 --pair nl:en --pair nl:en_g4 --model xxl \
         --root "$SHM/metricx" --out "$SHM/out/qe.parquet"
+      gsutil -q cp "$SHM/out/qe.parquet" "$O/qe.parquet"
     fi
   ) > ~/logs/gemma4_qe.log 2>&1 & b=$!
   wait $a && ca=0 || ca=$?
   wait $b && cb=0 || cb=$?
   echo "EXIT $ca" >> ~/logs/gemma4_context.log
   echo "EXIT $cb" >> ~/logs/gemma4_qe.log
-  gsutil -q cp ~/logs/gemma4_context.log ~/logs/gemma4_qe.log "$O/logs/"
+  gsutil -q cp ~/logs/gemma4_context.log "$O/logs/gemma4_context-$RUN_ID.log"
+  gsutil -q cp ~/logs/gemma4_qe.log "$O/logs/gemma4_qe-$RUN_ID.log"
   echo "== context $ca, MetricX $cb $(date -u +%T)"
   [ $ca = 0 ] && [ $cb = 0 ]
-  gsutil -q cp "$SHM/out/context.parquet" "$SHM/out/qe.parquet" "$O/"
-  mkdir -p "$SHM/out/logs" && cp ~/logs/gemma4_en_nl.log ~/logs/gemma4_nl_en.log "$SHM/out/logs/"
+  mkdir -p "$SHM/out/logs" && gsutil -m -q cp "$O/logs/gemma4_en_nl-*.log" "$O/logs/gemma4_nl_en-*.log" "$SHM/out/logs/"
   "$PY" - "$SHM/out/setup.json" "$ZONE" <<'EOF'
 import json, os, sys, yaml
 from pathlib import Path
@@ -140,5 +174,5 @@ EOF
   echo "== post done $(date -u +%T)"
   ;;
 *)
-  echo "usage: run_gemma4_pilot.sh checks|translate|post"; exit 1 ;;
+  echo "usage: run_gemma4_pilot.sh all|checks|translate|post"; exit 1 ;;
 esac

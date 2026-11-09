@@ -679,9 +679,10 @@ def card(facts, nl_report, link_report, repo):
         check_tasks.update(c["tasks"])
     top_tasks = ", ".join(f"`{t}` ({n:,})" for t, n in check_tasks.most_common(5))
 
+    # Only categories of the Hub's official list; text2text-generation is not on it (a metadata warning on the page)
     yaml = "\n".join([
         "---", "license: cc-by-4.0", "language:", "- nl", "source_datasets:", f"- {FLAN_REPO}", "task_categories:",
-        "- text-generation", "- text2text-generation", "size_categories:", f"- {size_category(rows)}", "pretty_name: FLAN-nl",
+        "- text-generation", "size_categories:", f"- {size_category(rows)}", "pretty_name: FLAN-nl",
         "configs:", "- config_name: default", "  data_files:", "  - split: train", "    path: data/train-*", "---"])
     return f"""{yaml}
 

@@ -227,9 +227,11 @@ def test_the_card_has_the_numbers_of_the_data_and_the_reports(tmp_path):
     pub.main(["build", *assembled(tmp_path), "--out", str(out), "--repo", "someone/flan-nl"])
     card = (out / "README.md").read_text()
     header = card.split("---")[1]
-    for line in ("license: cc-by-4.0", "- nl", "- Open-Orca/FLAN", "- text-generation", "- text2text-generation",
+    for line in ("license: cc-by-4.0", "- nl", "- Open-Orca/FLAN", "- text-generation",
                  "- n<1K", "pretty_name: FLAN-nl", "path: data/train-*"):
         assert line in header
+    # Not on the Hub's official list of task categories
+    assert "text2text-generation" not in header
     for fact in ("6 English rows, of which 4 are in this dataset (3 translated from English, 1 of",
                  "| translated from English (`translated = true`) | 3 |",
                  "| Dutch tasks, not translated (`translated = false`) | 1 |",

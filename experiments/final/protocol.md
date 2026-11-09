@@ -1,8 +1,10 @@
 # Protocol (concept): de eindrun van Dutch ModernBERT 230M, WSD met cooldown-takken na 1 en 2 epochs
 
-Status: **concept**, geschreven op 10 nov 2026 (00:00–01:00 CET) door een subagent, vóór de start van de training. De
-hoofdsessie leest het voordat de keten `final_run.sh` de training start, en legt het vast (of wijzigt het) met een
-commit. Wijzigingen na de start komen onder "Amendementen", gedateerd, en vervangen de tekst erboven niet.
+Status: **vastgelegd** op 10 nov 2026 ~00:50 CET door de hoofdsessie, na lezing van het concept (geschreven 00:00–01:00
+door een subagent), vóór de start van de training. Wijzigingen na de start komen onder "Amendementen", gedateerd,
+en vervangen de tekst erboven niet. Eén wijziging bij het vastleggen: de keten verwijdert zelf niets meer (Yebs regel:
+verwijderen alleen met de hand, met letterlijke paden in een zichtbaar commando); de bucketmap van de smoke-test
+blijft staan, en bij variant (b) verwijdert de hoofdsessie `~/culturax_nl` met de hand vóór de mix.
 
 Besluiten waarop dit rust (LEARNINGS, "Besluiten van Yeb", 9 nov): 15% losse tokens; `hebban.nl` eruit met een
 URL-blocklist op alle webcorpora; een WSD-schema met een decay-tak na 1 en na 2 epochs uit dezelfde run, waarbij de
@@ -178,8 +180,8 @@ pass 2.
 
 Staging van (b): `prepare_final.sh mix` per worker (leest van Hugging Face met range requests, spill in
 `/dev/shm/final_work`, 128 bestanden in `~/final_cxgptnl`, ~27 GB per host, ~25 min geschat uit G's 12 min voor
-13,5 GB). Daarvoor moet `~/culturax_nl` (S's staging, 49 GB) weg: de keten doet `rm -rf ~/culturax_nl` pas als de
-TPU vrij is.
+13,5 GB). Daarvoor moet `~/culturax_nl` (S's staging, 49 GB) weg: de hoofdsessie verwijdert die met de hand op alle
+workers; de keten stopt tot dat gebeurd is.
 
 ## Epochs: volgorde en hervatting
 
@@ -220,8 +222,8 @@ FAILED; één niet-eindige stap wordt door `apply_if_finite` al overgeslagen en 
 200 stappen met het commando van de hoofdrun als `<run>-smoke` (eval op stap 200), vergeleken met S
 (`experiments/final/s_reference.json`, uit S's Trackio-database): het verlies op 100, 150 en 200 binnen 10% van S's
 (7,4894 / 6,8017 / 6,2256), de mediane staptijd op die stappen ten hoogste 1,25 × S's mediaan van 110–300 (0,2095
-s), geen overgeslagen stap, bij (a) de regel van de blocklist. Daarna wordt de bucketmap van de smoke-test
-verwijderd.
+s), geen overgeslagen stap, bij (a) de regel van de blocklist. De bucketmap van de smoke-test blijft
+staan.
 
 ## Evaluatie
 

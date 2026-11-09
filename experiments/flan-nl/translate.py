@@ -155,6 +155,98 @@ def make_engine(args, shapes):
     return engine, engine.load_params()
 
 
+def lora_modules(adapter):
+    """{module path: (lora_a, lora_b)} from an adapter of sft_lora.py (keys <module path>/kernel_lora_a and _b)."""
+    modules = {}
+    for key, value in adapter.items():
+        module, _, name = key.rpartition("/")
+        if name not in ("kernel_lora_a", "kernel_lora_b"):
+            raise ValueError(f"unexpected key in the adapter: {key}")
+        modules.setdefault(module, {})[name[-1]] = value
+    incomplete = sorted(m for m, sides in modules.items() if set(sides) != {"a", "b"})
+    if incomplete:
+        raise ValueError(f"adapter modules without both lora_a and lora_b: {incomplete[:3]}")
+    return {m: (sides["a"], sides["b"]) for m, sides in modules.items()}
+
+
+def kernel_nodes(tree, path=()):
+    """{"/"-joined module path: the dict that holds its "kernel"} of a nested dict of parameters."""
+    nodes = {}
+    for key, value in tree.items():
+        if isinstance(value, dict):
+            nodes.update(kernel_nodes(value, path + (str(key),)))
+        elif key == "kernel":
+            nodes["/".join(path)] = tree
+    return nodes
+
+
+def lora_targets(adapter, tree):
+    """[(module, node, lora_a, lora_b)]: each adapter module with the one kernel whose path ends in its path."""
+    nodes = kernel_nodes(tree)
+    targets = []
+    for module, (a, b) in sorted(lora_modules(adapter).items()):
+        matches = [p for p in nodes if p == module or p.endswith("/" + module)]
+        if len(matches) != 1:
+            raise ValueError(f"adapter module {module}: {len(matches)} kernels match ({matches[:3]})")
+        targets.append((module, nodes[matches[0]], a, b))
+    return targets
+
+
+def lora_delta(a, b, shape, scale, xp=np):
+    """The kernel's update that qwix's LoRA adds in the forward pass, x.A.B.scale, as an array of the kernel's shape.
+    A spans the kernel's contracted (leading) axes and the rank, B the rank and the remaining axes; qwix's dot_general
+    path keeps each flattened, (prod(contracted), rank) and (rank, prod(remaining)), its einsum path keeps the axes. The
+    update is A.B over the rank, reshaped in the kernel's (row-major) axis order."""
+    rank = a.shape[-1]
+    if b.shape[0] != rank:
+        raise ValueError(f"lora_a {a.shape} and lora_b {b.shape} differ in rank")
+    a2 = xp.reshape(xp.asarray(a, dtype=xp.float32), (-1, rank))
+    b2 = xp.reshape(xp.asarray(b, dtype=xp.float32), (rank, -1))
+    leading = [int(np.prod(shape[:k])) for k in range(1, len(shape))]
+    if a2.shape[0] not in leading or a2.shape[0] * b2.shape[1] != int(np.prod(shape)):
+        raise ValueError(f"lora_a {a.shape} and lora_b {b.shape} do not split a kernel of shape {tuple(shape)}")
+    return xp.reshape(a2 @ b2, tuple(shape)) * scale
+
+
+def merge_lora(tree, adapter, scale):
+    """Adds every adapter module's update to its kernel (float32 sum, cast back to the kernel's dtype and sharding), in
+    place in a nested dict of the engine's parameters. Returns what the merge changed."""
+    import jax
+    import jax.numpy as jnp
+
+    delta_sq = weight_sq = changed = total = 0.0
+    targets = lora_targets(adapter, tree)
+    for module, node, a, b in targets:
+        w = node["kernel"]
+        try:
+            delta = lora_delta(a, b, w.shape, scale, jnp)
+        except ValueError as error:
+            raise ValueError(f"{module}: {error}") from error
+        merged = jax.device_put((w.astype(jnp.float32) + delta).astype(w.dtype), w.sharding)
+        delta_sq += float(jnp.sum(delta ** 2))
+        weight_sq += float(jnp.sum(w.astype(jnp.float32) ** 2))
+        changed += float(jnp.sum(merged != w))
+        total += w.size
+        node["kernel"] = merged
+    return {"modules": len(targets), "relative_update_norm": (delta_sq / weight_sq) ** 0.5,
+            "elements_changed": changed / total, "kernel_dtype": str(targets[0][1]["kernel"].dtype)}
+
+
+def load_lora(engine_params, lora_dir):
+    """The engine's parameters with the adapter of sft_lora.py in lora_dir (adapter.npz, adapter.json) merged."""
+    from flax import nnx
+
+    meta = json.loads((Path(lora_dir) / "adapter.json").read_text())
+    with np.load(Path(lora_dir) / "adapter.npz") as npz:
+        adapter = {k: npz[k] for k in npz.files}
+    tree = nnx.to_pure_dict(engine_params)
+    stats = merge_lora(tree, adapter, meta["scale"])
+    nnx.replace_by_pure_dict(engine_params, tree)
+    print(f"LORA {json.dumps({'dir': str(lora_dir), 'rank': meta['rank'], 'alpha': meta['alpha'], **stats})}",
+          flush=True)
+    return engine_params
+
+
 class EngineSlots:
     """The device side of decode_all: MaxEngine's prefill, insert and generate on one decode state."""
 
@@ -293,6 +385,9 @@ def main(argv=None):
     parser.add_argument("--target-lang", default="nl", choices=sorted(LANGUAGES), help="Language to translate into")
     parser.add_argument("--work-dir", default="/dev/shm/flan_nl",
                         help="Local directory for the shards before upload and MaxText's output (default: FLAN-nl's)")
+    parser.add_argument("--lora", default=None,
+                        help="Local directory of a LoRA adapter of experiments/en-nl-translator/sft_lora.py "
+                             "(adapter.npz, adapter.json), merged into the checkpoint's kernels after loading")
     args = parser.parse_args(argv)
     if args.source_lang == args.target_lang:
         parser.error(f"--source-lang and --target-lang are both {args.source_lang}")
@@ -332,6 +427,8 @@ def main(argv=None):
     make_decode_cache_sharded()
     started = time.time()
     engine, params = make_engine(args, shapes)
+    if args.lora:
+        params = load_lora(params, args.lora)
     device = EngineSlots(engine, params, shapes["prefill_lengths"])
     print(f"engine ready in {time.time() - started:.0f} s", flush=True)
     local = Path(args.work_dir) / "shards" / args.length_class

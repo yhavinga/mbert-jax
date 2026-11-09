@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
-"""MetricX-24 (hybrid, v2p6, Apache-2.0) in quality-estimation mode, in JAX, on the 4 chips of one TPU host (or on the
-CPU for the check).
+"""MetricX-24 (hybrid, v2p6, Apache-2.0) in quality-estimation mode or with a reference, in JAX, on the 4 chips of one
+TPU host (or on the CPU for the check).
 
     python metricx_qe.py score --pairs pairs.parquet --pair en:nl --pair nl:en --model xxl --out qe.parquet
+    python metricx_qe.py score --pairs pairs.parquet --pair source:hypothesis:reference --pair source:hypothesis ...
     JAX_PLATFORMS=cpu python metricx_qe.py check --model large --pairs pairs.parquet --n 6
 
 What google-research/metricx (metricx24/predict.py and models.py, commit fc4978e) does, rewritten for JAX: the input
-is "source: <source> candidate: <candidate>" (QE: no reference), tokenized by mT5's tokenizer with at most 1,536 tokens,
-its final </s> removed; the model is mT5 (MT5ForConditionalGeneration's weights), the encoder over the input and one
-decoder step from token 0; the score is the logit of token 250089 (<extra_id_10>) of that step, clipped to [0, 25].
-Lower is better (an MQM-like error score). A score per (source column, candidate column) of --pairs: --pair en:nl
-scores the Dutch column as a translation of the English one.
+is "source: <source> candidate: <candidate>" (QE: no reference) or "source: <source> candidate: <candidate>
+reference: <reference>" (predict.py's _make_input with is_qe false; the hybrid models take both), tokenized by mT5's
+tokenizer with at most 1,536 tokens, its final </s> removed; the model is mT5 (MT5ForConditionalGeneration's weights),
+the encoder over the input and one decoder step from token 0; the score is the logit of token 250089 (<extra_id_10>)
+of that step, clipped to [0, 25]. Lower is better (an MQM-like error score). A score per --pair of columns of --pairs:
+--pair en:nl scores the Dutch column as a translation of the English one (QE, column qe_en_nl); --pair
+source:hypothesis:reference scores hypothesis against reference as well (column ref_source_hypothesis_reference).
 
 The weights are the bfloat16 releases (the README: within 0.0x of the float32 ones). On the TPU the matrix products
 take bfloat16 inputs and accumulate in float32; norms, softmax and the residual stream are float32. The layers are
@@ -39,8 +42,32 @@ LENGTHS = [128, 256, 384, 512, 768, 1024, 1536]  # inputs are padded to one of t
 TOKENS_PER_BATCH = 16384
 
 
-def make_input(source, candidate):
-    return "source: " + source + " candidate: " + candidate
+def make_input(source, candidate, reference=None):
+    """MetricX-24's input: QE without a reference, the reference-based form with one"""
+    if reference is None:
+        return "source: " + source + " candidate: " + candidate
+    return "source: " + source + " candidate: " + candidate + " reference: " + reference
+
+
+def parse_pair(pair):
+    """"src:cand" (QE) or "src:cand:ref" -> (src, cand, ref or None, output column)"""
+    parts = pair.split(":")
+    if len(parts) == 2:
+        return parts[0], parts[1], None, f"qe_{parts[0]}_{parts[1]}"
+    if len(parts) == 3:
+        return parts[0], parts[1], parts[2], f"ref_{parts[0]}_{parts[1]}_{parts[2]}"
+    raise SystemExit(f"--pair {pair!r}: source:candidate or source:candidate:reference")
+
+
+def rows_to_score(table, src, cand, ref, empty_candidates):
+    """The rows of table that get a score: a source (and a reference) that is not empty, and a candidate that is not
+    empty, or with empty_candidates one that is not missing (an empty translation is scored as one)"""
+    out = []
+    for k, (s, c) in enumerate(zip(table[src], table[cand])):
+        r = table[ref][k] if ref else "-"
+        if s and r and (c is not None if empty_candidates else c):
+            out.append(k)
+    return out
 
 
 def encode(tokenizer, texts):
@@ -232,11 +259,12 @@ class Scorer:
         config = self.config
         self.fn = jax.jit(lambda p, i, m: forward(p, i, m, config, compute_dtype))
 
-    def score(self, sources, candidates):
-        """MetricX-24 QE of each (source, candidate), in order"""
+    def score(self, sources, candidates, references=None):
+        """MetricX-24 of each (source, candidate), in order: QE, or against references when they are given"""
         import jax
 
-        ids = encode(self.tokenizer, [make_input(s, c) for s, c in zip(sources, candidates)])
+        references = references if references is not None else [None] * len(sources)
+        ids = encode(self.tokenizer, [make_input(s, c, r) for s, c, r in zip(sources, candidates, references)])
         order = sorted(range(len(ids)), key=lambda i: len(ids[i]))
         out = np.zeros(len(ids), np.float32)
         k = 0
@@ -264,16 +292,17 @@ def score(args):
     scorer = Scorer(args.model, args.root, "bfloat16")
     out = {"id": table["id"]}
     for pair in args.pair:
-        src, cand = pair.split(":")
-        rows = [k for k, (s, c) in enumerate(zip(table[src], table[cand])) if s and c]
+        src, cand, ref, name = parse_pair(pair)
+        rows = rows_to_score(table, src, cand, ref, args.empty_candidates)
         started = time.time()
-        scores, lengths = scorer.score([table[src][k] for k in rows], [table[cand][k] for k in rows])
+        scores, lengths = scorer.score([table[src][k] for k in rows], [table[cand][k] for k in rows],
+                                       [table[ref][k] for k in rows] if ref else None)
         column = [None] * len(table["id"])
         for k, s in zip(rows, scores):
             column[k] = round(float(s), 4)
-        out[f"qe_{src}_{cand}"] = column
+        out[name] = column
         seconds = time.time() - started
-        print(f"QE {json.dumps({'pair': pair, 'rows': len(rows), 'seconds': round(seconds, 1), 'mean': round(float(np.mean(scores)), 3), 'truncated': sum(n >= MAX_INPUT - 1 for n in lengths)})}", flush=True)
+        print(f"{'QE' if ref is None else 'REF'} {json.dumps({'pair': pair, 'rows': len(rows), 'of': len(column), 'seconds': round(seconds, 1), 'mean': round(float(np.mean(scores)), 3) if rows else None, 'truncated': sum(n >= MAX_INPUT - 1 for n in lengths)})}", flush=True)
     pq.write_table(pa.table(out), args.out)
     print(f"wrote {args.out}")
 
@@ -286,14 +315,15 @@ def check(args):
     from transformers import MT5ForConditionalGeneration
 
     table = pq.read_table(args.pairs).to_pydict()
-    src, cand = args.pair[0].split(":")
-    rows = [k for k in range(len(table["id"])) if table[src][k] and table[cand][k]][:args.n]
+    src, cand, ref, _ = parse_pair(args.pair[0])
+    rows = rows_to_score(table, src, cand, ref, False)[:args.n]
     sources, candidates = [table[src][k] for k in rows], [table[cand][k] for k in rows]
+    references = [table[ref][k] for k in rows] if ref else [None] * len(rows)
     scorer = Scorer(args.model, args.root, "float32", devices=jax.devices("cpu")[:1])
-    mine, _ = scorer.score(sources, candidates)
+    mine, _ = scorer.score(sources, candidates, references)
     path = Path(args.root) / MODELS[args.model][0].split("/")[1]
     model = MT5ForConditionalGeneration.from_pretrained(str(path), dtype=torch.float32).eval()
-    ids = encode(scorer.tokenizer, [make_input(s, c) for s, c in zip(sources, candidates)])
+    ids = encode(scorer.tokenizer, [make_input(s, c, r) for s, c, r in zip(sources, candidates, references)])
     ref = []
     with torch.no_grad():
         for x in ids:
@@ -301,7 +331,7 @@ def check(args):
                            decoder_input_ids=torch.zeros(1, 1, dtype=torch.long)).logits
             ref.append(float(torch.clamp(logits[0, 0, SCORE_TOKEN], 0, 25)))
     diff = np.abs(np.asarray(ref) - mine)
-    print(f"CHECK {json.dumps({'model': args.model, 'n': len(ids), 'jax': [round(float(v), 4) for v in mine], 'torch': [round(v, 4) for v in ref], 'max_abs_diff': round(float(diff.max()), 5)})}")
+    print(f"CHECK {json.dumps({'model': args.model, 'pair': args.pair[0], 'n': len(ids), 'jax': [round(float(v), 4) for v in mine], 'torch': [round(v, 4) for v in ref], 'max_abs_diff': round(float(diff.max()), 5)})}")
     if diff.max() > args.tolerance:
         raise SystemExit(f"the JAX scores differ from transformers' by {diff.max():.4f} > {args.tolerance}")
 
@@ -312,11 +342,15 @@ def main(argv=None):
     for name in ("score", "check"):
         p = sub.add_parser(name)
         p.add_argument("--pairs", required=True, help="parquet with id and the text columns")
-        p.add_argument("--pair", action="append", required=True, help="source column:candidate column")
+        p.add_argument("--pair", action="append", required=True,
+                       help="source column:candidate column (QE), or source:candidate:reference column")
         p.add_argument("--model", default="xxl", choices=sorted(MODELS))
         p.add_argument("--root", default="/dev/shm/translator/metricx", help="Where the weights are downloaded")
         if name == "score":
             p.add_argument("--out", required=True)
+            p.add_argument("--empty-candidates", action="store_true",
+                           help="Score an empty candidate too (an evaluation set's empty translation); only a missing "
+                                "one stays unscored")
         else:
             p.add_argument("--n", type=int, default=6)
             p.add_argument("--tolerance", type=float, default=0.01)

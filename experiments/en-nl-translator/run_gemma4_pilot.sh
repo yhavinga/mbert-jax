@@ -76,9 +76,14 @@ all)
     echo "== convert $(date -u +%T)"
     bash /dev/shm/judge/code/setup.sh convert
   fi
-  [ -e "$SHM/venv-025" ] || { [ -x /dev/shm/judge/venv/bin/python ] && ln -s /dev/shm/judge/venv "$SHM/venv-025"; } || bash "$C/setup_generic.sh" release
+  # The checks run on the CPU beside the TPU work (MaxText 0.2.5 for the decode check: en-nl-judge's venv where the
+  # conversion made one, else setup_generic.sh release); their log goes to the bucket when they pass
   if ! gsutil -q stat "$O/logs/checks.log"; then
-    bash "$0" checks > ~/logs/tg_checks.log 2>&1 && gsutil -q cp ~/logs/tg_checks.log "$O/logs/checks.log"
+    (
+      [ -e "$SHM/venv-025" ] || { [ -x /dev/shm/judge/venv/bin/python ] && ln -s /dev/shm/judge/venv "$SHM/venv-025"; } \
+        || bash "$C/setup_generic.sh" release
+      bash "$0" checks && gsutil -q cp ~/logs/tg_checks.log "$O/logs/checks.log"
+    ) > ~/logs/tg_checks.log 2>&1 &
   fi
   if ! gsutil -q stat "$O/logs/translate.done"; then
     bash "$0" translate && echo done | gsutil -q cp - "$O/logs/translate.done"

@@ -94,6 +94,55 @@ keeper-log `~/logs/tg_keeper_use1.log`. Status: `VM=translate-generic-use1 ZONE=
 "Klaar": `~/logs/tg_run.log` op de VM eindigt op `EXIT 0` en de keeper stopt met "run ended in EXIT 0"; daarna
 `$B/gemma4-pilot/gemma4-vs-tg27b.md` één keer naar `~/Developer/yhavinga/mbert-ops/translator-pilot/`.
 
-## 4. Stand
+## 4. Stand (9 nov, 17:30 UTC): code klaar, pilot nog niet gedraaid
 
-(wordt hieronder bijgewerkt)
+Gestopt volgens de rem: er bleef alleen wachten over (op een spot-VM, daarna ~1 uur onbewaakte keten).
+
+- **Code**: gecommit en gepusht (`translate-generic`). Tests op co1 (CPU, venv `~/Developer/yhavinga/maxtext/.venv`):
+  `pytest tests/test_translate_models.py tests/test_gemma4_pilot.py tests/test_flan_nl.py tests/test_en_nl_translator.py
+  tests/test_en_nl_sft.py tests/test_en_nl_lora_merge.py`: 85+ geslaagd, overgeslagen alleen de tests die echte
+  tokenizers of langid nodig hebben (die draaien op de VM in `run_gemma4_pilot.sh checks`). ruff schoon.
+- **Decode-controle op co1** (fork-checkout `~/Developer/yhavinga/maxtext` op `fix-nnx-decode-cache-abstract-init`,
+  CPU, klein Gemma 4-model): alle vier gevallen geslaagd (`within`, `past_window`, `prefill_past_window`,
+  `decode_past_window`; grootste relatieve afwijking 2,9e-06). Op 0.2.5 nog niet gedraaid (staat in `checks`; verwacht:
+  `within` slaagt, de gevallen voorbij het venster falen).
+- **VM's**: geen enkele VM heeft de keten afgemaakt.
+  - europe-west4-a, `translate-generic`: aangevraagd 14:54 UTC, 53 min PROVISIONING zonder node; op verzoek van de
+    hoofdsessie ingetrokken (`tpu.py down`, "verified gone").
+  - us-east1-d, `translate-generic-use1`: READY 15:45, setup klaar, gepreempt tijdens de omzetting (~15:50); opnieuw
+    READY 16:29 (de keten faalde eerst op mijn fout `HF_HUB_OFFLINE=1` in de setup, hersteld), gepreempt 16:36 tijdens
+    de omzetting. Daarna ingetrokken (`tpu.py down`, "verified gone"); in `gs://t5-dutch-english-use1` staat van deze
+    runs niets behalve de scripts.
+  - europe-west4-a, `translate-generic`: opnieuw aangevraagd 16:40 UTC door de keeper; sindsdien wisselt de node
+    tussen CREATING en weg (stand 17:27 UTC). **De keeper draait door op co1** (`~/logs/tg_keeper_euw4.log`, proces
+    `keeper_generic.sh`) en start de keten zodra de VM READY is.
+- **Data verplaatst**: niets tussen regio's of naar co1, behalve: 4 kleine configbestanden van `google/gemma-4-31B-it`
+  (generation_config, chat_template, config, tokenizer_config; samen 27 KB) van HF naar co1 voor de tests; op de
+  us-east1-VM's (nu weg) eenmaal `pairs.parquet` (1,4 MB) uit us-central2. Scripts van co1 naar
+  `gs://t5-dutch-english/mbert/translator/scripts/` en `gs://t5-dutch-english-use1/mbert/translator/scripts/`.
+
+### Als de keeper stopt
+
+- "run ended in EXIT 0": `gsutil cp gs://t5-dutch-english/mbert/translator/gemma4-pilot/gemma4-vs-tg27b.md
+  ~/Developer/yhavinga/mbert-ops/translator-pilot/` (één kopie) en de cijfers uit `gemma4-vs-tg27b.json`.
+- "run failed": op de VM `~/logs/tg_run.log`, `~/logs/gemma4_{en_nl,nl_en,context,qe}.log`, `~/logs/tg_checks.log`.
+  Waar de eerste run waarschijnlijk op kan stuiten, nog niet op TPU geprobeerd:
+  1. twee processen van 4 chips op één v6e-8 (`TPU_VISIBLE_CHIPS=0,1,2,3` / `4,5,6,7`, poorten 8476/8477): faalt de
+     preflight van de tweede helft, dan de richtingen na elkaar op chips 0–3 draaien;
+  2. het checkpoint van MaxText 0.2.5's `to_maxtext` laden met de fork (upstream `main`): andere parameternamen
+     zouden bij `load_params` falen;
+  3. geheugen: de slots van `gemma4-31b` zijn een schatting (~70% van de vrije ruimte); bij RESOURCE_EXHAUSTED lager
+     zetten in `translate_models.yml` (of `--slots`), bij veel ruimte hoger;
+  4. Nemotron: `context-data` eist 5 korte Engelse lmarena-gesprekken met ≥ 2 vragen in de drie bytebereiken; zijn
+     het er minder, dan een bereik toevoegen in `setup_generic.sh` of `CHAT_MAX` verruimen.
+  Na een fix: `tg_run.log` op de VM opzij zetten (anders ziet de keeper zijn oude EXIT), scripts opnieuw naar de
+  bucket, keeper opnieuw starten (`NAME=translate-generic ZONE=europe-west4-a setsid nohup bash
+  ~/Developer/yhavinga/mbert-ops/translate-generic/keeper_generic.sh >> ~/logs/tg_keeper_euw4.log 2>&1 < /dev/null &`).
+- De VM blijft staan na de run (keeper verwijdert niets); de hoofdsessie beslist.
+
+### Open
+
+- Doorvoer en kwaliteit van Gemma 4 tegen TranslateGemma: nog geen cijfers.
+- `sft_data.py` gebruikt `user_text` nog niet (andere branch); zie §1.
+- Een TPU-test van de twee omwegen tegen 0.2.5 (beide actief) staat niet in de keten; de unit-tests en de CPU-controle
+  dekken de voorwaarden.

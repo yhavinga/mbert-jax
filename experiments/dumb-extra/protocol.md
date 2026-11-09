@@ -129,6 +129,19 @@ fine-tunes and BLiMP-NL once it is done. Reported with the same comparison (diff
 seed range), against `300000`; descriptive, no consequence, and outside the question above, which the 653,000-step
 models answer.
 
+2026-11-09 (17:20 CET), before these runs, while G trains: G, `cxgptnl-300000`
+(`culturax-gptnl-nl-230m-chunk1024/ckpt_keep/300000`: 70% CulturaX nl and 30% GPT-NL Public Corpus, 15% masking,
+300,000 steps; protocol `experiments/gptnl/protocol.md` of branch `gptnl-mix`), gets the four fine-tune tasks with
+the same settings, code commit and seeds as the 300k references (`spec_g300k.txt`), and BLiMP-NL (`blimp.sh`, as in
+step 4). Results under the same names and paths: `<task>/cxgptnl-300000--<task>--seed<n>.json` and
+`blimp-nl/cxgptnl-300000.json`. They run after G's DUMB, on mbert-mix instead of mbert-corpus: a v4-32 of the same
+type in the same zone, whose `~/mbert-dumb/.venv` holds exactly the 141 packages and versions of `vm.lock` on all 4
+workers (checked 2026-11-09), with one task per worker and no compile cache of earlier rounds. Reported as the 300k
+references are: per task the difference of G's mean and that of `300000` (X) against the larger of the two seed
+ranges, and BLiMP-NL next to `300000` (92.86), `fw2-300000` (92.23) and `fw2rh3-300000` (93.12), in
+`summary-300k-cxgptnl.json`. Descriptive, no consequence: outside the question above, and outside the decision rule
+of the GPT-NL protocol, which rests on DBRD and SICK-NL.
+
 ## Result (2026-11-09)
 
 All 72 fine-tunes and 17 BLiMP-NL runs complete (`summary.json` next to the results). The question: `mix-653000` beats

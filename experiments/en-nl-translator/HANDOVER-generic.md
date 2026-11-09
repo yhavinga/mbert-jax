@@ -185,3 +185,31 @@ kopie: `gsutil cp gs://t5-dutch-english/mbert/translator/gemma4-pilot/gemma4-vs-
 `translate.py` en `run_gemma4_pilot.sh` (45 KB) naar de scripts in de bucket en een testscript van 1 KB naar de VM. De
 setup haalde opnieuw Handelingen, Nemotron-bereiken en tokenizers van HF en `pairs.parquet` (1,4 MB) uit us-central2,
 zoals in §4.
+
+## 6. Aanvulling 9 nov, 23:25 UTC: `post` op de VM van 23:08, drie fouten, gerepareerd in `61c075f` en `ba9647f`
+
+- **MetricX: geen torch.** De bfloat16-releases van MetricX-24 hebben alleen `pytorch_model-*.bin` (geen
+  safetensors), dus `load_weights` heeft torch nodig; de venv-fork had het niet. `setup_generic.sh` installeert nu
+  `torch==2.9.1` (CPU, `UV_TORCH_BACKEND=cpu`, zoals `setup.sh`) in de venv-fork, ook als `done.txt` er al is. Op deze
+  VM: geladen in 19 s, vier paren van 2.000 rijen in 12–27 s elk, `qe.parquet` om 23:21 in de bucket.
+- **TPU-init van een helft.** `TPU_VISIBLE_CHIPS` nummert de `/dev/vfio`-groepen, en hun volgorde verschilt per
+  VM-instantie. Op deze VM waren groepen 0–3 chips achter beide PCI-roots (libtpu: `pe4:2, pe2:2, pe2:3, pe2:1`;
+  bus `00` = pe2, bus `80` = pe4), en libtpu weigerde zowel `0,1,2,3` als `4,5,6,7` (`TPU_RET_CHECK ...
+  index_on_host() == i (0 vs. 1)`); alle 8 samen werkten. `half()` kiest nu de 4 groepen achter de eerste (0) of de
+  tweede (1) PCI-root (`/sys/kernel/iommu_groups/N/devices`), hier `1,2,3,4` en `0,5,6,7`, en schrijft ze in de log.
+  Preflight (`jax.devices()`, 4 chips, 1 proces) per helft, beide tegelijk: geslaagd; `post` doet die preflight nu in
+  elke helft vóór het werk. Tegelijk draaien blijft dus.
+- **`post` liep door naar `report`.** `[ $ca = 0 ] && [ $cb = 0 ]` stopt `set -e` niet als de linker faalt; nu een
+  expliciete `exit 1` ("post stops before the report"). Om 23:21 bevestigd: context 1, MetricX 0, geen report.
+- **Daarna: context-run.** `context_run` gaf `make_engine` geen `tokenizer` mee (`AttributeError`); gerepareerd in
+  `ba9647f`. De context-run draaide 23:21–23:27 met de hand op helft 0 (`~/logs/ctx_manual.sh`, pid in
+  `~/logs/ctx_manual.pid`, log `~/logs/gemma4_context_manual.log`): `EXIT 0`, 25 ketens, 86 beurten, 356 s (engine
+  106 s), alle beurten beëindigd; `context.parquet` en de log staan in de bucket.
+- **Keeper.** Schrijft nu de pid van de run in `~/logs/tg_run.pid` op de VM (polls via `kill -0`, niet `pgrep -f`).
+  Op co1: pid van de keeper in `~/logs/tg_keeper_euw4.pid`. Om 23:28 `tg_run.log` op de VM opzij gezet
+  (`tg_run.context-tokenizer.log`) en de keeper opnieuw gestart (§4); `post` haalt `context.parquet` en `qe.parquet` uit
+  de bucket en draait alleen nog merge, preflight en report. Klaar zien: zoals in §5.
+
+**Data verplaatst in deze stap**: niets tussen regio's of naar co1. Van co1 naar europe-west4: de scripts (~90 KB) en
+testscripts van enkele KB naar de VM. De VM haalde torch 2.9.1 (CPU) van download.pytorch.org; de MetricX-gewichten
+stonden al in `/dev/shm`.

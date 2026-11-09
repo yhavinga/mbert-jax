@@ -15,8 +15,9 @@ Sources (SOURCES), read straight from Hugging Face, only the row groups and colu
   conversational or opinion_editorial weigh RAAD_PREFERRED_WEIGHT times as much in the draw (the design's "bij
   voorkeur"; the council minutes themselves are mostly legal_document/procedural, so the others stay in).
 
-A passage is 1-4 consecutive prose paragraphs of one block (a turn, or a document) with MIN_TOKENS-MAX_TOKENS Gemma
-tokens; the number of paragraphs aimed at is drawn per passage, so lengths vary. A paragraph longer than MAX_TOKENS is
+A passage is 1-MAX_PARAGRAPHS consecutive prose paragraphs of one block (a turn, or a document) with
+MIN_TOKENS-MAX_TOKENS Gemma tokens; the number of paragraphs aimed at is drawn per passage, so lengths vary. Its length
+class is short (up to SHORT_MAX tokens) or long; of the passages chosen per source LONG_SHARE are long. A paragraph longer than MAX_TOKENS is
 cut into runs of whole sentences, each a passage of its own (`piece` = true). In council documents a speaker label at
 the start of a paragraph is removed and a passage never runs over the next label (no change of speaker inside one).
 
@@ -71,8 +72,11 @@ NOT_CONTENT = {"boilerplate", "structured_data"}
 RAAD_PREFERRED = {"conversational", "opinion_editorial"}
 RAAD_PREFERRED_WEIGHT = 3.0
 
-MIN_TOKENS, MAX_TOKENS = 48, 384
-MAX_PARAGRAPHS = 4
+# Yeb, 9 Nov (design §7 point 7): passages up to 768 tokens, ~25% of them longer than 384 (length class "long")
+MIN_TOKENS, MAX_TOKENS = 48, 768
+SHORT_MAX = 384
+LONG_SHARE = 0.25
+MAX_PARAGRAPHS = 8
 IDIOM_CLASS_FACTOR = 3
 NGRAM = 13
 # Stage-0 thresholds, chosen on the pilot's distributions (report.json has them per source)
@@ -503,6 +507,34 @@ def split_of(source, doc_id, eval_permille):
     return "eval" if h % 1000 < eval_permille else "train"
 
 
+# Design §9 (Yeb, 9 Nov): translating with earlier turns as context. A Handelingen passage keeps a reference to the
+# 1-3 turns right before its own in the same agenda item (the chair's too), each through the source filters and at
+# most MAX_TOKENS long, together at most CONTEXT_MAX_TOKENS; CONTEXT_SHARE of the Handelingen passages are marked as
+# context examples, and their context turns go into the nl->en run as segments of their own.
+CONTEXT_TURNS = 3
+CONTEXT_MAX_TOKENS = 1024
+CONTEXT_SHARE = 0.20
+
+
+def turn_text(turn):
+    """The text of a turn of the Handelingen as this selection reads it: its lines cleaned, empty ones left out"""
+    return "\n".join(p for p in (clean(x) for x in (turn.get("text") or "").split("\n")) if p)
+
+
+def context_of(t, turns):
+    """The turns before turn t that serve as its context, oldest first: [(turn index, tokens)]. turns: per turn index
+    (tokens, passes the filters) or None for a turn without text. Walks back from t - 1 and stops at the first turn
+    that is missing, fails a filter, is longer than MAX_TOKENS or would bring the total above CONTEXT_MAX_TOKENS."""
+    out, total = [], 0
+    for j in range(t - 1, max(t - 1 - CONTEXT_TURNS, -1), -1):
+        info = turns[j]
+        if info is None or not info[1] or info[0] > MAX_TOKENS or total + info[0] > CONTEXT_MAX_TOKENS:
+            break
+        out.append((j, info[0]))
+        total += info[0]
+    return out[::-1]
+
+
 def blocks_of(source, doc, wordset):
     """[(block id, [paragraphs], meta)] of a document: the turns of a debate, or the document itself"""
     if source == "handelingen":
@@ -650,6 +682,20 @@ class Builder:
         doc_id = str(doc["id"] if source == "handelingen" else doc["doc_id"])
         rng = random.Random(f"{source}/{doc_id}")
         passages = []
+        turns = []
+        if source == "handelingen":
+            # every turn's length and verdict, for the context of the passages after it
+            texts = [turn_text(turn) for turn in doc["turns"] or []]
+            counts = self.count([t for t in texts if t])
+            sizes = iter(counts)
+            for text in texts:
+                if not text:
+                    turns.append(None)
+                    continue
+                n = next(sizes)
+                ok = n <= MAX_TOKENS and not self.checks(source, text)[0]
+                turns.append((n, ok))
+            counters["turns_context_ok"] += sum(1 for x in turns if x and x[1])
         for block_id, paragraphs, meta in blocks_of(source, doc, self.wordset):
             labels = [False] * len(paragraphs)
             if source == "raad":
@@ -677,7 +723,8 @@ class Builder:
                     "words": n_words, "idioms": hits, "idiom_score": round(100 * len(hits) / max(n_words, 1), 4),
                     "speaker": meta.get("speaker"), "party": meta.get("party"),
                     "date": doc.get("date"), "content_type": list(doc.get("content_type") or []),
-                    "before": before, "after": after,
+                    "before": before, "after": after, "turn_paragraph": first[3],
+                    "context": context_of(int(block_id[1:]), turns) if source == "handelingen" else [],
                 })
         texts = [p["text"] for p in passages]
         for p, n in zip(passages, self.count(texts)):
@@ -806,6 +853,36 @@ class Chooser:
         return chosen
 
 
+def mark_context_examples(chosen, docs, seed):
+    """CONTEXT_SHARE of the chosen Handelingen passages (train and eval side) as context examples, drawn with a fixed
+    seed from those with a context that start at their turn's first or second paragraph; returns the report and the
+    rows of the context turns to translate (each turn once)."""
+    hand = [p for p in chosen if p["source"] == "handelingen"]
+    for p in chosen:
+        p["context_example"] = False
+    candidates = sorted((p for p in hand if p["context"] and p["turn_paragraph"] <= 1), key=lambda p: p["pid"])
+    k = min(len(candidates), round(CONTEXT_SHARE * len(hand)))
+    examples = random.Random(f"{seed}/context").sample(candidates, k)
+    for p in examples:
+        p["context_example"] = True
+    tokens = {(p["doc_id"], j): n for p in examples for j, n in p["context"]}
+    used_by = collections.Counter((p["doc_id"], j) for p in examples for j, _ in p["context"])
+    rows = []
+    for doc_id, j in sorted(tokens):
+        turn = docs[doc_id]["turns"][j]
+        rows.append({"id": f"handelingen:{doc_id}:t{j}", "doc_id": doc_id, "turn": j, "speaker": turn.get("speaker"),
+                     "party": turn.get("party"), "text": turn_text(turn), "tokens": tokens[(doc_id, j)],
+                     "used_by": used_by[(doc_id, j)]})
+    per_example = [sum(n for _, n in p["context"]) for p in examples]
+    report = {"handelingen_passages": len(hand), "with_context": sum(1 for p in hand if p["context"]),
+              "candidates": len(candidates), "wanted": round(CONTEXT_SHARE * len(hand)), "examples": len(examples),
+              "context_turns": len(rows), "context_turn_tokens": sum(r["tokens"] for r in rows),
+              "turns_per_example": dict(collections.Counter(len(p["context"]) for p in examples)),
+              "context_tokens_per_example": percentiles(per_example),
+              "passage_tokens_all": sum(p["tokens"] for p in chosen)}
+    return report, rows
+
+
 def quotas(n):
     """Passages per source for n in all, by SHARES, rounded so that they add up to n"""
     raw = {s: n * share for s, share in SHARES.items()}
@@ -813,6 +890,24 @@ def quotas(n):
     for s in sorted(raw, key=lambda s: raw[s] - out[s], reverse=True)[:n - sum(out.values())]:
         out[s] += 1
     return out
+
+
+def length_class(p):
+    return "long" if p["tokens"] > SHORT_MAX else "short"
+
+
+def choose_by_length(pool, n, chooser, rng, source):
+    """n passages of one source, LONG_SHARE of them long: choose() within each length class"""
+    n_long = round(LONG_SHARE * n)
+    chosen, info = [], {}
+    for name, k in (("long", n_long), ("short", n - n_long)):
+        part = [p for p in pool if length_class(p) == name]
+        picked, i = choose(part, k, chooser, rng, source)
+        for p in picked:
+            p["length_class"] = name
+        chosen += picked
+        info[name] = {**i, "wanted": k, "chosen": len(picked)}
+    return chosen, info
 
 
 def choose(pool, n, chooser, rng, source):
@@ -888,6 +983,7 @@ def build_passages(args, report):
     from huggingface_hub import HfFileSystem
 
     fs = HfFileSystem()
+    handelingen_docs = {}  # the debates by id, for the texts of context turns
     n_groups = parse_per_source(args.row_groups, 0)
     max_docs = parse_per_source(args.max_docs, 0)
     started = time.time()
@@ -896,6 +992,8 @@ def build_passages(args, report):
         groups = row_groups(source, n_groups[source], args.seed, fs)
         groups_read[source] = [[name, g] for name, g, _ in groups]
         docs, counters = read_docs(source, groups, fs)
+        if source == "handelingen":
+            handelingen_docs.update((str(d["id"]), d) for d in docs)
         if max_docs[source] and len(docs) > max_docs[source]:
             docs = random.Random(f"{args.seed}/{source}/docs").sample(docs, max_docs[source])
             counters["docs_sampled"] = len(docs)
@@ -915,7 +1013,7 @@ def build_passages(args, report):
             counters[source].update(c)
     print(f"passages built ({time.time() - started:.0f} s): "
           f"{ {s: len(v) for s, v in passages.items()} }", flush=True)
-    return passages, counters, started
+    return passages, counters, started, handelingen_docs
 
 
 def annotate(args):
@@ -926,7 +1024,7 @@ def annotate(args):
 
     wanted = {line.strip() for line in open(args.pids, encoding="utf-8") if line.strip()}
     report = {"args": vars(args), "sources": {}}
-    passages, _, _ = build_passages(args, report)
+    passages, _, _, _ = build_passages(args, report)
     columns = ("pid", "source", "text", "fails", "before", "after")
     rows = [{c: p[c] for c in columns} for v in passages.values() for p in v if p["pid"] in wanted]
     out = Path(args.out)
@@ -944,12 +1042,13 @@ def select(args):
     if any(out.glob("*.parquet")):
         raise SystemExit(f"{out} has parquet files already: a new selection goes to a new directory")
     report = {"args": vars(args), "sources": {}, "thresholds": {
-        "min_tokens": MIN_TOKENS, "max_tokens": MAX_TOKENS, "max_paragraphs": MAX_PARAGRAPHS, "max_oov": MAX_OOV,
+        "min_tokens": MIN_TOKENS, "max_tokens": MAX_TOKENS, "short_max": SHORT_MAX, "long_share": LONG_SHARE,
+        "max_paragraphs": MAX_PARAGRAPHS, "max_oov": MAX_OOV,
         "max_digits": MAX_DIGITS, "max_punct": MAX_PUNCT, "max_capitalized": MAX_CAPITALIZED,
         "idiom_class_factor": IDIOM_CLASS_FACTOR, "open_min_words": OPEN_MIN_WORDS,
         "heading_max_words": HEADING_MAX_WORDS, "raad_preferred_weight": RAAD_PREFERRED_WEIGHT, "ngram": NGRAM},
         "resources": {"wordlist": sha256(args.wordlist), "idioms": sha256(args.idioms)}}
-    passages, counters, started = build_passages(args, report)
+    passages, counters, started, handelingen_docs = build_passages(args, report)
     frequent, df = drop_frequent_idioms([p for v in passages.values() for p in v], args.max_idiom_share)
     kept = [(i, n) for i, n in df.most_common() if i not in dict(frequent)]
     report["idioms"] = {"max_share": args.max_idiom_share, "left_out": len(frequent), "kept_found": len(kept),
@@ -984,14 +1083,15 @@ def select(args):
         # the most the document cap allows: per document at most max_per_doc of its passages
         per_doc = collections.Counter(p["doc_id"] for p in train)
         capacity = sum(min(max_per_doc[source], k) for k in per_doc.values())
-        picked, info = choose(train, want[source], chooser, rng, source)
+        picked, info = choose_by_length(train, want[source], chooser, rng, source)
         info["capacity"] = capacity
         info["documents_with_passages"] = len(per_doc)
         if len(picked) < want[source]:
             raise SystemExit(f"{source}: only {len(picked)} passages for {want[source]} (pool {len(train)} in "
                              f"{len(per_doc)} documents, at most {capacity} by the cap of {max_per_doc[source]} a "
                              f"document; skipped {dict(chooser.skipped)}): read more row groups or raise the cap")
-        picked_eval, info_eval = choose(evalp, want_eval[source], chooser, rng, source) if want_eval[source] \
+        picked_eval, info_eval = choose_by_length(evalp, want_eval[source], chooser, rng, source) \
+            if want_eval[source] \
             else ([], {})
         if len(picked_eval) < want_eval[source]:
             raise SystemExit(f"{source}: only {len(picked_eval)} eval passages for {want_eval[source]}")
@@ -1012,11 +1112,14 @@ def select(args):
             "chosen_tokens": percentiles([p["tokens"] for p in picked]),
             "chosen_piece": sum(p["piece"] for p in picked),
             "chosen_halves": dict(collections.Counter(p["half"] for p in picked)),
+            "chosen_length_classes": dict(collections.Counter(p["length_class"] for p in picked)),
+            "chosen_eval_length_classes": dict(collections.Counter(p["length_class"] for p in picked_eval)),
             "chosen_with_idiom": sum(bool(p["idioms"]) for p in picked),
             "chosen_preferred_types": sum(bool(set(p["content_type"]) & RAAD_PREFERRED) for p in picked),
             "chosen_starts_voorzitter": sum(p["text"].startswith("Voorzitter") for p in picked),
         })
     report["skipped_while_choosing"] = dict(chooser.skipped)
+    report["context"], context_rows = mark_context_examples(chosen + chosen_eval, handelingen_docs, args.seed)
     for k, p in enumerate(chosen):
         p["id"] = k
     for k, p in enumerate(chosen_eval):
@@ -1025,7 +1128,11 @@ def select(args):
     if any((p["source"], p["doc_id"]) in eval_docs for p in chosen):
         raise SystemExit("a document has both training and eval passages")
 
-    columns = ["id", "pid", "source", "doc_id", "split", "half", "idiom_class", "text", "tokens", "paragraphs",
+    for p in chosen + chosen_eval:
+        p["context_turns"] = [j for j, _ in p["context"]]
+        p["context_tokens"] = [n for _, n in p["context"]]
+    columns = ["id", "pid", "source", "doc_id", "split", "half", "idiom_class", "length_class", "context_example",
+               "context_turns", "context_tokens", "turn_paragraph", "text", "tokens", "paragraphs",
                "piece", "words",
                "idiom_score", "idioms", "oov", "digits", "punct", "capitalized", "lang", "speaker", "party", "date",
                "content_type"]
@@ -1034,6 +1141,9 @@ def select(args):
         pq.write_table(pa.table({c: [r.get(c) for r in rows] for c in columns}), out / name, compression="zstd")
 
     write(chosen, "passages.parquet")
+    if context_rows:
+        pq.write_table(pa.table({c: [r[c] for r in context_rows] for c in context_rows[0]}), out / "context-turns.parquet",
+                       compression="zstd")
     if chosen_eval:
         write(chosen_eval, "eval.parquet")
     pq.write_table(pa.table({c: [r.get(c) for r in rejected] for c in columns + ["fails"]}), out / "rejected.parquet")

@@ -84,14 +84,19 @@ class FakeJudge:
 
     tokenizer = FakeTokenizer()
 
-    def __init__(self):
+    def __init__(self, offsets=(-1,)):
         self.calls = []
+        self.offsets = offsets
 
     def run(self, prompts, length, rows):
+        # per row and answer position (judge.Judge.run): log P(yes), log P(no), the topic letters' log probabilities
         self.calls.append((length, rows, len(prompts)))
+        positions = len(self.offsets)
         p = np.array([1.0 / (1 + len(p) % 7) for p in prompts])
         top = np.tile(np.array([[1, 2, 3]]), (len(prompts), 1))
-        return np.log(p) - 0.1, np.log(1 - p) - 0.1, top, np.zeros((len(prompts), 3))
+        letters = np.log(np.tile(np.arange(1, len(judge.TOPICS) + 1) / 120.0, (len(prompts), positions, 1)))
+        return (np.tile((np.log(p) - 0.1)[:, None], (1, positions)), np.tile((np.log(1 - p) - 0.1)[:, None],
+                (1, positions)), letters, top, np.zeros((len(prompts), 3)))
 
 
 def test_score_rows_keeps_row_order_and_skips():
@@ -324,3 +329,27 @@ def test_source_markdown_overlap_and_order():
     assert "| paarscore < 0,1 (de afgekeurde paren) | 20 | 10 (50.0%) | 10 (50.0%) |" in md
     assert "| MetricX-QE en→nl > 10 | 5 | 5 (100.0%) | 5 (100.0%) |" in md
     assert md.index("`p0`") < md.index("`p9`")
+
+
+def test_source_topic_reads_the_answers_at_fixed_offsets():
+    tok = FakeTokenizer()
+    suffix, offsets = judge.answer_offsets(tok, "source_topic")
+    words = len(judge.follow_up_texts("source_topic")[0].split())
+    assert len(suffix) == words and offsets == (-1 - words, -1)
+    _, offsets3 = judge.answer_offsets(tok, "source_topic_origin")
+    assert len(offsets3) == 3 and offsets3[-1] == -1 and offsets3[0] < offsets3[1] < -1
+    assert judge.answer_offsets(tok, "source") == ([], (-1,))
+    # the source check's own prompt comes first, unchanged: its answer does not see the follow-ups
+    assert judge.task_prompt("source_topic", "", "Een tekst.").startswith(judge.source_prompt_text("Een tekst."))
+    fake = FakeJudge(offsets)
+    cols = judge.score_rows(fake, ["", ""], ["een twee drie", "vier"], token_budget=4096, multiple=1,
+                            task="source_topic")
+    assert cols["topic"] == ["O", "O"] and all(0 < p < 1 for p in cols["topic_p"])
+    assert all(len(lp) == len(judge.TOPICS) for lp in cols["topic_logps"])
+    with pytest.raises(RuntimeError):
+        judge.score_rows(FakeJudge(), [""], ["een"], token_budget=4096, multiple=1, task="source_topic")
+
+
+def test_letter_ids():
+    vocab = ["A", "▁A", "AB", "B", "▁b", "a"]
+    assert judge.letter_ids(vocab, ["A", "B"]) == [[0, 1], [3]]

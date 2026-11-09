@@ -21,6 +21,8 @@ TOKEN_BUDGET=${TOKEN_BUDGET:-32768}
 # The 4 chips as judge.py's mesh: FSDP 4 asks 31.3 GB of HLO temporaries of the 30.75 GB of a v4 chip (9 Nov)
 FSDP=${FSDP:-4}
 TENSOR=${TENSOR:-1}
+# source, or source_topic (with the topic of TOPICS), or source_topic_origin (also: written in Dutch or translated)
+TASK=${TASK:-source}
 SHARDS=${SHARDS//\{w\}/$WORKER}
 OUT=${OUT//\{w\}/$WORKER}
 
@@ -48,7 +50,7 @@ export TPU_LOG_DIR=$SHM/tpu_logs JUDGE_JAX_CACHE=$SHM/jax_cache
 timeout 600 $PY -c "import jax; assert (jax.device_count(), jax.process_count()) == (4, 1), (jax.device_count(), jax.process_count()); print('devices', jax.devices())" || { echo "preflight failed: not 4 chips of one process"; exit 2; }
 echo "\$(date +%H:%M:%S) $(hostname): $SHARDS -> $OUT with \$(ls $LOCAL | wc -l) shards, parameters $ITEMS"
 $PY -u $CODE/judge.py score --ckpt $ITEMS --tokenizer $SHM/tokenizer --fsdp $FSDP --tensor $TENSOR --token-budget $TOKEN_BUDGET \
-  --task source --pairs $LOCAL --out $OUT
+  --task $TASK --pairs $LOCAL --out $OUT
 EOF
 setsid nohup bash -c "bash ~/run_$NAME.sh > ~/logs/$NAME.log 2>&1; echo EXIT \$? >> ~/logs/$NAME.log; gsutil -q cp ~/logs/$NAME.log $ROOT/mainset/logs/$NAME-w$WORKER.log" > /dev/null 2>&1 < /dev/null &
 echo "started $NAME on $(hostname): ~/logs/$NAME.log, scores in $OUT"

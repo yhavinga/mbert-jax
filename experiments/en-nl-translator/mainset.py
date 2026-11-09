@@ -8,6 +8,7 @@ stage 0 v2 on the pilot.
     python mainset.py stage0-eval --annotated annotated.parquet --scores <source scores> --out stage0-eval.json
     python mainset.py eval-rows --plan <flan-nl plan2> --english <flan-nl en/w*.parquet> --out <dir>
     python mainset.py replay --plan <flan-nl plan2> --translations <translations/27b> --eval-rows <dir> --out <dir>
+    python mainset.py minipilot --select <pool dir> --scores <score dir> --out <dir> [--n 500]
     python mainset.py report --select <pool dir> --stage0 stage0-eval.json --pilot-pairs pairs.parquet \
         --replay <dir> --eval-rows <dir> --testsets manifest.json [--scores <score dir>] --out mainset-prep.md
 
@@ -140,11 +141,16 @@ def judge_shards(args):
         path = Path(args.select) / name
         if path.exists():
             rows += pq.read_table(path).to_pylist()
+    context = Path(args.select) / "context-turns.parquet"
+    if context.exists():
+        # the turns before the context examples (design §9): through the same source check, as split "context"
+        rows += [{"pid": r["id"], "source": "handelingen", "split": "context", "doc_id": r["doc_id"], "text": r["text"],
+                  "tokens": r["tokens"]} for r in pq.read_table(context).to_pylist()]
     ids = [r["pid"] for r in rows]
     if len(set(ids)) != len(ids):
         raise SystemExit("a pid twice in the selection")
     out = Path(args.out)
-    columns = ("id", "source", "split", "half", "idiom_class", "doc_id", "tokens", "nl", "en")
+    columns = ("id", "source", "split", "half", "idiom_class", "length_class", "doc_id", "tokens", "nl", "en")
     counts = {}
     for k, part in enumerate(sp.balanced_workers([{**r, "id": r["pid"]} for r in rows], args.workers)):
         part.sort(key=lambda r: r["pid"])  # a shard holds a mix of lengths; judge.py batches by length
@@ -160,7 +166,8 @@ def judge_shards(args):
     print(f"JUDGE-SHARDS {len(rows)} passages: {counts}")
 
 
-EVAL_BAND = (48, 384)  # select_passages.MIN_TOKENS, MAX_TOKENS
+EVAL_BAND = (48, 384)  # the band of the pilot's BT passages (select_passages.MIN_TOKENS, SHORT_MAX)
+SHARES_MAINSET = (0.40, 0.20, 0.075, 0.075)  # Handelingen, raad, dpc, rechtspraak; FineWeb-2 0.25 (Yeb, 9 Nov)
 EVAL_SETS = (("classifier", 1000), ("yeb", 35))
 EVAL_SEED = "en-nl-translator/flan-eval/1"
 
@@ -399,9 +406,11 @@ def report(args):
 
     # the pool
     out += ["## 2. Kandidatenpool", "",
-            "Doel: na het Gemma-bronfilter 200.000 passages in de verdeling 50/30/10/10, met ~30% marge, gerekend met "
-            "de afkeurpercentages van de pilot (score < 0,1). Plus 4.000 evaluatiepassages uit andere documenten "
-            "(splitsing per document), met dezelfde marge.", ""]
+            "Doel (Yeb, 9 nov, ontwerp §7 punt 7): na het Gemma-bronfilter 200.000 passages, verdeeld als Handelingen "
+            "40%, raadsinformatie 20%, dpc 7,5%, rechtspraak 7,5% en FineWeb-2 25%, met ~30% marge, gerekend met de "
+            "afkeurpercentages van de pilot (score < 0,1); passages tot 768 tokens, per bron 25% langer dan 384. Plus "
+            "4.000 evaluatiepassages uit andere documenten (splitsing per document), met dezelfde marge. Deze pool "
+            "heeft de vier bestaande bronnen; FineWeb-2 is de volgende stap (zie HANDOVER.md).", ""]
     rates = {s: sides["rejected"][s] / (sides["rejected"][s] + sides["accepted"][s] + sides["between"][s])
              for s in sources}
     args_sel = sel["args"]
@@ -410,9 +419,9 @@ def report(args):
         if args_sel.get("eval_counts") else {}
     out += [_md_table(["bron", "aandeel", "nodig", "afkeur pilot", "pool = nodig × 1,3 / (1 − afkeur)", "eval nodig",
                        "eval-pool"],
-                      [[s, f"{int(100 * sh)}%", _n(int(200000 * sh)), f"{100 * rates[s]:.1f}%", _n(int(counts.get(s, 0))),
+                      [[s, f"{100 * sh:g}%", _n(int(200000 * sh)), f"{100 * rates[s]:.1f}%", _n(int(counts.get(s, 0))),
                         _n(int(4000 * sh)), _n(int(eval_counts.get(s, 0)))]
-                       for s, sh in zip(sources, (0.5, 0.3, 0.1, 0.1))]), ""]
+                       for s, sh in zip(sources, SHARES_MAINSET)]), ""]
     out += [f"Selectie: `select_passages.py select` met `--row-groups {args_sel['row_groups']}`, `--max-per-doc "
             f"{args_sel['max_per_doc']}` (anders 3), `--eval-permille {args_sel['eval_permille']}`, seed "
             f"{args_sel['seed']}, dezelfde bronnen en revisies als de pilot; {sel['seconds']} s.", ""]
@@ -422,10 +431,11 @@ def report(args):
         d, c = r["documents"], r["counts"]
         rows.append([s, r["row_groups"], _n(d.get("docs_read", 0)), _n(d.get("docs_kept", 0)), _n(c.get("passages", 0)),
                      _n(r["passed"]), _n(r["passed_train"]), _n(r["passed_eval"]), _n(r["chosen"]),
-                     _n(r["chosen_eval"]), r["chosen_halves"].get("idiom", 0), r["choice"]["idiom_class_size"]])
+                     _n(r["chosen_eval"]), _n(r.get("chosen_length_classes", {}).get("long", 0)),
+                     _n(r["chosen_halves"].get("idiom", 0)), _n(r["choice"].get("capacity", 0))])
     out += [_md_table(["bron", "row groups", "documenten", "na documentfilters", "passages", "door alle filters",
-                       "train-kant", "eval-kant", "pool (train)", "pool (eval)", "waarvan idioomhelft",
-                       "idioomklasse"], rows), "",
+                       "train-kant", "eval-kant", "pool (train)", "pool (eval)", "waarvan lang (> 384 tokens)",
+                       "waarvan idioomhelft", "capaciteit documentmaximum"], rows), "",
             f"Overgeslagen bij het kiezen (alle bronnen): {sel['skipped_while_choosing']}. Geblokkeerde 13-grammen "
             f"uit de testsets: {_n(sel.get('blocked_ngrams', 0))}. De idioomhelft is kleiner dan de helft waar de "
             f"bron te weinig passages met een idioomtreffer heeft; de rest komt dan uit de willekeurige helft.", ""]
@@ -450,11 +460,7 @@ def report(args):
         if path.exists():
             for r in pq.read_table(path, columns=["pid", "source", "split", "half", "text"]).to_pylist():
                 pool[r["pid"]] = r
-    scored = {}
-    if args.scores:
-        for path in sorted(Path(args.scores).glob("w*/shard-*.parquet")):
-            for r in pq.read_table(path, columns=["id", "score", "logp_yes", "logp_no", "skipped"]).to_pylist():
-                scored[r["id"]] = r
+    scored = read_scores(args.scores) if args.scores else {}
     if not scored:
         out += ["Nog niet gescoord: deze sectie vult `mainset.py report --scores` na de run.", ""]
     else:
@@ -540,6 +546,58 @@ def report(args):
     print(f"REPORT {args.out}: {len(out)} lines, {len(scored)} scores")
 
 
+def read_scores(directory):
+    """{pid: score row} of the score shards under directory (w*/shard-*.parquet)"""
+    import pyarrow.parquet as pq
+
+    out = {}
+    for path in sorted(Path(directory).glob("w*/shard-*.parquet")):
+        for r in pq.read_table(path).to_pylist():
+            out[r["id"]] = r
+    return out
+
+
+def minipilot(args):
+    """~500 long passages for a mini-pilot of nl->en (Yeb, 9 Nov; not run here): training side, length class long,
+    source score >= MINIPILOT_SCORE, per source in the shares of the main set, drawn with a fixed seed; written as
+    passages.parquet and as translate.py's segments-w<k>.parquet"""
+    import random
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    import select_passages as sp
+
+    scores = read_scores(args.scores)
+    pool = [r for r in pq.read_table(Path(args.select) / "passages.parquet").to_pylist()
+            if r["length_class"] == "long" and r["pid"] in scores and scores[r["pid"]]["score"] >= MINIPILOT_SCORE]
+    total = sum(SHARES_MAINSET)
+    rng = random.Random(MINIPILOT_SEED)
+    chosen = []
+    for source, share in zip(("handelingen", "raad", "dpc", "rechtspraak"), SHARES_MAINSET):
+        part = sorted((r for r in pool if r["source"] == source), key=lambda r: r["pid"])
+        k = round(args.n * share / total)
+        if len(part) < k:
+            raise SystemExit(f"{source}: {len(part)} long passages with a source score >= {MINIPILOT_SCORE}, {k} wanted")
+        chosen += rng.sample(part, k)
+    for r in chosen:
+        r["source_score"] = scores[r["pid"]]["score"]
+        r["topic"] = scores[r["pid"]].get("topic")
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    columns = ["id", "pid", "source", "doc_id", "half", "length_class", "tokens", "text", "source_score", "topic"]
+    pq.write_table(pa.table({c: [r.get(c) for r in chosen] for c in columns}), out / "passages.parquet")
+    for k, part in enumerate(sp.balanced_workers(chosen, args.workers)):
+        pq.write_table(pa.table({"id": [r["id"] for r in part], "text": [r["text"] for r in part],
+                                 "tokens": [r["tokens"] for r in part]}), out / f"segments-w{k}.parquet")
+    counts = collections.Counter(r["source"] for r in chosen)
+    print(f"MINIPILOT {len(chosen)} long passages: {dict(counts)}")
+
+
+MINIPILOT_SCORE = 0.9
+MINIPILOT_SEED = "en-nl-translator/minipilot-long/0"
+
+
 SIDES = (("rejected", lambda s: s < 0.1), ("accepted", lambda s: s >= 0.9), ("between", lambda s: 0.1 <= s < 0.9))
 
 
@@ -601,6 +659,12 @@ def main(argv=None):
     p.add_argument("--eval-rows", required=True)
     p.add_argument("--out", required=True)
     p.add_argument("--processes", type=int, default=64)
+    p = sub.add_parser("minipilot", help="Long passages for a mini-pilot of nl->en")
+    p.add_argument("--select", required=True)
+    p.add_argument("--scores", required=True)
+    p.add_argument("--out", required=True)
+    p.add_argument("--n", type=int, default=500)
+    p.add_argument("--workers", type=int, default=4)
     p = sub.add_parser("report", help="mainset-prep.md")
     p.add_argument("--select", required=True)
     p.add_argument("--stage0", required=True)
@@ -617,7 +681,7 @@ def main(argv=None):
     p.add_argument("--out", required=True)
     args = parser.parse_args(argv)
     {"testsets": testsets, "judge-shards": judge_shards, "stage0-eval": stage0_eval, "eval-rows": eval_rows,
-     "replay": replay, "report": report}[args.command](args)
+     "replay": replay, "report": report, "minipilot": minipilot}[args.command](args)
 
 
 if __name__ == "__main__":

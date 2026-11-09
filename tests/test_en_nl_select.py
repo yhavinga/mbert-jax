@@ -409,3 +409,43 @@ def test_max_per_doc_per_source_and_the_idiom_class():
     chosen, info = sp.choose(pool, 20, sp.Chooser(3), random.Random(0), "dpc")
     assert all(p["idiom_class"] for p in chosen if p["half"] == "idiom")
     assert all(p["idiom_class"] == (p["idiom_score"] >= info["idiom_class_threshold"]) for p in chosen)
+
+
+def test_a_quarter_of_the_chosen_passages_are_long():
+    pool = [{**passage(f"p{k}", f"tekst {k} met eigen woorden", f"d{k}", score=(k % 7) / 10), "tokens": 100 + 7 * k}
+            for k in range(200)]
+    chosen, info = sp.choose_by_length(pool, 40, sp.Chooser(3), random.Random(0), "dpc")
+    classes = collections.Counter(p["length_class"] for p in chosen)
+    assert classes == {"long": 10, "short": 30}
+    assert all((p["tokens"] > sp.SHORT_MAX) == (p["length_class"] == "long") for p in chosen)
+    assert info["long"]["chosen"] == 10 and info["short"]["wanted"] == 30
+
+
+
+def test_context_turns_walk_back_until_a_turn_fails_or_the_budget_is_spent():
+    turns = [(100, True), None, (200, True), (900, True), (300, True), (400, True), (500, False), (50, True)]
+    assert sp.context_of(0, turns) == []
+    assert sp.context_of(3, turns) == [(2, 200)]  # turn 1 has no text
+    assert sp.context_of(5, turns) == [(4, 300)]  # turn 3 is longer than MAX_TOKENS
+    assert sp.context_of(7, turns) == []  # turn 6 fails a filter
+    assert sp.context_of(6, [(400, True), (400, True), (300, True), (300, True), (300, True), (300, True), (1, True)]) \
+        == [(3, 300), (4, 300), (5, 300)]  # at most three turns
+    assert sp.context_of(3, [(100, True), (600, True), (500, True), (1, True)]) == [(2, 500)]  # 1,024 at most
+
+
+def test_a_debate_gives_its_passages_a_context_and_a_share_are_examples(idioms):
+    chair = "Ik geef het woord aan de heer Dibi, die vandaag namens zijn fractie het debat over de woningbouw opent."
+    words = set(sp.words_of(SPEECH.lower())) | set(sp.words_of(chair.lower()))
+    doc = {"id": "h-tk-2", "date": "2011-01-18", "turns": [
+        {"speaker": "De voorzitter", "party": None, "text": chair},
+        {"speaker": "De heer Dibi", "party": "GroenLinks", "text": SPEECH},
+        {"speaker": "De heer Rutte", "party": "VVD", "text": SPEECH.replace("Voorzitter. ", "")},
+    ]}
+    passages, counters = builder(idioms, words).document("handelingen", doc)
+    by_turn = {p["pid"].split(":")[2]: p for p in passages}
+    assert by_turn["t1"]["context"] == [(0, len(chair.split()))]  # the chair's turn, a token a word here
+    assert [j for j, _ in by_turn["t2"]["context"]] == [0, 1]
+    chosen = [{**p, "source": "handelingen", "doc_id": "h-tk-2"} for p in passages] * 1
+    report, rows = sp.mark_context_examples(chosen, {"h-tk-2": doc}, seed=0)
+    assert report["examples"] == round(sp.CONTEXT_SHARE * len(chosen))
+    assert all(r["text"] and r["tokens"] > 0 for r in rows)

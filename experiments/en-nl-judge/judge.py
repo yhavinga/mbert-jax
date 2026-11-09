@@ -55,7 +55,37 @@ SOURCE_QUESTION = (
     "in the middle of the text, and sentences cut off at the beginning or the end. The register (spoken, official, "
     "legal) and the opinions in the text do not count. Answer with one word: yes or no."
 )
-TASKS = ("pair", "source")
+# Yeb, 9 Nov (design §7 point 7): a topic per passage, to spread the set over domains, and for FineWeb-2 whether a text
+# reads as written in Dutch. Both are asked in the same forward pass as the source check: after its generation prompt
+# come a fixed answer ("yes") and a further user turn per question. The logits at the source answer's position are
+# then those of the source prompt alone (attention is causal), and every further answer is read at a fixed distance
+# from the end of the prompt.
+TOPICS = (
+    ("A", "Politics, parliament and public administration"),
+    ("B", "Law and justice"),
+    ("C", "Economy, finance and business"),
+    ("D", "Health and care"),
+    ("E", "Education, youth and family"),
+    ("F", "Environment, energy and climate"),
+    ("G", "Spatial planning, housing and construction"),
+    ("H", "Traffic, transport and infrastructure"),
+    ("I", "Security, police, defence and emergencies"),
+    ("J", "Work, income and social affairs"),
+    ("K", "Culture, sport, media and recreation"),
+    ("L", "Science and technology"),
+    ("M", "Agriculture, nature, animals and food"),
+    ("N", "International affairs, migration and integration"),
+    ("O", "Daily life, consumers and other topics"),
+)
+TOPIC_QUESTION = ("Which topic fits this Dutch text best? Answer with one letter.\n"
+                  + "\n".join(f"{letter}. {name}" for letter, name in TOPICS))
+ORIGIN_QUESTION = ("Does this Dutch text read as written originally in Dutch? Answer no if it reads as a translation from "
+                   "another language. Answer with one word: yes or no.")
+FOLLOW_UP = "yes<turn|>\n<|turn>user\n{question}" + TEMPLATE_SUFFIX
+# The questions after the source check, per task, in order
+FOLLOW_UPS = {"pair": (), "source": (), "source_topic": (("topic", TOPIC_QUESTION),),
+              "source_topic_origin": (("origin", ORIGIN_QUESTION), ("topic", TOPIC_QUESTION))}
+TASKS = tuple(FOLLOW_UPS)
 
 # Padded prompt lengths; a batch holds token_budget // length rows (a multiple of the batch axis), so a step costs
 # about the same at every length. Few lengths, because every shape compiles the 60 unscanned layers anew, for minutes,
@@ -74,6 +104,40 @@ def prompt_text(en, nl):
 
 def source_prompt_text(nl):
     return TEMPLATE_PREFIX + SOURCE_QUESTION.format(nl=nl.strip()) + TEMPLATE_SUFFIX
+
+
+def follow_up_texts(task):
+    return [FOLLOW_UP.format(question=q) for _, q in FOLLOW_UPS[task]]
+
+
+def task_prompt(task, en, nl):
+    if task == "pair":
+        return prompt_text(en, nl)
+    return source_prompt_text(nl) + "".join(follow_up_texts(task))
+
+
+def answer_offsets(tokenizer, task):
+    """(the token ids of the follow-up turns, joined; the negative offsets of the answers: the source check's first,
+    then each follow-up's)"""
+    pieces = [tokenizer.encode_batch([t])[0] for t in follow_up_texts(task)]
+    suffix = [i for piece in pieces for i in piece]
+    offsets, after = [], len(suffix)
+    offsets.append(-1 - after)
+    for piece in pieces:
+        after -= len(piece)
+        offsets.append(-1 - after)
+    return suffix, tuple(offsets)
+
+
+def letter_ids(vocab, letters):
+    """Per letter the ids of the tokens that are that capital letter alone (with or without the word-boundary mark)"""
+    out = []
+    for letter in letters:
+        ids = [i for i, token in enumerate(vocab) if token.replace("▁", " ").strip() == letter]
+        if not ids:
+            raise RuntimeError(f"no token for the letter {letter}")
+        out.append(ids)
+    return out
 
 
 def answer_ids(vocab):
@@ -163,10 +227,12 @@ class Tokenizer:
         return self.vocab[i]
 
 
-def keep_last_position_only():
-    """MaxText computes the logits of every position; the judge needs the last one, and [batch, length, 262144]
-    float32 logits would take more memory than the model. The decoder's output head gets the last position only
-    (the prompts are left-padded, so that is every row's last token)."""
+def keep_last_position_only(offsets=(-1,)):
+    """MaxText computes the logits of every position; the judge needs the last one (or a few at fixed distances from
+    the end, offsets), and [batch, length, 262144] float32 logits would take more memory than the model. The decoder's
+    output head gets those positions only (the prompts are left-padded, so every row ends at the last position)."""
+    import jax.numpy as jnp
+
     from maxtext.layers import nnx_decoders
 
     classes = [c for c in vars(nnx_decoders).values() if isinstance(c, type) and "apply_output_head" in vars(c)]
@@ -175,8 +241,11 @@ def keep_last_position_only():
     cls = classes[0]
     original = cls.apply_output_head
 
+    index = jnp.asarray(offsets, jnp.int32) + 0  # negative: counted from the end
+
     def apply_output_head(self, shared_embedding, y, deterministic, model_mode, normalize_y=True):
-        return original(self, shared_embedding, y[:, -1:, :], deterministic, model_mode, normalize_y)
+        return original(self, shared_embedding, jnp.take(y, index, axis=1, mode="wrap"), deterministic, model_mode,
+                        normalize_y)
 
     cls.apply_output_head = apply_output_head
 
@@ -184,7 +253,7 @@ def keep_last_position_only():
 class Judge:
     """The model on the host's chips and the jitted score of one batch."""
 
-    def __init__(self, ckpt, tokenizer, fsdp, tensor, top_k=5):
+    def __init__(self, ckpt, tokenizer, fsdp, tensor, top_k=5, offsets=(-1,)):
         import jax
         import jax.numpy as jnp
         from flax import nnx
@@ -194,7 +263,8 @@ class Judge:
 
         if fsdp * tensor != jax.device_count():
             raise SystemExit(f"fsdp {fsdp} x tensor {tensor} is not the {jax.device_count()} devices of this host")
-        keep_last_position_only()
+        keep_last_position_only(offsets)
+        self.offsets = offsets
         self.config = pyconfig.initialize(
             [""], model_name="gemma4-31b", load_parameters_path=ckpt, run_name="en_nl_judge", log_config=False,
             base_output_directory="/dev/shm/judge/maxtext_output", enable_checkpointing=False,
@@ -213,17 +283,22 @@ class Judge:
         yes, no = answer_ids(tokenizer.vocab)
         self.yes_ids, self.no_ids = yes, no
         yes_ids, no_ids = jnp.asarray(yes, jnp.int32), jnp.asarray(no, jnp.int32)
+        self.letter_ids = letter_ids(tokenizer.vocab, [letter for letter, _ in TOPICS])
+        letters = [jnp.asarray(ids, jnp.int32) for ids in self.letter_ids]
 
         @nnx.jit
         def step(model, tokens, positions, segments):
+            """Per row and answer position (offsets): log P(yes), log P(no), the log probability of each topic
+            letter; and the top tokens of the first position"""
             out = model(decoder_input_tokens=tokens, decoder_positions=positions, decoder_segment_ids=segments,
                         enable_dropout=False)
             logits = out[0] if isinstance(out, tuple) else out
-            logp = jax.nn.log_softmax(logits[:, -1, :].astype(jnp.float32), axis=-1)
-            logp_yes = jax.nn.logsumexp(logp[:, yes_ids], axis=-1)
-            logp_no = jax.nn.logsumexp(logp[:, no_ids], axis=-1)
-            top_logp, top_ids = jax.lax.top_k(logp, top_k)
-            return logp_yes, logp_no, top_ids, top_logp
+            logp = jax.nn.log_softmax(logits.astype(jnp.float32), axis=-1)  # [rows, positions, vocabulary]
+            logp_yes = jax.nn.logsumexp(logp[..., yes_ids], axis=-1)
+            logp_no = jax.nn.logsumexp(logp[..., no_ids], axis=-1)
+            logp_letters = jnp.stack([jax.nn.logsumexp(logp[..., ids], axis=-1) for ids in letters], axis=-1)
+            top_logp, top_ids = jax.lax.top_k(logp[:, 0, :], top_k)
+            return logp_yes, logp_no, logp_letters, top_ids, top_logp
 
         self._step = step
         self.shapes = set()
@@ -236,7 +311,7 @@ class Judge:
         started = time.time()
         with jax.set_mesh(self.mesh), nn_partitioning.axis_rules(self.rules):
             out = self._step(self.model, tokens, positions, segments)
-        logp_yes, logp_no, top_ids, top_logp = (np.asarray(jax.device_get(x)) for x in out)
+        logp_yes, logp_no, logp_letters, top_ids, top_logp = (np.asarray(jax.device_get(x)) for x in out)
         if (length, rows) not in self.shapes:
             # The first step of a shape includes its compilation; the cache goes to the bucket at once, so that a
             # preempted VM's successor need not compile it again
@@ -245,21 +320,28 @@ class Judge:
                                            "seconds": round(time.time() - started, 1)}), flush=True)
             sync_compilation_cache()
         n = len(prompts)
-        return logp_yes[:n], logp_no[:n], top_ids[:n], top_logp[:n]
+        return logp_yes[:n], logp_no[:n], logp_letters[:n], top_ids[:n], top_logp[:n]
 
 
 def score_rows(judge, en, nl, token_budget, multiple, task="pair"):
     """Scores of all rows of one shard: a dict of columns in the order of the rows; a row whose prompt is longer than
     the longest padded length, or with an empty text, has no score and its reason in `skipped`. task "pair" asks
-    about the translation en -> nl, task "source" about the Dutch text alone (en is not used)."""
+    about the translation en -> nl, task "source" about the Dutch text alone (en is not used); source_topic and
+    source_topic_origin add the follow-ups of FOLLOW_UPS (topic: the letter of TOPICS, origin: yes/no)."""
     n = len(nl)
     skipped = [None] * n
     for i in range(n):
         if not nl[i].strip() or (task == "pair" and not en[i].strip()):
             skipped[i] = "empty"
     live = [i for i in range(n) if skipped[i] is None]
-    texts = [prompt_text(en[i], nl[i]) if task == "pair" else source_prompt_text(nl[i]) for i in live]
+    texts = [task_prompt(task, en[i], nl[i]) for i in live]
     ids = judge.tokenizer.encode_batch(texts)
+    suffix, offsets = answer_offsets(judge.tokenizer, task)
+    if offsets != judge.offsets:
+        raise RuntimeError(f"task {task} reads answers at {offsets}, the model was built for {judge.offsets}")
+    for row in ids:
+        if suffix and row[-len(suffix):] != suffix:
+            raise RuntimeError("the follow-up turns tokenize differently inside a prompt than alone")
     prompt_tokens = [0] * n
     for i, row in zip(live, ids):
         prompt_tokens[i] = len(row)
@@ -270,17 +352,36 @@ def score_rows(judge, en, nl, token_budget, multiple, task="pair"):
     nan = float("nan")
     cols = {"score": [nan] * n, "logp_yes": [nan] * n, "logp_no": [nan] * n, "answer_mass": [nan] * n,
             "top_token": [None] * n, "top_logp": [nan] * n}
+    names = [name for name, _ in FOLLOW_UPS[task]]
+    if "origin" in names:
+        cols.update({"origin_score": [nan] * n, "origin_logp_yes": [nan] * n, "origin_logp_no": [nan] * n})
+    if "topic" in names:
+        cols.update({"topic": [None] * n, "topic_p": [nan] * n, "topic_mass": [nan] * n,
+                     "topic_logps": [None] * n})
     for length, members in batches:
         rows = [live[k] for k in members]
-        logp_yes, logp_no, top_ids, top_logp = judge.run([by_row[i] for i in rows], length,
-                                                         batch_rows(length, token_budget, multiple))
+        logp_yes, logp_no, logp_letters, top_ids, top_logp = judge.run([by_row[i] for i in rows], length,
+                                                                       batch_rows(length, token_budget, multiple))
         for j, i in enumerate(rows):
-            y, m = float(logp_yes[j]), float(logp_no[j])
+            y, m = float(logp_yes[j, 0]), float(logp_no[j, 0])
             cols["score"][i] = score_from_logps(y, m)
             cols["logp_yes"][i], cols["logp_no"][i] = y, m
             cols["answer_mass"][i] = math.exp(y) + math.exp(m)
             cols["top_token"][i] = judge.tokenizer.token(int(top_ids[j, 0]))
             cols["top_logp"][i] = float(top_logp[j, 0])
+            for position, name in enumerate(names, start=1):
+                if name == "origin":
+                    y, m = float(logp_yes[j, position]), float(logp_no[j, position])
+                    cols["origin_score"][i] = score_from_logps(y, m)
+                    cols["origin_logp_yes"][i], cols["origin_logp_no"][i] = y, m
+                else:
+                    lp = [float(x) for x in logp_letters[j, position]]
+                    best = max(range(len(lp)), key=lambda k: lp[k])
+                    mass = sum(math.exp(x) for x in lp)
+                    cols["topic"][i] = TOPICS[best][0]
+                    cols["topic_p"][i] = math.exp(lp[best]) / mass if mass > 0 else nan
+                    cols["topic_mass"][i] = mass
+                    cols["topic_logps"][i] = [round(x, 4) for x in lp]
     cols["prompt_tokens"] = prompt_tokens
     cols["skipped"] = skipped
     return cols
@@ -298,7 +399,7 @@ def done_shards(out):
 # The columns of the input shards that the score shards carry along (all but the texts)
 PASSTHROUGH = ("id", "kind", "source_id", "date", "year", "intervention_id", "paragraph", "paragraphs", "speaker",
                "speaker_id", "nationality", "mode", "role", "sl", "row_id", "source", "half", "chrf", "qe_en_nl",
-               "qe_nl_en")
+               "qe_nl_en", "split", "idiom_class", "length_class", "doc_id", "tokens")
 
 
 def sync_compilation_cache():
@@ -330,7 +431,12 @@ def score_command(args):
     if not jobs:
         return
     started = time.time()
-    judge = Judge(args.ckpt, Tokenizer(args.tokenizer), args.fsdp, args.tensor)
+    tokenizer = Tokenizer(args.tokenizer)
+    # one model reads the answers at one set of positions: tasks with other follow-ups go in runs of their own
+    offset_sets = {answer_offsets(tokenizer, task)[1] for _, _, task in jobs}
+    if len(offset_sets) != 1:
+        raise SystemExit(f"tasks {sorted({t for _, _, t in jobs})} read their answers at other positions: one run each")
+    judge = Judge(args.ckpt, tokenizer, args.fsdp, args.tensor, offsets=offset_sets.pop())
     print(f"model ready in {time.time() - started:.0f} s; yes ids {judge.yes_ids}, no ids {judge.no_ids}", flush=True)
     local = Path("/dev/shm/judge/out_shards")
     local.mkdir(parents=True, exist_ok=True)
@@ -386,8 +492,9 @@ def probe_command(args):
     for length in sorted({bucket_length(len(row)) for row in ids}):
         members = [k for k, row in enumerate(ids) if bucket_length(len(row)) == length]
         t0 = time.time()
-        logp_yes, logp_no, top_ids, top_logp = judge.run([ids[k] for k in members], length,
-                                                         batch_rows(length, args.token_budget, args.fsdp))
+        logp_yes, logp_no, _, top_ids, top_logp = judge.run([ids[k] for k in members], length,
+                                                            batch_rows(length, args.token_budget, args.fsdp))
+        logp_yes, logp_no = logp_yes[:, 0], logp_no[:, 0]
         print(f"length {length}: {len(members)} rows in {time.time() - t0:.1f} s (incl. compile)", flush=True)
         for j, k in enumerate(members):
             results.append((k, {"logp_yes": float(logp_yes[j]), "logp_no": float(logp_no[j]),

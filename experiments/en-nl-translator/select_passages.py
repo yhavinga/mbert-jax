@@ -22,7 +22,8 @@ the start of a paragraph is removed and a passage never runs over the next label
 
 Filters per passage (all recorded, a passage passes when none fails): langid not nl, an old spelling form
 (OLD_SPELLING), the share of lowercase words outside OpenTaal's word list, the share of digits and of punctuation among
-the characters, the share of capitalized words (lists of names), motion boilerplate (MOTION), and in GPT-NL a name
+the characters, the share of capitalized words (lists of names), motion boilerplate (MOTION), words a line break hyphenated
+(hyphenation: "be-ant-woord"), and in GPT-NL a name
 the PII filter made inconsistent (name_conflict), and in council documents a speaker label inside a paragraph
 (speaker_change).
 
@@ -98,11 +99,12 @@ WORD = re.compile(r"[^\W\d_]+(?:['’][^\W\d_]+)*")
 NGRAM_WORD = re.compile(r"\w+")
 PUNCT = re.compile(r"[^\w\s]")
 ABBREVIATIONS = frozenset("""mr dr drs ir ing prof art nr nrs blz jl mw mevr dhr ca bijv vgl o.a e.d i.c z.g.a etc
-    st lid sub resp jr sr ds pag""".split())
+    st lid sub resp jr sr ds pag p d.d r.o jo""".split())
 SENTENCE_END = re.compile(r"(?<=[.!?…])(['\"”’)]*)\s+(?=[\"'“‘(]?[A-Z0-9À-Ý])")
 PROSE_END = re.compile(r"[.!?…]['\"”’)]*$")
 BULLET = re.compile(r"^(?:[-•*–·▪>#]|\(?(?:\d{1,3}|[a-zA-Z]|[ivxIVX]{1,4})[.)]\s)")
 URL = re.compile(r"https?://|www\.|\S+@\S+\.\w+")
+HYPHENATED = re.compile(r"(?<![\w-])[a-zà-ÿ]+(?:-[a-zà-ÿ]+)+(?![\w-])")
 
 # Speaker labels of council minutes: a title or a name with a party, then a colon
 _PARTICLE = r"(?:[Vv]an|[Dd]e|[Dd]er|[Dd]en|[Tt]er|[Tt]en|[Hh]et|'t|[Oo]p|[Ii]n|[Ll]a|[Ll]e|[Dd]u|[Dd]a|[Vv]on|[Zz]u)"
@@ -131,7 +133,7 @@ def split_sentences(text, abbreviations=ABBREVIATIONS):
     parts, start = [], 0
     for m in SENTENCE_END.finditer(text):
         before = text[start:m.start()].split()
-        last = before[-1].lower().rstrip(".") if before else ""
+        last = before[-1].lower().rstrip(".").lstrip("([\"'“‘") if before else ""
         if last in abbreviations or (len(last) == 1 and last.isalpha()):
             continue
         parts.append(text[start:m.start() + len(m.group(1))].strip())
@@ -184,6 +186,19 @@ def paragraphs_of(source, text, wordset):
             parts += re.split(r"(?<=[.;:])\s+(?=(?:\d+(?:\.\d+)+\.?|Titel\s+\d+)\s)", block)
         return [p for p in (clean(re.sub(r"^\d+(?:\.\d+)*\.?\s+", "", x.strip())) for x in parts) if p]
     return [p for p in (clean(x) for x in text.split("\n")) if p]
+
+
+# Prefixes that stand before a hyphen in correct spelling (co-produceren, semi-publieke)
+HYPHEN_PREFIXES = frozenset("""co ex anti pre post pro semi vice super mini multi non inter para pseudo quasi neo
+    oud niet""".split())
+
+
+def hyphen_artifacts(text, wordset):
+    """Words that a line break hyphenated and the extraction kept ("voor-ge-legd", "be-ant-woord"): lowercase words
+    with hyphens that the word list lacks, has without the hyphens, and with a piece that is no word (so not
+    sociaal-democratische or fractie-assistent)"""
+    return [w for w in HYPHENATED.findall(text) if w not in wordset and w.replace("-", "") in wordset
+            and any(part not in wordset and part not in HYPHEN_PREFIXES for part in w.split("-"))]
 
 
 def name_conflict(text):
@@ -430,6 +445,8 @@ class Builder:
             fails.append("capitals")
         if MOTION.search(text):
             fails.append("motion")
+        if hyphen_artifacts(text, self.wordset):
+            fails.append("hyphenation")
         if source != "handelingen" and name_conflict(text):
             fails.append("name_conflict")
         if source == "raad" and INLINE_LABEL.search(text):

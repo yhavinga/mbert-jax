@@ -41,6 +41,20 @@ def test_numbers_ignore_separators_and_decimal_commas():
     assert pairs.numbers("Op 3 mei") - pairs.numbers("On May 4") == {"3"}
 
 
+def test_numbers_the_english_writes_otherwise_are_not_missing():
+    assert pairs.missing_numbers("Een plantekst en 2 plankaarten.", "A plan text and two plan maps.") == []
+    assert pairs.missing_numbers("Om 01.30 uur vannacht.", "At 1:30 last night.") == []
+    assert pairs.missing_numbers("Den Haag, 30-04-2015.", "The Hague, April 30, 2015.") == []
+    assert pairs.missing_numbers("Den Haag, 30-04-2015.", "The Hague, 30 2015.") == ["4"]
+    assert pairs.missing_numbers("Op de Janneboulevard 78 en in 2023.", "On Janneboulevard in 2023.") == ["78"]
+    assert pairs.missing_numbers("Er zijn 1.000.000 woningen, 12,5% meer.", "There are 1,000,000 homes, 12.5% more.") == []
+
+
+def test_sentences_know_dutch_references():
+    text = "Het proces-verbaal d.d. 7 december is opgemaakt. Zie de stukken (pag. 6) en het verslag."
+    assert pairs.sentences(text, pairs.sp.ABBREVIATIONS) == 2
+
+
 def test_sentences_know_english_abbreviations():
     assert pairs.sentences("Mrs. Smith spoke. Mr. Jones, e.g. here, did not.", pairs.ENGLISH_ABBREVIATIONS) == 2
 

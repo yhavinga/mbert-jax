@@ -13,7 +13,8 @@ here: Yeb sets them on the pilot):
 - dutch_left: the mirror of publish.english_left, a stretch of the Dutch source left in the English
 - len_ratio: the longer of the two texts' characters over the shorter's
 - sentences_nl, sentences_en: sentence counts (select_passages.split_sentences)
-- numbers_missing: numbers of the Dutch that the English lacks (digits only, separators ignored: 1.000,5 = 1,000.5)
+- numbers_missing: numbers of the Dutch that the English lacks (missing_numbers: separators, times, number words up
+  to twenty and months in dates aside)
 - chrf: chrF (sacrebleu, chrF2) of the back-translation against the original
 - the back-translation's own ended and decode_loop, for reading
 MetricX-24 QE comes from metricx_qe.py.
@@ -35,8 +36,14 @@ import publish  # noqa: E402
 import select_passages as sp  # noqa: E402
 
 MAX_BACK_TOKENS = 512  # translate.py's longest class
-ENGLISH_ABBREVIATIONS = sp.ABBREVIATIONS | frozenset("mrs ms e.g i.e no vs u.s u.k para sec fig approx".split())
-NUMBER = re.compile(r"\d+(?:[.,  ]\d{3})*(?:[.,]\d+)?")
+ENGLISH_ABBREVIATIONS = sp.ABBREVIATIONS | frozenset("mrs ms e.g i.e no vs u.s u.k para sec fig approx pp".split())
+NUMBER = re.compile(r"\d+(?:[.,\u00a0]\d{3})*(?:[.,]\d+)?")  # a plain space is no thousands separator: "30 2015"
+# A number of the Dutch that the English writes as a word, or as a month in a date
+NUMBER_WORDS = {w: str(k) for k, w in enumerate("""zero one two three four five six seven eight nine ten eleven twelve
+    thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty""".split())}
+MONTHS = frozenset("""january february march april may june july august september october november december jan feb mar
+    apr jun jul aug sep sept oct nov dec""".split())
+NUMERIC_DATE = re.compile(r"\b\d{1,2}[-/](\d{1,2})[-/]\d{2,4}\b")
 
 
 def source_left(translation, source, source_words, target_words, shared=publish.SHARED_WORDS,
@@ -68,6 +75,27 @@ def dutch_left(en, nl):
 
 def numbers(text):
     return {re.sub(r"\D", "", m) for m in NUMBER.findall(text)}
+
+
+def _value(digits):
+    return digits.lstrip("0") or "0"
+
+
+def missing_numbers(nl, en):
+    """Numbers of the Dutch that the English lacks. Present: the same digits (separators and leading zeros aside:
+    1.000,5 = 1,000.5), each group of a time or decimal (01.30 = 1:30), a number word up to twenty (2 = two), or the
+    month of a numeric date when the English names a month (30-04-2015 = April 30, 2015)"""
+    words = {w.lower() for w in re.findall(r"[A-Za-z]+", en)}
+    present = {_value(n) for n in numbers(en)} | {v for w, v in NUMBER_WORDS.items() if w in words}
+    months = {_value(m) for m in NUMERIC_DATE.findall(nl)} if words & MONTHS else set()
+    missing = set()
+    for raw in NUMBER.findall(nl):
+        value = _value(re.sub(r"\D", "", raw))
+        groups = [_value(g) for g in re.split(r"[.,:\s]", raw) if g]
+        if value in present or (len(groups) > 1 and all(g in present for g in groups)) or value in months:
+            continue
+        missing.add(value)
+    return sorted(missing)
 
 
 def sentences(text, abbreviations):
@@ -135,7 +163,7 @@ def measure(nl, en, back):
     import sacrebleu
 
     sentences_nl, sentences_en = sentences(nl, sp.ABBREVIATIONS), sentences(en, ENGLISH_ABBREVIATIONS)
-    missing = sorted(numbers(nl) - numbers(en))
+    missing = missing_numbers(nl, en)
     row = {
         "decode_loop": bool(en) and publish.decode_loop(en, nl),
         "dutch_left": dutch_left(en, nl),

@@ -117,6 +117,8 @@ def main(argv=None):
     parser.add_argument("--metricx-model", required=True, help="Name of the MetricX-24 variant, for the text")
     parser.add_argument("--out", required=True)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--wordlist", help="OpenTaal's word list: count hyphenation artifacts in the originals")
+    parser.add_argument("--metricx-note", default="", help="A line on how the MetricX port was checked")
     args = parser.parse_args(argv)
 
     rows = pq.read_table(args.pairs).to_pylist()
@@ -214,6 +216,10 @@ def main(argv=None):
         for t in QE:
             crow.append([f"{label} > {t}"] + [share(sum(r[key] is not None and r[key] > t for r in part), len(part))
                                               for part in [rows] + [by_source[s] for s in SOURCES]])
+    for t in (1, 2):
+        crow.append([f"verschil in zinnen ≥ {t}"] + [share(sum(abs(r["sentences_nl"] - r["sentences_en"]) >= t
+                                                            for r in part), len(part))
+                                                     for part in [rows] + [by_source[s] for s in SOURCES]])
     for t in RATIO:
         crow.append([f"lengteverhouding > {fmt(t)}"] + [share(sum(r["len_ratio"] > t for r in part), len(part))
                                                         for part in [rows] + [by_source[s] for s in SOURCES]])
@@ -236,7 +242,23 @@ def main(argv=None):
            "eigen JAX-implementatie op de TPU (`metricx_qe.py`), op de CPU gecontroleerd tegen transformers. Per paar "
            "twee scores: en→nl (het Engels als bron, het Nederlandse origineel als kandidaat: de trainingsrichting) en "
            "nl→en (het origineel als bron, het synthetische Engels als kandidaat: wat de back-translation verloor of "
-           "toevoegde).", ""]
+           "toevoegde)."] + ([args.metricx_note] if args.metricx_note else []) + [""]
+    if args.wordlist:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import select_passages as sp
+
+        with open(args.wordlist, encoding="utf-8") as f:
+            words = {line.strip().lower() for line in f if line.strip()}
+        broken = {r["id"]: sp.hyphen_artifacts(r["nl"], words) for r in rows}
+        hit = [r for r in rows if broken[r["id"]]]
+        md += ["## Doeltekst: afbreekfouten in het origineel", "",
+               "Woorden die een regelafbreking in de bron heeft laten staan (\"voor-ge-legd\", \"be-ant-woord\"): "
+               "zonder koppeltekens wel in de OpenTaal-lijst, met niet. Dat raakt de doelkant van een trainingspaar. "
+               "Dit filter (`hyphenation`) is na de selectie van de pilot aan stap 0 toegevoegd; hier staat wat het in de "
+               f"pilot had weggelaten: {share(len(hit), n)} — "
+               + ", ".join(f"{SOURCE_NAMES[s]} {sum(r['source'] == s for r in hit)}" for s in SOURCES) + ".", ""]
+        md += [f"- `{r['pid']}`: {', '.join(broken[r['id']][:5])}" for r in hit[:8]] + [""]
+        summary["hyphenation"] = {s: sum(r["source"] == s for r in hit) for s in SOURCES} | {"all": len(hit)}
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     (out / "report.md").write_text("\n".join(md))

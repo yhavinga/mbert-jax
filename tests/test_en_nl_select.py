@@ -268,3 +268,12 @@ def test_a_speaker_inside_a_council_paragraph_fails(idioms):
     assert "speaker_change" not in b.checks("raad", "Mevrouw Huisman sprak. Zij was het eens met de wethouder.")[0]
     procedure = "Deze motie is voorgesteld door de leden Ormel en Peters. Zij krijgt nr. 81 (33000-V)."
     assert "motion" in b.checks("handelingen", procedure)[0]
+
+
+def test_hyphens_a_line_break_left_inside_words():
+    words = {"voorgelegd", "beantwoord", "e-mail", "sloop", "nieuwbouw", "sociaaldemocratische", "sociaal",
+             "democratische", "coproduceren", "produceren", "voor", "woord"}
+    text = ("De vragen worden voor-ge-legd en be-ant-woord per e-mail; sloop-nieuwbouw, sociaal-democratische "
+            "partijen co-produceren.")
+    assert sp.hyphen_artifacts(text, words) == ["voor-ge-legd", "be-ant-woord"]
+    assert "hyphenation" in builder([], words).checks("rechtspraak", text)[0]

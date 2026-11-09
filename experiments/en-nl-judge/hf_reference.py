@@ -71,7 +71,7 @@ def main(argv=None):
     for k, row in enumerate(rows):
         t0 = time.time()
         with torch.no_grad():
-            logits = model(input_ids=torch.tensor([row["prompt_ids"]]), logits_to_keep=1).logits
+            logits = model(input_ids=torch.tensor([row["prompt_ids"]])).logits
         logp = torch.log_softmax(logits[0, -1].float(), dim=-1)
         row["logp_yes"] = float(torch.logsumexp(logp[yes], 0))
         row["logp_no"] = float(torch.logsumexp(logp[no], 0))

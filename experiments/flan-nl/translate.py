@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""TranslateGemma on the 4 chips of one host: this worker's segments from English to Dutch, greedy, in resumable shards.
+"""TranslateGemma on the 4 chips of one host: this worker's segments from English to Dutch (or, with --source-lang
+and --target-lang, between other languages of LANGUAGES), greedy, in resumable shards.
 
 Usage (translate.sh, on each worker, as a TPU of its own 4 chips):
     python translate.py --segments <plan>/segments-w0.parquet --out gs://.../out/w0 --ckpt gs://.../0/items \\
         --tokenizer /dev/shm/flan_nl/tokenizer-27b --model gemma3-27b --length-class small
+The translation is in the column text_<target language> of the shards (text_nl for English to Dutch).
 
 The model is MaxText's gemma3 with the converted checkpoint in MaxText's MaxEngine: a KV cache of fixed shape
 (slots x max_target_length), prompts padded to a few prefill lengths, continuous batching over the slots (decode_all),
@@ -13,8 +15,9 @@ when it is done, so a restart skips every shard that is there. A segment that hi
 ended = false; the assemble step drops its examples.
 
 The prompt is the model's chat template (chat_template.jinja of the Hugging Face repo): a user turn with
-{type: text, source_lang_code: en, target_lang_code: nl, text}, which the template turns into "You are a professional
-English (en) to Dutch (nl) translator. ... Please translate the following English text into Dutch:\n\n\n<text>".
+{type: text, source_lang_code: en, target_lang_code: nl, text} (the defaults of --source-lang and --target-lang),
+which the template turns into "You are a professional English (en) to Dutch (nl) translator. ... Please translate the
+following English text into Dutch:\n\n\n<text>".
 """
 
 import argparse
@@ -54,19 +57,25 @@ EOS_IDS = [1, 106]
 _MARK = ""  # a private-use character, never in FLAN: where the text goes in the rendered template
 
 
-def messages(text):
-    return [{"role": "user", "content": [{"type": "text", "source_lang_code": "en", "target_lang_code": "nl",
+# The language codes this script takes, with the names the chat template gives them
+LANGUAGES = {"en": "English", "nl": "Dutch"}
+
+
+def messages(text, source="en", target="nl"):
+    return [{"role": "user", "content": [{"type": "text", "source_lang_code": source, "target_lang_code": target,
                                           "text": text}]}]
 
 
 class PromptCodec:
     """Prompt ids of a segment: the template rendered once around a mark, checked against the template itself."""
 
-    def __init__(self, tokenizer):
-        self.tokenizer = tokenizer
-        rendered = tokenizer.apply_chat_template(messages(_MARK), tokenize=False, add_generation_prompt=True)
+    def __init__(self, tokenizer, source="en", target="nl"):
+        self.tokenizer, self.source, self.target = tokenizer, source, target
+        rendered = tokenizer.apply_chat_template(messages(_MARK, source, target), tokenize=False,
+                                                 add_generation_prompt=True)
         self.prefix, self.suffix = rendered.split(_MARK)
-        if "English (en) to Dutch (nl)" not in self.prefix or not self.suffix.endswith("<start_of_turn>model\n"):
+        pair = f"{LANGUAGES[source]} ({source}) to {LANGUAGES[target]} ({target})"
+        if pair not in self.prefix or not self.suffix.endswith("<start_of_turn>model\n"):
             raise RuntimeError(f"unexpected chat template: {rendered!r}")
 
     def encode(self, text):
@@ -74,7 +83,8 @@ class PromptCodec:
 
     def check(self, texts):
         for text in texts:
-            expected = self.tokenizer.apply_chat_template(messages(text), tokenize=True, add_generation_prompt=True)
+            expected = self.tokenizer.apply_chat_template(messages(text, self.source, self.target), tokenize=True,
+                                                          add_generation_prompt=True)
             if isinstance(expected, dict) or hasattr(expected, "keys"):
                 expected = expected["input_ids"]
             if list(expected) != self.encode(text):
@@ -134,7 +144,7 @@ def make_engine(args, shapes):
     config = pyconfig.initialize(
         [""], model_name=args.model, load_parameters_path=args.ckpt, run_name="flan_nl", log_config=False,
         # Not the home directory: the boot disk is nearly full
-        base_output_directory="/dev/shm/flan_nl/maxtext_output",
+        base_output_directory=f"{args.work_dir}/maxtext_output",
         enable_checkpointing=False, async_checkpointing=False, skip_jax_distributed_system=True, scan_layers=False,
         use_multimodal=False, attention="dot_product", dtype="bfloat16", weight_dtype="bfloat16",
         ici_fsdp_parallelism=1, ici_tensor_parallelism=4, per_device_batch_size=shapes["slots"] / 4,
@@ -256,10 +266,11 @@ def translate_shard(device, codec, tokenizer, ids, texts, shapes, sync_every):
     started = time.time()
     outputs = decode_all(prompts, shapes["slots"], device, shapes["max_decode"], sync_every)
     seconds = time.time() - started
-    rows = {"id": [], "text_nl": [], "ended": [], "tokens_in": [], "tokens_out": []}
+    column = f"text_{codec.target}"
+    rows = {"id": [], column: [], "ended": [], "tokens_in": [], "tokens_out": []}
     for i, prompt, (completion, ended) in zip(ids, prompts, outputs):
         rows["id"].append(i)
-        rows["text_nl"].append(tokenizer.decode(completion, skip_special_tokens=True).strip())
+        rows[column].append(tokenizer.decode(completion, skip_special_tokens=True).strip())
         rows["ended"].append(ended)
         rows["tokens_in"].append(len(prompt))
         rows["tokens_out"].append(len(completion) + int(ended))
@@ -278,7 +289,13 @@ def main(argv=None):
     parser.add_argument("--shard-size", type=int, default=4096, help="Segments per shard (default: 4096)")
     parser.add_argument("--max-shards", type=int, default=None, help="Stop after this many new shards (pilot)")
     parser.add_argument("--sync-every", type=int, default=8, help="Generate steps between transfers (default: 8)")
+    parser.add_argument("--source-lang", default="en", choices=sorted(LANGUAGES), help="Language of the segments")
+    parser.add_argument("--target-lang", default="nl", choices=sorted(LANGUAGES), help="Language to translate into")
+    parser.add_argument("--work-dir", default="/dev/shm/flan_nl",
+                        help="Local directory for the shards before upload and MaxText's output (default: FLAN-nl's)")
     args = parser.parse_args(argv)
+    if args.source_lang == args.target_lang:
+        parser.error(f"--source-lang and --target-lang are both {args.source_lang}")
 
     import jax
     import pyarrow as pa
@@ -309,7 +326,7 @@ def main(argv=None):
         return
 
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
-    codec = PromptCodec(tokenizer)
+    codec = PromptCodec(tokenizer, args.source_lang, args.target_lang)
     codec.check(texts[:3] + texts[-3:])
     make_result_tokens_a_pytree()
     make_decode_cache_sharded()
@@ -317,7 +334,7 @@ def main(argv=None):
     engine, params = make_engine(args, shapes)
     device = EngineSlots(engine, params, shapes["prefill_lengths"])
     print(f"engine ready in {time.time() - started:.0f} s", flush=True)
-    local = Path("/dev/shm/flan_nl/shards") / args.length_class
+    local = Path(args.work_dir) / "shards" / args.length_class
     local.mkdir(parents=True, exist_ok=True)
     totals = {"segments": 0, "tokens_in": 0, "tokens_out": 0, "seconds": 0.0}
 

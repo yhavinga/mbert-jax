@@ -133,3 +133,13 @@ def test_the_real_template_in_both_directions():
     assert nl_en.prefix.endswith("Please translate the following Dutch text into English:\n\n\n")
     nl_en.check(["Dat is het paard achter de wagen spannen.", "Voorzitter. Ik dank de minister voor zijn antwoord."])
     assert en_nl.suffix == nl_en.suffix
+
+
+def test_the_longest_class_takes_the_passages_of_up_to_768_tokens():
+    # Yeb, 9 Nov: passages up to 768 tokens; their prompt (~70 tokens of template) fits the class's prefill
+    xx = tr.LENGTH_CLASSES["xxlong"]
+    assert tr.CLASS_ORDER[-1] == "xxlong" and xx["max_source"] == 768
+    assert xx["prefill_lengths"][-1] >= 768 + 100 and xx["max_decode"] >= 1.4 * 768
+    assert all(set(slots) == set(tr.CLASS_ORDER) for slots in tr.SLOTS.values())
+    # no more slot-tokens than a class measured on a v4 host (small: 224 x 512)
+    assert tr.SLOTS["gemma3-27b"]["xxlong"] * (xx["prefill_lengths"][-1] + xx["max_decode"]) <= 224 * 512

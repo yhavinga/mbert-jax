@@ -42,15 +42,19 @@ LENGTH_CLASSES = {
     "medium": {"max_source": 256, "prefill_lengths": [256, 384], "max_decode": 448},
     "long": {"max_source": 384, "prefill_lengths": [384, 512], "max_decode": 640},
     "xlong": {"max_source": 512, "prefill_lengths": [512, 640], "max_decode": 832},
+    # The en-nl translator's passages of up to 768 tokens (Yeb, 9 Nov); 1.5 x the source leaves room for Dutch, which
+    # is longer than English
+    "xxlong": {"max_source": 768, "prefill_lengths": [768, 896], "max_decode": 1152},
 }
-CLASS_ORDER = ["tiny", "small", "medium", "long", "xlong"]
+CLASS_ORDER = ["tiny", "small", "medium", "long", "xlong", "xxlong"]
 # Slots per class: slots x (prefill + decode) x the KV of a token in bf16 (12B: 48 layers x 8 heads x 256 x 2 x 2 =
 # 0.39 MB; 27B: 62 x 16 x 128 x 2 x 2 = 0.51 MB) next to the weights (24 and 54 GB) in the host's 4 x 30.7 GiB.
 # 27B measured on a v4 host on 8 Nov: tiny 384 x 224 peaks at 27.0 GiB per chip, small 224 x 512 at 28.9 GiB; the
 # others hold about as many slot-tokens. (The 12B run of 8 Nov had four classes, long being 256-512 with 128 slots.)
 SLOTS = {
-    "gemma3-12b": {"tiny": 512, "small": 320, "medium": 224, "long": 160, "xlong": 128},
-    "gemma3-27b": {"tiny": 384, "small": 224, "medium": 136, "long": 104, "xlong": 80},
+    "gemma3-12b": {"tiny": 512, "small": 320, "medium": 224, "long": 160, "xlong": 128, "xxlong": 88},
+    # xxlong: 56 x 2048 slot-tokens, as many as small's 224 x 512 (28.9 GiB per chip)
+    "gemma3-27b": {"tiny": 384, "small": 224, "medium": 136, "long": 104, "xlong": 80, "xxlong": 56},
 }
 # generation_config.json of TranslateGemma: <eos> and <end_of_turn>
 EOS_IDS = [1, 106]
@@ -145,6 +149,8 @@ def make_engine(args, shapes):
         [""], model_name=args.model, load_parameters_path=args.ckpt, run_name="flan_nl", log_config=False,
         # Not the home directory: the boot disk is nearly full
         base_output_directory=f"{args.work_dir}/maxtext_output",
+        # pyconfig points JAX's compilation cache here; its default is ~/jax_cache on the boot disk
+        jax_cache_dir=f"{args.work_dir}/jax_cache",
         enable_checkpointing=False, async_checkpointing=False, skip_jax_distributed_system=True, scan_layers=False,
         use_multimodal=False, attention="dot_product", dtype="bfloat16", weight_dtype="bfloat16",
         ici_fsdp_parallelism=1, ici_tensor_parallelism=4, per_device_batch_size=shapes["slots"] / 4,

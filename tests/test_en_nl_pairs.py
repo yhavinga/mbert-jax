@@ -122,3 +122,75 @@ def test_measures_record_the_structure_of_both_directions():
     assert row["structure"] == ["newline_doubled"] and row["back_structure"] == ["paragraph_break", "line_break"]
     row = pairs.measure("Een **vette** zin.", "A **bold** sentence.", None)
     assert row["structure"] == [] and row["back_structure"] is None
+
+
+# ---------------------------------------------------------------- the main run: context turns, hard checks, summary
+
+def test_hard_checks_of_a_pair():
+    nl = "Het kabinet besloot gisteren.\n\nDat was laat."
+    row = {"ended": True, **pairs.measure(nl, "The cabinet decided yesterday.\n\nThat was late.", None)}
+    assert pairs.hard_fails(row) == []
+    row = {"ended": False, **pairs.measure(nl, "The cabinet decided yesterday. " * 8, None)}
+    assert pairs.hard_fails(row) == ["not_ended", "decode_loop", "len_ratio", "structure"]
+    # the known empty line for a single newline is counted apart from other structure
+    row = {"ended": True, **pairs.measure("Een zin hier.\nNog een zin.", "A sentence here.\n\nOne more sentence.", None)}
+    assert pairs.hard_fails(row) == ["newline_doubled"]
+
+
+def make_run(tmp_path):
+    pa = pytest.importorskip("pyarrow")
+    import pyarrow.parquet as pq
+
+    sel = tmp_path / "select"
+    sel.mkdir()
+    passages = [{"id": f"raad:{k}:d:0", "pid": f"raad:{k}:d:0", "source": "raad", "split": "train", "half": "random",
+                 "idiom_score": 0.0, "text": f"De raad besloot punt {k}.\n\nDaarna was het klaar.", "tokens": 12}
+                for k in range(3)]
+    turns = [{"id": "handelingen:9:t3", "doc_id": "9", "turn": 3, "speaker": "De voorzitter", "party": None,
+              "text": "Ik geef het woord aan de minister.", "text_pool": "Ik geef het woord aan de minister.",
+              "tokens": 8, "source_score": 1.0, "used_by": 1}]
+    pq.write_table(pa.table({c: [p[c] for p in passages] for c in passages[0]}), sel / "passages.parquet")
+    pq.write_table(pa.table({c: [t[c] for t in turns] for c in turns[0]}), sel / "context-turns.parquet")
+    ids = [p["id"] for p in passages] + [turns[0]["id"]]
+    en = [f"The council decided point {k}.\n\nThen it was done." for k in range(3)] + ["I give the floor to the minister."]
+    back = [f"De raad besliste punt {k}.\n\nToen was het klaar." for k in range(3)] + ["Ik geef het woord aan de minister."]
+    for name, column, texts in (("nl-en", "text_en", en), ("en-nl", "text_nl", back)):
+        d = tmp_path / name / "w0" / "small"
+        d.mkdir(parents=True)
+        pq.write_table(pa.table({"id": ids, column: texts, "ended": [True] * 4, "tokens_in": [80] * 4,
+                                 "tokens_out": [10] * 4}), d / "shard-00000.parquet")
+    return sel, pa, pq
+
+
+def test_measures_cover_the_context_turns(tmp_path):
+    sel, pa, pq = make_run(tmp_path)
+    rows = pairs.read_passages(sel)
+    assert [r["kind"] for r in rows] == ["passage"] * 3 + ["context"]
+    out = tmp_path / "pairs.parquet"
+    pairs.main(["measures", "--select", str(sel), "--nl-en", str(tmp_path / "nl-en"), "--en-nl",
+                str(tmp_path / "en-nl"), "--out", str(out), "--processes", "1"])
+    got = pq.read_table(out).to_pylist()
+    assert len(got) == 4 and got[-1]["kind"] == "context" and got[-1]["source"] == "handelingen"
+    assert all(r["hard_fails"] == [] and r["structure"] == [] and r["chrf"] > 0 for r in got)
+    pairs.main(["qe-split", "--pairs", str(out), "--workers", "2", "--out", str(tmp_path / "qe-in")])
+    split = [pq.read_table(tmp_path / "qe-in" / f"qe-in-w{k}.parquet").to_pylist() for k in range(2)]
+    assert sorted(r["id"] for part in split for r in part) == sorted(r["id"] for r in got)
+    for k, part in enumerate(split):
+        pq.write_table(pa.table({"id": [r["id"] for r in part], "qe_en_nl": [1.5] * len(part)}),
+                       tmp_path / f"qe-w{k}.parquet")
+    pairs.main(["summary", "--pairs", str(out), "--qe", str(tmp_path / "qe-w0.parquet"), str(tmp_path / "qe-w1.parquet"),
+                "--out", str(tmp_path / "final")])
+    final = pq.read_table(tmp_path / "final" / "pairs.parquet").to_pylist()
+    assert all(r["qe_en_nl"] == 1.5 for r in final)
+    summary = (tmp_path / "final" / "summary.md").read_text()
+    assert "| all | 4 | 4 |" in summary
+
+
+def test_the_summary_refuses_pairs_without_qe(tmp_path):
+    sel, pa, pq = make_run(tmp_path)
+    out = tmp_path / "pairs.parquet"
+    pairs.main(["measures", "--select", str(sel), "--nl-en", str(tmp_path / "nl-en"), "--en-nl",
+                str(tmp_path / "en-nl"), "--out", str(out)])
+    pq.write_table(pa.table({"id": ["raad:0:d:0"], "qe_en_nl": [1.0]}), tmp_path / "qe.parquet")
+    with pytest.raises(SystemExit, match="3 pairs without a QE row"):
+        pairs.main(["summary", "--pairs", str(out), "--qe", str(tmp_path / "qe.parquet"), "--out", str(tmp_path / "f")])

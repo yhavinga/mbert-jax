@@ -5,6 +5,8 @@ back-translation into Dutch).
 
     python pairs.py back-segments --select <dir> --nl-en <shards> --tokenizer <dir> --out <dir>
     python pairs.py measures --select <dir> --nl-en <shards> --en-nl <shards> --out <dir>/pairs.parquet
+    python pairs.py qe-split --pairs pairs.parquet --out <dir>
+    python pairs.py summary --pairs pairs.parquet --qe <qe-w0.parquet> ... --out <dir>
 
 <shards> is a local copy of a run's shards (w<k>/<class>/shard-*.parquet). Measures per pair (no threshold is fixed
 here: Yeb sets them on the pilot):
@@ -38,7 +40,7 @@ import publish  # noqa: E402
 import select_passages as sp  # noqa: E402
 import structure  # noqa: E402
 
-MAX_BACK_TOKENS = 512  # translate.py's longest class
+MAX_BACK_TOKENS = 768  # translate.py's longest class (xxlong)
 ENGLISH_ABBREVIATIONS = sp.ABBREVIATIONS | frozenset("mrs ms e.g i.e no vs u.s u.k para sec fig approx pp".split())
 NUMBER = re.compile(r"\d+(?:[.,\u00a0]\d{3})*(?:[.,]\d+)?")  # a plain space is no thousands separator: "30 2015"
 # A number of the Dutch that the English writes as a word, or as a month in a date
@@ -123,9 +125,42 @@ def read_shards(root, column):
 
 
 def read_passages(select):
+    """The segments of a selection: its passages (kind passage) and, when it has context-turns.parquet (the main set,
+    design §9), the turns before the context examples (kind context), which go through both steps as well"""
     import pyarrow.parquet as pq
 
-    return pq.read_table(Path(select) / "passages.parquet").to_pylist()
+    rows = pq.read_table(Path(select) / "passages.parquet").to_pylist()
+    for r in rows:
+        r.setdefault("kind", "passage")
+    context = Path(select) / "context-turns.parquet"
+    if context.exists():
+        rows += [{**t, "kind": "context", "pid": t["id"], "source": "handelingen", "split": None, "half": None,
+                  "idiom_score": None} for t in pq.read_table(context).to_pylist()]
+    return rows
+
+
+# The hard checks of a pair (design §7 point 6, Yeb 9 Nov: strict on the source, only these on the pair); MetricX-24-QE
+# and chrF are scores without a threshold
+MAX_LEN_RATIO = 1.5
+
+
+def hard_fails(row):
+    """The hard checks a pair (original Dutch, synthetic English) fails; TranslateGemma's known empty line for a single
+    newline is named newline_doubled, apart from the other structure differences"""
+    fails = []
+    if not row["ended"]:
+        fails.append("not_ended")
+    if row["decode_loop"]:
+        fails.append("decode_loop")
+    if row["dutch_left"]:
+        fails.append("dutch_left")
+    if row["len_ratio"] > MAX_LEN_RATIO:
+        fails.append("len_ratio")
+    if row["structure"] == [structure.NEWLINE_DOUBLED]:
+        fails.append("newline_doubled")
+    elif row["structure"]:
+        fails.append("structure")
+    return fails
 
 
 def back_segments(args):
@@ -183,7 +218,14 @@ def measure(nl, en, back):
     return row
 
 
+def _measure_chunk(triples):
+    return [measure(nl, en, back) for nl, en, back in triples]
+
+
 def measures(args):
+    import concurrent.futures
+    import multiprocessing
+
     import pyarrow as pa
     import pyarrow.parquet as pq
 
@@ -194,16 +236,96 @@ def measures(args):
     for p in passages:
         en, ended, en_tokens = english[p["id"]]
         b = back.get(p["id"])
-        row = {"id": p["id"], "pid": p["pid"], "source": p["source"], "half": p["half"], "nl": p["text"],
-               "tokens_nl": p["tokens"], "idiom_score": p["idiom_score"], "en": en, "ended": ended,
-               "tokens_en": en_tokens - int(ended), "back": b[0] if b else None,
-               "back_ended": b[1] if b else None}
-        row.update(measure(p["text"], en, b[0] if b else None))
-        rows.append(row)
+        rows.append({"id": p["id"], "pid": p["pid"], "kind": p["kind"], "source": p["source"],
+                     "split": p.get("split"), "half": p["half"], "nl": p["text"], "tokens_nl": p["tokens"],
+                     "idiom_score": p["idiom_score"], "en": en, "ended": ended, "tokens_en": en_tokens - int(ended),
+                     "back": b[0] if b else None, "back_ended": b[1] if b else None})
+    triples = [(r["nl"], r["en"], r["back"]) for r in rows]
+    chunks = [triples[k:k + 2000] for k in range(0, len(triples), 2000)]
+    if args.processes <= 1:
+        measured = [m for part in map(_measure_chunk, chunks) for m in part]
+    else:
+        with concurrent.futures.ProcessPoolExecutor(args.processes,
+                                                    mp_context=multiprocessing.get_context("spawn")) as pool:
+            measured = [m for part in pool.map(_measure_chunk, chunks) for m in part]
+    for row, m in zip(rows, measured):
+        row.update(m)
+        row["hard_fails"] = hard_fails(row)
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     pq.write_table(pa.table({c: [r[c] for r in rows] for c in rows[0]}), out, compression="zstd")
     print(f"MEASURES {len(rows)} pairs, {sum(r['back'] is not None for r in rows)} back-translated -> {out}")
+
+
+def qe_split(args):
+    """The pairs as MetricX's input, one file per worker (id, en, nl): every worker scores a share"""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    t = pq.read_table(args.pairs, columns=["id", "en", "nl", "tokens_nl"]).to_pylist()
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    for k, part in enumerate(sp.balanced_workers([{**r, "tokens": r["tokens_nl"]} for r in t], args.workers)):
+        pq.write_table(pa.table({c: [r[c] for r in part] for c in ("id", "en", "nl")}), out / f"qe-in-w{k}.parquet")
+    print(f"QE-SPLIT {len(t)} pairs over {args.workers} workers -> {out}")
+
+
+def _quantiles(values, qs=(5, 25, 50, 75, 95)):
+    v = sorted(x for x in values if x is not None)
+    return {f"p{q}": round(v[min(len(v) - 1, int(q / 100 * (len(v) - 1)))], 3) for q in qs} if v else {}
+
+
+def summary(args):
+    """pairs.parquet with MetricX-24-QE (--qe, metricx_qe.py's output per worker) joined in as qe_en_nl
+    (the synthetic English as source, the original Dutch as candidate: the training pair's direction), written as
+    --out/pairs.parquet; and the counts of the hard checks per source and kind with the scores' quantiles
+    (summary.json, summary.md)"""
+    import collections
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    table = pq.read_table(args.pairs)
+    qe = {}
+    for path in args.qe:
+        t = pq.read_table(path).to_pydict()
+        qe.update(zip(t["id"], t["qe_en_nl"]))
+    ids = table.column("id").to_pylist()
+    missing = [i for i in ids if i not in qe]
+    if missing:
+        raise SystemExit(f"{len(missing)} pairs without a QE row, e.g. {missing[:3]}")
+    table = table.append_column("qe_en_nl", pa.array([qe[i] for i in ids], pa.float64()))
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    pq.write_table(table, out / "pairs.parquet", compression="zstd")
+    rows = table.select(["kind", "source", "split", "hard_fails", "qe_en_nl", "chrf"]).to_pylist()
+    groups = collections.defaultdict(list)
+    for r in rows:
+        groups[f"{r['kind']}/{r['source']}/{r['split']}"].append(r)
+        groups["all"].append(r)
+    result = {}
+    for key, part in sorted(groups.items()):
+        kept = [r for r in part if not r["hard_fails"]]
+        result[key] = {"pairs": len(part), "kept": len(kept),
+                       "fails": dict(collections.Counter(f for r in part for f in r["hard_fails"])),
+                       "qe_en_nl_kept": _quantiles([r["qe_en_nl"] for r in kept]),
+                       "chrf_kept": _quantiles([r["chrf"] for r in kept])}
+    (out / "summary.json").write_text(json.dumps(result, indent=1))
+    names = ("not_ended", "decode_loop", "dutch_left", "len_ratio", "structure", "newline_doubled")
+    lines = ["# Hoofdrun en→nl-vertaler: paren na stap 1 en 2", "",
+             "Harde controles op het paar (ontwerp §7 punt 6): niet afgelopen, `decode_loop`, Nederlandse resten in het "
+             f"Engels, lengteverhouding > {MAX_LEN_RATIO}, structuur (`newline_doubled` = alleen TranslateGemma's lege "
+             "regel voor één regelovergang, apart geteld). MetricX-24-QE (en→nl: synthetisch Engels als bron, origineel "
+             "Nederlands als kandidaat; lager is beter) en chrF (terugvertaling tegen origineel) zijn scores zonder "
+             "drempel; kwantielen over de paren die door de harde controles komen.", "",
+             "| groep | paren | over | " + " | ".join(names) + " | QE p5/p50/p95 | chrF p5/p50/p95 |",
+             "|---|" + "---:|" * (len(names) + 4)]
+    for key, d in result.items():
+        q, c = d["qe_en_nl_kept"], d["chrf_kept"]
+        lines.append(f"| {key} | {d['pairs']} | {d['kept']} | " + " | ".join(str(d["fails"].get(n, 0)) for n in names)
+                     + f" | {q.get('p5')}/{q.get('p50')}/{q.get('p95')} | {c.get('p5')}/{c.get('p50')}/{c.get('p95')} |")
+    (out / "summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"SUMMARY {json.dumps(result['all'])}")
 
 
 def main(argv=None):
@@ -220,8 +342,17 @@ def main(argv=None):
     p.add_argument("--nl-en", required=True)
     p.add_argument("--en-nl", required=True)
     p.add_argument("--out", required=True)
+    p.add_argument("--processes", type=int, default=1)
+    p = sub.add_parser("qe-split", help="The pairs as MetricX's input per worker")
+    p.add_argument("--pairs", required=True)
+    p.add_argument("--workers", type=int, default=4)
+    p.add_argument("--out", required=True)
+    p = sub.add_parser("summary", help="QE joined into the pairs, and the counts of the hard checks")
+    p.add_argument("--pairs", required=True)
+    p.add_argument("--qe", required=True, nargs="+")
+    p.add_argument("--out", required=True)
     args = parser.parse_args(argv)
-    {"back-segments": back_segments, "measures": measures}[args.command](args)
+    {"back-segments": back_segments, "measures": measures, "qe-split": qe_split, "summary": summary}[args.command](args)
 
 
 if __name__ == "__main__":

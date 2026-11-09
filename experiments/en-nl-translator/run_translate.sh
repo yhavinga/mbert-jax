@@ -6,7 +6,7 @@
 #   SOURCE=nl TARGET=en SEGMENTS=$R/pilot/select/segments-w{w}.parquet OUT=$R/pilot/nl-en/w{w} NAME=translator_nl_en \
 #     bash run_translate.sh
 # {w} in SEGMENTS and OUT is this worker's number. Log: ~/logs/$NAME.log, a fresh file per start that ends in
-# "EXIT <code>"; a copy goes to $ROOT/pilot/logs/. Shards land in $OUT/<class>/; a second start skips every shard there.
+# "EXIT <code>"; a copy goes to $LOGS (default $ROOT/pilot/logs/). Shards land in $OUT/<class>/; a second start skips every shard there.
 set -euo pipefail
 ROOT=gs://t5-dutch-english-usc2/mbert/translator
 CKPT=gs://t5-dutch-english-usc2/mbert/flan-nl/translategemma-27b-maxtext
@@ -20,7 +20,9 @@ TARGET=${TARGET:?en or nl}
 SEGMENTS=${SEGMENTS:?the segments of a worker, w in braces for its number}
 OUT=${OUT:?the bucket directory of its shards, w in braces for its number}
 NAME=${NAME:?the name of the log}
-CLASSES=${CLASSES:-tiny small medium long xlong}
+CLASSES=${CLASSES:-tiny small medium long xlong xxlong}
+# Where the log's copy goes (the pilot's place by default)
+LOGS=${LOGS:-$ROOT/pilot/logs}
 EXTRA=${EXTRA:-}
 SEGMENTS=${SEGMENTS//\{w\}/$WORKER}
 OUT=${OUT//\{w\}/$WORKER}
@@ -42,6 +44,8 @@ export TPU_CHIPS_PER_PROCESS_BOUNDS=2,2,1 TPU_PROCESS_BOUNDS=1,1,1 TPU_VISIBLE_C
 export TPU_PROCESS_ADDRESSES=localhost:8476 CLOUD_TPU_TASK_ID=0 ALLOW_MULTIPLE_LIBTPU_LOAD=1
 export TOKENIZERS_PARALLELISM=false HF_HUB_OFFLINE=1
 export JAX_COMPILATION_CACHE_DIR=$SHM/jax_cache
+# MaxText 0.2.5 dumps every program to /tmp/xla_dump on the boot disk when XLA_FLAGS is empty; libtpu's logs go to /dev/shm
+export XLA_FLAGS=--xla_dump_hlo_as_text=false TPU_LOG_DIR=$SHM/tpu_logs
 timeout 600 $PY -c "import jax; assert (jax.device_count(), jax.process_count()) == (4, 1), (jax.device_count(), jax.process_count()); print('devices', jax.devices())" || { echo "preflight failed: not 4 chips of one process"; exit 2; }
 echo "\$(date +%H:%M:%S) $(hostname): $SOURCE -> $TARGET, $SEGMENTS -> $OUT with $CKPT"
 for class in $CLASSES; do
@@ -50,5 +54,5 @@ for class in $CLASSES; do
     --work-dir $SHM $EXTRA || exit \$?
 done
 EOF
-setsid nohup bash -c "bash ~/run_$NAME.sh > ~/logs/$NAME.log 2>&1; echo EXIT \$? >> ~/logs/$NAME.log; gsutil -q cp ~/logs/$NAME.log $ROOT/pilot/logs/$NAME-w$WORKER.log" > /dev/null 2>&1 < /dev/null &
+setsid nohup bash -c "bash ~/run_$NAME.sh > ~/logs/$NAME.log 2>&1; echo EXIT \$? >> ~/logs/$NAME.log; gsutil -q cp ~/logs/$NAME.log $LOGS/$NAME-w$WORKER.log" > /dev/null 2>&1 < /dev/null &
 echo "started $NAME on $(hostname): ~/logs/$NAME.log, shards in $OUT"

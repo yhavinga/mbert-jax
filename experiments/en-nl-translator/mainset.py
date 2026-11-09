@@ -11,6 +11,11 @@ stage 0 v2 on the pilot.
     python mainset.py minipilot --select <pool dir> --scores <score dir> --out <dir> [--n 500]
     python mainset.py report --select <pool dir> --stage0 stage0-eval.json --pilot-pairs pairs.parquet \
         --replay <dir> --eval-rows <dir> --testsets manifest.json [--scores <score dir>] --out mainset-prep.md
+    python mainset.py fineweb-hosts --select <FineWeb-2 pool> --out hosts.parquet
+    python mainset.py minipilot-segments --minipilot <dir> --tokenizer <dir> --out <dir>
+    python mainset.py minipilot-check --segments <dir> --nl-en <shards> --out minipilot-check.json
+    python mainset.py final --select <pool> <FineWeb-2 pool> <repaired> --scores <dir> [<dir>] --hosts hosts.parquet \
+        --tokenizer <dir> --block-texts <test sets> [--max-tokens 768] --out <dir>
 
 testsets: the texts of the test sets that no training passage may share a 13-gram with, one text a line, straight
 from Hugging Face at fixed revisions (TESTSETS). They serve only as a list to block passages with, never as data.
@@ -32,6 +37,7 @@ import argparse
 import collections
 import hashlib
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -718,6 +724,454 @@ def stage0_eval(args):
               f"{e['accepted']['all']:4} / {result['sides']['accepted']['all']}")
 
 
+# ---------------------------------------------------------------- the final selection of the main set
+
+# Yeb, 9 Nov (design §7 point 7): source score >= 0.5 (the score is nearly binary); for FineWeb-2 also "reads as
+# original Dutch" >= 0.5; FineWeb-2 spread over the topics (none above ~15%, unless the pool is too small) and over its
+# hosts (none above 0.5%, coordinator after talking with Yeb: nl.wikipedia.org and tripadvisor.nl took up to 5% and 3%
+# of a row group)
+SOURCE_MIN = 0.5
+ORIGIN_MIN = 0.5
+TOPIC_CAP = 0.15
+HOST_CAP = 0.005
+FINAL_SEED = "en-nl-translator/mainset-final/0"
+
+
+def host_of(url):
+    """The host of a page without www. ("" when the address has none)"""
+    from urllib.parse import urlsplit
+
+    try:
+        host = (urlsplit(url or "").hostname or "").lower()
+    except ValueError:
+        return ""
+    return host[4:] if host.startswith("www.") else host
+
+
+def fineweb_hosts(args):
+    """doc_id, url and host of the FineWeb-2 documents of a selection's row groups (its report.json), read straight
+    from Hugging Face (only the columns id and url)"""
+    from huggingface_hub import HfFileSystem
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    import select_passages as sp
+
+    report = json.loads((Path(args.select) / "report.json").read_text())
+    groups = report["row_groups_read"]["fineweb"]
+    repo, revision = sp.SOURCES["fineweb"]["repo"]
+    by_file = collections.defaultdict(list)
+    for name, g in groups:
+        by_file[name].append(g)
+    fs = HfFileSystem()
+    ids, urls = [], []
+    for name, gs in sorted(by_file.items()):
+        with fs.open(f"datasets/{repo}@{revision}/{name}", "rb", block_size=1 << 23) as f:
+            t = pq.ParquetFile(f).read_row_groups(sorted(gs), columns=["id", "url"]).to_pydict()
+        ids += [str(x) for x in t["id"]]
+        urls += t["url"]
+    pq.write_table(pa.table({"doc_id": ids, "url": urls, "host": [host_of(u) for u in urls]}), args.out,
+                   compression="zstd")
+    print(f"HOSTS {len(ids)} documents of {len(groups)} row groups, {len(set(map(host_of, urls)))} hosts -> {args.out}")
+
+
+def transformed(text):
+    """The text that goes into step 1: marked headings repaired, an empty line between paragraphs (Yeb, 9 Nov)"""
+    import select_passages as sp
+
+    fixed, n = sp.repair_headings(text)
+    return sp.paragraph_breaks(fixed), n
+
+
+class Quotas:
+    """Draws one source's passages for one split in passes that relax one condition after the other. A candidate is a
+    dict with length_class (long/short), idiom_class, context (Handelingen: a context example), topic and host
+    (FineWeb-2). Pass 1 holds every target: per length class its count, half of it idiom-rich, CONTEXT_SHARE of it with
+    context (Handelingen); every pass holds the caps on topic and host and the chooser's (document cap, duplicates)."""
+
+    def __init__(self, n, long_share, context_share, topic_cap, host_cap, chooser):
+        self.n, self.chooser = n, chooser
+        n_long = round(long_share * n)
+        self.length = {"long": n_long, "short": n - n_long}
+        self.idiom = {(c, True): self.length[c] // 2 for c in self.length}
+        self.idiom.update({(c, False): self.length[c] - self.length[c] // 2 for c in self.length})
+        self.context = {}
+        for c in self.length:
+            k = round(context_share * self.length[c])
+            self.context[(c, True)], self.context[(c, False)] = k, self.length[c] - k
+        self.topic_cap = max(1, math.floor(topic_cap * n)) if topic_cap else None
+        self.host_cap = max(1, math.floor(host_cap * n)) if host_cap else None
+        self.counts = collections.Counter()
+        self.chosen, self.passes = [], {}
+
+    def fits(self, p, level):
+        if self.host_cap is not None and self.counts[("host", p["host"])] >= self.host_cap:
+            return False
+        if self.topic_cap is not None and level < 5 and self.counts[("topic", p["topic"])] >= self.topic_cap:
+            return False
+        c = p["length_class"]
+        if level < 4 and self.counts[("length", c)] >= self.length[c]:
+            return False
+        if level < 3 and self.counts[("context", c, p["context"])] >= self.context[(c, p["context"])]:
+            return False
+        if level < 2 and self.counts[("idiom", c, p["idiom_class"])] >= self.idiom[(c, p["idiom_class"])]:
+            return False
+        return True
+
+    def draw(self, candidates):
+        """candidates in a fixed random order; returns the chosen ones"""
+        taken, refused = set(), set()  # a passage the chooser refuses stays refused: its sets only grow
+        for level in (1, 2, 3, 4, 5):
+            before = len(self.chosen)
+            for k, p in enumerate(candidates):
+                if len(self.chosen) == self.n:
+                    break
+                if k in taken or k in refused or not self.fits(p, level):
+                    continue
+                if not self.chooser.admit(p):
+                    refused.add(k)
+                    continue
+                taken.add(k)
+                p["drawn_in_pass"] = level
+                self.chosen.append(p)
+                c = p["length_class"]
+                self.counts.update([("length", c), ("context", c, p["context"]), ("idiom", c, p["idiom_class"]),
+                                    ("topic", p["topic"]), ("host", p["host"])])
+            self.passes[level] = len(self.chosen) - before
+            if len(self.chosen) == self.n:
+                break
+        return self.chosen
+
+
+def final_selection(args):
+    """The main set's passages for steps 1 and 2 (design §7 point 7, Yeb 9 Nov): from the pool (--select: the four
+    sources, FineWeb-2, the repaired headings) the passages with a source score >= SOURCE_MIN (FineWeb-2 also origin
+    >= ORIGIN_MIN) and at most --max-tokens tokens after the two edits (transformed), per source by the shares, a
+    quarter long, half idiom-rich, CONTEXT_SHARE of the Handelingen with their context turns (each turn's own source
+    score >= SOURCE_MIN, the turns nearest to the passage), FineWeb-2 spread over topics and hosts; the training side
+    (--n) and the eval side (--n-eval, other documents). Exact and 13-gram duplicates, the test sets' 13-grams and the
+    pool's document caps are kept out across all of it. Written to --out: passages.parquet, context-turns.parquet,
+    segments-w<k>.parquet (passages and context turns for translate.py, id = pid), report.json and selection.md."""
+    import random
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from tokenizers import Tokenizer
+
+    import select_passages as sp
+
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    if any(out.glob("*.parquet")):
+        raise SystemExit(f"{out} has parquet files already: a new selection goes to a new directory")
+    tok = Tokenizer.from_file(str(Path(args.tokenizer) / "tokenizer.json"))
+
+    def count(texts):
+        return [len(e.ids) for e in tok.encode_batch(texts, add_special_tokens=False)] if texts else []
+
+    scores = {}
+    for d in args.scores:
+        scores.update(read_scores(d))
+    hosts = {}
+    for path in args.hosts or []:
+        hosts.update((r["doc_id"], r["host"]) for r in pq.read_table(path, columns=["doc_id", "host"]).to_pylist())
+    pool, origin_of, turns, max_per_doc = [], {}, {}, {}
+    for select in args.select:
+        rows = read_pool([select])
+        for r in rows:
+            origin_of[r["pid"]] = Path(select).name
+        pool += rows
+        context = Path(select) / "context-turns.parquet"
+        if context.exists():
+            turns.update((r["id"], r) for r in pq.read_table(context).to_pylist())
+        rep = json.loads((Path(select) / "report.json").read_text())
+        caps = rep.get("args", {}).get("max_per_doc")
+        if caps is not None:
+            for source, k in sp.parse_per_source(caps, 3).items():
+                max_per_doc[source] = max(max_per_doc.get(source, 0), k)
+    pids = [r["pid"] for r in pool]
+    if len(set(pids)) != len(pids):
+        raise SystemExit(f"{len(pids) - len(set(pids))} pids stand in more than one selection")
+
+    # eligibility, with the reasons counted per source and split
+    reasons = collections.defaultdict(collections.Counter)
+    live = []
+    for r in pool:
+        key = f"{r['source']}/{r['split']}"
+        reasons[key]["pool"] += 1
+        s = scores.get(r["pid"])
+        if s is None or s.get("skipped") is not None:
+            reasons[key]["no_score"] += 1
+            continue
+        if s["score"] < SOURCE_MIN:
+            reasons[key]["source_below"] += 1
+            continue
+        if r["source"] == "fineweb":
+            if s.get("origin_score") is None or s["origin_score"] < ORIGIN_MIN:
+                reasons[key]["origin_below"] += 1
+                continue
+            if r["doc_id"] not in hosts:
+                raise SystemExit(f"{r['pid']}: no host for FineWeb-2 document {r['doc_id']} in --hosts")
+        live.append(r)
+    texts = [transformed(r["text"]) for r in live]
+    for r, (text, n), tokens in zip(live, texts, count([t for t, _ in texts])):
+        r["text_pool"], r["text"], r["headings_repaired"], r["tokens_pool"], r["tokens"] = \
+            r["text"], text, n, r["tokens"], tokens
+    eligible = []
+    for r in live:
+        key = f"{r['source']}/{r['split']}"
+        if r["tokens"] > args.max_tokens:
+            reasons[key]["too_long"] += 1
+            continue
+        reasons[key]["eligible"] += 1
+        eligible.append(r)
+
+    # the context turns: walk back from the turn nearest to the passage; a turn whose source score is below
+    # SOURCE_MIN or that is longer than --max-tokens after the edit ends the context there
+    turn_text = {}
+    for i, t in turns.items():
+        turn_text[i] = transformed(t["text"])[0]
+    turn_tokens = dict(zip(turn_text, count(list(turn_text.values()))))
+    ctx_stats = collections.Counter()
+    for r in eligible:
+        r["context_ids"] = []
+        if r["source"] != "handelingen" or not r.get("context_example"):
+            r["context"] = False
+            continue
+        ctx_stats["marked"] += 1
+        kept = []
+        for j in reversed(r["context_turns"] or []):
+            i = f"handelingen:{r['doc_id']}:t{j}"
+            s = scores.get(i)
+            if i not in turns or s is None or s.get("skipped") is not None or s["score"] < SOURCE_MIN \
+                    or turn_tokens[i] > args.max_tokens:
+                ctx_stats["cut_at_a_turn"] += 1
+                break
+            kept.append(i)
+        r["context_ids"] = kept[::-1]
+        r["context"] = bool(kept)
+        ctx_stats["with_context" if kept else "no_turn_left"] += 1
+        ctx_stats["turns_dropped"] += len(r["context_turns"] or []) - len(kept)
+    for r in eligible:
+        r["length_class"] = "long" if r["tokens"] > sp.SHORT_MAX else "short"
+        r["idiom_class"] = bool(r.get("idiom_class"))
+        r["topic"] = scores[r["pid"]].get("topic")
+        r["host"] = hosts.get(r["doc_id"]) if r["source"] == "fineweb" else None
+
+    blocked = set()
+    for path in args.block_texts or []:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                blocked |= sp.ngrams(line)
+    chooser = sp.Chooser({s: max_per_doc.get(s, 3) for s in sp.SOURCES}, blocked)
+    long_share = sp.LONG_SHARE if args.max_tokens > sp.SHORT_MAX else 0.0
+    chosen, draws = [], {}
+    for split, n in (("train", args.n), ("eval", args.n_eval)):
+        want = sp.quotas(n) if n else {}
+        for source in sp.SOURCES:
+            if not want.get(source):
+                continue
+            cands = sorted((r for r in eligible if r["source"] == source and r["split"] == split),
+                           key=lambda r: r["pid"])
+            random.Random(f"{FINAL_SEED}/{split}/{source}").shuffle(cands)
+            q = Quotas(want[source], long_share, sp.CONTEXT_SHARE if source == "handelingen" else 0.0,
+                       TOPIC_CAP if source == "fineweb" else None, HOST_CAP if source == "fineweb" else None, chooser)
+            picked = q.draw(cands)
+            for p in picked:
+                p["half"] = "idiom" if p["idiom_class"] else "random"
+            chosen += picked
+            draws[f"{source}/{split}"] = {
+                "wanted": want[source], "chosen": len(picked), "candidates": len(cands), "passes": q.passes,
+                "targets": {"length": q.length, "idiom": {f"{c}/{i}": v for (c, i), v in q.idiom.items()},
+                            "context": {f"{c}/{i}": v for (c, i), v in q.context.items()},
+                            "topic_cap": q.topic_cap, "host_cap": q.host_cap},
+                "length": dict(collections.Counter(p["length_class"] for p in picked)),
+                "idiom": sum(p["idiom_class"] for p in picked),
+                "context": sum(p["context"] for p in picked),
+                "repaired": sum(origin_of[p["pid"]] == args.repaired_name for p in picked),
+                "headings_repaired": sum(p["headings_repaired"] > 0 for p in picked),
+                "topics": dict(sorted(collections.Counter(p["topic"] for p in picked).items(),
+                                      key=lambda kv: str(kv[0]))),
+                "hosts_top10": collections.Counter(p["host"] for p in picked).most_common(10)
+                if source == "fineweb" else None,
+                "available": {"long": sum(r["length_class"] == "long" for r in cands),
+                              "idiom": sum(r["idiom_class"] for r in cands),
+                              "context": sum(r["context"] for r in cands),
+                              "topics": dict(sorted(collections.Counter(r["topic"] for r in cands).items(),
+                                                    key=lambda kv: str(kv[0])))},
+            }
+            print(f"FINAL {source}/{split}: {json.dumps(draws[f'{source}/{split}'], ensure_ascii=False)}", flush=True)
+    chosen_turns = sorted({i for p in chosen for i in p["context_ids"]})
+    used_by = collections.Counter(i for p in chosen for i in p["context_ids"])
+
+    # FineWeb-2's origin score among its passages with a source score >= SOURCE_MIN (training side)
+    origin = [scores[r["pid"]]["origin_score"] for r in pool
+              if r["source"] == "fineweb" and r["split"] == "train" and r["pid"] in scores
+              and scores[r["pid"]].get("skipped") is None and scores[r["pid"]]["score"] >= SOURCE_MIN]
+    origin_report = {"passages": len(origin), **{f"below_{t}": sum(x < t for x in origin) for t in (0.1, 0.5, 0.9)}}
+
+    columns = ["id", "pid", "source", "split", "doc_id", "half", "idiom_class", "idiom_score", "length_class",
+               "tokens", "tokens_pool", "text", "text_pool", "headings_repaired", "repaired", "context_example",
+               "context_ids", "source_score", "origin_score", "topic", "host", "speaker", "party", "date",
+               "content_type", "drawn_in_pass", "selection"]
+    for p in chosen:
+        s = scores[p["pid"]]
+        p.update({"id": p["pid"], "repaired": origin_of[p["pid"]] == args.repaired_name,
+                  "context_example": p["context"], "source_score": s["score"],
+                  "origin_score": s.get("origin_score"), "selection": origin_of[p["pid"]]})
+    pq.write_table(pa.table({c: [p.get(c) for p in chosen] for c in columns}), out / "passages.parquet",
+                   compression="zstd")
+    turn_rows = [{"id": i, "doc_id": turns[i]["doc_id"], "turn": turns[i]["turn"], "speaker": turns[i]["speaker"],
+                  "party": turns[i]["party"], "text": turn_text[i], "text_pool": turns[i]["text"],
+                  "tokens": turn_tokens[i], "source_score": scores[i]["score"], "used_by": used_by[i]}
+                 for i in chosen_turns]
+    if turn_rows:
+        pq.write_table(pa.table({c: [t[c] for t in turn_rows] for c in turn_rows[0]}), out / "context-turns.parquet",
+                       compression="zstd")
+    segments = [{"id": p["id"], "text": p["text"], "tokens": p["tokens"]} for p in chosen] + \
+               [{"id": t["id"], "text": t["text"], "tokens": t["tokens"]} for t in turn_rows]
+    for k, part in enumerate(sp.balanced_workers(segments, args.workers)):
+        pq.write_table(pa.table({c: [r[c] for r in part] for c in ("id", "text", "tokens")}),
+                       out / f"segments-w{k}.parquet")
+    report = {"args": vars(args), "seed": FINAL_SEED, "thresholds": {"source": SOURCE_MIN, "origin": ORIGIN_MIN,
+                                                                      "topic_cap": TOPIC_CAP, "host_cap": HOST_CAP},
+              "eligibility": {k: dict(v) for k, v in sorted(reasons.items())}, "context": dict(ctx_stats),
+              "draws": draws, "fineweb_origin": origin_report, "max_per_doc": max_per_doc,
+              "skipped_while_choosing": dict(chooser.skipped), "blocked_ngrams": len(blocked),
+              "passages": len(chosen), "context_turns": len(turn_rows),
+              "tokens": {"passages": sum(p["tokens"] for p in chosen), "context_turns": sum(t["tokens"] for t in turn_rows)},
+              "segments": len(segments)}
+    (out / "report.json").write_text(json.dumps(report, indent=1, ensure_ascii=False))
+    (out / "selection.md").write_text(selection_md(report), encoding="utf-8")
+    print(f"SELECTED {len(chosen)} passages and {len(turn_rows)} context turns, {report['tokens']} tokens -> {out}")
+
+
+def _pct(k, n):
+    return f"{100 * k / n:.1f}%".replace(".", ",") if n else "-"
+
+
+def selection_md(report):
+    """The final selection in Dutch, for Yeb"""
+    th = report["thresholds"]
+    lines = ["# Hoofdset en→nl-vertaler: definitieve selectie", "",
+             f"Gegenereerd door `mainset.py final`. Bronscore ≥ {th['source']}; FineWeb-2 ook herkomst ≥ {th['origin']}; "
+             f"per bron de verdeling 40/20/7,5/7,5/25, ~25% lang (384–{report['args']['max_tokens']} tokens na de "
+             f"bewerkingen), de helft idioomrijk (`idiom_class`), 20% van de Handelingen met contextbeurten; FineWeb-2 "
+             f"hoogstens {100 * th['topic_cap']:g}% per onderwerp en {100 * th['host_cap']:g}% per host. Seed "
+             f"`{report['seed']}`. Bewerkingen vóór stap 1: een kop tussen `_…_` vast aan de alinea naar een eigen regel, "
+             f"en een lege regel tussen alinea's.", ""]
+    rows = []
+    for key, d in report["draws"].items():
+        rows.append([key, _n(d["wanted"]), _n(d["chosen"]), _n(d["length"].get("long", 0)),
+                     _n(d["length"].get("short", 0)), _n(d["idiom"]), _n(d["context"]), _n(d["repaired"]),
+                     _n(d["headings_repaired"]), ", ".join(f"{k}: {_n(v)}" for k, v in d["passes"].items() if v)])
+    lines += ["## Aantallen", "", _md_table(["bron/kant", "gevraagd", "gekozen", "lang", "kort", "idioomrijk",
+                                             "met context", "uit herstel `heading_glued`", "met herstelde kop",
+                                             "per ronde (1 = alle doelen, 2 = idioom los, 3 = context los, "
+                                             "4 = lengte los, 5 = onderwerp los)"], rows), ""]
+    rows = []
+    for key, e in report["eligibility"].items():
+        rows.append([key, _n(e.get("pool", 0)), _n(e.get("no_score", 0)), _n(e.get("source_below", 0)),
+                     _n(e.get("origin_below", 0)), _n(e.get("too_long", 0)), _n(e.get("eligible", 0))])
+    lines += ["## Kandidaten", "", _md_table(["bron/kant", "pool", "geen score", "bronscore < 0,5", "herkomst < 0,5",
+                                              "te lang na bewerking", "kandidaat"], rows), ""]
+    o = report["fineweb_origin"]
+    lines += ["## Herkomst FineWeb-2", "",
+              f"Van de {_n(o['passages'])} FineWeb-2-passages (train-kant) met bronscore ≥ 0,5 valt bij een drempel "
+              f"van 0,1 {_n(o['below_0.1'])} af ({_pct(o['below_0.1'], o['passages'])}), bij 0,5 {_n(o['below_0.5'])} "
+              f"({_pct(o['below_0.5'], o['passages'])}) en bij 0,9 {_n(o['below_0.9'])} "
+              f"({_pct(o['below_0.9'], o['passages'])}).", ""]
+    names = dict(TOPIC_NAMES)
+    rows = []
+    for key, d in report["draws"].items():
+        n = d["chosen"]
+        rows.append([key] + [_pct(d["topics"].get(letter, 0), n) for letter in "ABCDEFGHIJKLMNO"])
+    lines += ["## Onderwerp (% van de gekozen passages)", "",
+              "; ".join(f"{letter} = {name}" for letter, name in names.items()), "",
+              _md_table(["bron/kant"] + list("ABCDEFGHIJKLMNO"), rows), ""]
+    for key, d in report["draws"].items():
+        if d["hosts_top10"]:
+            lines += [f"## Grootste hosts, {key}", "",
+                      _md_table(["host", "passages", "aandeel"],
+                                [[h, _n(k), _pct(k, d["chosen"])] for h, k in d["hosts_top10"]]), ""]
+    c = report["context"]
+    lines += ["## Context (ontwerp §9)", "",
+              f"In de pool gemarkeerde contextvoorbeelden onder de kandidaten: {_n(c.get('marked', 0))}; met minstens "
+              f"één bruikbare beurt: {_n(c.get('with_context', 0))}; zonder: {_n(c.get('no_turn_left', 0))} (een beurt "
+              f"met bronscore < 0,5 of te lang beëindigt de context; {_n(c.get('turns_dropped', 0))} beurten vielen zo "
+              f"weg). Contextbeurten in de selectie: {_n(report['context_turns'])}.", "",
+              f"Tokens voor stap 1: {_n(report['tokens']['passages'])} in passages, "
+              f"{_n(report['tokens']['context_turns'])} in contextbeurten; {_n(report['segments'])} segmenten. "
+              f"Overgeslagen bij het kiezen: {report['skipped_while_choosing']}.", ""]
+    return "\n".join(lines) + "\n"
+
+
+def minipilot_segments(args):
+    """The minipilot's long passages (mainset.py minipilot) with the two edits of step 1, as translate.py's segments
+    with id = pid; passages above --max-tokens after the edits are left out and counted"""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from tokenizers import Tokenizer
+
+    import select_passages as sp
+
+    tok = Tokenizer.from_file(str(Path(args.tokenizer) / "tokenizer.json"))
+    rows = pq.read_table(Path(args.minipilot) / "passages.parquet").to_pylist()
+    texts = [transformed(r["text"])[0] for r in rows]
+    counts = [len(e.ids) for e in tok.encode_batch(texts, add_special_tokens=False)]
+    kept = [{"id": r["pid"], "text": t, "tokens": n, "source": r["source"]} for r, t, n in zip(rows, texts, counts)
+            if n <= args.max_tokens]
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    for k, part in enumerate(sp.balanced_workers(kept, args.workers)):
+        pq.write_table(pa.table({c: [r[c] for r in part] for c in ("id", "text", "tokens")}),
+                       out / f"segments-w{k}.parquet")
+    pq.write_table(pa.table({c: [r[c] for r in kept] for c in ("id", "source", "text", "tokens")}),
+                   out / "passages.parquet")
+    print(f"MINIPILOT-SEGMENTS {len(kept)} of {len(rows)} passages (left out above {args.max_tokens} tokens: "
+          f"{len(rows) - len(kept)}), tokens {min(counts)}-{max(counts)}")
+
+
+MINIPILOT_MAX_FAILURES = 0.02  # Yeb, 9 Nov: above 2% loops or breaks, only passages up to SHORT_MAX tokens
+
+
+def minipilot_check(args):
+    """The minipilot's nl->en translations: per passage not ended, decode_loop and Dutch left in the English
+    (pairs.py's measures); the share with any of them decides whether long passages go into the main run"""
+    import pyarrow.parquet as pq
+
+    import pairs
+
+    rows = pq.read_table(Path(args.segments) / "passages.parquet").to_pylist()
+    english = pairs.read_shards(args.nl_en, "text_en")
+    missing = [r["id"] for r in rows if r["id"] not in english]
+    if missing:
+        raise SystemExit(f"{len(missing)} minipilot passages without a translation, e.g. {missing[:3]}")
+    result = collections.Counter()
+    per_source = collections.defaultdict(collections.Counter)
+    examples = []
+    for r in rows:
+        en, ended, n_out = english[r["id"]]
+        fails = [name for name, bad in (("not_ended", not ended), ("decode_loop", bool(en) and
+                                                                    pairs.publish.decode_loop(en, r["text"])),
+                                        ("dutch_left", pairs.dutch_left(en, r["text"]))) if bad]
+        result["passages"] += 1
+        per_source[r["source"]]["passages"] += 1
+        result.update(fails)
+        per_source[r["source"]].update(fails)
+        if fails:
+            result["any"] += 1
+            per_source[r["source"]]["any"] += 1
+            examples.append({"id": r["id"], "fails": fails, "tokens_nl": r["tokens"], "tokens_en": n_out,
+                             "nl": r["text"][:300], "en": en[:300]})
+    share = result["any"] / max(result["passages"], 1)
+    decision = "long" if share <= MINIPILOT_MAX_FAILURES else "short_only"
+    report = {"result": dict(result), "share": round(share, 4), "limit": MINIPILOT_MAX_FAILURES,
+              "decision": decision, "per_source": {k: dict(v) for k, v in per_source.items()}, "failures": examples}
+    Path(args.out).write_text(json.dumps(report, indent=1, ensure_ascii=False))
+    print(f"MINIPILOT-CHECK {json.dumps({k: report[k] for k in ('result', 'share', 'decision')})}")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = parser.add_subparsers(dest="command", required=True)
@@ -756,6 +1210,31 @@ def main(argv=None):
     p.add_argument("--testsets", required=True)
     p.add_argument("--scores", help="The local copy of the score shards (w*/shard-*.parquet)")
     p.add_argument("--out", required=True)
+    p = sub.add_parser("fineweb-hosts", help="url and host of the FineWeb-2 documents of a selection's row groups")
+    p.add_argument("--select", required=True, help="The FineWeb-2 pool (its report.json)")
+    p.add_argument("--out", required=True, help="hosts.parquet")
+    p = sub.add_parser("final", help="The main set's final selection for steps 1 and 2")
+    p.add_argument("--select", required=True, nargs="+", help="The pool's selections and the repaired passages")
+    p.add_argument("--repaired-name", default="repaired", help="The directory name of select_passages.py repair's output")
+    p.add_argument("--scores", required=True, nargs="+", help="Local copies of score shards (w*/shard-*.parquet)")
+    p.add_argument("--hosts", nargs="*", help="fineweb-hosts' parquet files")
+    p.add_argument("--tokenizer", required=True)
+    p.add_argument("--block-texts", nargs="*", help="The test sets as text files, their 13-grams blocked")
+    p.add_argument("--n", type=int, default=200000)
+    p.add_argument("--n-eval", type=int, default=4000)
+    p.add_argument("--max-tokens", type=int, default=768, help="768, or 384 when the minipilot keeps long passages out")
+    p.add_argument("--workers", type=int, default=4)
+    p.add_argument("--out", required=True)
+    p = sub.add_parser("minipilot-segments", help="The minipilot's passages after the two edits as segments")
+    p.add_argument("--minipilot", required=True, help="mainset.py minipilot's directory")
+    p.add_argument("--tokenizer", required=True)
+    p.add_argument("--max-tokens", type=int, default=768)
+    p.add_argument("--workers", type=int, default=4)
+    p.add_argument("--out", required=True)
+    p = sub.add_parser("minipilot-check", help="Loops and breaks of the minipilot's nl->en translations")
+    p.add_argument("--segments", required=True, help="minipilot-segments' directory")
+    p.add_argument("--nl-en", required=True, help="Local copy of the shards (w<k>/<class>/shard-*.parquet)")
+    p.add_argument("--out", required=True, help="minipilot-check.json")
     p = sub.add_parser("stage0-eval", help="Stage 0 v2's rules against Gemma's source scores of the pilot")
     p.add_argument("--annotated", required=True)
     p.add_argument("--scores", required=True, nargs="+")
@@ -763,7 +1242,9 @@ def main(argv=None):
     p.add_argument("--out", required=True)
     args = parser.parse_args(argv)
     {"testsets": testsets, "judge-shards": judge_shards, "stage0-eval": stage0_eval, "eval-rows": eval_rows,
-     "replay": replay, "report": report, "minipilot": minipilot}[args.command](args)
+     "replay": replay, "report": report, "minipilot": minipilot, "fineweb-hosts": fineweb_hosts,
+     "final": final_selection, "minipilot-segments": minipilot_segments, "minipilot-check": minipilot_check,
+     }[args.command](args)
 
 
 if __name__ == "__main__":

@@ -64,6 +64,9 @@ if [ ! -s "$V/done.txt" ]; then
 fi
 cat "$V/done.txt"
 PY=$V/bin/python
+# MetricX-24's bfloat16 releases have only pytorch_model*.bin (no safetensors): metricx_qe.py reads them with torch on
+# the CPU. Outside the done.txt step, so a venv-fork made before this line gets it too
+"$PY" -c "import torch" 2> /dev/null || VIRTUAL_ENV=$V UV_TORCH_BACKEND=cpu uv pip install -q torch==2.9.1
 
 snapshot() {  # repo revision dir [patterns...]
   local repo=$1 rev=$2 dir=$3; shift 3

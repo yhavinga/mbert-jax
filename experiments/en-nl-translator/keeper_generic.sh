@@ -57,7 +57,7 @@ while true; do
       if echo "$out" | grep -q '^NORUN'; then
         log "new VM: token, scripts, run_gemma4_pilot.sh all"
         ssh_vm 'mkdir -p ~/.cache/huggingface && umask 077 && cat > ~/.cache/huggingface/token' < "$HOME/.cache/huggingface/token" > /dev/null 2>&1 \
-          && ssh_vm "mkdir -p /dev/shm/translate-generic/code ~/logs && gsutil -m -q cp -r '$SCRIPTS/*' /dev/shm/translate-generic/code/ && (setsid nohup bash -c 'bash /dev/shm/translate-generic/code/run_gemma4_pilot.sh all > ~/logs/tg_run.log 2>&1; echo EXIT \$? >> ~/logs/tg_run.log' > /dev/null 2>&1 < /dev/null &) && echo started" < /dev/null 2>&1 | tail -n 1
+          && ssh_vm "mkdir -p /dev/shm/translate-generic/code ~/logs && gsutil -m -q cp -r '$SCRIPTS/*' /dev/shm/translate-generic/code/ && (setsid nohup bash -c 'echo \$\$ > ~/logs/tg_run.pid; bash /dev/shm/translate-generic/code/run_gemma4_pilot.sh all > ~/logs/tg_run.log 2>&1; echo EXIT \$? >> ~/logs/tg_run.log' > /dev/null 2>&1 < /dev/null &) && echo started" < /dev/null 2>&1 | tail -n 1
       elif echo "$out" | grep -q '^RUNLOG'; then
         tail_line=$(echo "$out" | grep -v '^RUNLOG' | tail -n 1)
         log "run: $tail_line"

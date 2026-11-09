@@ -6,6 +6,7 @@
         [--sanity-md sanity.md] [--compare-md compare.md]
     python report.py compare --reference ref.json --scores <dir of the sanity scores>
     python report.py pilot --pairs <dir> --scores <dir> --ids pairs30_ids.txt --out pilot-scores.md
+    python report.py source --pairs <dir> --scores <dir> --pair-scores <dir> --ids pairs30_ids.txt --out source-quality.md
 
 sanity: per kind of pair (the originals and each deterministic error of data.py) the number of rows, the spread of
 the scores and their counts per score class, and per error the AUC of the score against the originals: the chance
@@ -329,6 +330,109 @@ def pilot_command(args):
     print(f"{args.out}: {len(rows):,} pairs")
 
 
+def log_odds(r):
+    return r["logp_yes"] - r["logp_no"]
+
+
+def passage(r, pair):
+    return [f"**{r['score']:.4f}** (log-odds {log_odds(r):.1f}) · `{r['id']}` · {r.get('source', '')} · "
+            f"paarscore {fmt(pair['score'])} · chrF {fmt(r.get('chrf', float('nan')), 1)} · QE en→nl "
+            f"{fmt(r.get('qe_en_nl', float('nan')), 2)} · {r['nl_words']} woorden", "", quote(r["nl"]), ""]
+
+
+def source_markdown(rows, pair_rows, ids30, seed=0):
+    """The source check of the pilot's Dutch originals: distribution (also per source), overlap with the pair score
+    and with MetricX-QE, the 30 pairs of pairs30.md, the 15 lowest and 15 random rejected passages with their text."""
+    import judge
+
+    pairs = {r["id"]: r for r in pair_rows}
+    missing = [r["id"] for r in rows if r["id"] not in pairs] + [i for i in ids30 if i not in pairs]
+    if missing:
+        raise SystemExit(f"{len(missing)} ids without a pair score: {missing[:3]}")
+    scored = [r for r in rows if r["skipped"] is None]
+    g = [r["score"] for r in scored]
+    sp = spread(g)
+    odds = np.array([log_odds(r) for r in scored])
+    q = np.quantile(odds, [0.05, 0.25, 0.5, 0.75, 0.95])
+    prompt = judge.TEMPLATE_PREFIX + judge.SOURCE_QUESTION + judge.TEMPLATE_SUFFIX
+    lines = ["# Pilot en→nl-vertaler: bronkwaliteit van de Nederlandse originelen (Gemma 4 31B)", "",
+             f"- {len(rows):,} Nederlandse originelen uit `pairs.parquet`, monolinguaal beoordeeld (zonder het Engels); "
+             f"gescoord {len(scored):,}.",
+             "- Score = P(yes) / (P(yes) + P(no)) van het eerste antwoordtoken, zoals bij de paren. Er is geen drempel "
+             "gekozen. Waar hieronder \"afgekeurd\" staat, is dat beschrijvend: het model zegt eerder no dan yes "
+             "(score < 0,5); < 0,1 staat er steeds naast. De 652 afgekeurde paren zijn de paren met paarscore < 0,1 "
+             "(pilot-scores.md).",
+             f"- Verdeling: gemiddeld {fmt(sp['mean'])}, mediaan {fmt(sp['median'])}, p10 {fmt(sp['p10'])}; "
+             f"aandeel ≥ 0,5: {fmt(sp['share_ge_0.5'])}. Log-odds log P(yes) − log P(no): p5 {q[0]:.1f}, p25 "
+             f"{q[1]:.1f}, mediaan {q[2]:.1f}, p75 {q[3]:.1f}, p95 {q[4]:.1f}.", "",
+             "## Prompt (letterlijk; {nl} is de passage)", "", f"````\n{prompt}\n````", "",
+             "## Verdeling, ook per bron", "",
+             "| bron | passages | gemiddeld | mediaan | < 0,1 | < 0,5 | " +
+             " | ".join(class_label(k) for k in range(10)) + " |", "|---|---:|---:|---:|---:|---:|" + "---:|" * 10]
+    for name in ["alle"] + sorted({r.get("source", "") for r in scored}):
+        part = [r["score"] for r in scored if name == "alle" or r.get("source", "") == name]
+        s = spread(part)
+        lines.append(f"| {name} | {len(part):,} | {fmt(s['mean'])} | {fmt(s['median'])} | "
+                     f"{sum(x < 0.1 for x in part):,} | {sum(x < 0.5 for x in part):,} | "
+                     + " | ".join(str(c) for c in histogram(part)) + " |")
+
+    def overlap(selected, label):
+        n = len(selected)
+        b01 = sum(r["score"] < 0.1 for r in selected)
+        b05 = sum(r["score"] < 0.5 for r in selected)
+        return f"| {label} | {n:,} | {b01:,} ({b01 / max(n, 1):.1%}) | {b05:,} ({b05 / max(n, 1):.1%}) |"
+
+    pair_low = [r for r in scored if pairs[r["id"]]["score"] < 0.1]
+    pair_ok = [r for r in scored if pairs[r["id"]]["score"] >= 0.1]
+    qe_high = [r for r in scored if r.get("qe_en_nl") is not None and r["qe_en_nl"] > 10]
+    qe_low = [r for r in scored if r.get("qe_en_nl") is not None and r["qe_en_nl"] <= 10]
+    lines += ["", "## Overlap met de paarscore en met MetricX-QE en→nl", "",
+              "| groep | passages | bronscore < 0,1 | bronscore < 0,5 |", "|---|---:|---:|---:|",
+              overlap(scored, "alle passages"),
+              overlap(pair_low, "paarscore < 0,1 (de afgekeurde paren)"),
+              overlap(pair_ok, "paarscore ≥ 0,1"),
+              overlap(qe_high, "MetricX-QE en→nl > 10"),
+              overlap(qe_low, "MetricX-QE en→nl ≤ 10")]
+    src_low = [r for r in scored if r["score"] < 0.5]
+    both = sum(pairs[r["id"]]["score"] < 0.1 for r in src_low)
+    lines += ["", f"Omgekeerd: van de {len(src_low):,} passages met bronscore < 0,5 hebben er {both:,} ook een "
+              "paarscore < 0,1.", "", "Spearman van de bronscore met:", "", "| met | rho | n |", "|---|---:|---:|"]
+    for name, values in (("paarscore", [pairs[r["id"]]["score"] for r in scored]),
+                         ("chrF", [r.get("chrf", float("nan")) for r in scored]),
+                         ("MetricX-QE en→nl", [r.get("qe_en_nl", float("nan")) for r in scored])):
+        rho, n = spearman(g, values)
+        lines.append(f"| {name} | {rho:.3f} | {n:,} |")
+    by_id = {r["id"]: r for r in rows}
+    lines += ["", "## De 30 paren van pairs30.md (zelfde volgorde)", "",
+              "| # | id | bron | bronscore | paarscore | chrF | QE en→nl |", "|---:|---|---|---:|---:|---:|---:|"]
+    for k, i in enumerate(ids30, 1):
+        r = by_id[i]
+        lines.append(f"| {k} | `{i}` | {r.get('source', '')} | {fmt(r['score'])} | {fmt(pairs[i]['score'])} | "
+                     f"{fmt(r.get('chrf', float('nan')), 1)} | {fmt(r.get('qe_en_nl', float('nan')), 2)} |")
+    lowest = sorted(scored, key=log_odds)[:15]
+    lines += ["", "## De 15 laagste passages (op log-odds, want veel scores zijn 0,0000)", ""]
+    for k, r in enumerate(lowest, 1):
+        lines += [f"### {k}."] + passage(r, pairs[r["id"]])
+    taken = {r["id"] for r in lowest}
+    rest = sorted((r for r in src_low if r["id"] not in taken), key=lambda r: r["id"])
+    chosen = random.Random(seed).sample(rest, min(15, len(rest)))
+    lines += [f"## 15 willekeurige afgekeurde passages (bronscore < 0,5, buiten de 15 laagste; seed {seed}, uit "
+              f"{len(rest):,})", ""]
+    for k, r in enumerate(sorted(chosen, key=lambda r: r["score"]), 1):
+        lines += [f"### {k}."] + passage(r, pairs[r["id"]])
+    return "\n".join(lines) + "\n"
+
+
+def source_command(args):
+    texts = {r["id"]: r for r in read_dir(args.pairs, columns=["id", "nl"])}
+    rows = read_dir(args.scores)
+    for r in rows:
+        r["nl"] = texts[r["id"]]["nl"]
+    ids30 = [line.strip() for line in Path(args.ids).read_text().splitlines() if line.strip()]
+    Path(args.out).write_text(source_markdown(rows, read_dir(args.pair_scores), ids30))
+    print(f"{args.out}: {len(rows):,} passages")
+
+
 def compare_command(args):
     """The TPU's scores of the reference rows next to those of transformers on the CPU (float32)."""
     reference = json.loads(Path(args.reference).read_text())
@@ -370,13 +474,19 @@ def main(argv=None):
     p.add_argument("--scores", required=True)
     p.add_argument("--ids", required=True, help="The 30 ids of pairs30.md, one per line, in its order")
     p.add_argument("--out", required=True)
+    p = sub.add_parser("source")
+    p.add_argument("--pairs", required=True)
+    p.add_argument("--scores", required=True, help="The source scores (judge.py score --task source)")
+    p.add_argument("--pair-scores", required=True, help="The pair scores of the same pilot")
+    p.add_argument("--ids", required=True)
+    p.add_argument("--out", required=True)
     p = sub.add_parser("compare")
     p.add_argument("--reference", required=True)
     p.add_argument("--scores", required=True)
     p.add_argument("--out", default=None)
     args = parser.parse_args(argv)
     {"sanity": sanity_command, "scan": scan_command, "compare": compare_command,
-     "pilot": pilot_command}[args.command](args)
+     "pilot": pilot_command, "source": source_command}[args.command](args)
 
 
 if __name__ == "__main__":

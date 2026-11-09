@@ -45,6 +45,18 @@ QUESTION = (
     "written in Dutch. Answer with one word: yes or no."
 )
 
+# The source check (9 Nov, Yeb): a Dutch original on its own, before translation; extraction errors should drop it
+# at selection already (the lowest pair of the pilot was a council report whose two PDF columns ran into each other)
+SOURCE_QUESTION = (
+    "Here is a Dutch text.\n\n"
+    "Text:\n{nl}\n\n"
+    "Is this well-formed, coherent Dutch text without text-extraction errors? Extraction errors are: columns or "
+    "tables that run into each other, words that are broken off or glued together, headers, footers or page numbers "
+    "in the middle of the text, and sentences cut off at the beginning or the end. The register (spoken, official, "
+    "legal) and the opinions in the text do not count. Answer with one word: yes or no."
+)
+TASKS = ("pair", "source")
+
 # Padded prompt lengths; a batch holds token_budget // length rows (a multiple of the batch axis), so a step costs
 # about the same at every length. Few lengths, because every shape compiles the 60 unscanned layers anew, for minutes,
 # and a spot VM may be gone before that; padding to the next power of two wastes ~25% of a step instead.
@@ -58,6 +70,10 @@ def user_text(en, nl):
 
 def prompt_text(en, nl):
     return TEMPLATE_PREFIX + user_text(en, nl) + TEMPLATE_SUFFIX
+
+
+def source_prompt_text(nl):
+    return TEMPLATE_PREFIX + SOURCE_QUESTION.format(nl=nl.strip()) + TEMPLATE_SUFFIX
 
 
 def answer_ids(vocab):
@@ -232,16 +248,18 @@ class Judge:
         return logp_yes[:n], logp_no[:n], top_ids[:n], top_logp[:n]
 
 
-def score_rows(judge, en, nl, token_budget, multiple, log=print):
+def score_rows(judge, en, nl, token_budget, multiple, task="pair"):
     """Scores of all rows of one shard: a dict of columns in the order of the rows; a row whose prompt is longer than
-    the longest padded length, or with an empty side, has no score and its reason in `skipped`."""
-    n = len(en)
+    the longest padded length, or with an empty text, has no score and its reason in `skipped`. task "pair" asks
+    about the translation en -> nl, task "source" about the Dutch text alone (en is not used)."""
+    n = len(nl)
     skipped = [None] * n
     for i in range(n):
-        if not en[i].strip() or not nl[i].strip():
+        if not nl[i].strip() or (task == "pair" and not en[i].strip()):
             skipped[i] = "empty"
     live = [i for i in range(n) if skipped[i] is None]
-    ids = judge.tokenizer.encode_batch([prompt_text(en[i], nl[i]) for i in live])
+    texts = [prompt_text(en[i], nl[i]) if task == "pair" else source_prompt_text(nl[i]) for i in live]
+    ids = judge.tokenizer.encode_batch(texts)
     prompt_tokens = [0] * n
     for i, row in zip(live, ids):
         prompt_tokens[i] = len(row)
@@ -295,17 +313,18 @@ def score_command(args):
     import pyarrow as pa
     import pyarrow.parquet as pq
 
-    if len(args.pairs) != len(args.out):
-        raise SystemExit("give one --out per --pairs")
+    tasks = args.task or ["pair"] * len(args.pairs)
+    if len(args.pairs) != len(args.out) or len(tasks) != len(args.pairs):
+        raise SystemExit("give one --out per --pairs, and one --task per --pairs or none")
     jobs = []
-    for pairs, out in zip(args.pairs, args.out):
+    for pairs, out, task in zip(args.pairs, args.out, tasks):
         shards = sorted(Path(pairs).glob("shard-*.parquet"))
         if not shards:
             raise SystemExit(f"no shard-*.parquet in {pairs}")
         done = done_shards(out)
         pending = [s for s in shards if s.name not in done]
         print(f"{len(shards)} shards in {pairs}, {len(shards) - len(pending)} done before in {out}", flush=True)
-        jobs.extend((shard, out) for shard in pending)
+        jobs.extend((shard, out, task) for shard in pending)
     if args.max_shards is not None:
         jobs = jobs[:args.max_shards]
     if not jobs:
@@ -316,11 +335,11 @@ def score_command(args):
     local = Path("/dev/shm/judge/out_shards")
     local.mkdir(parents=True, exist_ok=True)
     totals = {"pairs": 0, "scored": 0, "seconds": 0.0}
-    for shard, out_dir in jobs:
+    for shard, out_dir, task in jobs:
         table = pq.read_table(shard)
         en, nl = table.column("en").to_pylist(), table.column("nl").to_pylist()
         t0 = time.time()
-        cols = score_rows(judge, en, nl, args.token_budget, args.fsdp)
+        cols = score_rows(judge, en, nl, args.token_budget, args.fsdp, task)
         seconds = time.time() - t0
         out = {c: table.column(c).to_pylist() for c in PASSTHROUGH if c in table.column_names}
         out.update({"en_chars": [len(x) for x in en], "nl_chars": [len(x) for x in nl],
@@ -404,6 +423,8 @@ def main(argv=None):
         p.add_argument("--token-budget", type=int, default=32768, help="Padded tokens per step (default: 32768)")
     sub.choices["score"].add_argument("--out", required=True, action="append",
                                       help="Bucket directory of the score shards, one per --pairs")
+    sub.choices["score"].add_argument("--task", action="append", choices=TASKS,
+                                      help="pair (default) or source, one per --pairs")
     sub.choices["score"].add_argument("--max-shards", type=int, default=None)
     sub.choices["probe"].add_argument("--reference", default=None, help="hf_reference.py's JSON")
     args = parser.parse_args(argv)

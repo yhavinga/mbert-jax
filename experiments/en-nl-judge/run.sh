@@ -37,10 +37,14 @@ CKPT_ITEMS=$JUDGE/gemma-4-31b-it-maxtext/0/items
 mkdir -p "$SHM/jax_cache"
 if gsutil -q ls "$JUDGE/jax_cache/" > /dev/null 2>&1; then gsutil -m -q rsync -r "$JUDGE/jax_cache" "$SHM/jax_cache"; fi
 echo "== score $(date -u +%T), parameters $CKPT_ITEMS"
-# In this order: the sanity set, the translator's pilot (if its pairs are there), the Europarl pairs
-SETS=(--pairs "$SHM/sanity" --out "$JUDGE/scores/sanity")
-[ -d "$SHM/pilot" ] && SETS+=(--pairs "$SHM/pilot" --out "$JUDGE/scores/pilot")
-SETS+=(--pairs "$SHM/motra" --out "$JUDGE/scores/motra")
+# In this order: the sanity set, the translator's pilot (if its pairs are there) as pairs and its Dutch originals on
+# their own (task source), the Europarl pairs
+SETS=(--pairs "$SHM/sanity" --out "$JUDGE/scores/sanity" --task pair)
+if [ -d "$SHM/pilot" ]; then
+  SETS+=(--pairs "$SHM/pilot" --out "$JUDGE/scores/pilot" --task pair)
+  SETS+=(--pairs "$SHM/pilot" --out "$JUDGE/scores/pilot-source" --task source)
+fi
+SETS+=(--pairs "$SHM/motra" --out "$JUDGE/scores/motra" --task pair)
 JUDGE_JAX_CACHE=$SHM/jax_cache JUDGE_JAX_CACHE_GCS=$JUDGE/jax_cache "$PY" -u "$CODE/judge.py" score \
   --ckpt "$CKPT_ITEMS" --tokenizer "$SHM/tokenizer" "${SETS[@]}"
 if [ -n "$REF_PID" ]; then

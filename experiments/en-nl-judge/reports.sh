@@ -31,6 +31,12 @@ if [ -d "$SHM/pilot" ] && gsutil -q stat "$JUDGE/data/pilot-source/pairs30_ids.t
   gsutil -q cp "$JUDGE/data/pilot-source/pairs30_ids.txt" "$SHM/pairs30_ids.txt"
   "$PY" "$CODE/report.py" pilot --pairs "$SHM/pilot" --scores "$SHM/scores/pilot" --ids "$SHM/pairs30_ids.txt" \
     --out "$R/pilot-scores.md"
+  if gsutil -q ls "$JUDGE/scores/pilot-source/" > /dev/null 2>&1; then
+    mkdir -p "$SHM/scores/pilot-source"
+    gsutil -m -q rsync -r "$JUDGE/scores/pilot-source" "$SHM/scores/pilot-source"
+    "$PY" "$CODE/report.py" source --pairs "$SHM/pilot" --scores "$SHM/scores/pilot-source" \
+      --pair-scores "$SHM/scores/pilot" --ids "$SHM/pairs30_ids.txt" --out "$R/source-quality.md"
+  fi
 fi
 gsutil -m -q cp "$R/*" "$JUDGE/reports/"
 echo "reports in $JUDGE/reports/: $(ls "$R" | tr '\n' ' ')"

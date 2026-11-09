@@ -302,3 +302,25 @@ def test_pilot_markdown_keeps_the_order_of_the_30():
     assert "| MetricX-QE en→nl (lager is beter, dus verwacht negatief) | -1.000 | 40 |" in md
     with pytest.raises(SystemExit):
         report.pilot_markdown(rows, ["nope"] * 30)
+
+
+def test_source_prompt_and_score_rows_without_english():
+    text = judge.source_prompt_text("  Een tekst.\n")
+    assert text.startswith("<bos><|turn>user\nHere is a Dutch text.\n\nText:\nEen tekst.\n\n")
+    assert text.endswith("Answer with one word: yes or no.<turn|>\n<|turn>model\n<|channel>thought\n<channel|>")
+    cols = judge.score_rows(FakeJudge(), ["", "", ""], ["een twee", "", "drie"], token_budget=1024, multiple=8,
+                            task="source")
+    assert cols["skipped"] == [None, "empty", None]
+
+
+def test_source_markdown_overlap_and_order():
+    rows, pair_rows = [], []
+    for i in range(40):
+        rows.append({"id": f"p{i}", "score": 0.0 if i < 10 else 1.0, "logp_yes": -20.0 + i if i < 10 else 0.0,
+                     "logp_no": 0.0 if i < 10 else -20.0, "skipped": None, "source": "raad" if i % 2 else "dpc",
+                     "chrf": float(i), "qe_en_nl": 12.0 if i < 5 else 2.0, "nl_words": 3, "nl": f"tekst {i}"})
+        pair_rows.append({"id": f"p{i}", "score": 0.0 if i < 20 else 1.0})
+    md = report.source_markdown(rows, pair_rows, [f"p{i}" for i in range(30)])
+    assert "| paarscore < 0,1 (de afgekeurde paren) | 20 | 10 (50.0%) | 10 (50.0%) |" in md
+    assert "| MetricX-QE en→nl > 10 | 5 | 5 (100.0%) | 5 (100.0%) |" in md
+    assert md.index("`p0`") < md.index("`p9`")

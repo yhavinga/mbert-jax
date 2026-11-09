@@ -160,6 +160,18 @@ def scan_markdown(rows, meta, seed, per_class):
         lines.append(f"| {class_label(k)} | {hist[k]:,} | {hist[k] / max(len(scores), 1):.3f} | "
                      f"{above / max(len(scores), 1):.3f} |")
         above -= hist[k]
+    odds = np.array([r["logp_yes"] - r["logp_no"] for r in scored])
+    edges = [-np.inf, -10, -5, -2, 0, 2, 5, 10, np.inf]
+    counts = np.histogram(odds, bins=edges)[0]
+    q = np.quantile(odds, [0.05, 0.25, 0.5, 0.75, 0.95])
+    lines += ["", "De score is bijna binair; de log-odds log P(yes) − log P(no) (score = 1 / (1 + e^−log-odds)) "
+              "ordenen fijner. Kwantielen: p5 " + ", p25 ".join([f"{q[0]:.1f}", f"{q[1]:.1f}"]) +
+              f", mediaan {q[2]:.1f}, p75 {q[3]:.1f}, p95 {q[4]:.1f}.", "",
+              "| log-odds | paren | aandeel |", "|---|---:|---:|"]
+    for k, c in enumerate(counts):
+        low, high = edges[k], edges[k + 1]
+        label = f"< {high:g}" if low == -np.inf else (f"≥ {low:g}" if high == np.inf else f"{low:g} tot {high:g}")
+        lines.append(f"| {label} | {c:,} | {c / max(len(odds), 1):.3f} |")
     if "year" in scored[0]:
         lines += ["", "Per periode (aandeel per scoreklasse):", "",
                   "| periode | paren | " + " | ".join(class_label(k) for k in range(10)) + " |",

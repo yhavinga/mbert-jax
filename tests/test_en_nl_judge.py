@@ -261,11 +261,13 @@ def test_sanity_summary_pairs_with_own_originals():
 
 def test_scan_markdown_samples_per_class():
     rows = [{"id": f"2001:{i}", "score": i / 100, "skipped": None, "answer_mass": 1.0, "top_token": "yes",
+             "logp_yes": -0.1 * i, "logp_no": -1.0,
              "year": 2001 + i % 12, "date": "2001-01-01", "speaker": "S", "nationality": None, "en_words": 30,
              "nl_words": 31, "en": "E", "nl": "N"} for i in range(100)]
     md = report.scan_markdown(rows, {"title": "T", "intro": ["x"]}, seed=0, per_class=3)
     assert md.count("**0.") == 30
     assert "| 0.9–1.0 | 10 | 0.100 |" in md
+    assert "| -10 tot -5 | 39 | 0.390 |" in md
 
 
 def test_europarl_meta_has_source_counts_and_prompt():
@@ -274,6 +276,7 @@ def test_europarl_meta_has_source_counts_and_prompt():
                 "by_period": {"1999-2003": {"paired": 3}, "2004-2012": {"paired": 5}}}
     meta = report.europarl_meta(manifest, "| sanity |", None)
     rows = [{"id": "x", "score": 0.5, "skipped": None, "answer_mass": 1.0, "top_token": "yes", "year": 2001,
+             "logp_yes": -0.7, "logp_no": -0.7,
              "date": "2001-01-01", "speaker": "S", "nationality": None, "en_words": 3, "nl_words": 3, "en": "E",
              "nl": "N"}]
     md = report.scan_markdown(rows, meta, seed=0, per_class=1)

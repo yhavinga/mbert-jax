@@ -25,6 +25,12 @@ NEMOTRON=nvidia/Nemotron-SFT-Instruction-Following-Chat-v3
 PILOT=gs://t5-dutch-english-usc2/mbert/translator/pilot/pairs.parquet
 export PATH=$HOME/.local/bin:$PATH UV_CACHE_DIR=$SHM/uv-cache UV_PYTHON_INSTALL_DIR=$SHM/python HF_HUB_DISABLE_PROGRESS_BARS=1
 [ -s ~/.cache/huggingface/token ] || { echo "$(hostname): no ~/.cache/huggingface/token"; exit 1; }
+ZONE=$(curl -fs -H Metadata-Flavor:Google http://metadata.google.internal/computeMetadata/v1/instance/zone | awk -F/ '{print $NF}')
+case ${ZONE%-*} in
+  us-east1) BUCKET=gs://t5-dutch-english-use1 ;;
+  europe-west4) BUCKET=gs://t5-dutch-english ;;
+  *) echo "no bucket for zone '$ZONE'"; exit 1 ;;
+esac
 mkdir -p "$SHM/data" ~/logs
 command -v uv > /dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
 command -v uv > /dev/null || { echo "$(hostname): uv is not on PATH after installing it"; exit 1; }
@@ -92,6 +98,6 @@ if [ ! -s "$D/nemotron/done.txt" ]; then
   echo "$NEMOTRON@$rev data/chat.jsonl bytes 0, 4e9, 1e10 (+8 MB each) $(du -sh "$D/nemotron/chat-ranges.jsonl" | cut -f1)" > "$D/nemotron/done.txt"
 fi
 cat "$D/nemotron/done.txt"
-gsutil -q cp "gs://t5-dutch-english/mbert/translator/scripts/pairs30-pids.txt" "$D/pairs30-pids.txt"
+gsutil -q cp "$BUCKET/mbert/translator/scripts/pairs30-pids.txt" "$D/pairs30-pids.txt"
 "$PY" -c "import jax; d = jax.devices(); print('$(hostname):', len(d), d[0].platform, d[0].device_kind)" 2>&1 | tail -1
 echo "$(hostname): ready in $SHM, $(df -h /dev/shm | tail -1 | awk '{print $4}') free in /dev/shm"

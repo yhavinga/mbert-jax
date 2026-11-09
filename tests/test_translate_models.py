@@ -188,7 +188,7 @@ def test_checkpoint_of_the_region_or_an_error():
     assert tr.checkpoint_of(model, "europe-west4") == (
         "gs://t5-dutch-english/mbert/translator/judge/gemma-4-31b-it-maxtext/0/items")
     with pytest.raises(SystemExit):
-        tr.checkpoint_of(model, "us-east1")
+        tr.checkpoint_of(model, "asia-east1")
 
 
 def test_a_prompt_longer_than_the_largest_prefill_length_is_an_error():

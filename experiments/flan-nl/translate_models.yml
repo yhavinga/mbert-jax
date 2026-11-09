@@ -114,6 +114,7 @@ models:
     hf_repo: google/gemma-4-31B-it
     checkpoints:
       europe-west4: gs://t5-dutch-english/mbert/translator/judge/gemma-4-31b-it-maxtext/0/items
+      us-east1: gs://t5-dutch-english-use1/mbert/translator/judge/gemma-4-31b-it-maxtext/0/items
       us-central2: gs://t5-dutch-english-usc2/mbert/translator/judge/gemma-4-31b-it-maxtext/0/items
     chips: 4
     eos_ids: [1, 106, 50]  # generation_config.json: <eos>, <turn|>, and 50

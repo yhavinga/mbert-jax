@@ -9,13 +9,19 @@
 #                                        time; the report
 # The v6e-8 is used as two TPUs of 4 chips: Gemma 4 31B allows at most 4-way tensor parallelism (4 KV heads in its
 # global layers), as translate_models.yml says. Results go to $B/gemma4-pilot/; a second start of translate skips the
-# shards that are there.
+# shards that are there. The bucket is that of the VM's region (the checkpoint is there; nothing crosses regions).
 set -euo pipefail
 SHM=/dev/shm/translate-generic
 C=$SHM/code
 D=$SHM/data
 PY=$SHM/venv-fork/bin/python
-B=gs://t5-dutch-english/mbert/translator
+ZONE=$(curl -fs -H Metadata-Flavor:Google http://metadata.google.internal/computeMetadata/v1/instance/zone | awk -F/ '{print $NF}')
+case ${ZONE%-*} in
+  us-east1) BUCKET=gs://t5-dutch-english-use1 ;;
+  europe-west4) BUCKET=gs://t5-dutch-english ;;
+  *) echo "no bucket for zone '$ZONE'"; exit 1 ;;
+esac
+B=$BUCKET/mbert/translator
 O=$B/gemma4-pilot
 TOK=$SHM/tokenizer-gemma4
 CKPT=$B/judge/gemma-4-31b-it-maxtext/0/items
@@ -114,8 +120,8 @@ post)
   [ $ca = 0 ] && [ $cb = 0 ]
   gsutil -q cp "$SHM/out/context.parquet" "$SHM/out/qe.parquet" "$O/"
   mkdir -p "$SHM/out/logs" && cp ~/logs/gemma4_en_nl.log ~/logs/gemma4_nl_en.log "$SHM/out/logs/"
-  "$PY" - "$SHM/out/setup.json" <<'EOF'
-import json, sys, yaml
+  "$PY" - "$SHM/out/setup.json" "$ZONE" <<'EOF'
+import json, os, sys, yaml
 from pathlib import Path
 fork = Path("/dev/shm/translate-generic/venv-fork/done.txt").read_text().strip()
 slots = yaml.safe_load(Path("/dev/shm/translate-generic/code/translate_models.yml").read_text())["models"]["gemma4-31b"]["slots"]
@@ -123,7 +129,7 @@ Path(sys.argv[1]).write_text(json.dumps({
     "maxtext": "de fork yhavinga/maxtext, branch fix-nnx-decode-cache-abstract-init @ 2249474b9 (upstream main "
                "d1c0d0afe van 9 nov plus fix 1), zonder JetStream; omweg make_result_tokens_a_pytree actief, "
                "make_decode_cache_sharded niet nodig. Pakketten: " + fork,
-    "vm": "translate-generic, v6e-8 spot in europe-west4-a, als twee TPU's van 4 chips (TPU_VISIBLE_CHIPS)",
+    "vm": f"{os.uname().nodename}, v6e-8 spot in {sys.argv[2]}, als twee TPU's van 4 chips (TPU_VISIBLE_CHIPS)",
     "slots": slots}, ensure_ascii=False))
 EOF
   echo "== report $(date -u +%T)"

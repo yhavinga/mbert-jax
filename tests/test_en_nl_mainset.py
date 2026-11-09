@@ -234,3 +234,37 @@ def test_final_selection_end_to_end(tmp_path, monkeypatch):
     segments = [r for k in range(4) for r in pq.read_table(out / f"segments-w{k}.parquet").to_pylist()]
     assert len({r["id"] for r in segments}) == len(segments) == len(chosen) + len(turns_out)
     assert (out / "selection.md").read_text().startswith("# Hoofdset")
+
+
+def test_minipilot_segments_and_check(tmp_path, monkeypatch):
+    monkeypatch.setitem(sys.modules, "tokenizers", types.SimpleNamespace(Tokenizer=WordTokenizer))
+    mp = tmp_path / "minipilot-long"
+    mp.mkdir()
+    rows = [{"pid": f"raad:{k}:d:0", "source": "raad", "text": f"_Kop_ De raad {words(k, 40)}.\nNog een alinea."}
+            for k in range(50)]
+    rows.append({"pid": "raad:99:d:0", "source": "raad", "text": words(99, 900)})  # too long after the edits
+    pq.write_table(pa.table({c: [r[c] for r in rows] for c in rows[0]}), mp / "passages.parquet")
+    seg = tmp_path / "seg"
+    mainset.main(["minipilot-segments", "--minipilot", str(mp), "--tokenizer", "x", "--workers", "2",
+                  "--out", str(seg)])
+    kept = pq.read_table(seg / "passages.parquet").to_pylist()
+    assert len(kept) == 50 and kept[0]["text"].startswith("_Kop_\n\nDe raad") and kept[0]["text"].endswith(
+        "\n\nNog een alinea.")
+    parts = [pq.read_table(seg / f"segments-w{k}.parquet").to_pylist() for k in range(2)]
+    assert sorted(r["id"] for p in parts for r in p) == sorted(r["id"] for r in kept)
+    d = tmp_path / "nl-en" / "w0" / "xxlong"
+    d.mkdir(parents=True)
+    en = ["The council discussed it and decided." for _ in kept]
+    ended = [True] * len(kept)
+    ended[0] = False  # broke off
+    pq.write_table(pa.table({"id": [r["id"] for r in kept], "text_en": en, "ended": ended,
+                             "tokens_in": [50] * len(kept), "tokens_out": [8] * len(kept)}), d / "shard-00000.parquet")
+    out = tmp_path / "check.json"
+    mainset.main(["minipilot-check", "--segments", str(seg), "--nl-en", str(tmp_path / "nl-en"), "--out", str(out)])
+    check = json.loads(out.read_text())
+    assert check["result"]["not_ended"] == 1 and check["share"] == 0.02 and check["decision"] == "long"
+    ended[1] = False  # 2 of 50: above 2%
+    pq.write_table(pa.table({"id": [r["id"] for r in kept], "text_en": en, "ended": ended,
+                             "tokens_in": [50] * len(kept), "tokens_out": [8] * len(kept)}), d / "shard-00000.parquet")
+    mainset.main(["minipilot-check", "--segments", str(seg), "--nl-en", str(tmp_path / "nl-en"), "--out", str(out)])
+    assert json.loads(out.read_text())["decision"] == "short_only"

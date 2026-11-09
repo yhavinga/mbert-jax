@@ -340,7 +340,7 @@ def passage(r, pair):
             f"{fmt(r.get('qe_en_nl', float('nan')), 2)} · {r['nl_words']} woorden", "", quote(r["nl"]), ""]
 
 
-def source_markdown(rows, pair_rows, ids30, seed=0):
+def source_markdown(rows, pair_rows, ids30, seed=0, cases=()):
     """The source check of the pilot's Dutch originals: distribution (also per source), overlap with the pair score
     and with MetricX-QE, the 30 pairs of pairs30.md, the 15 lowest and 15 random rejected passages with their text."""
     import judge
@@ -403,6 +403,12 @@ def source_markdown(rows, pair_rows, ids30, seed=0):
         rho, n = spearman(g, values)
         lines.append(f"| {name} | {rho:.3f} | {n:,} |")
     by_id = {r["id"]: r for r in rows}
+    if cases:
+        lines += ["", "## Genoemde gevallen", ""]
+        for i in cases:
+            if i not in by_id:
+                raise SystemExit(f"case {i} is not among the passages")
+            lines += passage(by_id[i], pairs[i])
     lines += ["", "## De 30 paren van pairs30.md (zelfde volgorde)", "",
               "| # | id | bron | bronscore | paarscore | chrF | QE en→nl |", "|---:|---|---|---:|---:|---:|---:|"]
     for k, i in enumerate(ids30, 1):
@@ -429,7 +435,7 @@ def source_command(args):
     for r in rows:
         r["nl"] = texts[r["id"]]["nl"]
     ids30 = [line.strip() for line in Path(args.ids).read_text().splitlines() if line.strip()]
-    Path(args.out).write_text(source_markdown(rows, read_dir(args.pair_scores), ids30))
+    Path(args.out).write_text(source_markdown(rows, read_dir(args.pair_scores), ids30, cases=args.case or ()))
     print(f"{args.out}: {len(rows):,} passages")
 
 
@@ -478,6 +484,7 @@ def main(argv=None):
     p.add_argument("--pairs", required=True)
     p.add_argument("--scores", required=True, help="The source scores (judge.py score --task source)")
     p.add_argument("--pair-scores", required=True, help="The pair scores of the same pilot")
+    p.add_argument("--case", action="append", help="An id to show with its text (repeatable)")
     p.add_argument("--ids", required=True)
     p.add_argument("--out", required=True)
     p = sub.add_parser("compare")

@@ -46,20 +46,38 @@ gsutil ls $J/scores/motra/ | wc -l                        # 13 shards when done
 europarl-scan.md; then copy pilot-scores.md and europarl-scan.md (small) to
 `~/Developer/yhavinga/mbert-ops/translator-judge/` on co1, and a small copy of `$J/scores/pilot/` there.
 
-## State (9 Nov, 12:46 UTC)
+## State (9 Nov, 13:26 UTC): done
 
-- VM `en-nl-judge`, v6e-8 spot, europe-west4-a (third VM of the day; us-east1-d VMs were preempted after 5-8 minutes,
-  europe-west4-a once during the first compile). Keeper on co1: `NAME=en-nl-judge ZONE=europe-west4-a bash keeper.sh`,
-  log `~/logs/judge_keeper_euw4.log`; it ends when run.sh ends.
-- Conversion: works (MaxText's to_maxtext, 4.75 min on the host CPU, peak 101 GB RAM). Loading from the bucket 87 s;
-  compiling 53-58 s per shape (fsdp 8, unscanned).
+Everything below is in `$J` (europe-west4). `run.sh` ended in `EXIT 0` twice (12:36-13:15 the sets, 13:19-13:22 the
+source check); the reports were rebuilt at 13:25 (`~/logs/judge_reports2.log`). Run log: `$J/logs/judge_run-20261109.log`.
+
+- VM `en-nl-judge`, v6e-8 spot, europe-west4-a, READY and idle (TPU free); not deleted (the main session decides).
+  No keeper runs. Preemptions: us-east1-d twice (after ~5 and ~8 minutes), europe-west4-a once (during the first
+  compile). After a run ends, /dev/shm/judge is emptied (no reboot; probably logind removing the user's shared memory
+  once no process of the user is left), so every new run starts with prep.sh (~40 s when the bucket has everything).
+- Conversion works (MaxText to_maxtext, 4.75 min on the host CPU, peak 101 GB RAM). Load from the bucket 70-90 s;
+  compiling 53-59 s per shape, 4 s from the compilation cache in `$J/jax_cache/`.
 - Check against transformers (CPU, float32), 9 sanity rows: score difference at most 0.0002, log probabilities within
   0.37 (bf16), same top token (`$J/reports/compare.md`). Prompt ids equal to apply_chat_template.
 - Sanity (`$J/reports/sanity.md`), AUC against all 500 originals / against the same paragraphs: english_kept
   1.000/1.000, mismatch 1.000/1.000, sentence_dropped 0.973/0.971, number_changed 0.932/0.948, negation_removed
-  0.920/0.927. 119 of the 500 originals score below 0.1: the judge is strict (it rejects free but correct renderings,
-  a speaker prefix such as "namens de ECR-Fractie . -", and also catches real errors). Scores are nearly binary (0 or
-  1); logp_yes - logp_no in the score shards ranks more finely.
-- Pilot (`$J/reports/pilot-scores.md`, copy on co1): Spearman with chrF 0.198, with MetricX-QE en-nl -0.486, nl-en
-  -0.190 (n 2,000); 652 of 2,000 below 0.1.
-- Tempo: MoTra 64 pairs/s (20k prompt tokens/s); sanity and pilot ~55-70 pairs/s net of compiling.
+  0.920/0.927. 119 of the 500 originals score below 0.1: the judge is strict (it rejects free but correct renderings
+  and a speaker prefix such as "namens de ECR-Fractie . -", and catches real errors). Scores are nearly binary; the
+  log-odds logp_yes - logp_no in the score shards rank more finely.
+- Pilot pairs (`$J/scores/pilot/`, `$J/reports/pilot-scores.md`): Spearman with chrF 0.198, MetricX-QE en-nl -0.486,
+  nl-en -0.190 (n 2,000); 652 of 2,000 below 0.1.
+- Pilot sources (`$J/scores/pilot-source/`, `$J/reports/source-quality.md`): 288 of 2,000 below 0.1 (raad 200 of 600,
+  rechtspraak 47 of 200, dpc 16 of 200, handelingen 25 of 1,000); of the 652 pairs below 0.1, 182 also have a source
+  score below 0.1; of the 24 pairs with MetricX-QE en-nl > 10, 18. The PDF case raad:e9ec1e4c...:d:34 scores 0.0000.
+- Europarl-direct (`$J/scores/motra/`, 13 shards, `$J/reports/europarl-scan.md`): 126,362 pairs scored, none
+  skipped; mean 0.730, 25.9% below 0.1, 71.8% at 0.9 or more; 5 pairs whose likeliest first token is neither yes nor
+  no (You 4, Please 1). Tempo 61-74 pairs/s (20k prompt tokens/s); 1,893 s of scoring for the 13 shards.
+- Copies on co1: `~/Developer/yhavinga/mbert-ops/translator-judge/` (europarl-scan.md, pilot-scores.md,
+  pilot-scores.parquet, source-quality.md).
+
+## Next steps (not done)
+
+- Yeb: a threshold, after the calibration on the 30 pilot pairs; the log-odds may serve better than the score.
+- The source check can run on the 200,000 candidates before their translation (task source; ~57 passages/s).
+- Europarl-direct has no en-nl pairs after mid-2011; utils.py's langdetect filter is not applied (an English side
+  that is in fact another language is not caught by the pair prompt).

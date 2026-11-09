@@ -118,6 +118,13 @@ def test_quotas_cap_topics_and_hosts_and_relax_only_the_topic():
     assert q.passes[1] == 6 and q.passes[5] == 14  # 3 per topic, then the topic cap goes
 
 
+def test_quotas_cap_on_what_the_pool_can_give():
+    cands = [cand(k, host="nrc.nl" if k % 2 else f"h{k}.nl", source="fineweb") for k in range(40)]
+    q = mainset.Quotas(80, 0.0, 0.0, None, 0.05, sp.Chooser(3), cap_base=40)
+    chosen = q.draw(cands)
+    assert q.host_cap == 2 and sum(p["host"] == "nrc.nl" for p in chosen) == 2 and len(chosen) == 22
+
+
 def test_quotas_respect_the_document_cap_and_duplicates():
     cands = [cand(k, doc="same") for k in range(10)] + [cand(99)] * 3
     chosen = mainset.Quotas(10, 0.0, 0.0, None, None, sp.Chooser(3)).draw(cands)

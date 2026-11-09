@@ -790,9 +790,10 @@ class Quotas:
     """Draws one source's passages for one split in passes that relax one condition after the other. A candidate is a
     dict with length_class (long/short), idiom_class, context (Handelingen: a context example), topic and host
     (FineWeb-2). Pass 1 holds every target: per length class its count, half of it idiom-rich, CONTEXT_SHARE of it with
-    context (Handelingen); every pass holds the caps on topic and host and the chooser's (document cap, duplicates)."""
+    context (Handelingen); every pass holds the caps on topic and host and the chooser's (document cap, duplicates).
+    The caps are shares of cap_base (default n)."""
 
-    def __init__(self, n, long_share, context_share, topic_cap, host_cap, chooser):
+    def __init__(self, n, long_share, context_share, topic_cap, host_cap, chooser, cap_base=None):
         self.n, self.chooser = n, chooser
         n_long = round(long_share * n)
         self.length = {"long": n_long, "short": n - n_long}
@@ -802,8 +803,9 @@ class Quotas:
         for c in self.length:
             k = round(context_share * self.length[c])
             self.context[(c, True)], self.context[(c, False)] = k, self.length[c] - k
-        self.topic_cap = max(1, math.floor(topic_cap * n)) if topic_cap else None
-        self.host_cap = max(1, math.floor(host_cap * n)) if host_cap else None
+        base = n if cap_base is None else cap_base
+        self.topic_cap = max(1, math.floor(topic_cap * base)) if topic_cap else None
+        self.host_cap = max(1, math.floor(host_cap * base)) if host_cap else None
         self.counts = collections.Counter()
         self.chosen, self.passes = [], {}
 
@@ -1008,8 +1010,11 @@ def final_selection(args):
             cands = sorted((r for r in eligible if r["source"] == source and r["split"] == split),
                            key=lambda r: r["pid"])
             random.Random(f"{args.seed}/{split}/{source}").shuffle(cands)
+            # the caps are shares of what the pool can give: the long run's FineWeb-2 pool holds about half its share,
+            # and a cap on the share wanted would let a host reach ~1% of what is chosen
             q = Quotas(want[source], long_share, context_share if source == "handelingen" else 0.0,
-                       TOPIC_CAP if source == "fineweb" else None, HOST_CAP if source == "fineweb" else None, chooser)
+                       TOPIC_CAP if source == "fineweb" else None, HOST_CAP if source == "fineweb" else None, chooser,
+                       cap_base=min(want[source], len(cands)))
             picked = q.draw(cands)
             for p in picked:
                 p["half"] = "idiom" if p["idiom_class"] else "random"

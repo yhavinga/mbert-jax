@@ -21,7 +21,8 @@ here: Yeb sets them on the pilot):
   differ; ["newline_doubled"] for TranslateGemma's empty line where the original has a single newline)
 - chrf: chrF (sacrebleu, chrF2) of the back-translation against the original
 - the back-translation's own ended and decode_loop, for reading
-MetricX-24 QE comes from metricx_qe.py.
+MetricX-24 QE comes from metricx_qe.py. A pair carries its passage's length_class from the selection (None for a
+context turn or a selection without it), so that the pairs of runs of different lengths can be joined.
 """
 
 import argparse
@@ -183,7 +184,7 @@ def back_segments(args):
             skipped["empty"].append(p["id"])
         else:
             n = len(tok.encode(text, add_special_tokens=False).ids)
-            if n > MAX_BACK_TOKENS:
+            if n > args.max_tokens:
                 skipped["too_long"].append(p["id"])
             else:
                 rows.append({"id": p["id"], "text": text, "tokens": n})
@@ -237,7 +238,8 @@ def measures(args):
         en, ended, en_tokens = english[p["id"]]
         b = back.get(p["id"])
         rows.append({"id": p["id"], "pid": p["pid"], "kind": p["kind"], "source": p["source"],
-                     "split": p.get("split"), "half": p["half"], "nl": p["text"], "tokens_nl": p["tokens"],
+                     "split": p.get("split"), "length_class": p.get("length_class"), "half": p["half"],
+                     "nl": p["text"], "tokens_nl": p["tokens"],
                      "idiom_score": p["idiom_score"], "en": en, "ended": ended, "tokens_en": en_tokens - int(ended),
                      "back": b[0] if b else None, "back_ended": b[1] if b else None})
     triples = [(r["nl"], r["en"], r["back"]) for r in rows]
@@ -312,7 +314,7 @@ def summary(args):
                        "chrf_kept": _quantiles([r["chrf"] for r in kept])}
     (out / "summary.json").write_text(json.dumps(result, indent=1))
     names = ("not_ended", "decode_loop", "dutch_left", "len_ratio", "structure", "newline_doubled")
-    lines = ["# Hoofdrun en→nl-vertaler: paren na stap 1 en 2", "",
+    lines = [f"# {args.title}", "",
              "Harde controles op het paar (ontwerp §7 punt 6): niet afgelopen, `decode_loop`, Nederlandse resten in het "
              f"Engels, lengteverhouding > {MAX_LEN_RATIO}, structuur (`newline_doubled` = alleen TranslateGemma's lege "
              "regel voor één regelovergang, apart geteld). MetricX-24-QE (en→nl: synthetisch Engels als bron, origineel "
@@ -337,6 +339,8 @@ def main(argv=None):
     p.add_argument("--tokenizer", required=True)
     p.add_argument("--out", required=True)
     p.add_argument("--workers", type=int, default=4)
+    # an English segment above it goes into a longer length class of translate.py; it is left out and counted
+    p.add_argument("--max-tokens", type=int, default=MAX_BACK_TOKENS)
     p = sub.add_parser("measures", help="The measures of step 2 per pair")
     p.add_argument("--select", required=True)
     p.add_argument("--nl-en", required=True)
@@ -351,6 +355,7 @@ def main(argv=None):
     p.add_argument("--pairs", required=True)
     p.add_argument("--qe", required=True, nargs="+")
     p.add_argument("--out", required=True)
+    p.add_argument("--title", default="Hoofdrun en→nl-vertaler: paren na stap 1 en 2", help="summary.md's heading")
     args = parser.parse_args(argv)
     {"back-segments": back_segments, "measures": measures, "qe-split": qe_split, "summary": summary}[args.command](args)
 

@@ -268,3 +268,96 @@ def test_minipilot_segments_and_check(tmp_path, monkeypatch):
                              "tokens_in": [50] * len(kept), "tokens_out": [8] * len(kept)}), d / "shard-00000.parquet")
     mainset.main(["minipilot-check", "--segments", str(seg), "--nl-en", str(tmp_path / "nl-en"), "--out", str(out)])
     assert json.loads(out.read_text())["decision"] == "short_only"
+
+
+# ---------------------------------------------------------------- a second run beside the main run (Yeb, 9 Nov:
+# the passages of 384-511 tokens)
+
+def long_run_pool(tmp_path):
+    """raad only, a cap of 2 per document: documents 0-9 hold a short passage each (the main run takes all ten),
+    document 0 two long ones as well (beside its short one only one fits under the cap), document 1 a long passage
+    that repeats its short passage's words (13-gram overlap), documents 20-39 one long passage each, document 50 an
+    eval document with a short and a long passage, document 70 a passage above 511 tokens"""
+    rows, scores = [], []
+
+    def add(doc, j, n_words, split="train", text=None):
+        pid = f"raad:{doc}:d:{j}"
+        text = text or f"Alinea {words(1000 * doc + j, n_words - 1)}."
+        rows.append({"pid": pid, "source": "raad", "doc_id": str(doc), "split": split, "text": text,
+                     "tokens": len(text.split()), "idiom_class": j % 2 == 0, "context_example": False,
+                     "context_turns": []})
+        scores.append({"id": pid, "score": 1.0, "skipped": None, "origin_score": None, "topic": "A"})
+
+    for doc in range(10):
+        add(doc, 0, 20)
+    add(0, 1, 400)
+    add(0, 2, 400)
+    add(1, 1, 0, text=f"Alinea {words(1000, 19)}. " + words(77, 380))
+    for doc in range(20, 40):
+        add(doc, 0, 400)
+    add(50, 0, 20, split="eval")
+    add(50, 1, 400, split="eval")
+    add(70, 0, 512)
+    write_pool(tmp_path / "pool", rows, None, {"args": {"max_per_doc": "raad=2"}})
+    (tmp_path / "scores" / "w0").mkdir(parents=True)
+    pq.write_table(pa.table({c: [s[c] for s in scores] for c in scores[0]}),
+                   tmp_path / "scores" / "w0" / "shard-00000.parquet")
+
+
+def test_a_long_run_beside_the_main_run(tmp_path, monkeypatch):
+    monkeypatch.setitem(sys.modules, "tokenizers", types.SimpleNamespace(Tokenizer=WordTokenizer))
+    long_run_pool(tmp_path)
+    main_out, long_out = tmp_path / "main", tmp_path / "long"
+    common = ["final", "--select", str(tmp_path / "pool"), "--scores", str(tmp_path / "scores"), "--tokenizer", "x"]
+    # raad's share of 50 is 10 and of 5 is 1: the main run takes every short passage
+    mainset.main(common + ["--n", "50", "--n-eval", "5", "--max-tokens", "384", "--out", str(main_out)])
+    main = pq.read_table(main_out / "passages.parquet").to_pylist()
+    assert sorted(p["pid"] for p in main) == sorted([f"raad:{d}:d:0" for d in range(10)] + ["raad:50:d:0"])
+    mainset.main(common + ["--n", "50", "--n-eval", "5", "--min-tokens", "384", "--max-tokens", "511", "--exclude",
+                           str(main_out), "--no-context", "--seed", "en-nl-translator/mainset-long/0",
+                           "--out", str(long_out)])
+    chosen = pq.read_table(long_out / "passages.parquet").to_pylist()
+    report = json.loads((long_out / "report.json").read_text())
+    assert not {p["pid"] for p in chosen} & {p["pid"] for p in main}
+    assert all(384 < p["tokens"] <= 511 and p["length_class"] == "long" for p in chosen)
+    assert report["eligibility"]["raad/train"]["excluded"] == 10 and report["eligibility"]["raad/eval"]["excluded"] == 1
+    assert "too_short" not in report["eligibility"]["raad/train"] and report["eligibility"]["raad/train"]["too_long"] == 1
+    # document 0: one of its long passages fits beside its short one (cap 2); document 1 repeats its short passage
+    assert sum(p["doc_id"] == "0" for p in chosen) <= 1 and "raad:1:d:1" not in {p["pid"] for p in chosen}
+    assert report["skipped_while_choosing"].get("ngram_overlap", 0) >= 1
+    # the eval document stays eval
+    assert [p["pid"] for p in chosen if p["split"] == "eval"] == ["raad:50:d:1"]
+    assert all(p["split"] == "train" for p in chosen if p["doc_id"] != "50")
+    assert len([p for p in chosen if p["split"] == "train"]) == 10
+    assert not (long_out / "context-turns.parquet").exists() and not any(p["context_ids"] for p in chosen)
+    assert report["seed"] == "en-nl-translator/mainset-long/0" and report["excluded_passages"] == 11
+    md = (long_out / "selection.md").read_text()
+    assert md.startswith("# Hoofdset en→nl-vertaler: aanvullende selectie") and "385–511 tokens" in md
+    assert "geen contextvoorbeelden" in md
+    sub = tmp_path / "dry"
+    mainset.main(["subset", "--select", str(long_out), "--n", "4", "--workers", "2", "--out", str(sub)])
+    rows = pq.read_table(sub / "passages.parquet").to_pylist()
+    assert len(rows) == 4 and any(r["split"] == "eval" for r in rows)
+    assert set(pq.read_table(sub / "passages.parquet").column_names) == set(pq.read_table(long_out / "passages.parquet").column_names)
+    segs = [r for k in range(2) for r in pq.read_table(sub / f"segments-w{k}.parquet").to_pylist()]
+    assert sorted(r["id"] for r in segs) == sorted(r["id"] for r in rows)
+
+
+def test_exclude_keeps_the_split_of_a_document(tmp_path, monkeypatch):
+    monkeypatch.setitem(sys.modules, "tokenizers", types.SimpleNamespace(Tokenizer=WordTokenizer))
+    long_run_pool(tmp_path)
+    before = tmp_path / "before"
+    before.mkdir()
+    # document 20 was eval in the earlier run; the pool has it on the training side
+    pq.write_table(pa.table({"pid": ["raad:20:d:9"], "source": ["raad"], "doc_id": ["20"], "split": ["eval"],
+                             "text": ["iets anders"]}), before / "passages.parquet")
+    args = ["final", "--select", str(tmp_path / "pool"), "--scores", str(tmp_path / "scores"), "--tokenizer", "x",
+            "--n", "50", "--n-eval", "5", "--min-tokens", "384", "--max-tokens", "511", "--exclude", str(before),
+            "--no-context", "--out", str(tmp_path / "long")]
+    with pytest.raises(SystemExit, match="1 pool passages have another split"):
+        mainset.main(args)
+    # two passages of the earlier run with one text cannot both have passed its chooser
+    pq.write_table(pa.table({"pid": ["raad:60:d:0", "raad:61:d:0"], "source": ["raad"] * 2, "doc_id": ["60", "61"],
+                             "split": ["train"] * 2, "text": ["dezelfde tekst"] * 2}), before / "passages.parquet")
+    with pytest.raises(SystemExit, match="does not pass the chooser"):
+        mainset.main(args)

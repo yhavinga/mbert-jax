@@ -2,8 +2,10 @@
 numbers, sentence counts, the measures of a pair, MetricX's input. The forward pass of metricx_qe.py is checked against
 transformers on a VM (`metricx_qe.py check`). Run with --noconftest where the conftest's imports are not installed."""
 
+import json
 import math
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -194,3 +196,40 @@ def test_the_summary_refuses_pairs_without_qe(tmp_path):
     pq.write_table(pa.table({"id": ["raad:0:d:0"], "qe_en_nl": [1.0]}), tmp_path / "qe.parquet")
     with pytest.raises(SystemExit, match="3 pairs without a QE row"):
         pairs.main(["summary", "--pairs", str(out), "--qe", str(tmp_path / "qe.parquet"), "--out", str(tmp_path / "f")])
+
+
+def test_a_long_run_carries_its_length_class_and_caps_the_back_translation(tmp_path, monkeypatch):
+    sel, pa, pq = make_run(tmp_path)
+    (sel / "context-turns.parquet").unlink()
+    rows = pq.read_table(sel / "passages.parquet").to_pylist()
+    for r in rows:
+        r["length_class"] = "long"
+    pq.write_table(pa.table({c: [r[c] for r in rows] for c in rows[0]}), sel / "passages.parquet")
+    out = tmp_path / "pairs.parquet"
+    pairs.main(["measures", "--select", str(sel), "--nl-en", str(tmp_path / "nl-en"), "--en-nl",
+                str(tmp_path / "en-nl"), "--out", str(out)])
+    got = pq.read_table(out).to_pylist()
+    assert [r["length_class"] for r in got] == ["long"] * 3
+    pq.write_table(pa.table({"id": [r["id"] for r in got], "qe_en_nl": [2.0] * 3}), tmp_path / "qe.parquet")
+    pairs.main(["summary", "--pairs", str(out), "--qe", str(tmp_path / "qe.parquet"), "--out", str(tmp_path / "f"),
+                "--title", "Aanvullende run: passages van 385–511 tokens"])
+    assert (tmp_path / "f" / "summary.md").read_text().startswith("# Aanvullende run: passages van 385–511 tokens\n")
+    assert pq.read_table(tmp_path / "f" / "pairs.parquet").column("length_class").to_pylist() == ["long"] * 3
+
+    class WordTokenizer:
+        @classmethod
+        def from_file(cls, path):
+            return cls()
+
+        def encode(self, text, add_special_tokens=False):
+            return types.SimpleNamespace(ids=text.split())
+
+    monkeypatch.setitem(sys.modules, "tokenizers", types.SimpleNamespace(Tokenizer=WordTokenizer))
+    # "The council decided point k. Then it was done." has 9 words: above a cap of 8 every segment stays out
+    pairs.main(["back-segments", "--select", str(sel), "--nl-en", str(tmp_path / "nl-en"), "--tokenizer", "x",
+                "--out", str(tmp_path / "back"), "--max-tokens", "8"])
+    report = json.loads((tmp_path / "back" / "back_segments.json").read_text())
+    assert report["segments"] == 0 and len(report["skipped"]["too_long"]) == 3
+    pairs.main(["back-segments", "--select", str(sel), "--nl-en", str(tmp_path / "nl-en"), "--tokenizer", "x",
+                "--out", str(tmp_path / "back9"), "--max-tokens", "9"])
+    assert json.loads((tmp_path / "back9" / "back_segments.json").read_text())["segments"] == 3

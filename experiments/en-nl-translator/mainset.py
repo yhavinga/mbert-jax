@@ -16,6 +16,9 @@ stage 0 v2 on the pilot.
     python mainset.py minipilot-check --segments <dir> --nl-en <shards> --out minipilot-check.json
     python mainset.py final --select <pool> <FineWeb-2 pool> <repaired> --scores <dir> [<dir>] --hosts hosts.parquet \
         --tokenizer <dir> --block-texts <test sets> [--max-tokens 768] --out <dir>
+    python mainset.py final ... --min-tokens 384 --max-tokens 511 --exclude <the main run's selection> --no-context \
+        --seed en-nl-translator/mainset-long/0 --n 66000 --n-eval 1320 --out <dir>
+    python mainset.py subset --select <final's dir> --n 16 --out <dir>
 
 testsets: the texts of the test sets that no training passage may share a 13-gram with, one text a line, straight
 from Hugging Face at fixed revisions (TESTSETS). They serve only as a list to block passages with, never as data.
@@ -851,7 +854,11 @@ def final_selection(args):
     score >= SOURCE_MIN, the turns nearest to the passage), FineWeb-2 spread over topics and hosts; the training side
     (--n) and the eval side (--n-eval, other documents). Exact and 13-gram duplicates, the test sets' 13-grams and the
     pool's document caps are kept out across all of it. Written to --out: passages.parquet, context-turns.parquet,
-    segments-w<k>.parquet (passages and context turns for translate.py, id = pid), report.json and selection.md."""
+    segments-w<k>.parquet (passages and context turns for translate.py, id = pid), report.json and selection.md.
+    A second run beside an earlier one (Yeb, 9 Nov: the passages of 384-511 tokens after the main run): --min-tokens
+    keeps only longer passages, --exclude names the earlier selection, whose passages are no candidates and enter the
+    chooser first (so duplicates, 13-grams and document caps hold for both together; a document keeps its split),
+    --no-context leaves the context examples out, --seed draws apart from the earlier run."""
     import random
 
     import pyarrow as pa
@@ -882,7 +889,7 @@ def final_selection(args):
             origin_of[r["pid"]] = Path(select).name
         pool += rows
         context = Path(select) / "context-turns.parquet"
-        if context.exists():
+        if context.exists() and not args.no_context:
             turns.update((r["id"], r) for r in pq.read_table(context).to_pylist())
         rep = json.loads((Path(select) / "report.json").read_text())
         caps = rep.get("args", {}).get("max_per_doc")
@@ -892,6 +899,19 @@ def final_selection(args):
     pids = [r["pid"] for r in pool]
     if len(set(pids)) != len(pids):
         raise SystemExit(f"{len(pids) - len(set(pids))} pids stand in more than one selection")
+    before = []
+    for d in args.exclude or []:
+        before += pq.read_table(Path(d) / "passages.parquet",
+                                columns=["pid", "source", "doc_id", "split", "text"]).to_pylist()
+    excluded = {p["pid"] for p in before}
+    split_before = {}
+    for p in before:
+        if split_before.setdefault((p["source"], p["doc_id"]), p["split"]) != p["split"]:
+            raise SystemExit(f"--exclude: document {p['source']}/{p['doc_id']} stands in both splits")
+    moved = [r["pid"] for r in pool if split_before.get((r["source"], r["doc_id"]), r["split"]) != r["split"]]
+    if moved:
+        raise SystemExit(f"{len(moved)} pool passages have another split than their document in --exclude, "
+                         f"e.g. {moved[:3]}")
 
     # eligibility, with the reasons counted per source and split
     reasons = collections.defaultdict(collections.Counter)
@@ -899,6 +919,9 @@ def final_selection(args):
     for r in pool:
         key = f"{r['source']}/{r['split']}"
         reasons[key]["pool"] += 1
+        if r["pid"] in excluded:
+            reasons[key]["excluded"] += 1
+            continue
         s = scores.get(r["pid"])
         if s is None or s.get("skipped") is not None:
             reasons[key]["no_score"] += 1
@@ -920,6 +943,9 @@ def final_selection(args):
     eligible = []
     for r in live:
         key = f"{r['source']}/{r['split']}"
+        if r["tokens"] <= args.min_tokens:
+            reasons[key]["too_short"] += 1
+            continue
         if r["tokens"] > args.max_tokens:
             reasons[key]["too_long"] += 1
             continue
@@ -935,7 +961,7 @@ def final_selection(args):
     ctx_stats = collections.Counter()
     for r in eligible:
         r["context_ids"] = []
-        if r["source"] != "handelingen" or not r.get("context_example"):
+        if r["source"] != "handelingen" or not r.get("context_example") or args.no_context:
             r["context"] = False
             continue
         ctx_stats["marked"] += 1
@@ -964,7 +990,15 @@ def final_selection(args):
             for line in f:
                 blocked |= sp.ngrams(line)
     chooser = sp.Chooser({s: max_per_doc.get(s, 3) for s in sp.SOURCES}, blocked)
-    long_share = sp.LONG_SHARE if args.max_tokens > sp.SHORT_MAX else 0.0
+    # the earlier selection passed this chooser's rules once; a refusal now means another pool or block list
+    for p in before:
+        if not chooser.admit(p):
+            raise SystemExit(f"--exclude: {p['pid']} does not pass the chooser ({dict(chooser.skipped)})")
+    if args.min_tokens >= sp.SHORT_MAX:
+        long_share = 1.0
+    else:
+        long_share = sp.LONG_SHARE if args.max_tokens > sp.SHORT_MAX else 0.0
+    context_share = 0.0 if args.no_context else sp.CONTEXT_SHARE
     chosen, draws = [], {}
     for split, n in (("train", args.n), ("eval", args.n_eval)):
         want = sp.quotas(n) if n else {}
@@ -973,8 +1007,8 @@ def final_selection(args):
                 continue
             cands = sorted((r for r in eligible if r["source"] == source and r["split"] == split),
                            key=lambda r: r["pid"])
-            random.Random(f"{FINAL_SEED}/{split}/{source}").shuffle(cands)
-            q = Quotas(want[source], long_share, sp.CONTEXT_SHARE if source == "handelingen" else 0.0,
+            random.Random(f"{args.seed}/{split}/{source}").shuffle(cands)
+            q = Quotas(want[source], long_share, context_share if source == "handelingen" else 0.0,
                        TOPIC_CAP if source == "fineweb" else None, HOST_CAP if source == "fineweb" else None, chooser)
             picked = q.draw(cands)
             for p in picked:
@@ -1033,8 +1067,9 @@ def final_selection(args):
     for k, part in enumerate(sp.balanced_workers(segments, args.workers)):
         pq.write_table(pa.table({c: [r[c] for r in part] for c in ("id", "text", "tokens")}),
                        out / f"segments-w{k}.parquet")
-    report = {"args": vars(args), "seed": FINAL_SEED, "thresholds": {"source": SOURCE_MIN, "origin": ORIGIN_MIN,
-                                                                      "topic_cap": TOPIC_CAP, "host_cap": HOST_CAP},
+    report = {"args": vars(args), "seed": args.seed, "thresholds": {"source": SOURCE_MIN, "origin": ORIGIN_MIN,
+                                                                     "topic_cap": TOPIC_CAP, "host_cap": HOST_CAP},
+              "excluded_passages": len(before),
               "eligibility": {k: dict(v) for k, v in sorted(reasons.items())}, "context": dict(ctx_stats),
               "draws": draws, "fineweb_origin": origin_report, "max_per_doc": max_per_doc,
               "skipped_while_choosing": dict(chooser.skipped), "blocked_ngrams": len(blocked),
@@ -1053,16 +1088,29 @@ def _pct(k, n):
 def selection_md(report):
     """The final selection in Dutch, for Yeb"""
     th = report["thresholds"]
-    max_tokens = report["args"]["max_tokens"]
-    length = (f"~25% lang (384–{max_tokens} tokens na de bewerkingen)" if max_tokens > 384 else
-              f"alleen passages tot {max_tokens} tokens na de bewerkingen (de minipilot hield de lange buiten de run)")
-    lines = ["# Hoofdset en→nl-vertaler: definitieve selectie", "",
+    args = report["args"]
+    max_tokens, min_tokens = args["max_tokens"], args.get("min_tokens", 0)
+    if min_tokens:
+        length = f"alleen passages van {min_tokens + 1}–{max_tokens} tokens na de bewerkingen"
+    elif max_tokens > 384:
+        length = f"~25% lang (384–{max_tokens} tokens na de bewerkingen)"
+    else:
+        length = f"alleen passages tot {max_tokens} tokens na de bewerkingen (de minipilot hield de lange buiten de run)"
+    context = "geen contextvoorbeelden" if args.get("no_context") else "20% van de Handelingen met contextbeurten"
+    title = "# Hoofdset en→nl-vertaler: definitieve selectie"
+    exclude = ""
+    if args.get("exclude"):
+        title = "# Hoofdset en→nl-vertaler: aanvullende selectie"
+        exclude = (f" Naast de {_n(report['excluded_passages'])} passages van {', '.join(args['exclude'])}: die zijn "
+                   f"geen kandidaat en gingen eerst door de controle op duplicaten, 13-grammen en het documentmaximum; "
+                   f"een document houdt zijn kant (train/eval).")
+    lines = [title, "",
              f"Gegenereerd door `mainset.py final`. Bronscore ≥ {th['source']:g}; FineWeb-2 ook herkomst ≥ "
              f"{th['origin']:g}; per bron de verdeling 40/20/7,5/7,5/25, {length}, de helft idioomrijk (`idiom_class`), "
-             f"20% van de Handelingen met contextbeurten; FineWeb-2 "
+             f"{context}; FineWeb-2 "
              f"hoogstens {100 * th['topic_cap']:g}% per onderwerp en {100 * th['host_cap']:g}% per host. Seed "
              f"`{report['seed']}`. Bewerkingen vóór stap 1: een kop tussen `_…_` vast aan de alinea naar een eigen regel, "
-             f"en een lege regel tussen alinea's.", ""]
+             f"en een lege regel tussen alinea's.{exclude}", ""]
     rows = []
     for key, d in report["draws"].items():
         rows.append([key, _n(d["wanted"]), _n(d["chosen"]), _n(d["length"].get("long", 0)),
@@ -1074,9 +1122,11 @@ def selection_md(report):
                                              "4 = lengte los, 5 = onderwerp los)"], rows), ""]
     rows = []
     for key, e in report["eligibility"].items():
-        rows.append([key, _n(e.get("pool", 0)), _n(e.get("no_score", 0)), _n(e.get("source_below", 0)),
-                     _n(e.get("origin_below", 0)), _n(e.get("too_long", 0)), _n(e.get("eligible", 0))])
-    lines += ["## Kandidaten", "", _md_table(["bron/kant", "pool", "geen score", "bronscore < 0,5", "herkomst < 0,5",
+        rows.append([key, _n(e.get("pool", 0)), _n(e.get("excluded", 0)), _n(e.get("no_score", 0)),
+                     _n(e.get("source_below", 0)), _n(e.get("origin_below", 0)), _n(e.get("too_short", 0)),
+                     _n(e.get("too_long", 0)), _n(e.get("eligible", 0))])
+    lines += ["## Kandidaten", "", _md_table(["bron/kant", "pool", "al gekozen (`--exclude`)", "geen score",
+                                              "bronscore < 0,5", "herkomst < 0,5", "te kort na bewerking",
                                               "te lang na bewerking", "kandidaat"], rows), ""]
     o = report["fineweb_origin"]
     lines += ["## Herkomst FineWeb-2", "",
@@ -1107,6 +1157,46 @@ def selection_md(report):
               f"{_n(report['tokens']['context_turns'])} in contextbeurten; {_n(report['segments'])} segmenten. "
               f"Overgeslagen bij het kiezen: {report['skipped_while_choosing']}.", ""]
     return "\n".join(lines) + "\n"
+
+
+SUBSET_SEED = "en-nl-translator/subset/0"
+
+
+def subset(args):
+    """--n passages of a final selection for a dry run of the later stages: the longest half, one of the eval side
+    (when it has one) and the rest drawn with a fixed seed; written as passages.parquet (all columns) and
+    segments-w<k>.parquet"""
+    import random
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    import select_passages as sp
+
+    if (Path(args.select) / "context-turns.parquet").exists():
+        raise SystemExit(f"{args.select} has context turns; subset takes passages only")
+    table = pq.read_table(Path(args.select) / "passages.parquet")
+    rows = table.to_pylist()
+    if len(rows) < args.n:
+        raise SystemExit(f"{args.select}: {len(rows)} passages, {args.n} wanted")
+    order = sorted(range(len(rows)), key=lambda k: (-rows[k]["tokens"], rows[k]["pid"]))
+    picked = order[:args.n // 2]
+    rest = sorted(order[args.n // 2:])
+    rng = random.Random(SUBSET_SEED)
+    evals = [k for k in rest if rows[k]["split"] == "eval"]
+    if evals and not any(rows[k]["split"] == "eval" for k in picked):
+        picked.append(rng.choice(evals))
+    rest = [k for k in rest if k not in picked]
+    picked = sorted(picked + rng.sample(rest, args.n - len(picked)))
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    pq.write_table(table.take(picked), out / "passages.parquet", compression="zstd")
+    chosen = [rows[k] for k in picked]
+    for k, part in enumerate(sp.balanced_workers(chosen, args.workers)):
+        pq.write_table(pa.table({c: [r[c] for r in part] for c in ("id", "text", "tokens")}),
+                       out / f"segments-w{k}.parquet")
+    print(f"SUBSET {len(chosen)} passages, tokens {min(r['tokens'] for r in chosen)}-{max(r['tokens'] for r in chosen)}"
+          f", {dict(collections.Counter((r['source'], r['split']) for r in chosen))} -> {out}")
 
 
 def minipilot_segments(args):
@@ -1226,6 +1316,16 @@ def main(argv=None):
     p.add_argument("--n", type=int, default=200000)
     p.add_argument("--n-eval", type=int, default=4000)
     p.add_argument("--max-tokens", type=int, default=768, help="768, or 384 when the minipilot keeps long passages out")
+    p.add_argument("--min-tokens", type=int, default=0, help="Only passages above this many tokens after the edits")
+    p.add_argument("--exclude", nargs="*", help="Earlier final selections: their passages are no candidates and "
+                   "enter the chooser first")
+    p.add_argument("--no-context", action="store_true", help="No context examples, no context turns")
+    p.add_argument("--seed", default=FINAL_SEED)
+    p.add_argument("--workers", type=int, default=4)
+    p.add_argument("--out", required=True)
+    p = sub.add_parser("subset", help="A few passages of a final selection for a dry run of the later stages")
+    p.add_argument("--select", required=True, help="final's directory")
+    p.add_argument("--n", type=int, default=16)
     p.add_argument("--workers", type=int, default=4)
     p.add_argument("--out", required=True)
     p = sub.add_parser("minipilot-segments", help="The minipilot's passages after the two edits as segments")
@@ -1246,8 +1346,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     {"testsets": testsets, "judge-shards": judge_shards, "stage0-eval": stage0_eval, "eval-rows": eval_rows,
      "replay": replay, "report": report, "minipilot": minipilot, "fineweb-hosts": fineweb_hosts,
-     "final": final_selection, "minipilot-segments": minipilot_segments, "minipilot-check": minipilot_check,
-     }[args.command](args)
+     "final": final_selection, "subset": subset, "minipilot-segments": minipilot_segments,
+     "minipilot-check": minipilot_check}[args.command](args)
 
 
 if __name__ == "__main__":

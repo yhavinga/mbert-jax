@@ -5,6 +5,7 @@
     python report.py scan --pairs <dir> --scores <dir> --out europarl-scan.md --manifest <pairs>/manifest.json \
         [--sanity-md sanity.md] [--compare-md compare.md]
     python report.py compare --reference ref.json --scores <dir of the sanity scores>
+    python report.py pilot --pairs <dir> --scores <dir> --ids pairs30_ids.txt --out pilot-scores.md
 
 sanity: per kind of pair (the originals and each deterministic error of data.py) the number of rows, the spread of
 the scores and their counts per score class, and per error the AUC of the score against the originals: the chance
@@ -240,6 +241,82 @@ def scan_command(args):
     print(f"{args.out}: {len(rows):,} pairs")
 
 
+def ranks(values):
+    """Ranks from 1, ties sharing their mean rank."""
+    values = np.asarray(values, float)
+    order = np.argsort(values, kind="mergesort")
+    sorted_values = values[order]
+    out = np.empty(len(values))
+    start = 0
+    while start < len(values):
+        end = start
+        while end + 1 < len(values) and sorted_values[end + 1] == sorted_values[start]:
+            end += 1
+        out[order[start:end + 1]] = (start + end) / 2 + 1
+        start = end + 1
+    return out
+
+
+def spearman(x, y):
+    """Spearman's rho over the rows where both are numbers: the Pearson correlation of their ranks."""
+    x, y = np.asarray(x, float), np.asarray(y, float)
+    keep = ~(np.isnan(x) | np.isnan(y))
+    rx, ry = ranks(x[keep]), ranks(y[keep])
+    return float(np.corrcoef(rx, ry)[0, 1]), int(keep.sum())
+
+
+def pilot_markdown(rows, ids30):
+    """The Gemma scores of the translator's pilot: the 30 pairs Yeb reads (in his order), Spearman with chrF and
+    MetricX-QE over all pairs, and the 10 lowest."""
+    by_id = {r["id"]: r for r in rows}
+    missing = [i for i in ids30 if i not in by_id]
+    if missing:
+        raise SystemExit(f"{len(missing)} of the 30 ids have no score: {missing[:3]}")
+    scored = [r for r in rows if r["skipped"] is None]
+    g = [r["score"] for r in scored]
+    lines = ["# Pilot en→nl-vertaler: score van Gemma 4 31B als beoordelaar", "",
+             f"- {len(rows):,} paren, gescoord {len(scored):,}. Beoordeeld als trainingspaar: Engelse bron = het "
+             "synthetische Engels (TranslateGemma 27B, nl→en), Nederlandse vertaling = het Nederlandse origineel.",
+             "- Gemma-score = P(yes) / (P(yes) + P(no)) van het eerste antwoordtoken (0–1, hoger = beter); "
+             "chrF = terugvertaling tegen origineel (0–100, hoger = beter); MetricX-24-QE (0–25, lager = beter).",
+             f"- Verdeling: gemiddeld {fmt(spread(g)['mean'])}, mediaan {fmt(spread(g)['median'])}, p10 "
+             f"{fmt(spread(g)['p10'])}, aandeel ≥ 0,5: {fmt(spread(g)['share_ge_0.5'])}.", "",
+             "## Spearman over alle paren", "", "| met | rho | n |", "|---|---:|---:|"]
+    for name, key, note in (("chrF", "chrf", "verwacht positief"),
+                            ("MetricX-QE en→nl", "qe_en_nl", "lager is beter, dus verwacht negatief"),
+                            ("MetricX-QE nl→en", "qe_nl_en", "lager is beter, dus verwacht negatief")):
+        rho, n = spearman(g, [r.get(key, float("nan")) for r in scored])
+        lines.append(f"| {name} ({note}) | {rho:.3f} | {n:,} |")
+    lines += ["", "Per scoreklasse:", "", "| scoreklasse | paren |", "|---|---:|"]
+    for k, c in enumerate(histogram(g)):
+        lines.append(f"| {class_label(k)} | {c} |")
+    lines += ["", "## De 30 paren van pairs30.md (zelfde volgorde)", "",
+              "| # | id | bron | Gemma | chrF | QE en→nl | QE nl→en |", "|---:|---|---|---:|---:|---:|---:|"]
+    for k, i in enumerate(ids30, 1):
+        r = by_id[i]
+        lines.append(f"| {k} | `{i}` | {r.get('source', '')} | {fmt(r['score'])} | {fmt(r.get('chrf', float('nan')), 1)}"
+                     f" | {fmt(r.get('qe_en_nl', float('nan')), 2)} | {fmt(r.get('qe_nl_en', float('nan')), 2)} |")
+    lowest = sorted(scored, key=lambda r: r["score"])[:10]
+    lines += ["", "## De 10 paren met de laagste Gemma-score", ""]
+    for k, r in enumerate(lowest, 1):
+        lines += [f"### {k}. `{r['id']}` — Gemma {r['score']:.4f} · chrF {fmt(r.get('chrf', float('nan')), 1)} · "
+                  f"QE en→nl {fmt(r.get('qe_en_nl', float('nan')), 2)} · {r.get('source', '')}", "",
+                  "Engelse bron (synthetisch):", "", quote(r["en"]), "", "Nederlands origineel:", "", quote(r["nl"]), ""]
+    return "\n".join(lines) + "\n"
+
+
+def pilot_command(args):
+    pairs = {r["id"]: r for r in read_dir(args.pairs, columns=["id", "en", "nl"])}
+    rows = read_dir(args.scores)
+    for r in rows:
+        r["en"], r["nl"] = pairs[r["id"]]["en"], pairs[r["id"]]["nl"]
+    ids30 = [line.strip() for line in Path(args.ids).read_text().splitlines() if line.strip()]
+    if len(ids30) != 30:
+        raise SystemExit(f"{args.ids} has {len(ids30)} ids, not 30")
+    Path(args.out).write_text(pilot_markdown(rows, ids30))
+    print(f"{args.out}: {len(rows):,} pairs")
+
+
 def compare_command(args):
     """The TPU's scores of the reference rows next to those of transformers on the CPU (float32)."""
     reference = json.loads(Path(args.reference).read_text())
@@ -276,12 +353,18 @@ def main(argv=None):
     p.add_argument("--compare-md", default=None)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--per-class", type=int, default=10)
+    p = sub.add_parser("pilot")
+    p.add_argument("--pairs", required=True)
+    p.add_argument("--scores", required=True)
+    p.add_argument("--ids", required=True, help="The 30 ids of pairs30.md, one per line, in its order")
+    p.add_argument("--out", required=True)
     p = sub.add_parser("compare")
     p.add_argument("--reference", required=True)
     p.add_argument("--scores", required=True)
     p.add_argument("--out", default=None)
     args = parser.parse_args(argv)
-    {"sanity": sanity_command, "scan": scan_command, "compare": compare_command}[args.command](args)
+    {"sanity": sanity_command, "scan": scan_command, "compare": compare_command,
+     "pilot": pilot_command}[args.command](args)
 
 
 if __name__ == "__main__":

@@ -45,6 +45,19 @@ else
   gsutil -q cp "$SHM/sanity/manifest.json" "$JUDGE/data/sanity/manifest.json"
 fi
 
+echo "== pilot $(date -u +%T)"
+# The translator's pilot pairs, copied once by hand from us-central2 into this region's data/pilot-source/
+if gsutil -q stat "$JUDGE/data/pilot/manifest.json"; then
+  mkdir -p "$SHM/pilot" && gsutil -m -q cp "$JUDGE/data/pilot/*" "$SHM/pilot/"
+elif gsutil -q stat "$JUDGE/data/pilot-source/pairs.parquet"; then
+  mkdir -p "$SHM/pilot-source" && gsutil -m -q cp "$JUDGE/data/pilot-source/*" "$SHM/pilot-source/"
+  "$PY" -u "$CODE/data.py" pilot --pairs "$SHM/pilot-source/pairs.parquet" --qe "$SHM/pilot-source/qe.parquet" --out "$SHM/pilot"
+  gsutil -q cp "$SHM/pilot/shard-00000.parquet" "$JUDGE/data/pilot/shard-00000.parquet"
+  gsutil -q cp "$SHM/pilot/manifest.json" "$JUDGE/data/pilot/manifest.json"
+else
+  echo "no pilot pairs in $JUDGE/data/pilot-source/: the pilot is not scored"
+fi
+
 echo "== checkpoint $(date -u +%T)"
 bash "$CODE/setup.sh" convert
 echo "== prep done $(date -u +%T)"

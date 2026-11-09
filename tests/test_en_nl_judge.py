@@ -279,3 +279,23 @@ def test_europarl_meta_has_source_counts_and_prompt():
     md = report.scan_markdown(rows, meta, seed=0, per_class=1)
     assert "commit `abc`" in md and "gekoppeld 8" in md and "| sanity |" in md
     assert judge.QUESTION in md and "<channel|>" in md
+
+
+def test_spearman_with_ties_and_nan():
+    assert report.ranks([3, 1, 2, 2]).tolist() == [4.0, 1.0, 2.5, 2.5]
+    rho, n = report.spearman([1, 2, 3, 4, float("nan")], [10, 20, 30, 40, 50])
+    assert rho == pytest.approx(1.0) and n == 4
+    rho, _ = report.spearman([1, 2, 3], [3, 2, 1])
+    assert rho == pytest.approx(-1.0)
+
+
+def test_pilot_markdown_keeps_the_order_of_the_30():
+    rows = [{"id": f"p{i}", "score": i / 40, "skipped": None, "chrf": float(i), "qe_en_nl": 40.0 - i,
+             "qe_nl_en": 1.0, "source": "raad", "en": "E", "nl": "N"} for i in range(40)]
+    ids30 = [f"p{i}" for i in reversed(range(30))]
+    md = report.pilot_markdown(rows, ids30)
+    assert md.index("`p29`") < md.index("`p0`")
+    assert "| chrF (verwacht positief) | 1.000 | 40 |" in md
+    assert "| MetricX-QE en→nl (lager is beter, dus verwacht negatief) | -1.000 | 40 |" in md
+    with pytest.raises(SystemExit):
+        report.pilot_markdown(rows, ["nope"] * 30)

@@ -3,6 +3,11 @@
 
     python data.py motra --repo <checkout of Multilingual-Parallel-Direct-Europarl> --out <dir>
     python data.py sanity --pairs <dir of motra> --out <dir> [--seed 0]
+    python data.py pilot --pairs pairs.parquet --qe qe.parquet --out <dir>
+
+pilot: the 2,000 pairs of the translator's pilot (mbert/translator/pilot/pairs.parquet with qe.parquet), scored as the
+training pair of the fine-tune: the English source is the synthetic English (nl->en by TranslateGemma 27B), the Dutch
+translation is the Dutch original. chrF (back-translation against the original) and MetricX-24-QE are carried along.
 
 motra: Multilingual Parallel Direct Europarl (Amponsah-Kaakyire et al., MoTra 2021), proceedings/xml/{en,nl}, one
 file per sitting. A paragraph with sl="en" in an intervention of the English file is paired with the Dutch file's
@@ -242,6 +247,41 @@ def sanity_command(args):
     print(json.dumps({"pool": len(rows), "kinds": counts}))
 
 
+PILOT_KEEP = ("source", "half", "chrf", "tokens_nl", "tokens_en")
+
+
+def pilot_command(args):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    table = pq.read_table(args.pairs)
+    qe = pq.read_table(args.qe)
+    print("pairs.parquet:", table.schema.to_string(show_schema_metadata=False).replace("\n", "; "))
+    print("qe.parquet:", qe.schema.to_string(show_schema_metadata=False).replace("\n", "; "))
+    need = {"id", "nl", "en", "chrf"}
+    if not need <= set(table.column_names) or not {"id", "qe_en_nl", "qe_nl_en"} <= set(qe.column_names):
+        raise SystemExit(f"pairs.parquet needs {sorted(need)}, qe.parquet id, qe_en_nl, qe_nl_en")
+    rows = table.to_pylist()
+    scores = {r["id"]: r for r in qe.to_pylist()}
+    if len(scores) != qe.num_rows or len({r["id"] for r in rows}) != len(rows):
+        raise SystemExit("duplicate ids")
+    missing = [r["id"] for r in rows if r["id"] not in scores]
+    if missing:
+        raise SystemExit(f"{len(missing)} pairs without QE, e.g. {missing[:3]}")
+    out = {"id": [r["id"] for r in rows], "en": [r["en"] for r in rows], "nl": [r["nl"] for r in rows]}
+    for c in PILOT_KEEP:
+        if c in table.column_names:
+            out[c] = [r[c] for r in rows]
+    out["qe_en_nl"] = [scores[r["id"]]["qe_en_nl"] for r in rows]
+    out["qe_nl_en"] = [scores[r["id"]]["qe_nl_en"] for r in rows]
+    path = Path(args.out)
+    path.mkdir(parents=True, exist_ok=True)
+    pq.write_table(pa.table(out), path / "shard-00000.parquet", compression="zstd")
+    (path / "manifest.json").write_text(json.dumps({"pairs": len(rows), "columns": list(out),
+                                                    "source_columns": table.column_names}, indent=1))
+    print(f"{len(rows)} pilot pairs -> {path}")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Pairs for the en-nl judge")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -257,8 +297,12 @@ def main(argv=None):
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--min-words", type=int, default=8)
     p.add_argument("--max-words", type=int, default=150)
+    p = sub.add_parser("pilot")
+    p.add_argument("--pairs", required=True)
+    p.add_argument("--qe", required=True)
+    p.add_argument("--out", required=True)
     args = parser.parse_args(argv)
-    {"motra": motra_command, "sanity": sanity_command}[args.command](args)
+    {"motra": motra_command, "sanity": sanity_command, "pilot": pilot_command}[args.command](args)
 
 
 if __name__ == "__main__":

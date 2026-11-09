@@ -25,5 +25,12 @@ if gsutil -q stat "$JUDGE/reference/ref.json"; then
 fi
 "$PY" "$CODE/report.py" scan --pairs "$SHM/motra" --scores "$SHM/scores/motra" --manifest "$SHM/motra/manifest.json" \
   --sanity-md "$R/sanity.md" "${COMPARE[@]}" --out "$R/europarl-scan.md"
+if [ -d "$SHM/pilot" ] && gsutil -q stat "$JUDGE/data/pilot-source/pairs30_ids.txt"; then
+  mkdir -p "$SHM/scores/pilot"
+  gsutil -m -q rsync -r "$JUDGE/scores/pilot" "$SHM/scores/pilot"
+  gsutil -q cp "$JUDGE/data/pilot-source/pairs30_ids.txt" "$SHM/pairs30_ids.txt"
+  "$PY" "$CODE/report.py" pilot --pairs "$SHM/pilot" --scores "$SHM/scores/pilot" --ids "$SHM/pairs30_ids.txt" \
+    --out "$R/pilot-scores.md"
+fi
 gsutil -m -q cp "$R/*" "$JUDGE/reports/"
 echo "reports in $JUDGE/reports/: $(ls "$R" | tr '\n' ' ')"

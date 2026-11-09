@@ -4,16 +4,17 @@
 Steps (commands.txt, step 11):
     link    on worker 0, CPU and network: every FLAN row of F's mixes (the English extracts en/w<h>.parquet) -> the file
             and row of Open-Orca/FLAN it was copied from -> links/w<h>.parquet and links/report.json
-    build   after the assembly: nl/w<h>.parquet, links/, plan2/examples.parquet and nl/report.json -> a folder with
-            data/train-*.parquet and README.md (the dataset card)
-    upload  that folder to a public dataset repo
+    build   after the assembly: nl/w<h>.parquet, links/, plan2/examples.parquet, nl/report.json and en/w<h>.parquet
+            -> a folder with data/train-*.parquet, README.md (the dataset card) and build_report.json
+    upload  that folder's README.md and data/ to a public dataset repo
 
 Open-Orca/FLAN has no id column: (revision, file, row) is the id. link reads per host the shards F's builder read
 (build_decay_mix.select_flan: host_units of each folder, in shard order, as many as F's manifest says it read) and
 matches on (task, inputs, targets), the strings F copied from those rows. Rows of identical content take the identical
 source rows one by one in shard order, so each source row is given to at most one row of F.
 
-The English text stays out of the dataset: build reads only the Dutch rows and the links.
+The English text stays out of the dataset: build reads the English extracts only for the checks of this publication
+(decode_loop, english_left) and writes none of it.
 """
 
 import argparse
@@ -275,6 +276,177 @@ F_DROPPED = {
     "too_long": "rows of more than {max_length:,} tokens (instruction and answer, in the experiment's tokenizer)",
 }
 
+# The checks of this publication: two failures that flan_nl.py's checks let through, found in samples of the first
+# build (9 Nov), decode loops in long passages and English left untranslated (langid takes a text that is mostly Dutch
+# for Dutch). They only decide what goes into this dataset; F-nl's training data stays as its protocol fixed it. Each
+# threshold was chosen by reading random samples of the rows it flags and of the rows just below it (HANDOVER.md).
+TOKEN = re.compile(r"\w+|[^\w\s]")
+LETTERS = re.compile(r"[^\W\d_]+")
+# A sequence of 1-4 tokens 5 or more times back to back; at 4, an ellipsis and a blank ("... .", "_ .") are among them
+LOOP_SHORT = (range(1, 5), 5)
+LOOP_LONG = (range(5, 17), 3)  # of 5-16 tokens 3 or more times
+# A translation can lengthen the sequence ("0 0 0" -> "0, 0, 0"), so the English's may be twice as long
+LOOP_ENGLISH_PERIODS = range(1, 33)
+LOOP_ENGLISH_COPIES = 3
+# English function words, other lowercase English words of 3 letters or more ("'s" and "'re" are not): titles have
+# few of the second; at 4 of them, quoted titles and lyrics were a quarter of a sample
+ENGLISH_LEFT = (3, 5)
+# English words that are not Dutch, or only rare Dutch
+ENGLISH_WORDS = frozenset("""
+    the and to that for with it are this on by from at not have has you your which they their them would can what who
+    whom whose there were these those should could about into than then also its his she him her he when where while
+    will after before because being does did said other some such only any each very just how why our my but if or so
+    up out all get got more most many much like make made yes""".split())
+# Dutch function words: English left in a Dutch sentence ends at one
+DUTCH_WORDS = frozenset("""
+    de het een en van dat die niet zijn op te met voor er maar om ook bij door naar dan nog wel uit ze hij zij wat wordt
+    worden werd werden kan kunnen zou zouden heeft hebben hun haar hem ik je jij jou jouw u uw wij deze dit daar hier
+    waar wie welke welk omdat toen nadat voordat terwijl tijdens tegen onder tussen na zonder geen alle moet moeten mag
+    kon konden waren ben bent zal zullen wil willen als aan sinds zich mijn ons onze iets niets veel meer ja nee hoe
+    waarom wanneer dus want toch echter alleen nu""".split())
+# Words of both languages, evidence of neither
+SHARED_WORDS = frozenset("""
+    a an i in is was had of over me we as man hand arm warm been kind room test team film films hotel park bus radio
+    computer sport water winter wind plan hard best even ten top net nest mild slim lip land open start stop week
+    museum school""".split())
+# Copied as they are in a translation, not text to translate: URLs, e-mail addresses, @names, #tags
+NOT_PROSE = re.compile(r"(?:https?://|www\.)\S+|\S+@\S+\.\w+|[@#]\w+")
+_INNER = re.compile(r"(.{2,}?)\1{2,}")
+
+
+def _is_word(token):
+    return token[0].isalnum() or token[0] == "_"
+
+
+def repeats(tokens, periods):
+    """The most copies of a sequence of p tokens (p in periods) with a word in it, back to back; 1 where none repeats.
+    Sequences of punctuation only do not count: in a sample they were tables the translation drew (`| ------- |`) and
+    emoji the English has as HTML entities, hardly ever a decode loop."""
+    import numpy as np
+
+    best = 1
+    if len(tokens) < 2:
+        return best
+    vocab = {}
+    ids = np.fromiter((vocab.setdefault(t, len(vocab)) for t in tokens), np.int64, len(tokens))
+    words = np.concatenate(([0], np.cumsum([_is_word(t) for t in tokens])))
+    for p in periods:
+        if len(ids) <= p:
+            break
+        # A run of k tokens equal to the token p before them is k // p + 1 copies of a sequence of p tokens
+        same = np.concatenate(([False], ids[p:] == ids[:-p], [False]))
+        edges = np.flatnonzero(same[1:] != same[:-1])
+        if not len(edges):
+            continue
+        starts, lengths = edges[::2], edges[1::2] - edges[::2]
+        has_word = words[starts + p] - words[starts] > 0
+        if has_word.any():
+            best = max(best, int((lengths[has_word] // p + 1).max()))
+    return best
+
+
+def _inner_repeats(tokens):
+    """The most copies of a piece back to back inside one token: emoji written out ("loudlycryingface" four times in
+    one word), which a translation turns into separate words"""
+    best = 1
+    for t in tokens:
+        if 6 <= len(t) <= 300:
+            for m in _INNER.finditer(t):
+                best = max(best, len(m.group()) // len(m.group(1)))
+    return best
+
+
+def decode_loop(nl, en):
+    """The translation nl repeats a sequence back to back where its English en has no such repeat.
+
+    In nl (lowercase tokens: words and punctuation), a sequence with a word of LOOP_SHORT's lengths at least
+    LOOP_SHORT's copies, or of LOOP_LONG's at least LOOP_LONG's, also counted over the words alone, as decode loops
+    vary their punctuation ("for, for: for: for,"). The English excuses it with a repeat of at least
+    LOOP_ENGLISH_COPIES and half as many copies, counted the same way and also inside one token: "No emotion,No
+    emotion,..." -> "Geen emotie, geen emotie, ...", "goals: 0 0 0 0 0" -> "doelpunten: 0, 0, 0, 0, 0"."""
+    tn = [t.lower() for t in TOKEN.findall(nl)]
+    words = [t for t in tn if _is_word(t)]
+    found = []
+    for periods, least in (LOOP_SHORT, LOOP_LONG):
+        n = max(repeats(tn, periods), repeats(words, periods))
+        if n >= least:
+            found.append(n)
+    if not found:
+        return False
+    te = [t.lower() for t in TOKEN.findall(en)]
+    english = max(repeats(te, LOOP_ENGLISH_PERIODS), repeats([t for t in te if _is_word(t)], LOOP_ENGLISH_PERIODS),
+                  _inner_repeats(te))
+    return any(english < max(LOOP_ENGLISH_COPIES, n / 2) for n in found)
+
+
+def english_left(nl, en):
+    """The translation nl has a stretch of its English en in it: a run of words of en, none a Dutch function word,
+    with at least ENGLISH_LEFT[0] English function words and ENGLISH_LEFT[1] other lowercase words of 3 letters or
+    more that are not words of both languages.
+
+    Names and titles are copied too, but are capitalized and have few lowercase words ("The Lord of the Rings"); a
+    Dutch word that en does not have ends the run. Words in capitals count for nothing; URLs and the like are left
+    out."""
+    en_words = {w.lower() for w in LETTERS.findall(NOT_PROSE.sub(" ", en))}
+    least_function, least_other = ENGLISH_LEFT
+    function = other = 0
+    for w in LETTERS.findall(NOT_PROSE.sub(" ", nl)):
+        if not (w.islower() or w.istitle()):
+            continue
+        lw = w.lower()
+        if lw in DUTCH_WORDS or lw not in en_words:
+            function = other = 0
+        elif lw in ENGLISH_WORDS:
+            function += 1
+        elif w.islower() and len(w) >= 3 and lw not in SHARED_WORDS:
+            other += 1
+        if function >= least_function and other >= least_other:
+            return True
+    return False
+
+
+PUBLICATION_CHECKS = {"decode_loop": decode_loop, "english_left": english_left}
+PUBLICATION_RULES = {
+    "decode_loop": f"the translation repeats itself where the English does not: a sequence of "
+                   f"{LOOP_SHORT[0][0]}-{LOOP_SHORT[0][-1]} tokens (words and punctuation, case ignored; at least one "
+                   f"word) {LOOP_SHORT[1]} or more times back to back, or of {LOOP_LONG[0][0]}-{LOOP_LONG[0][-1]} "
+                   f"tokens {LOOP_LONG[1]} or more times, also counted over the words alone; not when the English has "
+                   f"such a repeat of at least {LOOP_ENGLISH_COPIES} and at least half as many copies (sequences of up "
+                   f"to {LOOP_ENGLISH_PERIODS[-1]} tokens, also counted over the words alone and inside one word, as "
+                   f"in emoji written out)",
+    "english_left": f"the translation keeps a stretch of the English: a run of words that are all words of the English "
+                    f"and none a Dutch function word, with at least {ENGLISH_LEFT[0]} English function words (`the`, "
+                    f"`and`, `with`, `which`, `their`, ...) and at least {ENGLISH_LEFT[1]} other lowercase words of 3 "
+                    f"letters or more, words of both languages (`in`, `is`, `film`, ...) not counted; URLs, e-mail "
+                    f"addresses, @names and #tags left out (word lists: `ENGLISH_WORDS`, `DUTCH_WORDS` and "
+                    f"`SHARED_WORDS` in `publish.py`)",
+}
+
+
+def publication_checks(inputs_nl, targets_nl, inputs_en, targets_en):
+    """The names of the checks of this publication that a translated row fails, in PUBLICATION_CHECKS's order; each
+    check looks at inputs against the English inputs and at targets against the English targets."""
+    return tuple(name for name, check in PUBLICATION_CHECKS.items()
+                 if check(inputs_nl, inputs_en) or check(targets_nl, targets_en))
+
+
+def _check_rows(rows):
+    return [publication_checks(*row) for row in rows]
+
+
+def run_publication_checks(rows, processes, chunk=2000):
+    """publication_checks of each (inputs_nl, targets_nl, inputs_en, targets_en), in order; in processes, as a
+    million rows take about an hour in one."""
+    chunks = [rows[k:k + chunk] for k in range(0, len(rows), chunk)]
+    if processes <= 1:
+        return [r for part in map(_check_rows, chunks) for r in part]
+    import concurrent.futures
+    import multiprocessing
+
+    # spawn: the parent has arrow's threads, which fork does not carry over safely
+    with concurrent.futures.ProcessPoolExecutor(processes, mp_context=multiprocessing.get_context("spawn")) as pool:
+        return [r for part in pool.map(_check_rows, chunks) for r in part]
+
 
 def read_links(paths):
     """{(host, position): (flan_file, flan_row, template_idx, task_source, task_name, template_type)}"""
@@ -316,10 +488,13 @@ def build(args):
                       plan.column("status").to_pylist()))
 
     meta = {c: [] for c in DATA_COLUMNS if c not in ("inputs", "targets")}
-    texts, missing, wrong = [], [], []
+    texts, missing, wrong, unmatched = [], [], [], []
+    to_check, checked_at = [], []  # (inputs_nl, targets_nl, inputs_en, targets_en) of the translated rows; their index
     for h in hosts:
         nl = pq.read_table(Path(args.nl, f"w{h}.parquet"), columns=["position", "source", "inputs", "targets"])
-        for p, source in zip(nl.column("position").to_pylist(), nl.column("source").to_pylist()):
+        en = pq.read_table(Path(args.english, f"w{h}.parquet"), columns=["position", "source", "inputs", "targets"])
+        english = {p: (s, x, y) for p, s, x, y in zip(*(en.column(c).to_pylist() for c in ("position", "source", "inputs", "targets")))}
+        for p, source, x, y in zip(*(nl.column(c).to_pylist() for c in ("position", "source", "inputs", "targets"))):
             link = links.get((h, p))
             if link is None:
                 missing.append((h, p, source))
@@ -329,7 +504,15 @@ def build(args):
             if f"flan/{folder}/{task_name}" != source or status.get((h, p)) not in ("translate", "dutch_task"):
                 wrong.append((h, p, source, flan_file, task_name, status.get((h, p))))
                 continue
-            for key, value in (("id", f"w{h}-{p}"), ("translated", status[(h, p)] != "dutch_task"),
+            translated = status[(h, p)] != "dutch_task"
+            if translated:
+                source_en, x_en, y_en = english.get(p, (None, None, None))
+                if source_en != source:
+                    unmatched.append((h, p, source, source_en))
+                    continue
+                checked_at.append(len(meta["id"]))
+                to_check.append((x, y, x_en, y_en))
+            for key, value in (("id", f"w{h}-{p}"), ("translated", translated),
                                ("task_name", task_name), ("task_source", task_source), ("folder", folder),
                                ("template_type", template_type), ("template_idx", template_idx),
                                ("flan_revision", FLAN_REVISION), ("flan_file", flan_file), ("flan_row", flan_row)):
@@ -340,6 +523,9 @@ def build(args):
     if wrong:
         raise SystemExit(f"{len(wrong):,} Dutch rows disagree with their link or the plan, e.g. (host, position, source, "
                          f"flan_file, task_name, status) {wrong[:5]}")
+    if unmatched:
+        raise SystemExit(f"{len(unmatched):,} translated rows have no English row of their task in {args.english}, e.g. "
+                         f"(host, position, source, English source) {unmatched[:5]}")
     text = pa.concat_tables(texts)
     types = {"id": pa.string(), "translated": pa.bool_(), "template_idx": pa.int64(), "flan_row": pa.int64()}
     data = pa.table({c: text.column(c) if c in ("inputs", "targets") else pa.array(meta[c], types.get(c, pa.string()))
@@ -348,6 +534,28 @@ def build(args):
         raise SystemExit("ids are not unique")
     if len(set(zip(meta["flan_file"], meta["flan_row"]))) != data.num_rows:
         raise SystemExit("two Dutch rows have the same source row")
+
+    # The checks of this publication; a row that fails both is counted under the first
+    started = time.time()
+    failed = dict(zip(checked_at, run_publication_checks(to_check, args.processes)))
+    keep = [not failed.get(k) for k in range(data.num_rows)]
+    checks = {name: {"rows": 0, "rows_failing": 0, "tasks": Counter(), "ids": []} for name in PUBLICATION_CHECKS}
+    for k, names in failed.items():
+        for name in names:
+            checks[name]["rows_failing"] += 1
+        if names:
+            checks[names[0]]["rows"] += 1
+            checks[names[0]]["tasks"][meta["task_name"][k]] += 1
+            checks[names[0]]["ids"].append(meta["id"][k])
+    left_out = {name: c["rows"] for name, c in checks.items()}
+    print(f"checks: {len(to_check):,} translated rows in {time.time() - started:.0f} s, left out {left_out}", flush=True)
+    report = {"rows_of_the_experiment": data.num_rows, "translated_checked": len(to_check),
+              "rows": sum(keep), "rows_failing_every_check": sum(len(n) == len(PUBLICATION_CHECKS) for n in failed.values()),
+              "checks": {name: {"rows": c["rows"], "rows_failing": c["rows_failing"],
+                                "tasks": dict(c["tasks"].most_common()), "ids": sorted(c["ids"])}
+                         for name, c in checks.items()}}
+    data = data.filter(pa.array(keep))
+    meta = {key: [v for v, ok in zip(values, keep) if ok] for key, values in meta.items()}
     data = data.sort_by([("flan_file", "ascending"), ("flan_row", "ascending")])
 
     # Arrow's in-memory size bounds the compressed file's, so every shard stays under the limit
@@ -359,7 +567,10 @@ def build(args):
         "tasks": len(set(zip(meta["folder"], meta["task_name"]))), "task_names": len(set(meta["task_name"])),
         "folder_tasks": Counter(f for f, _ in set(zip(meta["folder"], meta["task_name"]))),
         "dutch_tasks": sorted({t for t, kept in zip(meta["task_name"], meta["translated"]) if not kept}),
+        "publication": report,
     }
+    if report["rows"] != facts["rows"]:
+        raise RuntimeError(f"{report['rows']:,} rows kept by the checks, {facts['rows']:,} in the data")
     # The card checks the reports against the data: all of that before anything is written, so a failed build leaves
     # no folder to clear
     card(facts, nl_report, link_report, args.repo)
@@ -372,7 +583,10 @@ def build(args):
             raise SystemExit(f"{path} has {path.stat().st_size:,} bytes, over {args.shard_bytes:,}")
         facts["bytes"] += path.stat().st_size
     (out / "README.md").write_text(card(facts, nl_report, link_report, args.repo))
-    print(f"BUILD {json.dumps({k: facts[k] for k in ('rows', 'translated', 'files', 'bytes', 'tasks')})} -> {out}", flush=True)
+    # Beside the card, not uploaded (upload's allow_patterns): the rows each check left out, by task and by id
+    (out / "build_report.json").write_text(json.dumps(report, indent=1) + "\n")
+    print(f"BUILD {json.dumps({**{k: facts[k] for k in ('rows', 'translated', 'files', 'bytes', 'tasks')}, 'left_out': left_out})} "
+          f"-> {out}", flush=True)
 
 
 def _table(header, rows):
@@ -397,9 +611,13 @@ def card(facts, nl_report, link_report, repo):
         raise SystemExit(f"nl/report.json has segment checks {sorted(set(unusable) - set(SEGMENT_CHECKS))} not in SEGMENT_CHECKS")
     rows, translated = facts["rows"], facts["translated"]
     kept = rows - translated
-    if (hosts["translated"], hosts["kept_dutch_task"]) != (translated, kept):
+    publication = facts["publication"]
+    checked = publication["translated_checked"]
+    left_out = sum(c["rows"] for c in publication["checks"].values())
+    if (hosts["translated"], hosts["kept_dutch_task"]) != (translated + left_out, kept) or checked != hosts["translated"]:
         raise SystemExit(f"nl/report.json counts {hosts['translated']:,} translated and {hosts['kept_dutch_task']:,} "
-                         f"Dutch-task rows, the data {translated:,} and {kept:,}")
+                         f"Dutch-task rows; the data {translated:,} and {kept:,}, after {left_out:,} of {checked:,} "
+                         f"translated rows left out by the checks of this publication")
     f_rows = hosts["flan_rows"]
     if f_rows != link_report["rows"]:
         raise SystemExit(f"nl/report.json counts {f_rows:,} FLAN rows of F, links/report.json {link_report['rows']:,}")
@@ -452,8 +670,14 @@ def card(facts, nl_report, link_report, repo):
         variant_rows.append((f"`{english}`".replace("|", "\\|"), used))
     head_tail = "; ".join(f"`{k}` {n:,}" for k, n in nl_report["head_tail_pairs"].items())
     dropped_total = sum(v for k, v in hosts.items() if k.startswith("dropped:"))
-    if f_rows - dropped_total != rows:
-        raise SystemExit(f"nl/report.json: {f_rows:,} FLAN rows minus {dropped_total:,} dropped is not the {rows:,} rows of the data")
+    if f_rows - dropped_total - left_out != rows:
+        raise SystemExit(f"nl/report.json: {f_rows:,} FLAN rows minus {dropped_total:,} dropped and {left_out:,} left out by "
+                         f"the checks of this publication is not the {rows:,} rows of the data")
+    check_rows = [(f"`{name}`", PUBLICATION_RULES[name], f"{c['rows']:,}") for name, c in publication["checks"].items()]
+    check_tasks = Counter()
+    for c in publication["checks"].values():
+        check_tasks.update(c["tasks"])
+    top_tasks = ", ".join(f"`{t}` ({n:,})" for t, n in check_tasks.most_common(5))
 
     yaml = "\n".join([
         "---", "license: cc-by-4.0", "language:", "- nl", "source_datasets:", f"- {FLAN_REPO}", "task_categories:",
@@ -468,7 +692,9 @@ zero-shot templates, as published in [{FLAN_REPO}](https://huggingface.co/datase
 translation of all of FLAN. It holds the FLAN rows that the FLAN arm of a Dutch ModernBERT experiment used:
 {f_rows:,} English rows, of which {rows:,} are in this dataset ({translated:,} translated from English, {kept:,} of
 Dutch tasks kept as they were). The other {f_rows - rows:,} were left out because their task does not survive
-translation or their translation failed a check (see "Selection" and "Translation").
+translation or their translation failed a check (see "Selection" and "Translation"); {left_out:,} of them are Dutch
+rows of the experiment that were left out of this dataset only, because their translation repeats itself or keeps a
+stretch of the English (step 6 of "Selection").
 
 Every row names the file and the row of {FLAN_REPO} it comes from, at revision `{FLAN_REVISION}`, so that it can be
 traced back to its English source.
@@ -488,7 +714,8 @@ template), `targets` the answer.
 
 ## Selection
 
-The rows were chosen in two stages: by the data builder of the experiment, from {FLAN_REPO}, and by the translation.
+The rows were chosen in three stages: by the data builder of the experiment, from {FLAN_REPO}; by the translation;
+and, for this dataset only, by two checks of the translations (step 6).
 
 1. Source: the seven zero-shot folders of {FLAN_REPO} at revision `{FLAN_REVISION}`
    ({", ".join(f"`{f}`" for f in FLAN_FOLDERS)}). The few-shot folders were not used.
@@ -511,6 +738,17 @@ The rows were chosen in two stages: by the data builder of the experiment, from 
 
 {_table(["reason", "rows"], after_rows)}
 
+   Steps 1-5 give the Dutch rows of the experiment, from which its training mixes were built.
+6. Checks for this publication: two more checks were run on each of the {checked:,} translated rows, each on
+   `inputs` against the English `inputs` and on `targets` against the English `targets`. A row that fails one was left
+   out of this dataset only; the Dutch rows of the experiment were not changed. The {kept:,} rows of Dutch tasks were
+   not checked.
+
+{_table(["check", "rule", "rows"], check_rows)}
+
+   {publication["rows_failing_every_check"]:,} rows fail both and are counted under the first. The tasks with the most
+   rows left out by these checks: {top_tasks}.
+
 ## Translation
 
 - Model: TranslateGemma 27B (`google/translategemma-27b-it` at revision `7d10f0b72f89a2d0f268cea30727d8b77c0d25c2`;
@@ -528,8 +766,9 @@ The rows were chosen in two stages: by the data builder of the experiment, from 
   dataset author with the help of Gemini. A row uses one form of address throughout: `je` or `u`, the one its machine
   translation uses, else one chosen by a hash of the row. Among the variants of that form, the one whose words the
   translation itself uses, else one chosen by hash. The labels `Head:` and `Tail:` follow the terms the translated
-  task definition uses for them (for example `Beginzin:`/`Eindzin:` or `Kop:`/`Staart:`). {with_templates:,} rows have a
-  template string; form of address: {", ".join(f"`{k}` {v:,}" for k, v in sorted(register_rows.items()))}.
+  task definition uses for them (for example `Beginzin:`/`Eindzin:` or `Kop:`/`Staart:`). {with_templates:,} Dutch
+  rows of the experiment (before step 6 of "Selection") have a template string; form of address:
+  {", ".join(f"`{k}` {v:,}" for k, v in sorted(register_rows.items()))}.
 - Repairs: the Devanagari danda (`।`) that the model sometimes writes for a period became a period
   ({repaired.get("danda", 0):,} segments); a final period that the source does not have was removed
   ({repaired.get("final_period", 0):,} segments).
@@ -541,7 +780,8 @@ The rows were chosen in two stages: by the data builder of the experiment, from 
   input and output with the English task definition of NIv2 (`translated = false`).
 
 <details>
-<summary>The template strings and the Dutch variants used (rows)</summary>
+<summary>The template strings and the Dutch variants used (Dutch rows of the experiment, before step 6 of
+"Selection")</summary>
 
 {_table(["English", "Dutch (rows)"], variant_rows)}
 
@@ -585,6 +825,10 @@ print(source["_task_name"], source["inputs"], source["targets"], sep="\\n")
 
 - Machine translation, not reviewed by people. The checks above catch some failures; errors of meaning, wrong terms
   and literal renderings remain.
+- Failed translations remain after the checks of step 6, mostly in long passages (film plots, news articles,
+  Wikipedia paragraphs): repetitions and stretches of English below their thresholds, garbled text, and errors of
+  meaning. The checks also left out some good rows, for example where the translation kept English song lyrics,
+  quotations or lists of titles as they are.
 - The content is FLAN's: English-language sources with their cultural context (names, places, units, facts about the
   United States and other English-speaking countries) are translated, not adapted.
 - Tasks about properties of English were left out as far as they are listed above, but some of the remaining tasks can
@@ -689,6 +933,9 @@ def main(argv=None):
     p.add_argument("--nl", required=True, help="the assembly's directory: w<h>.parquet and report.json")
     p.add_argument("--links", required=True)
     p.add_argument("--plan", required=True, help="plan2/: examples.parquet, for which rows are of Dutch tasks")
+    p.add_argument("--english", required=True,
+                   help="directory of the English extracts w<h>.parquet, for the checks of this publication")
+    p.add_argument("--processes", type=int, default=32, help="processes of those checks (default: 32)")
     p.add_argument("--out", required=True, help="a new or empty directory")
     p.add_argument("--repo", default="yhavinga/flan-nl", help="the repo named in the card's example")
     p.add_argument("--shard-bytes", type=int, default=400_000_000)

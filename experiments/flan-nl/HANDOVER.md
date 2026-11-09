@@ -123,20 +123,62 @@ and what it imports: `flan_nl.py` and F's `scripts/build_decay_mix.py`, both of 
    (folder, task) over F's 500 per host; 15 random links, fetched the way the card says, equal the English extract.
    Effect on the translation: w0's medium `shard-00010`, which ran during `link`, took 800.3 s against 789.2, 791.7 and
    794.3 s on w1-w3 (+1.1%; the shard before, `shard-00002`, +0.4%): within the spread between workers.
-2. `build`, after the assembly (step 8) ends in `EXIT 0`: step 11b of `commands.txt` (worker 0, CPU, ~2 minutes). Reads
-   `/dev/shm/flan_nl/nl/w<N>.parquet` and `nl/report.json`, `links/`, `plan2/examples.parquet` (`translated` = status
-   is not `dutch_task`); writes `/dev/shm/flan_nl/hf/` (`data/train-0000k-of-0000n.parquet`, zstd, each under 400 MB,
-   sorted by (flan_file, flan_row); `README.md`, the dataset card with every number from the data and the two
-   reports) and copies it to `$R/hf/`. Columns: id (`w<N>-<position>`), inputs, targets, translated, task_name,
-   task_source, folder, template_type, template_idx, flan_revision, flan_file, flan_row. No English text: it reads
-   only the Dutch rows. It refuses, before writing anything, a Dutch row without a link, a link of another task, a row
-   whose plan status is neither `translate` nor `dutch_task`, a report that does not add up to the data (FLAN rows of
-   F = links; translated and Dutch-task rows; FLAN rows minus dropped = rows), and a drop reason the card cannot
-   explain; and it refuses an `--out` that is not empty (rerun: `rm -rf /dev/shm/flan_nl/hf` first).
+2. `build`, after the assembly (step 8) ends in `EXIT 0`: step 11b of `commands.txt` (worker 0, CPU, `nice -n 19`,
+   32 processes, ~2 minutes). Reads `/dev/shm/flan_nl/nl/w<N>.parquet` and `nl/report.json`, `links/`,
+   `plan2/examples.parquet` (`translated` = status is not `dutch_task`) and the English extracts
+   `/dev/shm/flan_nl/en/w<N>.parquet` (`--english`, for the checks of this publication only); writes `--out`
+   (`data/train-0000k-of-0000n.parquet`, zstd, each under 400 MB, sorted by (flan_file, flan_row); `README.md`, the
+   dataset card with every number from the data and the reports; `build_report.json`, the rows the checks left out
+   per check, by task and by id, not uploaded). Columns: id (`w<N>-<position>`), inputs, targets, translated,
+   task_name, task_source, folder, template_type, template_idx, flan_revision, flan_file, flan_row. No English text in
+   the output. It refuses, before writing anything, a Dutch row without a link, a link of another task, a row whose
+   plan status is neither `translate` nor `dutch_task`, a translated row without its English row (same host,
+   position and source), a report that does not add up to the data (FLAN rows of F = links; translated rows = kept +
+   left out by the checks; FLAN rows minus dropped minus left out = rows), and a drop reason the card cannot explain;
+   and it refuses an `--out` that is not empty (a rerun goes to a new directory).
    Dry run, done: the 27B pilot rows (filtered to plan2's tasks, their report padded to add up) with the real links:
    `/dev/shm/flan_nl/publish/dry/hf/`, card `$R/publish/dev/dry-README.md` (its counts are the pilot's, not real).
-3. Read `$R/hf/README.md`, then `upload` (step 11c): `create_repo(repo_type="dataset", private=False, exist_ok=True)`
-   and `upload_folder` of README.md and data/; it prints the URL. Built and tested with a fake hub, not run.
+   Builds (9 Nov, the VMs' clock):
+   - `hf` (03:17, step 11b without checks): `/dev/shm/flan_nl/hf/`, `$R/hf/`, 1,031,764 rows. Not to be uploaded: the
+     main session's sample found decode loops and untranslated English in it.
+   - `hf2` (04:24) and `hf3` (04:29): the same data and `build_report.json` (md5 equal), 1,025,582 rows (1,019,417
+     translated, 6,165 Dutch-task), 4 files, 392 MB. Only the card differs: hf2's says the 6,182 rows left out were in
+     the training data, but 663 of them are not in F-nl's mixes (`$R/mix/w<N>-ids.parquet`: the mix builder dropped
+     them as longer than 1,024 tokens; 5,519 are in the mixes). hf3's card says "Dutch rows of the experiment".
+     **Upload hf3**: `/dev/shm/flan_nl/hf3/`, `$R/hf3/`; log `$R/logs/flan_nl_publish_build3.log`.
+   The checks of this publication (`publish.py`: `decode_loop`, `english_left`, `PUBLICATION_CHECKS`). Only for this
+   dataset: `flan_nl.py` and F-nl's training data stay as the protocol fixed them (translation errors are noted
+   there, not corrected). Each field (inputs, targets) of a translated row against the same field of its English row;
+   a row that fails both is counted under `decode_loop`.
+   - `decode_loop`: a sequence of 1-4 lowercase tokens (`\w+|[^\w\s]`) with a word in it, 5 or more times back to back,
+     or of 5-16 tokens 3 or more times, also counted over the words alone (loops vary their punctuation); excused when
+     the English has a repeat of at least 3 and half as many copies (periods up to 32, also over its words alone and
+     inside one token, e.g. emoji written out as `loudlycryingface` x5). Rows: 4,957.
+   - `english_left`: a run of words of the English row, none in `DUTCH_WORDS`, with at least 3 words of
+     `ENGLISH_WORDS` and at least 5 other lowercase words of 3+ letters not in `SHARED_WORDS`; capitalized words
+     (names, titles) count for nothing but do not end the run; URLs, e-mail, @names, #tags removed first. Rows failing
+     it: 1,519, of which 1,225 not already under `decode_loop`.
+   - Together 6,182 rows (0.60% of the 1,025,599 translated rows); 294 fail both; 238 tasks, most duorc (plots),
+     cnn_dailymail, wiki_hop. The known examples w2-497773, w3-976648, w3-1242456, w0-51286 are left out, w1-1353724
+     (samsum) is in.
+   - How the thresholds were chosen (on the hf rows with their English, `/dev/shm/flan_nl/publish/filter/` on worker
+     0, scripts also in `gs://t5-dutch-english-usc2/hammond/scratch-scripts/flan-nl-filter/`; samples read by the
+     agent of 9 Nov 03:20-04:30). `decode_loop`, random rows flagged: 30/30 loops at 6 copies (two samples); 29/30
+     with 5 copies while sequences of punctuation alone still counted (the miss, w2-1058347, 6 dots, `Bess...` /
+     `...is` for the English `bess .` / `.`; of the 29 rows flagged by punctuation alone ~2 were loops, the rest
+     tables the translation drew and emoji, so only sequences with a word count now); rows only caught by the
+     words-alone count 25/25; long periods beyond the short rule 27/30 (two of the three misses,
+     `C'mon........C'MON` and emoji written out, are now excused; the third, a dialogue whose English has a typo,
+     `no deawl`, remains). Just below: 5 copies 20/20 loops (so 5, not 6), 4 copies ~10/20 (`... .`, `_ .`), 2 copies
+     of 5-16 tokens would add 12,120 rows. `english_left`: 29/30 with the final rule (the miss: quoted song lyrics);
+     earlier variants (4 other words, no minimum of letters) 28/30 and 26/30, their misses quoted lyrics, song and
+     book titles; just below the final rule (4 other words) 15/20, the misses song titles (Gilbert and Sullivan, "May
+     the good lord bless and keep you"). Estimated precision: decode_loop ~97-100%, english_left ~95%. The remaining
+     false positives are lyrics, quotations and titles that the translation kept in English; failed rows below the
+     thresholds remain (the card says so).
+3. Read `$R/hf3/README.md`, then `upload` of hf3 (step 11c): `create_repo(repo_type="dataset", private=False,
+   exist_ok=True)` and `upload_folder` of README.md and data/ (not build_report.json); it prints the URL. Built and
+   tested with a fake hub, not run. `yhavinga/flan-nl` not created yet.
 
 ## For the final report
 
@@ -164,5 +206,5 @@ continuous batching, 57841a4 position order past 2 GB, b167a5d templates top 30 
 phrasing table (31 keys, variants by Yeb drafted with Gemini), register, Head/Tail and lexical rules, 1b52081 protocol
 for 27B. Tests: `tests/test_flan_nl.py`, 45 passed (local venv with pytest, numpy, pyarrow, langid; `--noconftest`,
 since the conftest imports jax and flax); ruff clean. The publish step: `publish.py` and `tests/test_flan_nl_publish.py`
-(14 tests; with `test_flan_nl.py` 59 passed, ruff clean). The mix builder was also dry-run on worker 0 with pilot rows
+(39 tests with the checks of this publication; with `test_flan_nl.py` 84 passed, ruff clean). The mix builder was also dry-run on worker 0 with pilot rows
 (passed `verify_order` and the byte check); `assemble` with templates was dry-run on a plan2 sample.

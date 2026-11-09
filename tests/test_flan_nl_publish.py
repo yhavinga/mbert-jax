@@ -132,7 +132,8 @@ def test_link_refuses_an_extract_of_another_build(tmp_path):
 
 ENGLISH = {(0, 5): ("Q: What is the capital of France?\nA:", "Paris is the capital"),
            (0, 9): ("Premise: The dog runs.\nOPTIONS:\n- yes\n- no", "yes"),
-           (1, 2): ("Translate nothing here, just answer the question please.", "The answer is no")}
+           (1, 2): ("Translate nothing here, just answer the question please.", "The answer is no"),
+           (1, 4): ("Q: How many?\nA:", "Three")}
 DUTCH = {(0, 5): ("Vraag: Wat is de hoofdstad van Frankrijk?\nAntwoord:", "Parijs is de hoofdstad"),
          (0, 9): ("Premisse: De hond rent.\nOPTIES:\n- ja\n- nee", "ja"),
          (1, 2): ("Gegeven: een zin.", "Antwoord: een zin."),  # a Dutch task, kept as it was
@@ -156,16 +157,20 @@ NL_REPORT = {
 }
 
 
-def assembled(tmp_path, links=LINKS):
-    """nl/, links/ and plan2/ as the assembly, link and plan leave them."""
-    nl, linked, plan = tmp_path / "nl", tmp_path / "links", tmp_path / "plan2"
-    for d in (nl, linked, plan):
+def assembled(tmp_path, links=LINKS, dutch=DUTCH, english=ENGLISH):
+    """nl/, links/, plan2/ and en/ as the assembly, link, plan and extract leave them."""
+    nl, linked, plan, en = tmp_path / "nl", tmp_path / "links", tmp_path / "plan2", tmp_path / "en"
+    for d in (nl, linked, plan, en):
         d.mkdir()
     for h in (0, 1):
-        keys = sorted(k for k in DUTCH if k[0] == h)
+        keys = sorted(k for k in dutch if k[0] == h)
         pq.write_table(pa.table({"position": [p for _, p in keys], "source": [SOURCES[k] for k in keys],
-                                 "inputs": [DUTCH[k][0] for k in keys], "targets": [DUTCH[k][1] for k in keys]}),
+                                 "inputs": [dutch[k][0] for k in keys], "targets": [dutch[k][1] for k in keys]}),
                        nl / f"w{h}.parquet")
+        keys = sorted(k for k in english if k[0] == h)
+        pq.write_table(pa.table({"host": pa.array([h] * len(keys), pa.int32()), "position": [p for _, p in keys],
+                                 "source": [SOURCES[k] for k in keys], "inputs": [english[k][0] for k in keys],
+                                 "targets": [english[k][1] for k in keys]}), en / f"w{h}.parquet")
         keys = sorted(k for k in links if k[0] == h)
         pq.write_table(pa.table({"host": [h] * len(keys), "position": [p for _, p in keys],
                                  **{c: [links[k][i] for k in keys] for i, c in enumerate(pub.LINK_COLUMNS[2:])}}),
@@ -181,7 +186,7 @@ def assembled(tmp_path, links=LINKS):
     keys = sorted(STATUS)
     pq.write_table(pa.table({"host": [h for h, _ in keys], "position": [p for _, p in keys],
                              "status": [STATUS[k] for k in keys]}), plan / "examples.parquet")
-    return ["--nl", str(nl), "--links", str(linked), "--plan", str(plan)]
+    return ["--nl", str(nl), "--links", str(linked), "--plan", str(plan), "--english", str(en), "--processes", "1"]
 
 
 def test_build_writes_the_columns_sorted_by_source_file_and_row(tmp_path):
@@ -274,6 +279,160 @@ def test_build_refuses_a_folder_with_old_files(tmp_path):
     (tmp_path / "hf" / "data" / "train-00000-of-00009.parquet").write_bytes(b"old")
     with pytest.raises(SystemExit, match="not empty"):
         pub.main(["build", *assembled(tmp_path), "--out", str(tmp_path / "hf")])
+
+
+# ------------------------------------------------------------------------------------ checks for this publication
+# The patterns of the first build's samples (9 Nov), shortened: w2-497773, w3-976648 and w3-1242456 (decode loops),
+# w0-51286 (English left, which langid took for Dutch), w1-1353724 (a samsum dialogue, fine)
+
+DIALOGUE_NL = ("Susan: Weet je nog dat het morgen Megan’s verjaardag is?\nMark: Natuurlijk... :P\n"
+               "Susan: Ik weet niet wat ik haar moet geven.\nMark: En wanneer is het precies?\nSusan: Morgen\n"
+               "Mark: Oeps, ik dacht dat het dinsdag was.\nSusan: Nee, morgen.\n"
+               "Mark: Oké, dan neem ik een fles rode wijn mee, en verder niets, denk ik.\nSusan: Ja, wijn kan wel.")
+DIALOGUE_EN = ("Susan: Do you remember about Megans bday?\nMark: Of course... :P\nSusan: I dont know what to buy her\n"
+               "Mark: And when is it?\nSusan: Tomorrow\nMark: Oops, I thought its on tuesday \nSusan: Nooo, no, tomorrow\n"
+               "Mark: Ok, so a bottle of red wine and nothing more, I guess\nSusan: Yeah, can be wine")
+PLOT_EN = ("Rahul has a novel strategy to rise up the ladder of success. He provides his flat to his superiors at the "
+           "office, where they can safely bring their mistresses, girlfriends or prostitutes, in return for "
+           "recommendation for his promotion. Ranjeet uses the flat to meet Neha. Amidst one of their escapades in "
+           "Rahul's flat, Neha asks Ranjeet about their future, which leads to an argument.")
+
+
+@pytest.mark.parametrize("nl, en", [
+    ("een leverancier van de levering van de levering van de levering van de levering van de levering van de levering "
+     "van de lever. Buddha Mar Gaya neemt je mee op een wilde rit.",
+     "a procurer of dead bodies, the paparazzi and a couple of cops. Buddha Mar Gaya takes you on a rip-roaring ride."),
+    ("de koningin hem wil doden om de: de: de: de: de: de: de: de: the queen to convince him otherwise",
+     "the Queen is going to kill him to get the last two pieces, but the Queen convinces him otherwise"),
+    ("hij bleef optreden. vervolg: vervolg: vervolg: vervolg: vervolg: vervolg: vervolg: vervatting: de: de:",
+     "while continuing to perform on the sodina in musical ensembles."),
+    # A sequence of 5 tokens 3 times; and a loop that varies its punctuation, counted over the words alone
+    ("Vraag: Wat is de vraag: Wat is de vraag: Wat is de vraag: Wat is de vraag", "Question: What is the question?"),
+    ("tijdunit for, for: for: for, for, for: for, unit", "The time unit of the trial."),
+    # 5 copies of 4 tokens
+    ("en wordt via de schoorsteen getrokken met de zak met de zak met de zak met de zak met de zak: eenmaal binnen",
+     "is pulled up the chimney with the bag; once inside, he brings a few presents"),
+])
+def test_a_decode_loop_is_caught(nl, en):
+    assert pub.decode_loop(nl, en)
+
+
+def test_an_ellipsis_for_a_blank_is_no_decode_loop():
+    # "... ." is 4 copies of ".", below the threshold; the English has a blank there, not a repeat
+    assert not pub.decode_loop("Vraag: Volgens de tekst is het ... . Ja of nee?", "Question: According to the text, it is  _  . Yes or no?")
+
+
+@pytest.mark.parametrize("nl, en", [
+    (DIALOGUE_NL, DIALOGUE_EN),
+    # The English has the same repeat, with its own punctuation, or inside one word (emoji written out)
+    ("Geen emotie, geen emotie, geen emotie, geen emotie, geen emotie, geen emotie, geen emotie, geluk",
+     "No emotion,No emotion,No emotion,No emotion,No emotion,No emotion,No emotion,happiness"),
+    ("doelpunten: 0, 0, 0, 0, 0, 0, 1, 0", "goals: 0 0 0 0 0 0 1 0"),
+    ("Hier, pak het. [huilend gezicht] [huilend gezicht] [huilend gezicht] [huilend gezicht] [huilend gezicht]",
+     "here collect it" + "loudlycryingface" * 5),
+    ("Hij zei het twee keer: kom op, kom op.", "He said it twice: come on, come on."),
+    # Punctuation alone: emoji, exclamation marks, a table the translation drew
+    ("Hier, pak het. 😭 😭 😭 😭 😭 😭", "here collect it &#128557;&#128557;&#128557;&#128557;&#128557;&#128557;"),
+    ("CARLA MOET EENS ZIJN MOND HOUDEN!!!!!!!!", "CARLA NEEDS TO SHUT UP!!!!!!!!"),
+    ("Artikel | Kleuren | Prijs\n------- | -------- | --------\nSokken | Zwart | $3",
+     "Goods     Colors     Price Socks      Black $3"),
+])
+def test_a_repeat_of_the_english_is_no_decode_loop(nl, en):
+    assert not pub.decode_loop(nl, en)
+
+
+def test_english_left_in_a_dutch_text_is_caught():
+    nl = ("Rahul heeft een unieke strategie om hogerop te komen: He provides his flat to his superiors at office, where "
+          "they can safely bring their mistresses, girlfriends or prostitutes, in return for recommendation for his "
+          "promotion. Ranjeet uses the flat to meet Neha. Tijdens een van hun avonturen in het appartement van Rahul "
+          "vraagt Neha naar hun toekomst, wat leidt tot een ruzie.")
+    assert pub.english_left(nl, PLOT_EN)
+    assert pub.english_left("Vraag: What is the last name of the person who transcribed the music of an English "
+                            "composer?\nAntwoord:",
+                            "Question: What is the last name of the person who transcribed the music of an English "
+                            "composer?\nAnswer:")
+
+
+@pytest.mark.parametrize("nl, en", [
+    (DIALOGUE_NL, DIALOGUE_EN),
+    # Titles and names are copied, capitalized, with few lowercase words
+    ("Het boek The Lord of the Rings van J.R.R. Tolkien verscheen in 1954 en werd een klassieker.",
+     "The book The Lord of the Rings by J.R.R. Tolkien was published in 1954 and became a classic."),
+    ("Ford speelde in de films Raiders of the Lost Ark, Kingdom of the Crystal Skull, The Sure Thing en Dead Man on "
+     "Campus.",
+     "Ford starred in the films Raiders of the Lost Ark, Kingdom of the Crystal Skull, The Sure Thing and Dead Man on "
+     "Campus."),
+    # A URL is copied as it is
+    ("Het oorspronkelijke bericht: https://old.reddit.com/r/AmItheAsshole/comments/alhmmr/"
+     "aita_for_breaking_up_out_of_fear_and_confusion",
+     "Original post: https://old.reddit.com/r/AmItheAsshole/comments/alhmmr/"
+     "aita_for_breaking_up_out_of_fear_and_confusion"),
+    ("Rahul heeft een nieuwe strategie om de ladder van succes te beklimmen. Hij stelt zijn appartement ter "
+     "beschikking aan zijn superieuren op kantoor, in ruil voor een aanbeveling voor zijn promotie.", PLOT_EN),
+])
+def test_names_titles_and_translations_are_no_english_left(nl, en):
+    assert not pub.english_left(nl, en)
+
+
+def test_a_row_fails_the_checks_of_either_field_in_order():
+    loop = "de: de: de: de: de: de: de: de:"
+    english = "Vraag: What is the last name of the person who transcribed the music of an English composer?"
+    source = "Question: What is the last name of the person who transcribed the music of an English composer?"
+    assert pub.publication_checks("Vraag: Hoeveel?", "Drie", "Q: How many?", "Three") == ()
+    assert pub.publication_checks("Vraag: Hoeveel?", loop, "Q: How many?", "Three") == ("decode_loop",)
+    assert pub.publication_checks(english, loop, source, "Three") == ("decode_loop", "english_left")
+
+
+# A loop in the instruction of (0, 5), and English left in the instruction of (1, 4)
+FAILING = DUTCH | {
+    (0, 5): ("Vraag: Wat is de hoofdstad van de hoofdstad van de hoofdstad van de hoofdstad van de hoofdstad van de "
+             "hoofdstad van Frankrijk?\nAntwoord:", "Parijs is de hoofdstad"),
+    (1, 4): ("Vraag: How many children lived with their mother in the old house near the river?\nAntwoord:", "Drie")}
+FAILING_ENGLISH = ENGLISH | {
+    (1, 4): ("Q: How many children lived with their mother in the old house near the river?\nA:", "Three")}
+
+
+def test_build_leaves_out_the_rows_that_fail_a_check_and_counts_them(tmp_path):
+    out = tmp_path / "hf"
+    pub.main(["build", *assembled(tmp_path, dutch=FAILING, english=FAILING_ENGLISH), "--out", str(out)])
+    table = pq.read_table(next((out / "data").glob("*.parquet")))
+    assert table.column("id").to_pylist() == ["w0-9", "w1-2"]
+    report = json.loads((out / "build_report.json").read_text())
+    assert (report["rows_of_the_experiment"], report["translated_checked"], report["rows"]) == (4, 3, 2)
+    assert report["checks"] == {
+        "decode_loop": {"rows": 1, "rows_failing": 1, "tasks": {"t0_task": 1}, "ids": ["w0-5"]},
+        "english_left": {"rows": 1, "rows_failing": 1, "tasks": {"t0_task": 1}, "ids": ["w1-4"]}}
+    card = (out / "README.md").read_text()
+    for fact in ("6 English rows, of which 2 are in this dataset (1 translated from English, 1 of",
+                 "translation failed a check (see \"Selection\" and \"Translation\"); 2 of them are Dutch",
+                 "| translated from English (`translated = true`) | 1 |", "| total | 2 |",
+                 "6. Checks for this publication: two more checks were run on each of the 3 translated rows, each on",
+                 "out of this dataset only; the Dutch rows of the experiment were not changed. The 1 rows of Dutch tasks were",
+                 "0 rows fail both and are counted under the first.",
+                 "rows left out by these checks: `t0_task` (2).",
+                 "Failed translations remain after the checks of step 6"):
+        assert fact in card, fact
+    lines = {line.split(" | ")[0]: line for line in card.splitlines() if line.startswith("| `decode_loop`")
+             or line.startswith("| `english_left`")}
+    assert lines["| `decode_loop`"].endswith(" | 1 |") and "5 or more times back to back" in lines["| `decode_loop`"]
+    assert lines["| `english_left`"].endswith(" | 1 |") and "at least 3 English function words" in lines["| `english_left`"]
+    assert "at least 5 other lowercase words of 3 letters or more" in lines["| `english_left`"]
+    # The English of the checks stays out of the output
+    written = b"".join(p.read_bytes() for p in out.rglob("*") if p.is_file()).decode("latin-1")
+    assert FAILING_ENGLISH[(1, 4)][0].encode().decode("latin-1") not in written
+
+
+def test_build_in_processes_gives_the_same_result(tmp_path):
+    args = assembled(tmp_path, dutch=FAILING, english=FAILING_ENGLISH)
+    pub.main(["build", *args[:-2], "--processes", "2", "--out", str(tmp_path / "hf")])
+    assert pq.read_table(next((tmp_path / "hf" / "data").glob("*.parquet"))).column("id").to_pylist() == ["w0-9", "w1-2"]
+
+
+def test_a_translated_row_without_its_english_fails(tmp_path):
+    english = {k: v for k, v in ENGLISH.items() if k != (1, 4)}
+    with pytest.raises(SystemExit, match=r"1 translated rows have no English row.*\(1, 4, 'flan/t0_zsopt_data/t0_task', None\)"):
+        pub.main(["build", *assembled(tmp_path, english=english), "--out", str(tmp_path / "hf")])
+    assert not (tmp_path / "hf").exists()
 
 
 # ----------------------------------------------------------------------------------------------------------- upload

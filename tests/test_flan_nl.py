@@ -264,6 +264,74 @@ def test_a_restart_translates_only_the_shards_that_are_not_stored():
     assert tr.translate_pending(shards, set(store) - {"crashed"}, translate, keep) == []
 
 
+class FakeBlob:
+    def __init__(self, name, uploads=None):
+        self.name, self.uploads = name, uploads
+
+    def upload_from_filename(self, filename, retry=None):
+        self.uploads.append((self.name, Path(filename).read_bytes(), retry))
+
+
+class FakeGCS:
+    """The calls of google.cloud.storage.Client that translate.py makes, on a dict of object names per bucket."""
+
+    def __init__(self, objects):
+        self.objects, self.listed, self.uploads = objects, [], []
+
+    def list_blobs(self, bucket, prefix="", delimiter=None):
+        self.listed.append((bucket, prefix, delimiter))
+        names = [n for n in self.objects.get(bucket, []) if n.startswith(prefix)]
+        if delimiter:
+            names = [n for n in names if delimiter not in n[len(prefix):]]
+        return iter([FakeBlob(n) for n in names])
+
+    def bucket(self, name):
+        client = self
+
+        class Bucket:
+            def blob(self, blob_name):
+                return FakeBlob(f"{name}/{blob_name}", client.uploads)
+
+        return Bucket()
+
+
+def test_done_shards_lists_the_parquet_files_directly_under_the_directory_without_gsutil(monkeypatch):
+    def no_subprocess(*args, **kwargs):
+        raise AssertionError("translate.py starts no subprocess for the bucket (gsutil is a snap on the v6e image)")
+
+    import subprocess
+
+    monkeypatch.setattr(subprocess, "run", no_subprocess)
+    gcs = FakeGCS({"b": ["out/w0/tiny/shard-00000.parquet", "out/w0/tiny/shard-00003.parquet", "out/w0/tiny/notes.txt",
+                         "out/w0/tiny/old/shard-00001.parquet", "out/w0/tiny-x/shard-00002.parquet",
+                         "out/w0/small/shard-00004.parquet"]})
+    assert tr.done_shards("gs://b/out/w0/tiny", gcs) == {"shard-00000.parquet", "shard-00003.parquet"}
+    assert gcs.listed == [("b", "out/w0/tiny/", "/")]
+    assert tr.done_shards("gs://b/out/w0/tiny/", gcs) == {"shard-00000.parquet", "shard-00003.parquet"}
+    assert tr.done_shards("gs://b/out/w0/medium", gcs) == set()
+    assert tr.done_shards("gs://empty/out", gcs) == set()
+
+
+def test_upload_writes_the_file_under_its_object_name_with_retries(tmp_path):
+    pytest.importorskip("google.cloud.storage")
+    from google.cloud.storage.retry import DEFAULT_RETRY
+
+    path = tmp_path / "shard-00007.parquet"
+    path.write_bytes(b"PAR1")
+    gcs = FakeGCS({})
+    tr.upload(path, "gs://b/out/w0/tiny/shard-00007.parquet", gcs)
+    assert gcs.uploads == [("b/out/w0/tiny/shard-00007.parquet", b"PAR1", DEFAULT_RETRY)]
+
+
+@pytest.mark.parametrize("url", ["/dev/shm/out/x.parquet", "gs:///x.parquet", "gs://b", "gs://b/out/"])
+def test_upload_refuses_a_url_without_bucket_or_object_name(tmp_path, url):
+    pytest.importorskip("google.cloud.storage")
+    path = tmp_path / "x.parquet"
+    path.write_bytes(b"PAR1")
+    with pytest.raises(ValueError):
+        tr.upload(path, url, FakeGCS({}))
+
+
 def test_a_shard_with_translations_of_other_segments_is_refused():
     shards = tr.shards_of([1, 2], ["a", "b"], 2)
     with pytest.raises(RuntimeError, match="not those"):

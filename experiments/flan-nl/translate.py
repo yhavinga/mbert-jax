@@ -1,64 +1,57 @@
 #!/usr/bin/env python3
-"""TranslateGemma on the 4 chips of one host: this worker's segments from English to Dutch (or, with --source-lang
-and --target-lang, between other languages of LANGUAGES), greedy, in resumable shards.
+"""A translation model in MaxText on the chips of one host: this worker's segments from English to Dutch (or, with
+--source-lang and --target-lang, between other languages of LANGUAGES), greedy, in resumable shards.
 
 Usage (translate.sh, on each worker, as a TPU of its own 4 chips):
     python translate.py --segments <plan>/segments-w0.parquet --out gs://.../out/w0 --ckpt gs://.../0/items \\
         --tokenizer /dev/shm/flan_nl/tokenizer-27b --model gemma3-27b --length-class small
 The translation is in the column text_<target language> of the shards (text_nl for English to Dutch).
 
-The model is MaxText's gemma3 with the converted checkpoint in MaxText's MaxEngine: a KV cache of fixed shape
-(slots x max_target_length), prompts padded to a few prefill lengths, continuous batching over the slots (decode_all),
-greedy decoding, a stop at <end_of_turn> or <eos>. The tensor axis of the mesh is the host's 4 chips. Segments are
-taken in shards of consecutive ids (similar lengths, as the plan sorts them); a shard is written to the bucket at once
-when it is done, so a restart skips every shard that is there. A segment that hits the decode limit is written with
-ended = false; the assemble step drops its examples.
+--model names a model of translate_models.yml (beside this file): its MaxText config, its checkpoint per region (the
+default of --ckpt, for the region of this VM), its stop tokens, its prompt, its length classes and its slots. The
+models are TranslateGemma 12B and 27B (gemma3-12b, gemma3-27b) and Gemma 4 31B-it (gemma4-31b).
 
-The prompt is the model's chat template (chat_template.jinja of the Hugging Face repo): a user turn with
-{type: text, source_lang_code: en, target_lang_code: nl, text} (the defaults of --source-lang and --target-lang),
-which the template turns into "You are a professional English (en) to Dutch (nl) translator. ... Please translate the
-following English text into Dutch:\n\n\n<text>".
+The model runs in MaxText's MaxEngine: a KV cache of fixed shape (slots x max_target_length), prompts padded to a few
+prefill lengths, continuous batching over the slots (decode_all), greedy decoding, a stop at the model's stop tokens.
+The tensor axis of the mesh is the process's chips. Segments are taken in shards of consecutive ids (similar lengths,
+as the plan sorts them); a shard is written to the bucket at once when it is done, so a restart skips every shard
+that is there. A segment that hits the decode limit is written with ended = false; the assemble step drops its
+examples.
+
+The prompt is a setting of the model. TranslateGemma's (prompt translategemma) is its own chat template
+(chat_template.jinja of the Hugging Face repo): a user turn with {type: text, source_lang_code: en, target_lang_code:
+nl, text} (the defaults of --source-lang and --target-lang), which the template turns into "You are a professional
+English (en) to Dutch (nl) translator. ... Please translate the following English text into Dutch:\n\n\n<text>".
+Other models get TranslateGemma's words (prompt chat-v1, user_text) in one user turn of their own chat format.
+A segment with context (a column `context` of the segments: a list of {label, source, translation}, the earlier turns
+of its conversation, and optionally a column `label`, the speaker of the segment) gets the model's context_prompt,
+which puts the earlier turns before the current turn; only the current turn is translated.
 """
 
 import argparse
 import json
 import os
 import random
-import subprocess
 import sys
 import time
 import traceback
+import urllib.request
 from pathlib import Path
 
 import numpy as np
+import yaml
 
-# The engine's shapes per length class: the longest source segment (tokens; the class takes those above the class
-# before it), the prefill lengths a prompt is padded to (the template adds ~70 tokens), and the decode limit. A step
-# attends over the whole cache of every slot, prefill and decode part, so its cost grows with prefill + decode (8 Nov
-# on a v4 host, 12B: 38 ms at 256 slots x 512): the classes keep that length close to what their segments need.
-LENGTH_CLASSES = {
-    "tiny": {"max_source": 32, "prefill_lengths": [128], "max_decode": 96},
-    "small": {"max_source": 128, "prefill_lengths": [128, 256], "max_decode": 256},
-    "medium": {"max_source": 256, "prefill_lengths": [256, 384], "max_decode": 448},
-    "long": {"max_source": 384, "prefill_lengths": [384, 512], "max_decode": 640},
-    "xlong": {"max_source": 512, "prefill_lengths": [512, 640], "max_decode": 832},
-    # The en-nl translator's passages of up to 768 tokens (Yeb, 9 Nov); 1.5 x the source leaves room for Dutch, which
-    # is longer than English
-    "xxlong": {"max_source": 768, "prefill_lengths": [768, 896], "max_decode": 1152},
-}
-CLASS_ORDER = ["tiny", "small", "medium", "long", "xlong", "xxlong"]
-# Slots per class: slots x (prefill + decode) x the KV of a token in bf16 (12B: 48 layers x 8 heads x 256 x 2 x 2 =
-# 0.39 MB; 27B: 62 x 16 x 128 x 2 x 2 = 0.51 MB) next to the weights (24 and 54 GB) in the host's 4 x 30.7 GiB.
-# 27B measured on a v4 host on 8 Nov: tiny 384 x 224 peaks at 27.0 GiB per chip, small 224 x 512 at 28.9 GiB; the
-# others hold about as many slot-tokens. (The 12B run of 8 Nov had four classes, long being 256-512 with 128 slots.)
-SLOTS = {
-    "gemma3-12b": {"tiny": 512, "small": 320, "medium": 224, "long": 160, "xlong": 128, "xxlong": 88},
-    # xxlong: 56 x 2048 slot-tokens, as many as small's 224 x 512 (28.9 GiB per chip)
-    "gemma3-27b": {"tiny": 384, "small": 224, "medium": 136, "long": 104, "xlong": 80, "xxlong": 56},
-}
-# generation_config.json of TranslateGemma: <eos> and <end_of_turn>
+MODELS_FILE = Path(__file__).with_name("translate_models.yml")
+CONFIG = yaml.safe_load(MODELS_FILE.read_text(encoding="utf-8"))
+MODELS = CONFIG["models"]
+PROMPTS = CONFIG["prompts"]
+# TranslateGemma's classes and slots, under the names of FLAN-nl's translate.py
+LENGTH_CLASSES = CONFIG["length_classes"]
+CLASS_ORDER = list(LENGTH_CLASSES)
+SLOTS = {name: model["slots"] for name, model in MODELS.items()}
+# generation_config.json of TranslateGemma: <eos> and <end_of_turn>; a model's own are its eos_ids
 EOS_IDS = [1, 106]
-_MARK = ""  # a private-use character, never in FLAN: where the text goes in the rendered template
+_MARK = "\ue000"  # a private-use character, never in FLAN: where the text goes in the rendered template
 
 
 # The language codes this script takes, with the names the chat template gives them
@@ -95,16 +88,126 @@ class PromptCodec:
                 raise RuntimeError(f"prompt ids differ from the chat template's for {text[:60]!r}")
 
 
+def speaker_attribute(label):
+    """' speaker="<label>"' for a turn's tag, or nothing without a label."""
+    if not label:
+        return ""
+    if '"' in label or "\n" in label:
+        raise ValueError(f"a speaker label without quotes or newlines, not {label!r}")
+    return f' speaker="{label}"'
+
+
+def user_text(prompt, text, source="en", target="nl", context=None, label=None):
+    """The user turn of a prompt of kind instruct (translate_models.yml). Without context: the plain request with the
+    text (chat-v1: TranslateGemma's own words). With context, the earlier turns of the conversation, oldest first, each
+    {label, source, translation} (label: the speaker, e.g. Gebruiker, Assistent or "De heer Thijssen (PvdA)"; may be
+    absent), and then the current turn, of speaker label. The same function makes the prompt of a translation and of a
+    fine-tune example, so that the model sees at translation what it learned on; the model's chat turn goes around it.
+    """
+    if prompt.get("kind") != "instruct":
+        raise ValueError(f"user_text needs a prompt of kind instruct, not {prompt.get('kind')!r}")
+    names = {"source": LANGUAGES[source], "target": LANGUAGES[target], "source_code": source, "target_code": target}
+    if not context:
+        return prompt["plain"].format(text=text.strip(), **names)
+    turns = "\n".join(prompt["turn"].format(speaker=speaker_attribute(turn.get("label")),
+                                            source_text=turn["source"].strip(),
+                                            translation=turn["translation"].strip(), **names)
+                      for turn in context)
+    return prompt["context"].format(turns=turns, text=text.strip(), speaker=speaker_attribute(label), **names)
+
+
+class TurnCodec:
+    """Prompt ids of a segment in a prompt of kind instruct: user_text between the strings of the model's user turn.
+    With check, the strings are checked against the tokenizer's chat template (a plain-text user turn)."""
+
+    def __init__(self, tokenizer, prompt, turn, source="en", target="nl"):
+        self.tokenizer, self.prompt, self.turn, self.source, self.target = tokenizer, prompt, turn, source, target
+
+    def text(self, text, context=None, label=None):
+        return (self.turn["prefix"] + user_text(self.prompt, text, self.source, self.target, context, label)
+                + self.turn["suffix"])
+
+    def encode(self, text, context=None, label=None):
+        return self.tokenizer(self.text(text, context, label), add_special_tokens=False)["input_ids"]
+
+    def check(self, texts, contexts=None, labels=None):
+        if not self.turn.get("check"):
+            return
+        n = len(texts)
+        for text, context, label in zip(texts, contexts or [None] * n, labels or [None] * n):
+            user = user_text(self.prompt, text, self.source, self.target, context, label)
+            expected = self.tokenizer.apply_chat_template([{"role": "user", "content": user}], tokenize=True,
+                                                          add_generation_prompt=True)
+            if isinstance(expected, dict) or hasattr(expected, "keys"):
+                expected = expected["input_ids"]
+            if list(expected) != self.encode(text, context, label):
+                raise RuntimeError(f"prompt ids differ from the chat template's for {text[:60]!r}")
+
+
+class ModelPrompts:
+    """A model's prompt ids: its prompt for a segment without context, its context_prompt for one with (the speaker
+    label of the current turn counts only with context)."""
+
+    def __init__(self, tokenizer, model, source="en", target="nl"):
+        self.source, self.target = source, target
+        self.plain = self._codec(tokenizer, model, model["prompt"])
+        name = model.get("context_prompt")
+        self.with_context = self._codec(tokenizer, model, name) if name else None
+
+    def _codec(self, tokenizer, model, name):
+        prompt = PROMPTS[name]
+        if prompt["kind"] == "translategemma":
+            return PromptCodec(tokenizer, self.source, self.target)
+        return TurnCodec(tokenizer, prompt, model["turn"], self.source, self.target)
+
+    def encode(self, text, context=None, label=None):
+        if not context:
+            return self.plain.encode(text)
+        if self.with_context is None:
+            raise ValueError("this model has no context_prompt, and the segment has context")
+        return self.with_context.encode(text, context, label)
+
+    def check(self, texts, contexts=None, labels=None):
+        n = len(texts)
+        rows = list(zip(texts, contexts or [None] * n, labels or [None] * n))
+        plain = [t for t, c, _ in rows if not c]
+        with_context = [r for r in rows if r[1]]
+        if plain:
+            self.plain.check(plain)
+        if with_context:
+            self.with_context.check(*(list(x) for x in zip(*with_context)))
+
+
+def vm_region():
+    """The region of this VM (europe-west4 for a zone europe-west4-a), from the metadata server."""
+    request = urllib.request.Request("http://metadata.google.internal/computeMetadata/v1/instance/zone",
+                                     headers={"Metadata-Flavor": "Google"})
+    with urllib.request.urlopen(request, timeout=10) as response:
+        zone = response.read().decode().rsplit("/", 1)[-1]
+    return zone.rsplit("-", 1)[0]
+
+
+def checkpoint_of(model, region):
+    """The model's checkpoint in the bucket of region; no checkpoint there is an error (nothing crosses regions)."""
+    try:
+        return model["checkpoints"][region]
+    except KeyError:
+        raise SystemExit(f"{model['maxtext_model']} has no checkpoint in {region} (translate_models.yml); "
+                         f"give --ckpt") from None
+
+
 def make_result_tokens_a_pytree():
     """Without JetStream, MaxText's engine returns a plain stand-in for JetStream's ResultTokens (a flax struct
     dataclass, so a pytree), and jit cannot return a plain object. Registered here as JetStream's is: arrays as children,
-    the index tuples as static data."""
+    the index tuples as static data. A MaxText whose stub is a pytree already (the fork yhavinga/maxtext, branch
+    fix-stub-resulttokens-pytree) refuses a second registration with a ValueError, which is then the sign that nothing
+    is needed, as in MaxText's own sliding_window_decode_test.py. Returns whether it registered the stub."""
     import jax
     from maxtext.inference.maxengine import maxengine
 
     api = maxengine.engine_api
     if not getattr(api, "_IS_STUB", False):
-        return
+        return False
     cls = api.ResultTokens
 
     def flatten(r):
@@ -114,7 +217,23 @@ def make_result_tokens_a_pytree():
         return cls(data=children[0], log_prob=children[1], tokens_idx=aux[0], valid_idx=aux[1], length_idx=aux[2],
                    samples_per_slot=aux[3])
 
-    jax.tree_util.register_pytree_node(cls, flatten, unflatten)
+    try:
+        jax.tree_util.register_pytree_node(cls, flatten, unflatten)
+    except ValueError as error:
+        if "Duplicate" not in str(error):
+            raise
+        return False
+    return True
+
+
+def decode_cache_fix_present():
+    """Whether MaxText makes the NNX decode cache from shapes inside its init jit (the fork yhavinga/maxtext, branch
+    fix-nnx-decode-cache-abstract-init: jax.eval_shape over _nnx_init_cache_dict in _init_decode_state_nnx)."""
+    import inspect
+
+    from maxtext.inference.maxengine import maxengine
+
+    return "eval_shape" in inspect.getsource(maxengine.MaxEngine._init_decode_state_nnx)
 
 
 def make_decode_cache_sharded():
@@ -139,21 +258,41 @@ def make_decode_cache_sharded():
     maxengine.MaxEngine._nnx_init_cache_dict = init_cache_dict
 
 
-def make_engine(args, shapes):
+def maxtext_source():
+    """The installed MaxText: its version and, for an install from git, the URL and commit (the version on main and
+    on the fork is still 0.2.5)."""
+    import importlib.metadata
+
+    dist = importlib.metadata.distribution("maxtext")
+    direct = json.loads(dist.read_text("direct_url.json") or "{}")
+    return {"version": dist.version, "url": direct.get("url"), "commit": direct.get("vcs_info", {}).get("commit_id")}
+
+
+def patch_maxtext():
+    """The two workarounds, each only where this MaxText still needs it: {name: applied}."""
+    applied = {"result_tokens_pytree": make_result_tokens_a_pytree(), "decode_cache_sharded": False}
+    if not decode_cache_fix_present():
+        make_decode_cache_sharded()
+        applied["decode_cache_sharded"] = True
+    return applied
+
+
+def make_engine(args, shapes, chips=4):
     """MaxText's MaxEngine with the converted checkpoint: (engine, params)."""
     from maxtext.configs import pyconfig
     from maxtext.inference.maxengine import maxengine
 
     max_prefill = shapes["prefill_lengths"][-1]
     config = pyconfig.initialize(
-        [""], model_name=args.model, load_parameters_path=args.ckpt, run_name="flan_nl", log_config=False,
+        [""], model_name=MODELS[args.model]["maxtext_model"], load_parameters_path=args.ckpt, run_name="flan_nl",
+        log_config=False,
         # Not the home directory: the boot disk is nearly full
         base_output_directory=f"{args.work_dir}/maxtext_output",
         # pyconfig points JAX's compilation cache here; its default is ~/jax_cache on the boot disk
         jax_cache_dir=f"{args.work_dir}/jax_cache",
         enable_checkpointing=False, async_checkpointing=False, skip_jax_distributed_system=True, scan_layers=False,
         use_multimodal=False, attention="dot_product", dtype="bfloat16", weight_dtype="bfloat16",
-        ici_fsdp_parallelism=1, ici_tensor_parallelism=4, per_device_batch_size=shapes["slots"] / 4,
+        ici_fsdp_parallelism=1, ici_tensor_parallelism=chips, per_device_batch_size=shapes["slots"] / chips,
         max_prefill_predict_length=max_prefill, max_target_length=max_prefill + shapes["max_decode"],
         decode_sampling_strategy="greedy", return_log_prob=False, tokenizer_type="huggingface",
         tokenizer_path=args.tokenizer)
@@ -263,7 +402,10 @@ class EngineSlots:
     def prefill(self, tokens):
         import jax.numpy as jnp
 
-        length = next(n for n in self.prefill_lengths if n >= len(tokens))
+        length = next((n for n in self.prefill_lengths if n >= len(tokens)), None)
+        if length is None:
+            raise RuntimeError(f"a prompt of {len(tokens)} tokens is longer than the largest prefill length "
+                               f"{self.prefill_lengths[-1]}")
         padded = np.zeros(length, np.int32)
         padded[:len(tokens)] = tokens
         prefix, first = self.engine.prefill(params=self.params, padded_tokens=jnp.asarray(padded), true_length=len(tokens))
@@ -283,7 +425,7 @@ class EngineSlots:
         return np.asarray(jax.device_get(arrays))
 
 
-def decode_all(prompts, slots, device, max_decode, sync_every):
+def decode_all(prompts, slots, device, max_decode, sync_every, eos_ids=EOS_IDS):
     """Greedy completions of prompts over a fixed number of slots: [(tokens without the stop token, ended)].
 
     Continuous batching with the engine's own pieces: every free slot gets the next prompt (prefill, insert; the
@@ -300,7 +442,7 @@ def decode_all(prompts, slots, device, max_decode, sync_every):
     tokens = [[] for _ in range(slots)]
 
     def finished(s):
-        return bool(tokens[s]) and (tokens[s][-1] in EOS_IDS or len(tokens[s]) >= max_decode)
+        return bool(tokens[s]) and (tokens[s][-1] in eos_ids or len(tokens[s]) >= max_decode)
 
     while queue or any(i >= 0 for i in owner):
         firsts = []
@@ -321,7 +463,7 @@ def decode_all(prompts, slots, device, max_decode, sync_every):
                     tokens[s].append(int(step[s]))
         for s in range(slots):
             if owner[s] >= 0 and finished(s):
-                ended = tokens[s][-1] in EOS_IDS
+                ended = tokens[s][-1] in eos_ids
                 outputs[owner[s]] = (tokens[s][:-1] if ended else tokens[s], ended)
                 owner[s] = -1
     return outputs
@@ -350,19 +492,50 @@ def translate_pending(shards, done, translate, store, max_shards=None):
     return stored
 
 
-def done_shards(out):
-    listed = subprocess.run(["gsutil", "ls", f"{out}/"], capture_output=True, text=True)
-    if listed.returncode != 0:
-        if "matched no objects" in listed.stderr or "One or more URLs matched no objects" in listed.stderr:
-            return set()
-        raise RuntimeError(f"gsutil ls {out}/ failed: {listed.stderr.strip()}")
-    return {Path(line).name for line in listed.stdout.split() if line.endswith(".parquet")}
+# The bucket through the Python client, not gsutil: on the v6e image gsutil is a snap, and a snap refuses to start
+# ("need to run as root or suid") under a process with no_new_privs, which this one has once libtpu is up (pilot of
+# 9 Nov). google-cloud-storage comes with maxtext[tpu].
+def gcs_client():
+    from google.cloud import storage
+
+    return storage.Client()
 
 
-def translate_shard(device, codec, tokenizer, ids, texts, shapes, sync_every):
-    prompts = [codec.encode(text) for text in texts]
+def split_gs(url):
+    if not url.startswith("gs://"):
+        raise ValueError(f"not a gs:// URL: {url}")
+    bucket, _, name = url[len("gs://"):].partition("/")
+    if not bucket:
+        raise ValueError(f"no bucket in {url}")
+    return bucket, name
+
+
+def done_shards(out, client=None):
+    """The shard files directly under the bucket directory out (as gsutil ls out/ listed them); none if it is empty."""
+    bucket, prefix = split_gs(out.rstrip("/"))
+    blobs = (client or gcs_client()).list_blobs(bucket, prefix=f"{prefix}/" if prefix else "", delimiter="/")
+    return {Path(blob.name).name for blob in blobs if blob.name.endswith(".parquet")}
+
+
+def upload(path, url, client=None):
+    from google.cloud.storage.retry import DEFAULT_RETRY
+
+    bucket, name = split_gs(url)
+    if not name or name.endswith("/"):
+        raise ValueError(f"no object name in {url}")
+    # Retried as gsutil cp retried: writing the same shard again under its name is harmless
+    (client or gcs_client()).bucket(bucket).blob(name).upload_from_filename(str(path), retry=DEFAULT_RETRY)
+
+
+def translate_shard(device, codec, tokenizer, ids, texts, shapes, sync_every, contexts=None, eos_ids=EOS_IDS,
+                    labels=None):
+    if contexts is None:
+        prompts = [codec.encode(text) for text in texts]
+    else:
+        prompts = [codec.encode(text, context, label)
+                   for text, context, label in zip(texts, contexts, labels or [None] * len(texts))]
     started = time.time()
-    outputs = decode_all(prompts, shapes["slots"], device, shapes["max_decode"], sync_every)
+    outputs = decode_all(prompts, shapes["slots"], device, shapes["max_decode"], sync_every, eos_ids)
     seconds = time.time() - started
     column = f"text_{codec.target}"
     rows = {"id": [], column: [], "ended": [], "tokens_in": [], "tokens_out": []}
@@ -376,13 +549,15 @@ def translate_shard(device, codec, tokenizer, ids, texts, shapes, sync_every):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="TranslateGemma on one host: segments from English to Dutch")
-    parser.add_argument("--segments", required=True, help="segments-w<N>.parquet of the plan (local)")
+    parser = argparse.ArgumentParser(description="A translation model on one host: segments from English to Dutch")
+    parser.add_argument("--segments", required=True,
+                        help="segments-w<N>.parquet of the plan (local): id, text, tokens, and optionally context")
     parser.add_argument("--out", required=True, help="Bucket directory of this worker's shards of this length class")
-    parser.add_argument("--ckpt", required=True, help="The MaxText parameters, <checkpoint>/0/items")
-    parser.add_argument("--tokenizer", required=True, help="TranslateGemma's tokenizer directory")
-    parser.add_argument("--model", default="gemma3-27b", choices=sorted(SLOTS))
-    parser.add_argument("--length-class", required=True, choices=sorted(LENGTH_CLASSES))
+    parser.add_argument("--ckpt", default=None,
+                        help="The MaxText parameters, <checkpoint>/0/items (default: the model's in this VM's region)")
+    parser.add_argument("--tokenizer", required=True, help="The model's tokenizer directory")
+    parser.add_argument("--model", default="gemma3-27b", choices=sorted(MODELS), help="A model of translate_models.yml")
+    parser.add_argument("--length-class", required=True)
     parser.add_argument("--slots", type=int, default=None, help="Override the class's number of decode slots")
     parser.add_argument("--shard-size", type=int, default=4096, help="Segments per shard (default: 4096)")
     parser.add_argument("--max-shards", type=int, default=None, help="Stop after this many new shards (pilot)")
@@ -397,24 +572,34 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.source_lang == args.target_lang:
         parser.error(f"--source-lang and --target-lang are both {args.source_lang}")
+    model = MODELS[args.model]
+    classes = model["length_classes"]
+    if args.length_class not in classes:
+        parser.error(f"--length-class {args.length_class} is not a class of {args.model}: {', '.join(classes)}")
 
     import jax
     import pyarrow as pa
     import pyarrow.parquet as pq
     from transformers import AutoTokenizer
 
-    if (jax.device_count(), jax.process_count()) != (4, 1):
-        raise SystemExit(f"needs one process with 4 chips, has {jax.process_count()} process(es) with "
+    chips = model["chips"]
+    if (jax.device_count(), jax.process_count()) != (chips, 1):
+        raise SystemExit(f"needs one process with {chips} chips, has {jax.process_count()} process(es) with "
                          f"{jax.device_count()} devices: set the TPU_* variables of translate.sh")
-    shapes = dict(LENGTH_CLASSES[args.length_class], slots=args.slots or SLOTS[args.model][args.length_class])
-    k = CLASS_ORDER.index(args.length_class)
-    low = LENGTH_CLASSES[CLASS_ORDER[k - 1]]["max_source"] if k else 0
+    shapes = dict(classes[args.length_class], slots=args.slots or model["slots"][args.length_class])
+    order = list(classes)
+    k = order.index(args.length_class)
+    low = classes[order[k - 1]]["max_source"] if k else 0
     table = pq.read_table(args.segments)
     ids, texts, tokens = (table.column(c).to_pylist() for c in ("id", "text", "tokens"))
-    if max(tokens, default=0) > LENGTH_CLASSES[CLASS_ORDER[-1]]["max_source"]:
+    contexts = table.column("context").to_pylist() if "context" in table.column_names else None
+    labels = table.column("label").to_pylist() if "label" in table.column_names else None
+    if max(tokens, default=0) > classes[order[-1]]["max_source"]:
         raise SystemExit(f"{args.segments} has a segment of {max(tokens)} tokens, more than the plan allows")
     chosen = [k for k, n in enumerate(tokens) if low < n <= shapes["max_source"]]
     ids, texts = [ids[k] for k in chosen], [texts[k] for k in chosen]
+    context_of = {ids[j]: contexts[k] for j, k in enumerate(chosen)} if contexts is not None else None
+    label_of = {ids[j]: labels[k] for j, k in enumerate(chosen)} if labels is not None else None
     # Shards hold consecutive ids, so similar lengths; they are done in a fixed random order, so that the time of the
     # first few is a fair sample of the whole class (the projection of the run's length)
     shards = shards_of(ids, texts, args.shard_size)
@@ -426,32 +611,42 @@ def main(argv=None):
     if not pending:
         return
 
+    if args.ckpt is None:
+        args.ckpt = checkpoint_of(model, vm_region())
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
-    codec = PromptCodec(tokenizer, args.source_lang, args.target_lang)
-    codec.check(texts[:3] + texts[-3:])
-    make_result_tokens_a_pytree()
-    make_decode_cache_sharded()
+    codec = ModelPrompts(tokenizer, model, args.source_lang, args.target_lang)
+    probe = texts[:3] + texts[-3:]
+    codec.check(probe, [context_of[i] for i in ids[:3] + ids[-3:]] if context_of else None,
+                [label_of[i] for i in ids[:3] + ids[-3:]] if label_of else None)
+    print(f"MAXTEXT {json.dumps({'model': args.model, 'ckpt': args.ckpt, **maxtext_source(), 'patches': patch_maxtext()})}", flush=True)
     started = time.time()
-    engine, params = make_engine(args, shapes)
+    engine, params = make_engine(args, shapes, chips)
     if args.lora:
         params = load_lora(params, args.lora)
     device = EngineSlots(engine, params, shapes["prefill_lengths"])
     print(f"engine ready in {time.time() - started:.0f} s", flush=True)
     local = Path(args.work_dir) / "shards" / args.length_class
     local.mkdir(parents=True, exist_ok=True)
+    client = gcs_client()
     totals = {"segments": 0, "tokens_in": 0, "tokens_out": 0, "seconds": 0.0}
 
     def store(name, rows, seconds):
         path = local / name
         pq.write_table(pa.table(rows), path, compression="zstd")
-        subprocess.run(["gsutil", "-q", "cp", str(path), f"{args.out}/{name}"], check=True)
+        upload(path, f"{args.out}/{name}", client)
         path.unlink()
         n_in, n_out = sum(rows["tokens_in"]), sum(rows["tokens_out"])
         for key, value in (("segments", len(rows["id"])), ("tokens_in", n_in), ("tokens_out", n_out), ("seconds", seconds)):
             totals[key] += value
         print(f"SHARD {json.dumps({'class': args.length_class, 'shard': name, 'segments': len(rows['id']), 'tokens_in': n_in, 'tokens_out': n_out, 'seconds': round(seconds, 1), 'out_per_s': round(n_out / seconds), 'all_per_s': round((n_in + n_out) / seconds), 'not_ended': rows['ended'].count(False)})}", flush=True)
 
-    translate_pending(shards, done, lambda i, t: translate_shard(device, codec, tokenizer, i, t, shapes, args.sync_every), store, args.max_shards)
+    def translate(shard_ids, shard_texts):
+        shard_contexts = [context_of[i] for i in shard_ids] if context_of else None
+        shard_labels = [label_of[i] for i in shard_ids] if label_of else None
+        return translate_shard(device, codec, tokenizer, shard_ids, shard_texts, shapes, args.sync_every,
+                               shard_contexts, model["eos_ids"], shard_labels)
+
+    translate_pending(shards, done, translate, store, args.max_shards)
     print(f"DONE {json.dumps({'class': args.length_class, **totals, 'out_per_s': round(totals['tokens_out'] / max(totals['seconds'], 1e-9))})}", flush=True)
 
 

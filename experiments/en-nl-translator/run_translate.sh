@@ -30,6 +30,7 @@ OUT=${OUT//\{w\}/$WORKER}
 [ -x "$PY" ] || { echo "$(hostname): no $PY (experiments/flan-nl/setup.sh)"; exit 1; }
 [ -s "$TOK/tokenizer.json" ] || { echo "$(hostname): no tokenizer in $TOK (experiments/flan-nl/setup.sh)"; exit 1; }
 [ -s "$CODE/translate.py" ] || { echo "$(hostname): no translate.py beside $0"; exit 1; }
+[ -s "$CODE/translate_models.yml" ] || { echo "$(hostname): no translate_models.yml beside $0 (translate.py reads it)"; exit 1; }
 [ -z "$(sudo lsof -t /dev/accel* /dev/vfio/* 2> /dev/null)" ] || { echo "$(hostname): the TPU is in use"; exit 1; }
 gsutil -q stat "$CKPT/done.txt" || { echo "$(hostname): $CKPT has no done.txt"; exit 1; }
 mkdir -p ~/logs "$SHM/segments"

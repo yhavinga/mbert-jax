@@ -18,7 +18,7 @@ NAME=${NAME:?the name of the run}
 MODEL=${MODEL:?12b or 27b}
 DATA=${DATA:?the training parquet}
 MULTIHOST=${MULTIHOST:-0}
-STEPS=${STEPS:-auto}  # auto: one epoch, counted by sft_lora.py
+STEPS=${STEPS:-auto}  # auto: one epoch, counted by sft_lora.py (multi-host: up to its step_limit, below every process's count)
 case $MODEL in
   12b) CKPT=gs://t5-dutch-english-usc2/mbert/translator/smoke-lora/translategemma-12b-maxtext ;;
   27b) CKPT=gs://t5-dutch-english-usc2/mbert/flan-nl/translategemma-27b-maxtext ;;

@@ -6,8 +6,9 @@ of the smoke test, and the adapter exported for translate.py --lora.
 
 The config is MaxText's post_train/sft.yml plus the overrides. One epoch: the training data first go once through
 MaxText's own pipeline (create_data_iterator on the training mesh) to count its batches, and `steps` becomes that count,
-so the cosine schedule ends with the epoch. Then MaxText's setup_trainer_state and train_model, unchanged, with two
-wrapped hooks that keep, per step, the loss, the time it ended and the batch's token counts.
+so the cosine schedule ends with the epoch; a multi-host job takes the smallest count of its processes minus a margin
+(step_limit), and holds a given number of steps to that limit too. Then MaxText's setup_trainer_state and train_model,
+unchanged, with two wrapped hooks that keep, per step, the loss, the time it ended and the batch's token counts.
 
 Writes to DIR (process 0): summary.json (configuration, times, throughput, memory per chip, loss per step), adapter.npz
 (the LoRA parameters in float32, keys as decoder/layers_0/self_attention/query/kernel_lora_a), adapter.json (rank,
@@ -17,6 +18,7 @@ of the LoRA parameters) under DIR/maxtext.
 
 import argparse
 import json
+import math
 import statistics
 import sys
 import time
@@ -66,6 +68,44 @@ def local_nonzero(array):
     return total
 
 
+# A multi-host job stops this many batches before the smallest count of its processes. Tunix's PeftTrainer.train loads
+# the next batch before it checks max_steps, so at steps == the smallest count the process with that count gets
+# StopIteration while the others load (and device_put over the global mesh) one more batch: the processes leave the
+# loop by different paths and their TPU programs run out of step (12B over 16 chips, 10 Nov: 431 steps, process 0
+# "program continuator has halted unexpectedly", the others "Failed to cancel preemption barrier"). One batch would
+# do; the margin also covers a count that comes out a little different in the training pass.
+STEP_MARGIN_MIN = 8
+STEP_MARGIN_FRACTION = 0.01
+
+
+def step_limit(batches_per_process):
+    """The most steps a multi-host job may take: the smallest batch count of its processes minus the margin, so every
+    process still has a batch left when the loop ends at max_steps."""
+    smallest = min(batches_per_process)
+    return smallest - max(STEP_MARGIN_MIN, math.ceil(STEP_MARGIN_FRACTION * smallest))
+
+
+def choose_steps(requested, batches_per_process):
+    """The job's step count: 'auto' is one epoch (a single process: all its batches; several: step_limit); a number
+    must stay within step_limit when several processes share the job. batches_per_process is None where nothing was
+    counted (a single process with a number)."""
+    if batches_per_process is None:
+        return int(requested)
+    if not min(batches_per_process):
+        raise SystemExit(f"a process got no batch from the training data: {batches_per_process}")
+    if len(batches_per_process) == 1:
+        return batches_per_process[0] if requested == "auto" else int(requested)
+    limit = step_limit(batches_per_process)
+    if limit < 1:
+        raise SystemExit(f"too few batches for a multi-host job: {batches_per_process}, limit {limit}")
+    if requested == "auto":
+        return limit
+    if int(requested) > limit:
+        raise SystemExit(f"steps={requested} exceeds the multi-host limit {limit} (batches per process "
+                         f"{batches_per_process}): a process would run out of data before the others")
+    return int(requested)
+
+
 def throughput(records, tokens, loss_tokens):
     """Steady-state rates from per-step end times: the first step carries the compilation, so the rates run from the
     end of step 1 to the end of the last; compile_s is step 1's time minus the median of the others."""
@@ -89,7 +129,9 @@ def main(argv=None):
     own, overrides = split_argv(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(description="LoRA SFT with MaxText's train_sft, measured")
     parser.add_argument("--out", required=True, help="Local output directory")
-    parser.add_argument("--steps", default="auto", help="'auto' (one epoch, counted) or a number")
+    parser.add_argument("--steps", default="auto",
+                        help="'auto' (one epoch, counted; multi-host: step_limit) or a number (multi-host: at most "
+                             "step_limit)")
     parser.add_argument("--maxtext-output", default=None,
                         help="MaxText's base_output_directory (default: OUT/maxtext). A multi-host job needs a shared "
                              "one (gs://): Orbax's final save waits for every process's commit in the same directory")
@@ -128,7 +170,9 @@ def main(argv=None):
     main_process = jax.process_index() == 0
 
     count = {"batches": 0, "tokens": 0, "loss_tokens": 0}
-    if args.steps == "auto":
+    batches_per_process = None
+    # A multi-host job counts also when given a number of steps, to hold that number to step_limit
+    if args.steps == "auto" or jax.process_count() > 1:
         mesh = maxtext_utils.get_mesh_from_config(config)
         iterator, _ = create_data_iterator(config, mesh)
         try:
@@ -143,21 +187,19 @@ def main(argv=None):
                 raise
             count["end"] = text[:300]
         del iterator
-        steps = count["batches"]
+        batches_per_process = [count["batches"]]
         if jax.process_count() > 1:
             # Each process counts the batches of its own shard of the data (tokens: its own part); they can differ by
             # a few, and a process whose data run out first would stop while the others wait in a collective: all take
-            # the smallest count, in one collective once every process is done counting
+            # step_limit of the counts, gathered in one collective once every process is done counting
             from jax.experimental import multihost_utils
 
             counts = multihost_utils.process_allgather(np.array([count["batches"]], np.int64))
-            count["batches_per_process"] = [int(x) for x in np.asarray(counts).reshape(-1)]
-            steps = min(count["batches_per_process"])
-        if not steps:
-            raise SystemExit("the training data gave no batch")
-    else:
-        steps = int(args.steps)
-    print(f"EPOCH {json.dumps(count | {'steps': steps})}", flush=True)
+            batches_per_process = [int(x) for x in np.asarray(counts).reshape(-1)]
+            count["batches_per_process"] = batches_per_process
+            count["step_limit"] = step_limit(batches_per_process)
+    steps = choose_steps(args.steps, batches_per_process)
+    print(f"EPOCH {json.dumps(count | {'requested': args.steps, 'steps': steps})}", flush=True)
     config = pyconfig.initialize_pydantic(base + [f"steps={steps}"])
 
     t_setup = time.time()
@@ -188,6 +230,9 @@ def main(argv=None):
     t_train = time.time()
     train_sft.train_model(config, trainer, mesh)
     train_s = time.time() - t_train
+    if trainer.train_steps != steps or len(records) != steps:
+        # the loop ended early (the data ran out) or a step went unlogged: not the run that was set up
+        raise SystemExit(f"trained {trainer.train_steps} steps ({len(records)} logged), not the {steps} set")
 
     tokens = [int(a) for a, _ in batch_counts]
     loss_tokens = [int(b) for _, b in batch_counts]

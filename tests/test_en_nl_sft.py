@@ -162,3 +162,36 @@ def test_local_nonzero_counts_each_shard_once_on_the_host():
     # rows 0 and 1 of the batch, row 0 also held by a second device (a replicated axis)
     array = types.SimpleNamespace(addressable_shards=[shard(a, 0), shard(b, 1), shard(a, 0)])
     assert local_nonzero(array) == 3
+
+
+def test_step_limit_keeps_a_batch_left_on_every_process():
+    # the 12B tag test of 10 Nov: steps 431 == the smallest count left process 0 without its next batch
+    counts = [431, 433, 438, 437]
+    limit = sft_lora.step_limit(counts)
+    assert limit == 431 - 8
+    assert limit < min(counts)
+    # one percent once that exceeds the minimum margin
+    assert sft_lora.step_limit([1650, 1660]) == 1650 - 17
+
+
+def test_choose_steps_auto_takes_the_limit_on_several_processes_and_all_batches_on_one():
+    assert sft_lora.choose_steps("auto", [431, 433, 438, 437]) == 423
+    assert sft_lora.choose_steps("auto", [431]) == 431
+    assert sft_lora.choose_steps("8", None) == 8
+    assert sft_lora.choose_steps("500", [431]) == 500
+
+
+def test_choose_steps_holds_a_number_to_the_multihost_limit():
+    assert sft_lora.choose_steps("8", [1650, 1660, 1655, 1652]) == 8
+    assert sft_lora.choose_steps("423", [431, 433, 438, 437]) == 423
+    with pytest.raises(SystemExit, match="exceeds the multi-host limit 423"):
+        sft_lora.choose_steps("431", [431, 433, 438, 437])
+
+
+def test_choose_steps_refuses_empty_or_too_little_data():
+    with pytest.raises(SystemExit, match="no batch"):
+        sft_lora.choose_steps("auto", [0])
+    with pytest.raises(SystemExit, match="no batch"):
+        sft_lora.choose_steps("auto", [12, 0])
+    with pytest.raises(SystemExit, match="too few batches"):
+        sft_lora.choose_steps("auto", [8, 9])

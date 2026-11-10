@@ -161,8 +161,11 @@ vergelijkt de id's met `translate.py`'s prompt.
   alle lagen; embeddings bevroren; LoRA-dropout 0 (MaxText geeft qwix 0,0).
 - Optimalisatie: AdamW (β2 0,999, weight decay 0,01), LR 1e-5, cosine naar 0 met 10% warmup, clipping 1,0, één
   epoch, `num_vocab_tiling=8`. Het aantal stappen telt `sft_lora.py` eerst: elk proces telt de batches van zijn
-  eigen deel van de data, en alle processen nemen het kleinste aantal (in de 12B-proef 431, 433, 438 en 437 → 431
-  stappen: ~1% van de batches van drie processen blijft ongebruikt) [gemeten].
+  eigen deel van de data, en alle processen nemen het kleinste aantal min een marge van max(8, 1%) batches
+  (`step_limit`; in de 12B-proef 431, 433, 438 en 437 → 423 stappen, ~3% van de batches ongebruikt). De marge is
+  nodig: Tunix laadt de volgende batch vóór de controle op `max_steps`, dus bij precies het kleinste aantal liep het
+  proces met dat aantal leeg terwijl de andere nog een batch over de 16 chips verdeelden, en de job brak na de
+  laatste stap af (10 nov) [gemeten]. Een opgegeven `STEPS` boven die grens weigert `sft_lora.py` in multi-host.
 - Data: packing, sequenties van **2.048** tokens (de smoke-test gebruikte 1.024), 1 sequentie per chip
   (`per_device_batch_size=1`, 16 × 2.048 = 32.768 tokens per stap; de smoke-test: 2 × 1.024), geen shuffling in
   MaxText (de build schudt), verlies alleen op het Nederlands en `<end_of_turn>` (`sft_train_on_completion_only`).
@@ -268,8 +271,9 @@ Doel: kiezen tussen de twee vormen van de tag (§2.4), omdat `<BT> ` als platte 
   afgemaakt; Engels over; MetricX-24-QE.
 - Uitslag: `mbert-ops/translator-sft/tag-test.md` en `$S/tagtest/report/`.
 
-**Stand bij het schrijven** (10 nov ~05:55 CET): de adapter met het token traint (431 stappen van 3,6 s; verlies
-2,16 bij stap 6, 1,71 bij stap 19), daarna die met de instructie, dan de vertalingen en MetricX. De uitslag komt in
+**Stand bij het schrijven** (10 nov ~07:00 CET): de eerste training van de adapter met het token (431 stappen)
+brak na de laatste stap af op het leeglopen van de data op één proces (§3); opnieuw met de stapgrens van §3, daarna
+die met de instructie, dan de vertalingen en MetricX. De uitslag komt in
 `mbert-ops/translator-sft/tag-test.md` (automatisch, met tabel en 10 voorbeelden per adapter) en
 `$S/tagtest/report/`; de keuze van de vorm hoort daarna hier, als besluit van Yeb.
 

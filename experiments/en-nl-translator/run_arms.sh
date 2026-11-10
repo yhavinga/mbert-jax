@@ -170,8 +170,12 @@ translate)
   if [ -n "$ADAPTER" ]; then
     gsutil -q stat "$ADAPTER/adapter.npz" || { echo "w$W: no $ADAPTER/adapter.npz"; exit 1; }
   fi
-  E=$(data_dir "$DATA") B=$(model_dir "$MODEL" "$DATA") ADAPTER=$ADAPTER PROMPT=$PROMPT TAG=${TAG}_${MODEL}_$DATA \
-    bash "$CODE/run_baseline.sh" translate
+  out=$(model_dir "$MODEL" "$DATA")
+  xe=$(data_dir "$DATA")
+  name=${TAG}_${MODEL}_$DATA
+  # MODEL here is the translator of this chain (base, B, N, Ninstr); run_translate.sh reads MODEL as TranslateGemma's
+  # size, so it is set to 27b for the call
+  MODEL=27b E=$xe B=$out ADAPTER=$ADAPTER PROMPT=$PROMPT TAG=$name bash "$CODE/run_baseline.sh" translate
   ;;
 score)
   MODEL=${MODEL:?base, B, N or Ninstr}

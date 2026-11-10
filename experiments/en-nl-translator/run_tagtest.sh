@@ -9,6 +9,11 @@
 #                                              eligible pair untagged (B), plus 20% replay with the conventional
 #                                              sentence (N); to $S/data/$ARMS (arms-v2 at 7.5, else arms-v2-qe$QE_MAX),
 #                                              refused when that has a report.json      (job sft_build_arms_$TAG)
+#   bash run_tagtest.sh examples-rule          a worker (its TPU, then CPU): examples_qe.py rule: the tag test's WMT24++
+#                                              QE differences with MetricX-24 (reference) and COMET-22, to
+#                                              $S/examples/                               (job sft_ex_rule_$TAG)
+#   bash run_tagtest.sh examples-cutoff        w3 (CPU): examples_qe.py cutoff: pairs around the QE bound, to
+#                                              $S/examples/                               (job sft_ex_cutoff_$TAG)
 #   SET=arms/B bash run_tagtest.sh check       a worker (CPU): sft_build.py check of a set in the SFT venv
 #                                              (job sft_check_<set>_$TAG)
 #   ARM=token bash run_tagtest.sh train        every worker at once (one job over the 16 chips): run_sft.sh, 12B,
@@ -109,6 +114,42 @@ gsutil -m -q rsync -r \$O/segments $T/segments
 echo "BUILT: $S/data/arms, $S/data/tagtest, $T/segments"
 EOF
   detach "sft_build_$TAG" bash ~/job_body_build_$TAG.sh
+  ;;
+examples-rule)
+  tpu_free
+  X=$W_DIR/examples-rule-$TAG
+  cat > ~/job_body_ex_rule_$TAG.sh <<EOF
+set -euo pipefail
+mkdir -p $X
+gsutil -q cp $T/report/pairs.parquet $T/report/qe.parquet $T/segments/items.parquet $X/
+$PY -I -u $CODE/examples_qe.py rule-pairs --pairs $X/pairs.parquet --items $X/items.parquet --out $X/rule-pairs.parquet
+(
+  export TPU_CHIPS_PER_PROCESS_BOUNDS=2,2,1 TPU_PROCESS_BOUNDS=1,1,1 TPU_VISIBLE_CHIPS=0,1,2,3 TPU_PROCESS_PORT=8476
+  export TPU_PROCESS_ADDRESSES=localhost:8476 CLOUD_TPU_TASK_ID=0 ALLOW_MULTIPLE_LIBTPU_LOAD=1
+  export JAX_COMPILATION_CACHE_DIR=$SHM/jax_cache_metricx XLA_FLAGS=--xla_dump_hlo_as_text=false TPU_LOG_DIR=$SHM/tpu_logs
+  $PY -I -u $CODE/metricx_qe.py score --pairs $X/rule-pairs.parquet --pair source:hypothesis:reference --pair source:hypothesis --model xxl --root $SHM/metricx --empty-candidates --out $X/metricx.parquet
+)
+$SHM/comet-venv/bin/python -I -u $CODE/comet_score.py score --root $SHM/comet --pairs $X/rule-pairs.parquet --out $X/comet.parquet
+$PY -I -u $CODE/examples_qe.py rule --pairs $X/pairs.parquet --qe $X/qe.parquet --items $X/items.parquet --scores $X/metricx.parquet --comet $X/comet.parquet --out $X/examples-qe-rule.md --json $X/examples-qe-rule.json
+gsutil -m -q cp $X/rule-pairs.parquet $X/metricx.parquet $X/comet.parquet $X/examples-qe-rule.md $X/examples-qe-rule.json $S/examples/
+echo "EXAMPLES: $S/examples/examples-qe-rule.md"
+EOF
+  detach "sft_ex_rule_$TAG" bash ~/job_body_ex_rule_$TAG.sh
+  ;;
+examples-cutoff)
+  IN=$W_DIR/in
+  X=$W_DIR/examples-cutoff-$TAG
+  for f in run/pairs.parquet run/context-turns.parquet run/passages.parquet long/pairs.parquet long/passages.parquet eval/evalsets.parquet; do
+    [ -s "$IN/$f" ] || { echo "w$W: no $IN/$f (the build stage fetches it)"; exit 1; }
+  done
+  cat > ~/job_body_ex_cutoff_$TAG.sh <<EOF
+set -euo pipefail
+mkdir -p $X
+$PY -I -u $CODE/examples_qe.py cutoff --run $IN/run --long $IN/long --evalsets $IN/eval/evalsets.parquet --tokenizer /dev/shm/flan_nl/tokenizer-27b --out $X/examples-qe-cutoff.md --json $X/examples-qe-cutoff.json
+gsutil -m -q cp $X/examples-qe-cutoff.md $X/examples-qe-cutoff.json $S/examples/
+echo "EXAMPLES: $S/examples/examples-qe-cutoff.md"
+EOF
+  detach "sft_ex_cutoff_$TAG" bash ~/job_body_ex_cutoff_$TAG.sh
   ;;
 check)
   SET=${SET:?arms/<set> or tagtest/<set>}

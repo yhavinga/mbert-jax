@@ -42,6 +42,8 @@ def test_an_opening_about_the_translation(text, intro):
 
 def test_an_opening_the_source_has_too_is_no_intro():
     assert not tt.flags({"source": "Here is the list: a, b."}, "Hier is de lijst: a, b.", True, None)["intro"]
+    # the base model's own translation of "All right, whoa, ..." (WMT24++, 10 Nov)
+    assert not tt.flags({"source": "All right, whoa, hold it down."}, "Oké, rustig, rustig.", True, None)["intro"]
 
 
 def test_longer_and_shorter_than_the_base_model():

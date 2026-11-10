@@ -53,7 +53,7 @@ TAG_TEXT = re.compile(r"<unused\d+>|<BT>|original[- ]sounding|natural, original|
 INTRO = re.compile(r"^\W*(?:hieronder (?:volgt|staat|vind|de)|hier (?:is|volgt|staat|de)|de (?:nederlandse )?vertaling"
                    r"|vertaling\s*:|vertaald\s*:|nederlandse vertaling|natuurlijk[,!.]|zeker[,!.]|uiteraard|graag[,!.]"
                    r"|sure\b|here is|here's|translation\s*:|okay|oké)", re.I)
-SOURCE_INTRO = re.compile(r"^\W*(?:here|below|sure|of course|translation|okay|ok\b|certainly)", re.I)
+SOURCE_INTRO = re.compile(r"^\W*(?:here|below|sure|of course|translation|okay|ok\b|certainly|all right|alright)", re.I)
 LONGER, SHORTER, CHRF_DIFFERENT = 1.4, 0.6, 50.0
 
 

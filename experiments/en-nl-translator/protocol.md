@@ -252,9 +252,11 @@ Helpen N en B allebei: [open, §8 punt 9].
 Doel: kiezen tussen de twee vormen van de tag (§2.4), omdat `<BT> ` als platte tekst in de smoke-test lekte
 (eenmaal letterlijk, eenmaal als inleidende zin) [gemeten 9 nov].
 
-- Twee LoRA-adapters op TranslateGemma 12B (`run_sft.sh`, instellingen van §3, één worker van mbert-mix per
-  adapter): elk 20.000 BT-voorbeelden uit de query van §2.1 (20% met context) plus 5.000 replay (20%), dezelfde
-  paren voor beide; alleen de vorm van de tag verschilt (`$S/data/tagtest/`).
+- Twee LoRA-adapters op TranslateGemma 12B (`run_sft.sh`, instellingen van §3): elk 20.000 BT-voorbeelden uit de
+  query van §2.1 (4.000 met context, 20%) plus 5.000 replay (20%), 12,9–13,0 M tokens, dezelfde paren voor beide;
+  alleen de vorm van de tag verschilt (`$S/data/tagtest/`). Elk als één job over de 16 chips van mbert-mix, dus dezelfde
+  indeling als de 27B-armen (16 × 1 × 2.048 tokens per stap): op één worker
+  vroeg 12B bij 1 × 2.048 per chip 38,5 GB aan tijdelijke buffers (> 30,75) [gemeten 10 nov].
 - Daarna vertaalt elke adapter met en zonder tag 300 FLAN-evaluatierijen (set `classifier`, seed
   `en-nl-sft/tagtest/0/flan`) en 300 WMT24++-segmenten zonder `is_bad_source` (seed `…/wmt`); het basismodel 12B
   ernaast.

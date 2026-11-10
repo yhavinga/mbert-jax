@@ -128,6 +128,14 @@ def main(argv=None):
             count["end"] = text[:300]
         del iterator
         steps = count["batches"]
+        if jax.process_count() > 1:
+            # Each process counts the batches of its own shard of the data; they can differ by a few, and a process
+            # whose data run out first would stop while the others wait in a collective: all take the smallest count
+            from jax.experimental import multihost_utils
+
+            counts = multihost_utils.process_allgather(np.array([count["batches"]], np.int64))
+            count["batches_per_process"] = [int(x) for x in np.asarray(counts).reshape(-1)]
+            steps = min(count["batches_per_process"])
         if not steps:
             raise SystemExit("the training data gave no batch")
     else:

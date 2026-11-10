@@ -13,14 +13,18 @@
 #                                   COMET-22 (the first 100 segments timed on their own first), to $B/pairs/, $B/scores/
 #   bash run_baseline.sh summary    worker 0: evalsets.py summary, to $B/ (translations, scores, summary.json/.md)
 # The code is beside this script (a copy of $E/scripts/). A rerun of score skips the scores in $B/scores/.
-# Environment: TAG (log names), COMMIT (named in the summary); for a dry run also SHM, W, E, B, TOK.
+# Environment: TAG (log names), COMMIT (named in the summary); for a dry run also SHM, W, E, B, TOK. For a fine-tuned
+# arm (protocol.md): B its output directory, ADAPTER the bucket directory of its LoRA adapter (sft_lora.py's
+# adapter.npz and adapter.json, merged by translate.py --lora), PROMPT a prompt of translate_models.yml (the tag:
+# chat-v1-tag-token or chat-v1-tag-instruction; none: the model's own), LABEL the model's name in the summary.
 set -euo pipefail
 STAGE=${1:?setup, data, translate, score or summary}
 E=${E:-gs://t5-dutch-english-usc2/mbert/translator/eval}
 B=${B:-$E/baseline-tg27b}
 CKPT=gs://t5-dutch-english-usc2/mbert/flan-nl/translategemma-27b-maxtext
 SHM=${SHM:-/dev/shm/translator}
-L=$SHM/eval/run
+# per output directory, so that an arm never reads the shards or scores of another run
+L=$SHM/eval/$(basename "$B")
 PY=$SHM/venv/bin/python
 CPY=$SHM/comet-venv/bin/python
 TOK=${TOK:-/dev/shm/flan_nl/tokenizer-27b}
@@ -52,8 +56,15 @@ data)
 translate)
   classes=$(gsutil cat "$E/data/classes-w$W.txt")
   [ -n "$classes" ] || { echo "w$W: no length classes in $E/data/classes-w$W.txt"; exit 1; }
+  extra=${PROMPT:+--prompt $PROMPT}
+  if [ -n "${ADAPTER:-}" ]; then
+    A=$SHM/adapters/$(basename "$ADAPTER")
+    mkdir -p "$A"
+    gsutil -q cp "$ADAPTER/adapter.npz" "$ADAPTER/adapter.json" "$A/"
+    extra="$extra --lora $A"
+  fi
   CLASSES="$classes" SOURCE=en TARGET=nl SEGMENTS="$E/data/segments-w{w}.parquet" OUT="$B/translations/w{w}" \
-    NAME="tbl_translate_$TAG" LOGS="$B/logs" bash "$CODE/run_translate.sh"
+    NAME="tbl_translate_$TAG" LOGS="$B/logs" EXTRA="$extra" bash "$CODE/run_translate.sh"
   ;;
 score)
   D=$L/data
@@ -95,8 +106,11 @@ summary)
   gsutil -m -q cp "$B/pairs/pairs-w*.parquet" "$B/scores/*" "$E/data/evalsets.parquet" "$E/data/manifest.json" "$A/"
   cp "$A/evalsets.parquet" "$A/manifest.json" "$L/data/"
   converted=$(gsutil cat "$CKPT/done.txt")
+  if [ -n "${ADAPTER:-}" ]; then
+    converted="LoRA-adapter $ADAPTER ($(gsutil cat "$ADAPTER/adapter.json" | tr -d '\n' | tr '"' "'")), prompt ${PROMPT:-van het model}, op $converted"
+  fi
   cat > "$L/setup.json" <<EOF
-{"vertaler": "TranslateGemma 27B, het basismodel, zonder fine-tune: $converted; checkpoint $CKPT",
+{"vertaler": "${LABEL:-TranslateGemma 27B, het basismodel, zonder fine-tune}: $converted; checkpoint $CKPT",
  "decodering": "greedy, de prompt van het chat-template van het model (en→nl), translate.py met zijn lengteklassen (MaxText 0.2.5, venv van FLAN-nl); per worker hele lengteklassen; segmenten boven 512 brontokens gemarkeerd (over_512)",
  "MetricX-24": "google/metricx-24-hybrid-xxl-v2p6-bfloat16 @ 3d9c6f7fd11b58d3eceeb68ee39fe7d2c761ee20, eigen JAX-port (metricx_qe.py), bf16-producten op de TPU; met referentie 'source: … candidate: … reference: …', QE 'source: … candidate: …', invoer tot 1.536 mT5-tokens; een lege vertaling krijgt ook een score",
  "COMET-22": "Unbabel/wmt22-comet-da @ 2760a223ac957f30acfb18c8aa649b01cf1d75f2 (encoder FacebookAI/xlm-roberta-large @ c23d21b0620b635a76227c604d44e43a9f0ee389), unbabel-comet 2.2.7, torch 2.9.1 op de CPU, met referentie",
@@ -107,7 +121,7 @@ summary)
 EOF
   "$PY" -I "$CODE/evalsets.py" summary --data "$L/data" --pairs "$A"/pairs-w*.parquet --metricx "$A"/metricx-w*.parquet \
     --comet "$A"/comet-w*.parquet --comet-timing "$A"/comet-timing-w*.json --setup "$(cat "$L/setup.json")" \
-    --model "TranslateGemma 27B (basismodel)" --out "$L/summary"
+    --model "${LABEL:-TranslateGemma 27B (basismodel)}" --out "$L/summary"
   gsutil -m -q cp "$L/summary/*" "$B/"
   echo "SUMMARY w$W: $B/summary.md"
   ;;

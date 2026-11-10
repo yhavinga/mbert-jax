@@ -29,6 +29,7 @@ test's 300 (their translations are shown in examples-qe-rule.md), drawn with WMT
 import argparse
 import collections
 import hashlib
+import html as html_lib
 import json
 import random
 import re
@@ -352,7 +353,7 @@ def page_facts(link):
     html, _ = http_get(link)
     m = re.search(r'<meta name="author" content="([^"]+)"', html)
     lic = re.search(r"Creative Commons Attribution 3\.0", html) is not None and LICENCE in html
-    return (m.group(1).strip() if m else None), lic
+    return (html_lib.unescape(m.group(1)).strip() if m else None), lic
 
 
 def train_overlap(texts_by_id, train_dirs):
@@ -438,6 +439,7 @@ def select(args):
                 log["page_without_author_or_licence"] += 1
                 continue
             hits = [h for h in sorted(p["idioms"], key=lambda h: h["idiom"] != idiom) if h["idiom"] in p["countable"]]
+            hits = [h for k, h in enumerate(hits) if h["idiom"] not in {x["idiom"] for x in hits[:k]}]  # once each
             chosen.append(p | {"author": author, "licence": "CC BY 3.0", "expressions": hits, "drawn": idiom})
             posts.add(p["post_id"])
             break

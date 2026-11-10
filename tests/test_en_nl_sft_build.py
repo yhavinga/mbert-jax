@@ -205,7 +205,7 @@ def tables(tmp_path, tag_text=False):
     return argparse.Namespace(run=str(run), long=str(long), replay=str(tmp_path / "replay.parquet"),
                               flan_eval=str(tmp_path / "eval-rows.parquet"),
                               evalsets=str(tmp_path / "evalsets.parquet"), tokenizer="char", seed="t",
-                              out=str(tmp_path / "out"))
+                              out=str(tmp_path / "out"), qe_max=sb.QE_MAX, replay_tag="none")
 
 
 def test_a_build_end_to_end(tmp_path, monkeypatch):
@@ -275,3 +275,73 @@ def test_a_context_that_makes_an_example_too_long_is_dropped_the_passage_stays(t
     assert '"train/context_too_long": 10' in report
     meta = pq.read_table(Path(args.out) / "B" / "train-meta.parquet").to_pylist()
     assert len(meta) == 20 and not any(m["kind"] == "bt_context" for m in meta)
+
+
+def test_the_qe_bound_is_a_parameter():
+    p = passage("a")
+    assert sb.query_fails(pair("a", qe=7.2), p, set(), qe_max=7.0) == ["qe"]
+    assert sb.query_fails(pair("a", qe=7.2), p, set(), qe_max=7.5) == []
+    ids = ["h:d:t1", "h:d:t2"]
+    pairs = {i: pair(i, kind="context", split=None, qe=7.2 if i == "h:d:t1" else 1.0) for i in ids}
+    turns = {i: turn(i) for i in ids}
+    assert sb.context_of(passage("h:d:t3:0", context_ids=ids), pairs, turns, set(), qe_max=7.0)[1] == ["h:d:t2"]
+
+
+def test_the_draw_of_all_takes_every_eligible_passage():
+    eligible = {"handelingen": [f"h{i}" for i in range(400)], "raad": [f"r{i}" for i in range(300)]}
+    context = [f"h{i}" for i in range(0, 400, 10)]  # 40
+    ctx, plain, info = sb.bt_draw(eligible, context, "all", "s")
+    assert info["bt_total"] == 700 and sorted(ctx) == sorted(context) and info["context_share"] == round(40 / 700, 4)
+    assert sorted(ctx + plain["handelingen"] + plain["raad"]) == sorted(eligible["handelingen"] + eligible["raad"])
+
+
+def test_the_conventional_tag_changes_one_place():
+    en = "The House agrees."
+    plain = sb.user_turn("chat-v1", en)
+    tagged = sb.user_turn("chat-v1-tag-conventional", en)
+    assert tagged == plain.replace("or commentary. ", "or commentary. " + sb.CONVENTIONAL_SENTENCE + " ", 1)
+    assert sb.CONVENTIONAL_SENTENCE == "Translate closely, as a conventional translation."
+    context = [{"label": "De heer A (VVD)", "source": "Mr President.", "translation": "Voorzitter."}]
+    assert sb.user_turn("chat-v1-tag-conventional", en, context, "De voorzitter") == sb.user_turn(
+        "chat-v1", en, context, "De voorzitter").replace("or commentary.\n", "or commentary. " + sb.CONVENTIONAL_SENTENCE
+                                                         + "\n", 1)
+
+
+def test_a_build_with_the_tag_turned_round(tmp_path):
+    """Yeb, 10 Nov: every eligible passage, untagged; arm N adds a replay of 20% with the conventional sentence."""
+    args = tables(tmp_path)
+    args.bt, args.sets, args.replay_tag = "all", ["B=none", "N=none+replay"], "conventional"
+    sb.build(args, tokenizer=CharTokenizer())
+    out = Path(args.out)
+    meta = {s: pq.read_table(out / s / "train-meta.parquet").to_pylist() for s in ("B", "N")}
+    bt = {s: sorted(m["id"] for m in rows if m["kind"] != "replay") for s, rows in meta.items()}
+    # 39 Handelingen (one QE outlier out), 19 FineWeb-2 (one hard fail out), 10 raad: all 68, 10 with context
+    assert len(bt["B"]) == 68 and bt["B"] == bt["N"]
+    assert sum(m["kind"] == "bt_context" for m in meta["B"]) == 10
+    replay = [m for m in meta["N"] if m["kind"] == "replay"]
+    assert len(replay) == 17 and len(meta["N"]) == 85  # 17 = 68 x 0.25: 20% of 85
+    for name in ("B", "N"):
+        msgs = pq.read_table(out / name / "train.parquet").column("messages").to_pylist()
+        for m, row in zip(meta[name], msgs):
+            want = "conventional" if m["kind"] == "replay" else "none"
+            assert m["tag"] == want and m["prompt"] == sb.TAG_PROMPTS[want]
+            assert (sb.CONVENTIONAL_SENTENCE in row[0]["content"]) == (want == "conventional")
+            assert sb.TAG_SENTENCE not in row[0]["content"] and sb.TAG_TOKEN not in row[0]["content"]
+            assert row[0]["content"] == sb.user_turn(m["prompt"], m["en"], m["context"], m["label"])
+    report = __import__("json").loads((out / "report.json").read_text())
+    assert report["query"]["qe_en_nl_max"] == sb.QE_MAX and report["replay_tag"] == "conventional"
+    train = report["sets"]["N"]["train"]
+    assert sum(train["tokens_by_source"].values()) == train["tokens"]
+    assert sum(train["loss_tokens_by_source"].values()) == train["loss_tokens"]
+    assert set(train["tokens_by_source"]) == {"handelingen", "fineweb", "raad", "replay"}
+    assert "## Tokens per bron" in (out / "report.md").read_text()
+
+
+def test_a_lower_qe_bound_gives_a_smaller_set(tmp_path):
+    args = tables(tmp_path)
+    args.bt, args.sets, args.qe_max = "all", ["B=none"], 8.0  # every pair of the tables has QE 1.0 or 9.0
+    sb.build(args, tokenizer=CharTokenizer())
+    assert len(pq.read_table(Path(args.out) / "B" / "train-meta.parquet")) == 68
+    args.qe_max, args.out = 10.0, str(tmp_path / "out10")
+    sb.build(args, tokenizer=CharTokenizer())
+    assert len(pq.read_table(Path(args.out) / "B" / "train-meta.parquet")) == 69  # the outlier with QE 9.0 joins

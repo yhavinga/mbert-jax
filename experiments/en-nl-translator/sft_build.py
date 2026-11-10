@@ -4,7 +4,8 @@ mbert/designs/en-nl-translator.md §3 step 3, §7 point 6, §9): a query on the 
 run, the FLAN-nl replay, and the user turn of translate.user_text.
 
     python sft_build.py build --run RUN --long LONG --replay REPLAY.parquet --flan-eval EVAL-ROWS.parquet \\
-        --evalsets EVALSETS.parquet --tokenizer TOK --bt auto|N --sets B=none N-token=token+replay ... --out OUT
+        --evalsets EVALSETS.parquet --tokenizer TOK --bt auto|all|N [--qe-max 7.5] [--replay-tag none|conventional] \\
+        --sets B=none N-token=token+replay ... --out OUT
     python sft_build.py check --data OUT/<set> --tokenizer TOK   (SFT venv: MaxText's own SFT steps on every example)
 
 RUN holds the main run's pairs.parquet (mainset/run/pairs/), passages.parquet and context-turns.parquet
@@ -15,8 +16,8 @@ eligible when
 - hard_fails is empty (not ended, decode_loop, Dutch left in the English, length ratio, structure; pairs.py);
 - its source passed the selection: Gemma's source score >= 0.5, for FineWeb-2 also the origin score >= 0.5 (the
   selection chose no other; checked here);
-- MetricX-24-QE en->nl <= QE_MAX, a wide bound against outliers near p99 of the training passages; chrF and the other
-  scores have no bound;
+- MetricX-24-QE en->nl <= --qe-max (QE_MAX by default), a wide bound against outliers near p99 of the training
+  passages; chrF and the other scores have no bound;
 - it shares no 13-gram of words with an evaluation set (WMT24++, FLORES-200, NTREX-128, Europarl-direct: source and
   reference). FLAN's evaluation rows are kept out of the replay by their segments (as the design has it), not by
   13-grams: their templates' fixed sentences recur in a quarter of the replay (131,273 of 521,329 pairs shared a
@@ -28,21 +29,24 @@ Context examples (design §9): a training passage the selection marked as a cont
 nearest first, as long as each turn is eligible by the same query; the first that fails ends the context there. Without
 a turn left it is a plain example. The share of context examples is CONTEXT_SHARE of the back-translation examples, in
 every arm alike: --bt auto takes every eligible context example and as many plain ones as make them that share; --bt N
-draws that share of N. The plain examples are drawn per source in proportion to the eligible passages of each source,
+draws that share of N; --bt all takes every eligible training passage (Yeb, 10 Nov), its context examples whatever
+share they make (~7%). The plain examples are drawn per source in proportion to the eligible passages of each source,
 so the sources keep their shares.
 
 Prompts (translate_models.yml): a plain example gets chat-v1 without context, which is TranslateGemma's own prompt word
 for word; a context example gets chat-v1 with its earlier turns. The tag of a set picks the variant of chat-v1 for its
 back-translation examples (TAG_PROMPTS): none, the unused token <unused0> before the text, or one sentence in the
-instruction. The FLAN-nl replay (a set with +replay: arm N) is REPLAY_SHARE of the set's examples, untagged, in chat-v1
-without context; it is drawn from the replay pairs that are none of FLAN's evaluation rows' segments and share no
+instruction. The FLAN-nl replay (a set with +replay: arm N) is REPLAY_SHARE of the set's examples, without context, in
+the prompt of --replay-tag: untagged chat-v1 (none), or with the tag turned round (Yeb, 10 Nov: the back-translations
+untagged, the replay with the sentence of chat-v1-tag-conventional, the mode of a close, conventional translation;
+at use nothing is added); it is drawn from the replay pairs that are none of FLAN's evaluation rows' segments and share no
 13-gram with an evaluation set.
 
 build writes per set OUT/<set>/: train.parquet and eval.parquet (one column `messages`, user then assistant, for
 MaxText's SFT pipeline; train shuffled), train-meta.parquet and eval-meta.parquet (row by row: id, kind bt/bt_context/
 replay, source, tag, prompt, the English, the context, the label, token counts, QE, chrF), template.jinja (the user
 turn as built, in Gemma 3's turn) and manifest.json; and OUT/report.json, OUT/report.md: what each bound costs, the
-counts per set, source and kind, and the tokens.
+counts per set, source and kind, and the tokens (per source too).
 """
 
 import argparse
@@ -71,10 +75,12 @@ QUERY = {"hard_fails": "empty", "source_score_min": SOURCE_MIN, "origin_score_mi
 CONTEXT_SHARE = 0.2
 REPLAY_SHARE = 0.2
 MAX_TOKENS = 2048  # the fine-tune's sequence length (design §7 point 7)
-TAG_PROMPTS = {"none": "chat-v1", "token": "chat-v1-tag-token", "instruction": "chat-v1-tag-instruction"}
+TAG_PROMPTS = {"none": "chat-v1", "token": "chat-v1-tag-token", "instruction": "chat-v1-tag-instruction",
+               "conventional": "chat-v1-tag-conventional"}
 TAG_TOKEN = "<unused0>"
 TAG_SENTENCE = "Translate into natural, original-sounding Dutch."
-REPLAY_PROMPT = "chat-v1"
+CONVENTIONAL_SENTENCE = "Translate closely, as a conventional translation."  # Yeb's wording, 10 Nov
+TAG_SENTENCES = {"instruction": TAG_SENTENCE, "conventional": CONVENTIONAL_SENTENCE}
 SEED = "en-nl-sft/0"
 MODEL = "gemma3-27b"  # its user turn; TranslateGemma 12B's is the same
 # The turn strings of Gemma 3, in MaxText's chat template: what translate.py's TurnCodec puts around the user turn
@@ -124,7 +130,7 @@ def flan_eval_ngrams(flan_eval):
     return grams
 
 
-def query_fails(pair, passage, blocked):
+def query_fails(pair, passage, blocked, qe_max=QE_MAX):
     """The parts of the query a back-translation pair fails (empty: eligible). passage is its row of the selection
     (None for a context turn, whose score is in context-turns.parquet)."""
     fails = []
@@ -135,14 +141,14 @@ def query_fails(pair, passage, blocked):
             fails.append("source_score")
         if passage["source"] == "fineweb" and (passage["origin_score"] is None or passage["origin_score"] < ORIGIN_MIN):
             fails.append("origin_score")
-    if pair["qe_en_nl"] is None or pair["qe_en_nl"] > QE_MAX:
+    if pair["qe_en_nl"] is None or pair["qe_en_nl"] > qe_max:
         fails.append("qe")
     if (sp.ngrams(pair["nl"]) | sp.ngrams(pair["en"])) & blocked:
         fails.append("eval_13gram")
     return fails
 
 
-def context_of(passage, context_pairs, turns, blocked):
+def context_of(passage, context_pairs, turns, blocked, qe_max=QE_MAX):
     """(context for user_text, turn ids): the passage's earlier turns, oldest first, cut at the nearest turn that fails
     the query (a turn with a source score below SOURCE_MIN fails too)."""
     kept = []
@@ -150,7 +156,7 @@ def context_of(passage, context_pairs, turns, blocked):
         pair, turn = context_pairs.get(turn_id), turns.get(turn_id)
         if pair is None or turn is None:
             raise SystemExit(f"{passage['pid']}: context turn {turn_id} has no pair or no row in context-turns.parquet")
-        if query_fails(pair, None, blocked) or turn["source_score"] is None or turn["source_score"] < SOURCE_MIN:
+        if query_fails(pair, None, blocked, qe_max) or turn["source_score"] is None or turn["source_score"] < SOURCE_MIN:
             break
         kept.append((turn_id, {"label": speaker_label(turn["speaker"], turn["party"]), "source": pair["en"].strip(),
                                "translation": pair["nl"].strip()}))
@@ -174,9 +180,12 @@ def bt_draw(eligible, context_ids, bt, seed):
     """The back-translation examples of a build: (chosen context examples, {source: chosen plain examples}, info).
 
     eligible: {source: [pid]} of the eligible training passages; context_ids: the pids among them that have a context
-    left. bt: 'auto' (every context example, CONTEXT_SHARE of the total) or a total."""
+    left. bt: 'auto' (every context example, CONTEXT_SHARE of the total), 'all' (every eligible passage) or a total."""
     n_ctx = len(context_ids)
-    total = round(n_ctx / CONTEXT_SHARE) if bt == "auto" else int(bt)
+    if bt == "all":
+        total = sum(len(v) for v in eligible.values())
+    else:
+        total = round(n_ctx / CONTEXT_SHARE) if bt == "auto" else int(bt)
     ctx_used = min(n_ctx, round(CONTEXT_SHARE * total))
     targets = allocate(total, {s: len(v) for s, v in eligible.items()})
     rng = random.Random(f"{seed}/context")
@@ -262,7 +271,7 @@ def candidates_bt(args, blocked, report):
             raise SystemExit(f"{r['pid']}: a pair without a passage in the selections")
         if p["split"] != r["split"]:
             raise SystemExit(f"{r['pid']}: split {r['split']} in the pairs, {p['split']} in the selection")
-        r["fails"] = query_fails(r, p, blocked)
+        r["fails"] = query_fails(r, p, blocked, args.qe_max)
         r["passage"] = p
         by_split[r["split"]] += 1
         for f in r["fails"]:
@@ -287,7 +296,7 @@ def candidates_bt(args, blocked, report):
         if r["fails"] or not r["passage"]["context_ids"]:
             continue
         ctx_stats[f"{r['split']}/marked"] += 1
-        r["context"], r["context_ids"] = context_of(r["passage"], context_pairs, turns, blocked)
+        r["context"], r["context_ids"] = context_of(r["passage"], context_pairs, turns, blocked, args.qe_max)
         dropped = len(r["passage"]["context_ids"]) - len(r["context_ids"])
         ctx_stats[f"{r['split']}/turns_dropped"] += dropped
         ctx_stats[f"{r['split']}/{'with_context' if r['context'] else 'no_turn_left'}"] += 1
@@ -357,9 +366,11 @@ def build(args, tokenizer=None):
     if counter.prompt_ids(TAG_TOKEN + "The House.").count(tag_id) != 1 or \
             tokenizer(TAG_TOKEN, add_special_tokens=False)["input_ids"] != [tag_id]:
         raise SystemExit(f"{TAG_TOKEN} is not one token of {args.tokenizer}")
-    report = {"query": QUERY, "context_share": CONTEXT_SHARE, "replay_share": REPLAY_SHARE, "max_tokens": MAX_TOKENS,
+    query = QUERY | {"qe_en_nl_max": args.qe_max}
+    replay_prompt = TAG_PROMPTS[args.replay_tag]
+    report = {"query": query, "context_share": CONTEXT_SHARE, "replay_share": REPLAY_SHARE, "max_tokens": MAX_TOKENS,
               "seed": args.seed, "bt_arg": args.bt, "sets": {}, "tag_token": {"text": TAG_TOKEN, "id": tag_id},
-              "tag_sentence": TAG_SENTENCE, "tag_prompts": TAG_PROMPTS,
+              "tag_sentences": TAG_SENTENCES, "tag_prompts": TAG_PROMPTS, "replay_tag": args.replay_tag,
               "inputs": {k: {"path": str(v), "sha256": sha256(v)} for k, v in (
                   ("pairs_main", Path(args.run) / "pairs.parquet"), ("pairs_long", Path(args.long) / "pairs.parquet"),
                   ("passages_main", Path(args.run) / "passages.parquet"),
@@ -417,7 +428,7 @@ def build(args, tokenizer=None):
     if any(with_replay for _, with_replay in sets.values()):
         pool = candidates_replay(args, blocked, report, flan_eval_ngrams(flan_eval))
         print(f"PROGRESS {len(pool)} replay candidates, counting tokens", flush=True)
-        prompts = counter.prompt_lengths([user_turn(REPLAY_PROMPT, r["en"]) for r in pool])
+        prompts = counter.prompt_lengths([user_turn(replay_prompt, r["en"]) for r in pool])
         targets = counter.target_lengths([r["nl"].strip() for r in pool])
         fitting = [r | {"tokens_prompt": p, "tokens_target": t} for r, p, t in zip(pool, prompts, targets)
                    if p + t <= MAX_TOKENS]
@@ -444,10 +455,10 @@ def build(args, tokenizer=None):
                  "tokens_target": r["tokens_target"], "qe_en_nl": r["qe_en_nl"], "chrf": r["chrf"]})
 
     def replay_example(r):
-        user = user_turn(REPLAY_PROMPT, r["en"])
+        user = user_turn(replay_prompt, r["en"])
         return ({"messages": [{"role": "user", "content": user}, {"role": "assistant", "content": r["nl"].strip()}]},
                 {"id": f"replay:{r['id']}", "kind": "replay", "source": f"flan:{r['task']}", "length_class": None,
-                 "tag": "none", "prompt": REPLAY_PROMPT, "en": r["en"].strip(), "context": [], "context_ids": [],
+                 "tag": args.replay_tag, "prompt": replay_prompt, "en": r["en"].strip(), "context": [], "context_ids": [],
                  "label": None, "tokens_prompt": r["tokens_prompt"], "tokens_target": r["tokens_target"],
                  "qe_en_nl": None, "chrf": None})
 
@@ -465,10 +476,12 @@ def build(args, tokenizer=None):
         (d / "template.jinja").write_text(TEMPLATE, encoding="utf-8")
         stats = set_stats(examples, eval_examples)
         manifest = {"set": name, "tag": tag, "replay": with_replay, "prompts": sorted({m["prompt"] for _, m in examples}),
-                    "query": QUERY, "seed": args.seed, "bt": args.bt, **stats,
+                    "replay_tag": args.replay_tag if with_replay else None, "query": query, "seed": args.seed,
+                    "bt": args.bt, **stats,
                     "files": {f.name: sha256(f) for f in sorted(d.iterdir()) if f.suffix in (".parquet", ".jinja")}}
         (d / "manifest.json").write_text(json.dumps(manifest, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
-        report["sets"][name] = {"tag": tag, "replay": with_replay, **stats}
+        report["sets"][name] = {"tag": tag, "replay": with_replay, "replay_tag": args.replay_tag if with_replay else None,
+                                **stats}
         print(f"SET {name} {json.dumps(stats['train'])}", flush=True)
     (out / "report.json").write_text(json.dumps(report, indent=1, ensure_ascii=False, default=str) + "\n",
                                      encoding="utf-8")
@@ -483,7 +496,14 @@ def set_stats(train, evals):
         tokens = sum(m["tokens_prompt"] + m["tokens_target"] for m in metas)
         loss = sum(m["tokens_target"] for m in metas)
         bt = kinds["bt"] + kinds["bt_context"]
+        by_source = collections.defaultdict(lambda: [0, 0])
+        for m in metas:
+            s = by_source[m["source"] if m["kind"] != "replay" else "replay"]
+            s[0] += m["tokens_prompt"] + m["tokens_target"]
+            s[1] += m["tokens_target"]
         return {"examples": len(metas), "kinds": dict(sorted(kinds.items())), "sources": dict(sorted(sources.items())),
+                "tokens_by_source": {k: v[0] for k, v in sorted(by_source.items())},
+                "loss_tokens_by_source": {k: v[1] for k, v in sorted(by_source.items())},
                 "long": sum(m["length_class"] == "long" for m in metas),
                 "context_share_of_bt": round(kinds["bt_context"] / bt, 4) if bt else None,
                 "replay_share": round(kinds["replay"] / len(metas), 4) if metas else None,
@@ -517,7 +537,9 @@ def report_md(report):
               f"BT: {json.dumps(report['bt'], ensure_ascii=False)}."]
     if "replay" in report:
         lines.append(f"Replay: {json.dumps(report['replay'])}.")
-    lines += ["", "## Sets", "", "| set | tag | replay | split | voorbeelden | bt | bt_context | replay | lang | "
+    lines += ["", "## Sets", "", f"Tag van de replay (`--replay-tag`): {report['replay_tag']} "
+              f"(`{report['tag_prompts'][report['replay_tag']]}`).", "",
+              "| set | tag | replay | split | voorbeelden | bt | bt_context | replay | lang | "
               "tokens | verliestokens | max |", "|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|"]
     for name, s in report["sets"].items():
         for split in ("train", "eval"):
@@ -528,6 +550,15 @@ def report_md(report):
                          f"{_n(p['long'])} | {_n(p['tokens'])} | {_n(p['loss_tokens'])} | {_n(p['max_tokens'])} |")
     lines += ["", "Bronnen per set (train): " + "; ".join(f"{n}: {json.dumps(s['train']['sources'])}"
                                                         for n, s in report["sets"].items()), ""]
+    lines += ["## Tokens per bron (train; tokens: prompt + doel, doeltokens: het Nederlands + `<end_of_turn>\\n`)", "",
+              "| set | bron | voorbeelden | tokens | doeltokens | doeltokens per voorbeeld |", "|---|---|---:|---:|---:|---:|"]
+    for name, s in report["sets"].items():
+        p = s["train"]
+        for source, n in p["sources"].items():
+            loss = p["loss_tokens_by_source"][source]
+            lines.append(f"| {name} | {source} | {_n(n)} | {_n(p['tokens_by_source'][source])} | {_n(loss)} | "
+                         f"{loss / n:.0f} |")
+    lines.append("")
     return "\n".join(lines)
 
 
@@ -573,8 +604,9 @@ def check(args):
                 raise SystemExit(f"{split} row {k} ({meta['id']}): not TranslateGemma's own prompt ids")
             if prompt.count(tag_id) != (1 if meta["tag"] == "token" else 0):
                 raise SystemExit(f"{split} row {k} ({meta['id']}): the tag token {prompt.count(tag_id)} times")
-            if user.count(TAG_SENTENCE) != (1 if meta["tag"] == "instruction" else 0):
-                raise SystemExit(f"{split} row {k} ({meta['id']}): the tag sentence {user.count(TAG_SENTENCE)} times")
+            for tag, sentence in TAG_SENTENCES.items():
+                if user.count(sentence) != (1 if meta["tag"] == tag else 0):
+                    raise SystemExit(f"{split} row {k} ({meta['id']}): the {tag} sentence {user.count(sentence)} times")
             completion = counter.target_ids(assistant)
             full = prompt + completion
             if got["inputs"].tolist() != full or got["targets"].tolist() != [pad_id] * len(prompt) + completion:
@@ -601,7 +633,10 @@ def main(argv=None):
     b.add_argument("--flan-eval", required=True, help="mainset/flan-eval/eval-rows.parquet")
     b.add_argument("--evalsets", required=True, help="eval/data/evalsets.parquet")
     b.add_argument("--tokenizer", required=True)
-    b.add_argument("--bt", default="auto", help="'auto' (every context example, CONTEXT_SHARE of the total) or a total")
+    b.add_argument("--bt", default="auto", help="'auto' (every context example, CONTEXT_SHARE of the total), 'all' "
+                   "(every eligible training passage) or a total")
+    b.add_argument("--qe-max", type=float, default=QE_MAX, help="the query's bound on MetricX-24-QE en->nl")
+    b.add_argument("--replay-tag", default="none", choices=sorted(TAG_PROMPTS), help="the tag of the replay's prompt")
     b.add_argument("--sets", nargs="+", required=True, help="NAME=TAG[+replay], TAG none, token or instruction")
     b.add_argument("--seed", default=SEED)
     b.add_argument("--out", required=True)
@@ -609,8 +644,8 @@ def main(argv=None):
     c.add_argument("--data", required=True)
     c.add_argument("--tokenizer", required=True)
     args = parser.parse_args(argv)
-    if args.command == "build" and args.bt != "auto" and not re.fullmatch(r"[1-9]\d*", args.bt):
-        parser.error("--bt is 'auto' or a positive number")
+    if args.command == "build" and args.bt not in ("auto", "all") and not re.fullmatch(r"[1-9]\d*", args.bt):
+        parser.error("--bt is 'auto', 'all' or a positive number")
     {"build": build, "check": check}[args.command](args)
 
 

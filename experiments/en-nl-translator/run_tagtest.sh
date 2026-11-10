@@ -5,6 +5,10 @@
 #   bash run_tagtest.sh setup                  every worker: linger, the SFT venv (setup_sft.sh), both tokenizers
 #   bash run_tagtest.sh build                  w3 (CPU): sft_build.py for the 27B arms and the tag test, tagtest.py
 #                                              segments, all to $S/data/ and $S/tagtest/segments/   (job sft_build_$TAG)
+#   QE_MAX=7.5 bash run_tagtest.sh build-arms  w3 (CPU): the 27B arms with the tag turned round (Yeb, 10 Nov): every
+#                                              eligible pair untagged (B), plus 20% replay with the conventional
+#                                              sentence (N); to $S/data/$ARMS (arms-v2 at 7.5, else arms-v2-qe$QE_MAX),
+#                                              refused when that has a report.json      (job sft_build_arms_$TAG)
 #   SET=arms/B bash run_tagtest.sh check       a worker (CPU): sft_build.py check of a set in the SFT venv
 #                                              (job sft_check_<set>_$TAG)
 #   ARM=token bash run_tagtest.sh train        every worker at once (one job over the 16 chips): run_sft.sh, 12B,
@@ -61,20 +65,38 @@ setup)
   [ "$free" -ge 3 ] || { echo "w$W: only $free GB free on the boot disk"; exit 1; }
   echo "READY w$W: boot disk $free GB free, /dev/shm $(df -h /dev/shm | tail -1 | awk '{print $4}') free"
   ;;
-build)
+build|build-arms)
   IN=$W_DIR/in
   mkdir -p "$IN/run" "$IN/long" "$IN/replay" "$IN/flan-eval" "$IN/eval"
-  cat > ~/job_body_build_$TAG.sh <<EOF
-set -euo pipefail
-export OMP_NUM_THREADS=8 TOKENIZERS_PARALLELISM=true
-[ -s $IN/run/pairs.parquet ] || gsutil -q cp $M/run/pairs/pairs.parquet $IN/run/
+  INPUTS="[ -s $IN/run/pairs.parquet ] || gsutil -q cp $M/run/pairs/pairs.parquet $IN/run/
 [ -s $IN/run/passages.parquet ] || gsutil -q cp $M/run/select/passages.parquet $IN/run/
 [ -s $IN/run/context-turns.parquet ] || gsutil -q cp $M/run/select/context-turns.parquet $IN/run/
 [ -s $IN/long/pairs.parquet ] || gsutil -q cp $M/run-long/pairs/pairs.parquet $IN/long/
 [ -s $IN/long/passages.parquet ] || gsutil -q cp $M/run-long/select/passages.parquet $IN/long/
 [ -s $IN/replay/pairs.parquet ] || gsutil -q cp $M/replay/pairs.parquet $IN/replay/
 [ -s $IN/flan-eval/eval-rows.parquet ] || gsutil -q cp $M/flan-eval/eval-rows.parquet $IN/flan-eval/
-[ -s $IN/eval/evalsets.parquet ] || gsutil -q cp $E/data/evalsets.parquet $IN/eval/
+[ -s $IN/eval/evalsets.parquet ] || gsutil -q cp $E/data/evalsets.parquet $IN/eval/"
+  if [ "$STAGE" = build-arms ]; then
+    QE_MAX=${QE_MAX:-7.5}
+    [ "$QE_MAX" = 7.5 ] && ARMS=${ARMS:-arms-v2} || ARMS=${ARMS:-arms-v2-qe$QE_MAX}
+    ! gsutil -q stat "$S/data/$ARMS/report.json" || { echo "$S/data/$ARMS has a report.json: a new set takes a new ARMS"; exit 1; }
+    cat > ~/job_body_build_arms_$TAG.sh <<EOF
+set -euo pipefail
+export OMP_NUM_THREADS=8 TOKENIZERS_PARALLELISM=true
+$INPUTS
+O=$W_DIR/out-$ARMS-$TAG
+[ ! -e \$O ] || { echo "\$O exists"; exit 1; }
+$PY -I -u $CODE/sft_build.py build --run $IN/run --long $IN/long --replay $IN/replay/pairs.parquet --flan-eval $IN/flan-eval/eval-rows.parquet --evalsets $IN/eval/evalsets.parquet --tokenizer /dev/shm/flan_nl/tokenizer-27b --bt all --qe-max $QE_MAX --replay-tag conventional --sets B=none N=none+replay --out \$O
+gsutil -m -q rsync -r \$O $S/data/$ARMS
+echo "BUILT: $S/data/$ARMS"
+EOF
+    detach "sft_build_arms_$TAG" bash ~/job_body_build_arms_$TAG.sh
+    exit 0
+  fi
+  cat > ~/job_body_build_$TAG.sh <<EOF
+set -euo pipefail
+export OMP_NUM_THREADS=8 TOKENIZERS_PARALLELISM=true
+$INPUTS
 common="--run $IN/run --long $IN/long --replay $IN/replay/pairs.parquet --flan-eval $IN/flan-eval/eval-rows.parquet --evalsets $IN/eval/evalsets.parquet --tokenizer /dev/shm/flan_nl/tokenizer-27b"
 O=$W_DIR/out
 [ ! -e \$O ] || { echo "\$O exists"; exit 1; }

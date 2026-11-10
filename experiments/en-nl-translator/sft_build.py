@@ -18,7 +18,9 @@ eligible when
 - MetricX-24-QE en->nl <= QE_MAX, a wide bound against outliers near p99 of the training passages; chrF and the other
   scores have no bound;
 - it shares no 13-gram of words with an evaluation set (WMT24++, FLORES-200, NTREX-128, Europarl-direct: source and
-  reference) or with FLAN's evaluation rows;
+  reference). FLAN's evaluation rows are kept out of the replay by their segments (as the design has it), not by
+  13-grams: their templates' fixed sentences recur in a quarter of the replay (131,273 of 521,329 pairs shared a
+  13-gram with them, 10 Nov), so a 13-gram block would take whole tasks out; the report counts that overlap;
 - the whole example fits MAX_TOKENS in every prompt of the build.
 The split is the selection's (per document): train pairs train, eval pairs eval.
 
@@ -34,7 +36,7 @@ for word; a context example gets chat-v1 with its earlier turns. The tag of a se
 back-translation examples (TAG_PROMPTS): none, the unused token <unused0> before the text, or one sentence in the
 instruction. The FLAN-nl replay (a set with +replay: arm N) is REPLAY_SHARE of the set's examples, untagged, in chat-v1
 without context; it is drawn from the replay pairs that are none of FLAN's evaluation rows' segments and share no
-13-gram with the evaluation texts.
+13-gram with an evaluation set.
 
 build writes per set OUT/<set>/: train.parquet and eval.parquet (one column `messages`, user then assistant, for
 MaxText's SFT pipeline; train shuffled), train-meta.parquet and eval-meta.parquet (row by row: id, kind bt/bt_context/
@@ -106,15 +108,20 @@ def sha256(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-def blocked_ngrams(evalsets, flan_eval):
-    """The 13-grams of the evaluation texts no training example may share: source and reference of every evaluation
-    set, the inputs and targets of FLAN's evaluation rows."""
+def blocked_ngrams(evalsets):
+    """The 13-grams no training example may share: source and reference of every evaluation set."""
     blocked = set()
     for r in evalsets:
         blocked |= sp.ngrams(r["source"] or "") | sp.ngrams(r["reference"] or "")
-    for r in flan_eval:
-        blocked |= sp.ngrams(r["inputs"] or "") | sp.ngrams(r["targets"] or "")
     return blocked
+
+
+def flan_eval_ngrams(flan_eval):
+    """The 13-grams of FLAN's evaluation rows (inputs and targets): counted in the replay, not blocked."""
+    grams = set()
+    for r in flan_eval:
+        grams |= sp.ngrams(r["inputs"] or "") | sp.ngrams(r["targets"] or "")
+    return grams
 
 
 def query_fails(pair, passage, blocked):
@@ -288,7 +295,7 @@ def candidates_bt(args, blocked, report):
     return rows
 
 
-def candidates_replay(args, blocked, report):
+def candidates_replay(args, blocked, report, flan_grams=frozenset()):
     import pyarrow.parquet as pq
 
     replay = pq.read_table(args.replay, columns=["id", "task", "en", "nl", "tokens_en", "tokens_nl"]).to_pylist()
@@ -303,9 +310,12 @@ def candidates_replay(args, blocked, report):
         if r["id"] in eval_segments:
             stats["eval_segment"] += 1
             continue
-        if (sp.ngrams(r["nl"]) | sp.ngrams(r["en"])) & blocked:
+        grams = sp.ngrams(r["nl"]) | sp.ngrams(r["en"])
+        if grams & blocked:
             stats["eval_13gram"] += 1
             continue
+        if grams & flan_grams:
+            stats["kept_sharing_a_13gram_with_flan_eval_rows"] += 1
         out.append(r)
     report["replay"] = {"pairs": len(replay), "dropped": dict(stats), "candidates": len(out)}
     return out
@@ -359,7 +369,7 @@ def build(args, tokenizer=None):
                   ("flan_eval", Path(args.flan_eval)), ("evalsets", Path(args.evalsets)))}}
     evalsets = pq.read_table(args.evalsets, columns=["source", "reference"]).to_pylist()
     flan_eval = pq.read_table(args.flan_eval, columns=["inputs", "targets"]).to_pylist()
-    blocked = blocked_ngrams(evalsets, flan_eval)
+    blocked = blocked_ngrams(evalsets)
     report["blocked_13grams"] = len(blocked)
     print(f"PROGRESS {len(blocked)} blocked 13-grams", flush=True)
     rows = candidates_bt(args, blocked, report)
@@ -406,7 +416,7 @@ def build(args, tokenizer=None):
     n_replay = round(info["bt_total"] * REPLAY_SHARE / (1 - REPLAY_SHARE))
     replay = []
     if any(with_replay for _, with_replay in sets.values()):
-        pool = candidates_replay(args, blocked, report)
+        pool = candidates_replay(args, blocked, report, flan_eval_ngrams(flan_eval))
         print(f"PROGRESS {len(pool)} replay candidates, counting tokens", flush=True)
         prompts = counter.prompt_lengths([user_turn(REPLAY_PROMPT, r["en"]) for r in pool])
         targets = counter.target_lengths([r["nl"].strip() for r in pool])
@@ -492,7 +502,7 @@ def report_md(report):
     lines = ["# Trainingsdata van de fine-tune (sft_build.py)", "",
              f"Query: {json.dumps(report['query'], ensure_ascii=False)}; contextaandeel {report['context_share']}, "
              f"replay-aandeel {report['replay_share']} (arm N), hoogstens {report['max_tokens']} tokens per voorbeeld; "
-             f"seed `{report['seed']}`, `--bt {report['bt']}`. Geblokkeerde 13-grammen van de evaluatieteksten: "
+             f"seed `{report['seed']}`, `--bt {report['bt']}`. Geblokkeerde 13-grammen van de evaluatiesets: "
              f"{_n(report['blocked_13grams'])}.", "",
              "## Wat elke grens kost (passages; `first_failed`: de eerste grens die een paar niet haalt, in de volgorde "
              "hard_fails, bronscore, herkomst, QE, 13-gram; `alone`: alle paren die die grens niet halen)", "",

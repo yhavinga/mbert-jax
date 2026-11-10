@@ -161,6 +161,9 @@ def write(path, rows):
     pq.write_table(pa.Table.from_pylist(rows), path)
 
 
+FLAN_TEMPLATE = "In this task you are given a question and you must answer it with one word only please"
+
+
 def tables(tmp_path, tag_text=False):
     """A main run of 40 Handelingen and 20 FineWeb-2 passages (10 Handelingen with two context turns), a long run of
     10 raad passages, 4 eval passages, a replay of 100 pairs, two FLAN eval rows and one evaluation set."""
@@ -191,10 +194,11 @@ def tables(tmp_path, tag_text=False):
     write(long / "passages.parquet", [passage(f"raad:d{i}:0:0", source="raad") for i in range(10)])
     blocked = "the quick brown fox jumps over the lazy dog near the river bank today again"
     write(tmp_path / "replay.parquet",
-          [{"id": i, "task": "flan/t", "en": blocked if i == 1 else f"Question {i}: what is it?",
+          [{"id": i, "task": "flan/t", "en": blocked if i == 1 else FLAN_TEMPLATE if i == 3 else f"Question {i}: what is it?",
             "nl": f"Vraag {i}: wat is het?", "tokens_en": 6, "tokens_nl": 6} for i in range(100)])
     write(tmp_path / "eval-rows.parquet", [{"set": "classifier", "host": 0, "position": 1, "source": "flan/t",
-                                            "instruction_tokens": 60, "inputs": "Eval input.", "targets": "x",
+                                            "instruction_tokens": 60, "inputs": FLAN_TEMPLATE + " Eval input.",
+                                            "targets": "x",
                                             "segments": [0, 2]}])
     write(tmp_path / "evalsets.parquet", [{"id": "w1", "set": "wmt24pp", "source": blocked, "reference": "Ref.",
                                            "tokens": 14, "over_512": False, "length_class": "tiny", "meta": "{}"}])
@@ -245,6 +249,9 @@ def test_a_build_end_to_end(tmp_path, monkeypatch):
         assert (out / name / "template.jinja").read_text() == sb.TEMPLATE
     report = (out / "report.json").read_text()
     assert '"bt_total": 40' in report and (out / "report.md").exists()
+    # FLAN's evaluation rows keep the replay out by their segments; a template they share is counted, not blocked
+    assert '"kept_sharing_a_13gram_with_flan_eval_rows": 1' in report and '"eval_13gram": 1' in report
+    assert '"candidates": 97' in report
     # the same seed, the same sets
     first = (out / "N-token" / "train.parquet").read_bytes()
     sb.build(args, tokenizer=CharTokenizer())

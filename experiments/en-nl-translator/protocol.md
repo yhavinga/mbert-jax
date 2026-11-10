@@ -1,9 +1,10 @@
-# Protocol (concept): fine-tune van de en→nl-vertaler, armen N en B op TranslateGemma 27B
+# Protocol: fine-tune van de en→nl-vertaler, armen N en B op TranslateGemma 27B
 
-Status: **concept**, 10 nov 2026, geschreven door een subagent voor de hoofdsessie en Yeb. Bijgewerkt 10 nov
-~10:30 met Yebs besluiten van ~09:00 en ~09:20 (§1, §2, §4, §5, §8). Nog niet vastgelegd: twee punten wachten op
-Yebs oordeel over voorbeelden (§8 punt 1 en 2). Nog niets op 27B gestart. Vast te leggen vóór de fine-tune (ontwerp §4: "vóór de fine-tune vast te leggen in
-`protocol.md`"). Branch `en-nl-sft` van `github.com/yhavinga/mbert-jax`.
+Status: **vastgelegd 10 nov 2026**, vóór de eerste trainingsstap op 27B (ontwerp §4: "vóór de fine-tune vast te leggen
+in `protocol.md`"), met Yebs akkoord van 10 nov ~10:15 (§8). Geschreven door subagents voor de hoofdsessie en Yeb;
+bijgewerkt 10 nov ~10:30 met Yebs besluiten van ~09:00 en ~09:20, en bij het vastleggen met de besluiten van ~10:15 en de
+aanvulling van de hoofdsessie bij §4.2.2 (in-domein). Wat na het vastleggen verandert, staat als gedateerd amendement in
+§9. Branch `en-nl-sft` van `github.com/yhavinga/mbert-jax`.
 
 Bronnen: hammond `mbert/designs/en-nl-translator.md` (hierna "ontwerp"), §3 stap 3, §4, §7 punt 6–8 en §9;
 hammond `mbert/LEARNINGS.md`, de vertaler-items; `experiments/en-nl-translator/HANDOVER.md` (smoke-test, hoofdrun,
@@ -12,7 +13,8 @@ aanvullende run); `mbert-ops/HANDOVER-baseline.md` en `mbert-ops/translator-eval
 Labels: **[besluit]** = besluit van Yeb (met datum); **[ontwerp]** = staat zo in het ontwerp; **[gemeten]** = op
 10 nov gemeten op de data (`sft_build.py`, rapport in `gs://t5-dutch-english-usc2/mbert/translator/sft/data/arms-v2/report.md`;
 de sets van vóór de besluiten van 10 nov in `…/sft/data/arms/report.md`);
-**[keuze]** = keuze van dit concept, door Yeb te bevestigen; **[open]** = beslist Yeb (§8).
+**[keuze]** = keuze van dit protocol (technisch, door de subagent die het schreef); **[aanvulling]** = toegevoegd door de
+hoofdsessie vóór de training.
 
 `R=gs://t5-dutch-english-usc2/mbert/translator`, `S=$R/sft`, `E=$R/eval`.
 
@@ -51,7 +53,7 @@ Een BT-paar (passage) komt in aanmerking als:
 2. de bron door de selectie kwam: Gemma-bronscore ≥ 0,5, bij FineWeb-2 ook herkomst ≥ 0,5. Dat geldt al voor elke
    passage in de selectie; de query controleert het en het kost 0 paren [gemeten];
 3. MetricX-24-QE en→nl ≤ **7,5**: een ruime grens tegen uitschieters, net boven p99 (7,416) van de trainpassages die
-   door de harde controles komen [keuze; voorlopig aangehouden, besluit 10 nov ~09:00; open, §8 punt 2]; geen grens op
+   door de harde controles komen [besluit 10 nov ~10:15: de grens blijft 7,5, tegen uitschieters]; geen grens op
    chrF en geen Gemma-paarscore, geen zinnen- of getallenfilter [besluit 9 nov]. De grens is een parameter
    (`sft_build.py --qe-max`): een andere grens geeft met één commando een nieuwe, gecontroleerde set,
    `QE_MAX=<x> bash mbert-ops/scripts/translator_sft_arms.sh` → `$S/data/arms-v2-qe<x>/` (startregel in de kop van
@@ -203,7 +205,8 @@ vergelijkt de id's met `translate.py`'s prompt.
   compileren; samen ~16,5 uur. Bij 32.768 tokenplaatsen per stap is dat bij volledig gevulde sequenties ~3.330
   (B) en ~3.870 (N) stappen. Bij 2.048 per sequentie niet gemeten. Eerst een korte run (`STEPS=8`) om geheugen en
   tempo bij 2.048 te meten [keuze].
-- Uitvoer: `$S/arms/runs/<naam>/` (`adapter.npz`, `adapter.json`, `summary.json`, logs).
+- Uitvoer: `$S/arms/runs/<naam>/` (`adapter.npz`, `adapter.json`, `summary.json`, logs); de adapter van elke arm
+  daarna ook in `$S/arms/B/` en `$S/arms/N/` (`adapter.npz`, `adapter.json`, `summary.json`).
 
 ## 4. Evaluatie
 
@@ -226,6 +229,11 @@ eigen `B` per arm), op dezelfde sets en met dezelfde code als het uitgangspunt:
   in de kernels (`--lora`). Beide armen met TranslateGemma's eigen prompt, zonder instructiezin (geen `PROMPT`)
   [besluit 10 nov ~09:00, §2.4].
 - Ook geteld: niet af, `decode_loop`, Engels over, leeg (zoals het uitgangspunt: daar alle 0).
+- **N met de instructiezin, als controle van de modus** [besluit 10 nov ~10:15, keuze van de hoofdsessie bij het
+  vroegere open punt 5 van §8]: arm N vertaalt ook mét "Translate closely, as a conventional translation." (preset `chat-v1-tag-conventional`)
+  de WMT24++-bron (998, de 960 apart) en de 1.000 FLAN-evaluatierijen van §4.2.1. Gerapporteerd naast N zonder zin
+  (MetricX-24 ref en QE en COMET-22 op WMT24++, het aandeel "origineel" van §4.2.1, PLL en MTLD van §4.2.3); het
+  beslist niet mee.
 
 ### 4.2 Natuurlijkheid (beslist, regel (b) en (c))
 
@@ -238,6 +246,14 @@ eigen `B` per arm), op dezelfde sets en met dezelfde code als het uitgangspunt:
      in het Nederlands van TranslateGemma 27B). 90/10 gesplitst per passage (de twee versies van een passage aan
      dezelfde kant). Keuze van de 2.000: de eval-passages zonder context, geordend op sha256 van `pid` met
      `en-nl-sft/classifier`, de eerste 2.000 [keuze].
+   - Uitvoering [keuze, vastgelegd vóór de training]: de eval-passages zonder context zijn de rijen van soort `bt`
+     in `$S/data/arms-v2/B/eval-meta.parquet`; hun `pid`, `nl` en `back` komen uit de pairs-tabellen (`run` en
+     `run-long`); volgorde op `sha256("en-nl-sft/classifier/" + pid)`, oplopend; de eerste 1.800 trainen, de laatste
+     200 testen (400 teksten). Label 1 = origineel (`nl`), 0 = vertaald (`back`). De lus en het model van
+     `scripts/dumb/finetune.py` (branch `dumb-extra`: `create_model_and_state`, AdamW met constante LR en weight decay
+     0,01, `collate_fn`), 8 per chip × 4 chips = 32 per update, opvullen tot een veelvoud van 128 (zoals dumb-extra);
+     geen validatieset en geen keuze van een "beste" epoch: de toestand na 3 epochs wordt getest en gebruikt. De
+     nauwkeurigheid telt alle 400 testteksten. "Origineel" = softmax-kans van label 1 ≥ 0,5.
    - Voorwaarde: nauwkeurigheid op de 10% ≥ 0,75 [besluit 10 nov ~09:00]; anders meldt het verslag dat (b) niet te
      meten is, en beslist Yeb.
    - Meting: het aandeel van de uitvoer dat de classifier "origineel" noemt (kans ≥ 0,5), op de vertalingen van de
@@ -245,11 +261,25 @@ eigen `B` per arm), op dezelfde sets en met dezelfde code als het uitgangspunt:
      `$R/mainset/flan-eval/eval-rows.parquet`), samen genomen; per set gerapporteerd.
    - Voorbehoud [ontwerp]: de classifier leert de stijl van dit basismodel herkennen; een arm kan daaraan
      ontsnappen zonder natuurlijker te worden. Daarom ook 3 en 4.
-2. **In-domein**: de volgende 2.000 eval-passages in dezelfde volgorde (dus niet die van de classifier), Engels →
-   arm, met het originele Nederlands als referentie: MetricX-24 ref, COMET-22, chrF. Gerapporteerd [ontwerp §4.1:
-   "de 2.000 achtergehouden GPT-NL-paren"].
+2. **In-domein** [aanvulling hoofdsessie, 10 nov, vóór de training; ontwerp §4, natuurlijkheid punt 1]: de hele
+   eval-split van de sets, **4.519 passages** (`$S/data/arms-v2/B/eval-meta.parquet`, uit andere documenten dan de
+   training): het synthetische Engels (`en`) als invoer, het Nederlandse origineel als referentie. Vertaald door het
+   basismodel en door elke arm, met TranslateGemma's eigen prompt en zonder context (ook bij de 296 passages die in de
+   set een context hebben) [keuze]. Het basismodel vertaalt opnieuw, in dezelfde keten als de armen [keuze: de kolom
+   `back` van de pairs-tabellen is ook een vertaling door het basismodel, maar uit de hoofdrun, met andere
+   lengteklassen en bij contextbeurten met context]. Maten: MetricX-24 met referentie en QE, COMET-22 en chrF
+   (sacrebleu, per passage en over het geheel) tegen het origineel, **per bron** (Handelingen, raad, dpc, rechtspraak,
+   FineWeb-2) en samen. Een natuurlijkheidsmaat naast Europarl-direct; beslist niet mee. Dit vervangt "de volgende
+   2.000 eval-passages" van het concept. De 2.000 passages van de classifier (1) zitten erin; de classifier wordt op
+   deze uitvoer niet toegepast, dus dat raakt (b) niet.
 3. **PLL en MTLD**: pseudo-log-likelihood onder S @ 653k (de PLL-word-l2r van BLiMP-NL in `dumb-extra`) per
    vertaling, en MTLD (woordenschatvariatie), op dezelfde uitvoer als 1. Gerapporteerd.
+   - Uitvoering [keuze, vastgelegd vóór de training]: PLL met de code van `scripts/eval_blimp_nl.py` (branch
+     `dumb-extra`: woorden zoals daar, `<s>`/`</s>` niet gescoord, float32, kop 0); per vertaling de som en de som
+     gedeeld door het aantal tokens; vertalingen boven 1.022 tokens van S vallen weg en worden geteld. MTLD naar McCarthy
+     en Jarvis (2010): woorden = `\w+` in kleine letters, drempel 0,72, het gemiddelde van de voorwaartse en de
+     achterwaartse richting, per set over de aaneengesloten uitvoer in de volgorde van de id's (voor elk model
+     dezelfde volgorde).
 4. **Blinde beoordeling** [ontwerp §4.4, besluit 9 nov: 100 passages; besluit 10 nov ~09:20: een Claude-subagent
    beoordeelt, twijfelgevallen gaan naar Yeb; regel (c)].
    - **De 100 passages**, gekozen vóór de fine-tune op 10 nov met `blind.py` en vastgelegd in
@@ -277,7 +307,9 @@ eigen `B` per arm), op dezelfde sets en met dezelfde code als het uitgangspunt:
    - **Wie beoordeelt** [besluit 10 nov ~09:20]: per arm een verse Claude-subagent (zonder andere context dan de
      rubriek hieronder en de passages). Per passage krijgt hij alleen de Engelse bron en twee vertalingen, als A en B:
      die van het basismodel en die van de arm, in een volgorde die per passage met een vaste seed is gehusseld (seed
-     `en-nl-sft/blind/ab/<arm>/<blind_id>`). Hij weet niet welke vertaling van welk model is; de sleutel staat apart
+     `en-nl-sft/blind/ab/<arm>/<blind_id>`: `random.Random(seed).random() < 0,5` → A is het basismodel, anders de
+     arm [keuze]). Het basismodel en de armen vertalen de 100 passages in de keten van de evaluatie, met
+     TranslateGemma's eigen prompt. Hij weet niet welke vertaling van welk model is; de sleutel staat apart
      in de bucket (`$S/blind/<arm>/key.jsonl`), zijn invoer in `$S/blind/<arm>/judge-input.jsonl`.
    - **Rubriek** (letterlijk zo aan de beoordelaar gegeven; vastgelegd vóór de fine-tune):
 
@@ -323,8 +355,9 @@ Per arm X ∈ {N, B}, tegen het basismodel TranslateGemma 27B (`$E/baseline-tg27
 - **(a) betekenis**: voor elk van WMT24++ (de 960 zonder `is_bad_source` [besluit 10 nov ~09:00]), FLORES-200 en
   NTREX-128 geldt gemiddelde MetricX-24-QE(X) − gemiddelde MetricX-24-QE(basis) ≤ 0,20, over alle segmenten van de
   set (onafgeronde gemiddelden). Grenzen: WMT24++ 1,547 + 0,20 = 1,747, FLORES 0,822 + 0,20 = 1,022, NTREX
-  1,082 + 0,20 = 1,282 (afgerond weergegeven). De drempel 0,20 is nog open [§8 punt 1; voorbeelden in
-  `mbert-ops/translator-sft/examples-qe-rule.md`].
+  1,082 + 0,20 = 1,282 (afgerond weergegeven). De drempel 0,20 blijft [besluit 10 nov ~10:15, na de voorbeelden in
+  `mbert-ops/translator-sft/examples-qe-rule.md`]. Het uitgangspunt per set wordt uit de scores per segment
+  (`$E/baseline-tg27b/scores.parquet`) berekend, niet uit de afgeronde waarden van `summary.json` [keuze].
 - **(b) natuurlijkheid volgens de classifier**: aandeel "origineel"(X) − aandeel "origineel"(basis) ≥ 0,10, op de
   samengenomen uitvoer van WMT24++ (960) en de 1.000 FLAN-rijen (§4.2.1).
 - **(c) blinde beoordeling** [besluit 10 nov ~09:20]: na vervanging van de twijfelgevallen door Yebs oordeel
@@ -397,14 +430,12 @@ die met de instructie, dan de vertalingen en MetricX. De uitslag komt in
 ## 7. Stappen na akkoord
 
 1. Yeb beslist de open punten (§8); daarna wordt dit protocol vastgelegd (commit, datum) vóór de eerste stap op 27B.
-   Kiest Yeb een andere QE-grens, dan eerst de set opnieuw (§2.1 punt 3, één commando), §2.5 bijwerken, en de
-   13-gramcontrole van de blinde passages tegen de nieuwe set herhalen (`run_blind.sh select`, zie
-   `mbert-ops/HANDOVER-sft.md`); bij een treffer verandert de keuze, met dezelfde seeds.
+   **Gedaan**: vastgelegd 10 nov (Yebs akkoord ~10:15); de QE-grens blijft 7,5, dus de sets `arms-v2` blijven.
 2. De 100 blinde passages: vastgelegd op 10 nov (§4.2.4).
 3. De classifier trainen en zijn nauwkeurigheid melden (§4.2.1); de uitvoer van het basismodel op de 1.000
    FLAN-rijen, het in-domeindeel en de blinde passages maken.
-4. Per arm: korte run (`STEPS=8`), dan de volledige epoch, dan de evaluatie van §4. Commando's in
-   `mbert-ops/HANDOVER-sft.md`.
+4. Per arm: korte run (`STEPS=8`, één keer, op de set van B), dan de volledige epoch, dan de evaluatie van §4.
+   Keten: `mbert-ops/scripts/translator_sft_arms_run.sh`; commando's en stand in `mbert-ops/HANDOVER-sft.md`.
 5. Verslag per arm met de regel van §5.
 
 ## 8. Besluiten en open punten
@@ -417,24 +448,31 @@ die met de instructie, dan de vertalingen en MetricX. De uitslag komt in
 - Alle BT-paren die door de query komen: 225.242 train, 6,8% met context; de replay in N blijft 20% van het totaal
   (§2.2, §2.3).
 - De classifier op S @ 653k met nauwkeurigheid ≥ 0,75 (§4.2.1); als N en B allebei helpen, wordt het B (§5); de
-  27B-armen op mbert-mix. Gestart wordt pas na punt 1 en 2 hieronder.
+  27B-armen op mbert-mix.
 
 **Beslist door Yeb, 10 nov ~09:20:** de blinde beoordeling doet een verse Claude-subagent met een vaste rubriek;
 twijfelgevallen gaan naar Yeb, wiens oordeel dat van de beoordelaar vervangt; regel (c) zoals in §5; met het
 voorbehoud over de stijlvoorkeur van een taalmodel (§4.2.4).
 
-**Open:**
+**Beslist door Yeb, 10 nov ~10:15 (akkoord om te starten):**
 
-1. **De drempel 0,20 van regel (a).** Yeb wil eerst voorbeelden zien: `mbert-ops/translator-sft/examples-qe-rule.md`
-   (de tagproef op 12B: basis tegen de adapter met de instructiezin, per segment het QE-verschil, 4 voorbeelden per
-   klasse rond +0,2, +0,5, +1, +2 en −0,5, met MetricX met referentie en COMET-22).
-2. **De grens QE ≤ 7,5 in de trainingsdata** (voorlopig aangehouden). Voorbeelden en kosten:
-   `mbert-ops/translator-sft/examples-qe-cutoff.md`. Een andere grens is één commando (§2.1 punt 3).
-3. **De 30 idioompassages**: gekozen zoals voorgesteld (§4.2.4); Yeb ziet ze pas bij de twijfelgevallen van de
-   beoordeling. Bezwaar tegen de bron of de keuzeregel: vóór de fine-tune melden.
-4. **Sequentielengte 2.048** met 1 sequentie per chip: niet gemeten op 27B; de korte run meet het. Bij
-   geheugengebrek terug naar 1.024 en de langste voorbeelden (context) weglaten?
-5. **N met de instructiezin** vertalen: niet in de beslisregel; alleen rapporteren (+~1 uur evaluatie op mbert-mix)
-   of niet meten? Dit concept: niet meten.
-6. **Rekentijd**: met alle paren B ~7,5 uur en N ~8,8 uur training (schatting, §3) plus ~1 uur evaluatie per arm, op
-   mbert-mix; mbert-corpus blijft bij de eindrun.
+1. De drempel 0,20 van regel (a) blijft: een arm mag op WMT24++ (960), FLORES en NTREX met MetricX-QE gemiddeld
+   hoogstens 0,2 slechter zijn dan het uitgangspunt (§5).
+2. De grens MetricX-QE ≤ 7,5 in de trainingsdata blijft, tegen uitschieters (§2.1).
+3. ~19 uur rekentijd op mbert-mix voor beide armen met training en evaluatie is akkoord; mbert-corpus blijft bij de
+   eindrun.
+4. N wordt ook mét de instructiezin vertaald en gerapporteerd, als controle van de modus; het beslist niet mee
+   (§4.1). Keuze van de hoofdsessie bij het vroegere open punt 5.
+
+**Aanvulling van de hoofdsessie, 10 nov, vóór de training:** het in-domeindeel is de hele eval-split (4.519
+passages), met het basismodel ernaast, gescoord met MetricX-24 (ref en QE), COMET-22 en chrF, per bron (§4.2.2).
+
+**Ter kennisname, zonder bezwaar vóór het vastleggen:** de 30 idioompassages (§4.2.4).
+
+**Nog te meten, niet te beslissen:** de sequentielengte van 2.048 met 1 sequentie per chip op 27B. De korte run
+meet geheugen en staptijd; past het niet, dan kiest de subagent de kleinste wijziging die past (bijvoorbeeld 1.024
+voor de voorbeelden zonder context, of remat) en legt die vast als amendement in §9, vóór de volledige epoch.
+
+## 9. Amendementen na het vastleggen
+
+Geen (stand bij het vastleggen, 10 nov).

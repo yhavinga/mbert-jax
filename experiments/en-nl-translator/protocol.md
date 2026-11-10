@@ -475,4 +475,14 @@ voor de voorbeelden zonder context, of remat) en legt die vast als amendement in
 
 ## 9. Amendementen na het vastleggen
 
-Geen (stand bij het vastleggen, 10 nov).
+Geen amendement (stand 10 nov ~10:50).
+
+**Meting, 10 nov ~10:50: de korte run past, de instellingen van §3 blijven.** Run `arm27b_v2_B_s8` (8 stappen, set B,
+`per_device_batch_size=1 max_target_length=2048`, `remat_policy` full zoals MaxText's standaard, multi-host over de 16
+chips van mbert-mix; code `e8979e1`, `sft_lora.py` en `run_sft.sh` gelijk aan `c7c600e`) [gemeten, `summary.json` in
+`$S/arms/runs/arm27b_v2_B_s8/`]:
+- piekgeheugen 21,23 GiB per chip op alle 16 (grens 30,75 GiB);
+- staptijd mediaan 7,11 s, gemiddeld 7,53 s over stap 2–8; 3.982 tokens/s over de 16 chips (de smoke-test bij
+  2 × 1.024: 4.018); ~29.900 van de 32.768 tokenplaatsen per stap gevuld;
+- `EPOCH`: batches per proces [3.638, 3.625, 3.649, 3.629], `step_limit` 3.588: de volledige epoch van B wordt
+  3.588 stappen, ~7,1–7,5 uur, plus ~12 min tellen, ~2 min laden en ~6 min compileren.

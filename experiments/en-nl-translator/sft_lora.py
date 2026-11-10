@@ -50,6 +50,22 @@ def adapter_arrays(lora_pure):
     return flat, dtypes
 
 
+def local_nonzero(array):
+    """The non-zero entries of this process's part of a (global) array, read from its addressable shards on the host.
+    A jnp operation on a global array is one program over all processes; in the epoch count the processes see different
+    numbers of batches, so such programs run out of step (10 Nov: "an unexpected peer shows up in the launch group").
+    A shard held twice (a replicated axis) counts once."""
+    import numpy as np
+
+    seen, total = set(), 0
+    for shard in array.addressable_shards:
+        key = tuple((s.start, s.stop, s.step) for s in shard.index)
+        if key not in seen:
+            seen.add(key)
+            total += int(np.count_nonzero(np.asarray(shard.data)))
+    return total
+
+
 def throughput(records, tokens, loss_tokens):
     """Steady-state rates from per-step end times: the first step carries the compilation, so the rates run from the
     end of step 1 to the end of the last; compile_s is step 1's time minus the median of the others."""
@@ -119,8 +135,8 @@ def main(argv=None):
             while True:
                 batch = next(iterator)
                 count["batches"] += 1
-                count["tokens"] += int(jnp.sum(batch["inputs_segmentation"] != 0))
-                count["loss_tokens"] += int(jnp.sum(batch["targets_segmentation"] != 0))
+                count["tokens"] += local_nonzero(batch["inputs_segmentation"])
+                count["loss_tokens"] += local_nonzero(batch["targets_segmentation"])
         except Exception as end:  # noqa: BLE001 - the pipeline's way to say the data ran out, checked below
             text = f"{type(end).__name__}: {end}"
             if not isinstance(end, StopIteration) and "Run out of shards" not in text:
@@ -129,8 +145,9 @@ def main(argv=None):
         del iterator
         steps = count["batches"]
         if jax.process_count() > 1:
-            # Each process counts the batches of its own shard of the data; they can differ by a few, and a process
-            # whose data run out first would stop while the others wait in a collective: all take the smallest count
+            # Each process counts the batches of its own shard of the data (tokens: its own part); they can differ by
+            # a few, and a process whose data run out first would stop while the others wait in a collective: all take
+            # the smallest count, in one collective once every process is done counting
             from jax.experimental import multihost_utils
 
             counts = multihost_utils.process_allgather(np.array([count["batches"]], np.int64))

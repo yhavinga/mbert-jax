@@ -148,3 +148,17 @@ def test_smoke_report_marks_identical_and_unfinished_outputs():
     assert "**LoRA arm N, met tag** (gelijk aan het basismodel)" in text
     assert "**LoRA arm N, zonder tag** (niet afgelopen, gelijk aan het basismodel)" in text
     assert "**Nederlands origineel (de doeltekst van de pilot)**\n\n> Drie." in text
+
+
+def test_local_nonzero_counts_each_shard_once_on_the_host():
+    import types
+
+    import numpy as np
+
+    from sft_lora import local_nonzero
+
+    a, b = np.array([[1, 1, 0, 0]]), np.array([[2, 0, 0, 0]])
+    shard = lambda data, row: types.SimpleNamespace(data=data, index=(slice(row, row + 1), slice(None)))  # noqa: E731
+    # rows 0 and 1 of the batch, row 0 also held by a second device (a replicated axis)
+    array = types.SimpleNamespace(addressable_shards=[shard(a, 0), shard(b, 1), shard(a, 0)])
+    assert local_nonzero(array) == 3

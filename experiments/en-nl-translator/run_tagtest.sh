@@ -125,6 +125,11 @@ translate)
   if [ -n "$ARM" ]; then
     A=$W_DIR/adapters/tag12b_${ARM}_mh
     mkdir -p "$A"
+    # run_sft.sh copies the adapter to the bucket after its log's EXIT line: give that copy up to 2 minutes
+    for _ in $(seq 1 24); do
+      gsutil -q stat "$T/runs/tag12b_${ARM}_mh/adapter.npz" && gsutil -q stat "$T/runs/tag12b_${ARM}_mh/adapter.json" && break
+      sleep 5
+    done
     gsutil -q cp "$T/runs/tag12b_${ARM}_mh/adapter.npz" "$T/runs/tag12b_${ARM}_mh/adapter.json" "$A/"
     EXTRA="$EXTRA --lora $A"
   fi

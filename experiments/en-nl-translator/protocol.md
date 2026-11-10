@@ -268,7 +268,10 @@ Doel: kiezen tussen de twee vormen van de tag (§2.4), omdat `<BT> ` als platte 
   afgemaakt; Engels over; MetricX-24-QE.
 - Uitslag: `mbert-ops/translator-sft/tag-test.md` en `$S/tagtest/report/`.
 
-‹TAGTEST›
+**Stand bij het schrijven** (10 nov ~05:55 CET): de adapter met het token traint (431 stappen van 3,6 s; verlies
+2,16 bij stap 6, 1,71 bij stap 19), daarna die met de instructie, dan de vertalingen en MetricX. De uitslag komt in
+`mbert-ops/translator-sft/tag-test.md` (automatisch, met tabel en 10 voorbeelden per adapter) en
+`$S/tagtest/report/`; de keuze van de vorm hoort daarna hier, als besluit van Yeb.
 
 ## 7. Stappen na akkoord
 

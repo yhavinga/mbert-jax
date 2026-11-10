@@ -178,6 +178,14 @@ class ModelPrompts:
             self.with_context.check(*(list(x) for x in zip(*with_context)))
 
 
+def with_prompt(model, name):
+    """The model with prompt `name` instead of its own (none: unchanged); a prompt with a context template also takes
+    the segments with context."""
+    if not name:
+        return model
+    return dict(model, prompt=name, context_prompt=name if "context" in PROMPTS[name] else model.get("context_prompt"))
+
+
 def vm_region():
     """The region of this VM (europe-west4 for a zone europe-west4-a), from the metadata server."""
     request = urllib.request.Request("http://metadata.google.internal/computeMetadata/v1/instance/zone",
@@ -566,13 +574,17 @@ def main(argv=None):
     parser.add_argument("--target-lang", default="nl", choices=sorted(LANGUAGES), help="Language to translate into")
     parser.add_argument("--work-dir", default="/dev/shm/flan_nl",
                         help="Local directory for the shards before upload and MaxText's output (default: FLAN-nl's)")
+    parser.add_argument("--prompt", default=None, choices=sorted(PROMPTS),
+                        help="A prompt of translate_models.yml instead of the model's own; with a context template it "
+                             "also serves the segments with context (the fine-tune's tag: chat-v1-tag-token, "
+                             "chat-v1-tag-instruction)")
     parser.add_argument("--lora", default=None,
                         help="Local directory of a LoRA adapter of experiments/en-nl-translator/sft_lora.py "
                              "(adapter.npz, adapter.json), merged into the checkpoint's kernels after loading")
     args = parser.parse_args(argv)
     if args.source_lang == args.target_lang:
         parser.error(f"--source-lang and --target-lang are both {args.source_lang}")
-    model = MODELS[args.model]
+    model = with_prompt(MODELS[args.model], args.prompt)
     classes = model["length_classes"]
     if args.length_class not in classes:
         parser.error(f"--length-class {args.length_class} is not a class of {args.model}: {', '.join(classes)}")
@@ -618,7 +630,7 @@ def main(argv=None):
     probe = texts[:3] + texts[-3:]
     codec.check(probe, [context_of[i] for i in ids[:3] + ids[-3:]] if context_of else None,
                 [label_of[i] for i in ids[:3] + ids[-3:]] if label_of else None)
-    print(f"MAXTEXT {json.dumps({'model': args.model, 'ckpt': args.ckpt, **maxtext_source(), 'patches': patch_maxtext()})}", flush=True)
+    print(f"MAXTEXT {json.dumps({'model': args.model, 'prompt': model['prompt'], 'context_prompt': model.get('context_prompt'), 'lora': args.lora, 'ckpt': args.ckpt, **maxtext_source(), 'patches': patch_maxtext()})}", flush=True)
     started = time.time()
     engine, params = make_engine(args, shapes, chips)
     if args.lora:

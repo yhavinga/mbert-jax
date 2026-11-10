@@ -1,12 +1,15 @@
 #!/bin/bash
 # On a worker of mbert-corpus: sft_lora.py (MaxText train_sft with LoRA) detached from ssh, either as a TPU of the
 # worker's own 4 chips (default) or, with MULTIHOST=1 started on all four workers at once, as one job over the 16 chips.
-#   NAME=sft12b_N MODEL=12b [STEPS=auto] DATA=/dev/shm/translator/smoke-lora/data/train-N.parquet bash run_sft.sh [key=value ...]
+#   NAME=sft12b_N MODEL=12b [STEPS=auto] DATA=/dev/shm/translator/smoke-lora/data/train-N.parquet [ROOT=gs://...]
+#     [TEMPLATE=<chat template>] bash run_sft.sh [key=value ...]
 # The key=value arguments are MaxText overrides after this script's own (later ones win). Log: ~/logs/$NAME.log, a fresh
 # file per start that ends in "EXIT <code>"; the log and, from worker 0, the run's summary and adapter go to
 # $ROOT/runs/$NAME/.
 set -euo pipefail
-ROOT=gs://t5-dutch-english-usc2/mbert/translator/smoke-lora
+# ROOT: where the run's log, summary and adapter go (the smoke test's place by default; the fine-tune's arms and tag
+# test: gs://t5-dutch-english-usc2/mbert/translator/sft). The venv, the runs and the compilation cache stay in SHM.
+ROOT=${ROOT:-gs://t5-dutch-english-usc2/mbert/translator/smoke-lora}
 SHM=/dev/shm/translator/smoke-lora
 PY=$SHM/venv/bin/python
 CODE=$(cd "$(dirname "$0")" && pwd)
@@ -17,12 +20,13 @@ DATA=${DATA:?the training parquet}
 MULTIHOST=${MULTIHOST:-0}
 STEPS=${STEPS:-auto}  # auto: one epoch, counted by sft_lora.py
 case $MODEL in
-  12b) CKPT=$ROOT/translategemma-12b-maxtext ;;
+  12b) CKPT=gs://t5-dutch-english-usc2/mbert/translator/smoke-lora/translategemma-12b-maxtext ;;
   27b) CKPT=gs://t5-dutch-english-usc2/mbert/flan-nl/translategemma-27b-maxtext ;;
   *) echo "MODEL is 12b or 27b, not $MODEL"; exit 1 ;;
 esac
 TOK=/dev/shm/flan_nl/tokenizer-$MODEL
-TEMPLATE=$SHM/data/translategemma_en_nl.jinja
+# sft_data.py's template (the smoke test) or sft_build.py's (template.jinja: the user turn as built, in Gemma 3's turn)
+TEMPLATE=${TEMPLATE:-$SHM/data/translategemma_en_nl.jinja}
 OUT=$SHM/runs/$NAME
 
 [ -x "$PY" ] || { echo "$(hostname): no $PY (setup_sft.sh)"; exit 1; }

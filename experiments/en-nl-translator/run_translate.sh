@@ -7,12 +7,19 @@
 #     bash run_translate.sh
 # {w} in SEGMENTS and OUT is this worker's number. Log: ~/logs/$NAME.log, a fresh file per start that ends in
 # "EXIT <code>"; a copy goes to $LOGS (default $ROOT/pilot/logs/). Shards land in $OUT/<class>/; a second start skips every shard there.
+# MODEL (27b, or 12b) and CKPT choose the model; EXTRA goes to translate.py (e.g. --prompt NAME --lora DIR).
 set -euo pipefail
 ROOT=gs://t5-dutch-english-usc2/mbert/translator
-CKPT=gs://t5-dutch-english-usc2/mbert/flan-nl/translategemma-27b-maxtext
+# MODEL 12b: the smoke test's conversion (the fine-tune's tag test); CKPT overrides either
+MODEL=${MODEL:-27b}
+case $MODEL in
+  27b) CKPT=${CKPT:-gs://t5-dutch-english-usc2/mbert/flan-nl/translategemma-27b-maxtext} ;;
+  12b) CKPT=${CKPT:-gs://t5-dutch-english-usc2/mbert/translator/smoke-lora/translategemma-12b-maxtext} ;;
+  *) echo "MODEL is 27b or 12b, not $MODEL"; exit 1 ;;
+esac
 SHM=/dev/shm/translator
 PY=/dev/shm/flan_nl/venv/bin/python
-TOK=/dev/shm/flan_nl/tokenizer-27b
+TOK=/dev/shm/flan_nl/tokenizer-$MODEL
 CODE=$(cd "$(dirname "$0")" && pwd)
 WORKER=$(hostname | sed 's/.*-w-//')
 SOURCE=${SOURCE:?nl or en}
@@ -51,7 +58,7 @@ timeout 600 $PY -c "import jax; assert (jax.device_count(), jax.process_count())
 echo "\$(date +%H:%M:%S) $(hostname): $SOURCE -> $TARGET, $SEGMENTS -> $OUT with $CKPT"
 for class in $CLASSES; do
   $PY -u $CODE/translate.py --segments $local_segments --out $OUT/\$class --ckpt $CKPT/0/items \
-    --tokenizer $TOK --model gemma3-27b --length-class \$class --source-lang $SOURCE --target-lang $TARGET \
+    --tokenizer $TOK --model gemma3-$MODEL --length-class \$class --source-lang $SOURCE --target-lang $TARGET \
     --work-dir $SHM $EXTRA || exit \$?
 done
 EOF

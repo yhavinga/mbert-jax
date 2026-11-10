@@ -284,3 +284,19 @@ def test_real_gemma4_prompt_matches_its_chat_template():
     tok = AutoTokenizer.from_pretrained(str(GEMMA4_TOKENIZER))
     prompts = tr.ModelPrompts(tok, tr.MODELS["gemma4-31b"])
     prompts.check(["The House agrees with the motion.", "Two lines\nof text."], [None, CONTEXT], [None, "Gebruiker"])
+
+
+@pytest.mark.parametrize("name", ["chat-v1-tag-token", "chat-v1-tag-instruction"])
+def test_a_tag_prompt_replaces_both_prompts_of_translategemma(name):
+    model = tr.with_prompt(tr.MODELS["gemma3-12b"], name)
+    assert model["prompt"] == model["context_prompt"] == name and tr.with_prompt(model, None) is model
+    assert tr.MODELS["gemma3-12b"]["prompt"] == "translategemma"
+    prompts = tr.ModelPrompts(TranslateGemmaTokenizer(), model)
+    tagged = "".join(map(chr, prompts.encode("The House agrees.")))
+    plain = "".join(map(chr, tr.ModelPrompts(TranslateGemmaTokenizer(), tr.MODELS["gemma3-12b"]).encode(
+        "The House agrees.")))
+    if name == "chat-v1-tag-token":
+        assert tagged == plain.replace("\n\n\nThe House", "\n\n\n<unused0>The House")
+    else:
+        assert tagged == plain.replace("commentary. ", "commentary. Translate into natural, original-sounding Dutch. ")
+    assert "<unused0>" in "".join(map(chr, prompts.encode("x", CONTEXT))) or name != "chat-v1-tag-token"

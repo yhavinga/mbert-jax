@@ -7,8 +7,11 @@
 #                                              segments, all to $S/data/ and $S/tagtest/segments/   (job sft_build_$TAG)
 #   SET=arms/B bash run_tagtest.sh check       a worker (CPU): sft_build.py check of a set in the SFT venv
 #                                              (job sft_check_<set>_$TAG)
-#   ARM=token bash run_tagtest.sh train        a worker (its TPU): run_sft.sh, 12B, one epoch of tagtest-$ARM
-#                                              (run tag12b_$ARM, log ~/logs/tag12b_$ARM.log)
+#   ARM=token bash run_tagtest.sh train        every worker at once (one job over the 16 chips): run_sft.sh, 12B,
+#                                              one epoch of tagtest-$ARM (run tag12b_${ARM}_mh, log
+#                                              ~/logs/tag12b_${ARM}_mh.log). On one worker 12B with a sequence of
+#                                              2,048 per chip needs 38.5 GB of HLO temporaries (10 Nov), over 16
+#                                              chips the smoke test's 12B took 9.65 GiB: the arms' layout on 27B
 #   VARIANT=token_tag bash run_tagtest.sh translate   a worker (its TPU): run_translate.sh, 12B, the 600 segments
 #                                              (log ~/logs/tagtr_${VARIANT}_$TAG.log)
 #   bash run_tagtest.sh score                  a worker (its TPU): tagtest.py collect, MetricX-24-QE, report, to
@@ -104,8 +107,8 @@ train)
   mkdir -p "$D"
   gsutil -m -q rsync -r "$S/data/tagtest/tagtest-$ARM" "$D"
   # One epoch at the smoke test's LoRA settings (run_sft.sh); sequences of 2048 (design §7 point 7), one per chip
-  NAME=tag12b_$ARM MODEL=12b DATA=$D/train.parquet TEMPLATE=$D/template.jinja ROOT=$T bash "$CODE/run_sft.sh" \
-    per_device_batch_size=1 max_target_length=2048
+  MULTIHOST=1 NAME=tag12b_${ARM}_mh MODEL=12b DATA=$D/train.parquet TEMPLATE=$D/template.jinja ROOT=$T \
+    bash "$CODE/run_sft.sh" per_device_batch_size=1 max_target_length=2048
   ;;
 translate)
   VARIANT=${VARIANT:?base, token_tag, token_plain, instruction_tag or instruction_plain}
@@ -120,9 +123,9 @@ translate)
   esac
   EXTRA=${PROMPT:+--prompt $PROMPT}
   if [ -n "$ARM" ]; then
-    A=$W_DIR/adapters/tag12b_$ARM
+    A=$W_DIR/adapters/tag12b_${ARM}_mh
     mkdir -p "$A"
-    gsutil -q cp "$T/runs/tag12b_$ARM/adapter.npz" "$T/runs/tag12b_$ARM/adapter.json" "$A/"
+    gsutil -q cp "$T/runs/tag12b_${ARM}_mh/adapter.npz" "$T/runs/tag12b_${ARM}_mh/adapter.json" "$A/"
     EXTRA="$EXTRA --lora $A"
   fi
   MODEL=12b SOURCE=en TARGET=nl SEGMENTS="$T/segments/segments.parquet" OUT="$T/translations/$VARIANT" \

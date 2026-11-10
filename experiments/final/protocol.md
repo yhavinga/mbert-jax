@@ -282,4 +282,13 @@ bevoordeelt 15%-masking en CulturaX.
 
 ## Amendementen
 
-(geen)
+1. **10 nov 2026, ~14:45 CET, vóór elke evaluatie van de eindrun** (hoofdsessie; voorstel van de bouwer van
+   `final_eval.sh`): uitvoering en paden van de evaluatie vastgelegd, geen wijziging van een toets of drempel.
+   - Uitslagen van de extra evals: `gs://t5-dutch-english-usc2/mbert/final/dumb-extra/<taak>/<naam>--<taak>--seed{42,43,44}.json`;
+     BLiMP-NL `gs://t5-dutch-english-usc2/mbert/final/blimp-nl/<naam>.json`; namen als bij de primaire evals.
+   - Alle drie de armen (S opnieuw, T1, T2) op mbert-mix (v4-32, per worker een TPU van 4 chips), met code `ae11478`
+     (branch `dumb-extra`; `finetune.py` byte voor byte die van `final-run`), venv `~/mbert-dumb/.venv` (`vm.lock`,
+     JAX 0.11.0). DBRD@1024 als 12 per chip × 4 chips × 4 accumulatie (update 192), opgevuld tot een veelvoud van
+     128; SICK-NL 64 × 4 × 1 zonder opvullen; een vaste verdeling van de jobs over de workers, gelijk voor de drie armen.
+   - Keten `mbert-ops/scripts/final_eval.sh` met het deel per worker `experiments/final/eval_final.sh` (`f510292`) en
+     de beslisregel in `experiments/final/decide.py` (`8954a5c`).

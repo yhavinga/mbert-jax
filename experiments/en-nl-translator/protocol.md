@@ -277,6 +277,31 @@ die met de instructie, dan de vertalingen en MetricX. De uitslag komt in
 `mbert-ops/translator-sft/tag-test.md` (automatisch, met tabel en 10 voorbeelden per adapter) en
 `$S/tagtest/report/`; de keuze van de vorm hoort daarna hier, als besluit van Yeb.
 
+**Uitslag** (10 nov 08:18, nagelezen door de hoofdsessie; 600 vertalingen per variant):
+
+| variant | tag letterlijk | inleiding | langer / korter | lus | QE WMT24++ gem. | QE alles gem. |
+|---|---:|---:|---:|---:|---:|---:|
+| basis 12B | 0 | 0 | 0 / 0 | 0 | 1,715 | 2,089 |
+| token, met tag | 0 | 0 | 3 / 6 | 0 | 1,925 | 2,208 |
+| token, zonder tag | 0 | 0 | 0 / 3 | 0 | 1,830 | 2,107 |
+| instructie, met tag | 0 | 0 | 0 / 3 | 0 | 1,923 | 2,156 |
+| instructie, zonder tag | 0 | 0 | 0 / 4 | 0 | 1,847 | 2,131 |
+
+- Geen van beide vormen lekt: geen tag of instructie in de uitvoer, geen inleidingen, geen lussen. Het lekken van
+  `<BT> ` in de smoke-test was dus de platte-tekstvorm.
+- Nagelezen gevallen:
+  - De FLAN-rij `flan:0-1173495` staat bij elke variant als "korter", omdat het basismodel daar een lange lijst
+    verzon. Daar zijn de varianten juist beter.
+  - De variant token met tag liet twee keer een @-vermelding weg ("@user33 wow!" → "Wauw!"), liet "hehehe" weg, en
+    maakte van "Finding an alternative shortly…" "Zoek een alternatief...". Dat is betekenisverlies op korte
+    sociale-mediazinnen.
+  - De variant instructie met tag maakte "And this is why" korter tot "En daarom."; verder niets.
+- MetricX-QE op WMT24++ ligt met tag bij beide vormen ~0,21 boven het basismodel, precies de drempel van regel (a).
+  Een vrijere, natuurlijkere vertaling scoort op QE vermoedelijk slechter (§4), maar dit is wel een waarschuwing
+  voor de armen.
+- **Voorstel (hoofdsessie): de instructiezin.** Hij geeft minder afwijkingen (3 tegen 9), laat geen @-vermeldingen
+  weg en heeft een iets betere QE over alles (2,156 tegen 2,208). Het besluit is aan Yeb.
+
 ## 7. Stappen na akkoord
 
 1. Yeb beslist de open punten (§8); daarna wordt dit protocol vastgelegd (commit, datum) vóór de eerste stap op 27B.

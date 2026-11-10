@@ -10,16 +10,18 @@ evaluation rows of set `yeb`, 35 WMT24++ segments and 30 passages with an Englis
 
 idioms: the multiword English lemmas of kaikki.org's extract of the English Wiktionary that Wiktionary marks as an idiom
 (a sense tagged idiomatic, or the category "English idioms"); per idiom whether Wiktionary also gives it a literal
-sense (a sense tagged literally, or the gloss "Used other than figuratively or idiomatically: ..."), which select
-leaves out: there a passage may use the words literally.
+sense (a sense tagged literally, or the gloss "Used other than figuratively or idiomatically: ...") or any sense not
+marked idiomatic or figurative ("free lunch": a meal that costs nothing). select leaves both out: there a passage may
+use the words literally.
 gv-fetch: the English posts of Global Voices (globalvoices.org, CC BY 3.0) in a date range, from its WordPress API.
 candidates: per post its own paragraphs (not quotes, captions or embeds; not a post that says it was published
 elsewhere first or republished under a partnership: its licence may differ) of PASSAGE_WORDS words, and the idioms in
 each, matched on lemma (spaCy en_core_web_sm): each word of the idiom by its form or lemma, a placeholder of the
 idiom (one's, oneself, someone, something) by a possessive, a reflexive or a short gap.
-select: RULE (below) for the idioms that may count; then, in an order fixed by IDIOM_SEED, the first passage of a post
-not chosen yet with an idiom not chosen yet, sharing no 13-gram with the training sets (--train) and whose page names
-its author and the CC BY 3.0 licence, until N_IDIOM; N_WMT WMT24++ segments without is_bad_source and outside the tag
+select: rule_ok (below) for the idioms that may count; the idioms in an order fixed by IDIOM_SEED (each idiom once, so
+that common phrases do not crowd the choice), and per idiom, in an order fixed by IDIOM_SEED/<idiom>, the first
+passage of a post not chosen yet that shares no 13-gram with the training sets (--train) and whose page names its
+author and the CC BY 3.0 licence, until N_IDIOM; N_WMT WMT24++ segments without is_bad_source and outside the tag
 test's 300 (their translations are shown in examples-qe-rule.md), drawn with WMT_SEED; FLAN's 35 rows of set yeb.
 --exclude leaves passages out by pid (a literal use found by reading), so that the choice stays one command.
 """
@@ -96,11 +98,14 @@ def build_idioms(lines):
             continue
         literal = any("literally" in t for t in tags) or any(
             LITERAL_GLOSS.match(g) for s in senses for g in s.get("glosses", []) or [])
+        plain = any(not (t & {"idiomatic", "figuratively"} or "English idioms" in categories_of(s))
+                    for s, t in zip(senses, tags))
         gloss = next((g for s in idiom_senses or senses for g in s.get("glosses", []) or []
                       if not LITERAL_GLOSS.match(g)), "")
-        got = found.setdefault(word, {"idiom": word, "pos": [], "literal": False, "gloss": gloss})
+        got = found.setdefault(word, {"idiom": word, "pos": [], "literal": False, "plain_sense": False, "gloss": gloss})
         got["pos"] = sorted(set(got["pos"]) | {e.get("pos")})
         got["literal"] = got["literal"] or literal
+        got["plain_sense"] = got["plain_sense"] or plain
         got["gloss"] = got["gloss"] or gloss
     return found
 
@@ -111,7 +116,9 @@ def idioms(args):
     with open(args.out, "w", encoding="utf-8") as f:
         for word in sorted(found):
             f.write(json.dumps(found[word], ensure_ascii=False) + "\n")
-    print(json.dumps({"idioms": len(found), "literal": sum(v["literal"] for v in found.values())}))
+    print(json.dumps({"idioms": len(found), "literal": sum(v["literal"] for v in found.values()),
+                      "plain_sense": sum(v["plain_sense"] for v in found.values()),
+                      "idiomatic_only": sum(not v["literal"] and not v["plain_sense"] for v in found.values())}))
 
 
 # ---------------------------------------------------------------- Global Voices
@@ -291,7 +298,8 @@ def candidates(args):
         if slots is None:
             stats["no_word"] += 1
             continue
-        meta[e["idiom"]] = {"literal": e["literal"], "rule": rule_ok(slots), "gloss": e["gloss"], "pos": e["pos"]}
+        meta[e["idiom"]] = {"literal": e["literal"] or e["plain_sense"], "rule": rule_ok(slots), "gloss": e["gloss"],
+                            "pos": e["pos"]}
         patterns.append((e["idiom"], slots))
     stats["patterns"] = len(patterns)
     stats["patterns_rule"] = sum(m["rule"] for m in meta.values())
@@ -382,8 +390,7 @@ def select(args):
     excluded = set(args.exclude or [])
     for p in cands:
         p["countable"] = sorted({h["idiom"] for h in p["idioms"] if h["rule"] and not h["literal"]})
-    pool = sorted((p for p in cands if p["countable"]), key=lambda p: (p["post_id"], p["paragraph"]))
-    random.Random(IDIOM_SEED).shuffle(pool)
+    pool = sorted((p for p in cands if p["countable"]), key=lambda p: p["pid"])
     # WMT24++: outside the tag test's segments (shown with translations in examples-qe-rule.md)
     tagtest = {r["id"] for r in pq.read_table(args.tagtest_items, columns=["id"]).to_pylist()}
     wmt_all = [r for r in pq.read_table(args.evalsets).to_pylist()
@@ -400,32 +407,42 @@ def select(args):
     texts |= {f"flan:{r['host']}-{r['position']}": [r["inputs"]] for r in flan}
     overlap, scanned = train_overlap(texts, args.train)
     log = collections.Counter()
-    chosen, posts, used = [], set(), set()
+    by_idiom = collections.defaultdict(list)
     for p in pool:
+        for i in p["countable"]:
+            by_idiom[i].append(p)
+    order = sorted(by_idiom)
+    random.Random(IDIOM_SEED).shuffle(order)
+    chosen, posts = [], set()
+    for idiom in order:
         if len(chosen) == N_IDIOM:
             break
-        if p["post_id"] in posts:
-            log["same_post"] += 1
+        if any(idiom in {h["idiom"] for h in c["expressions"]} for c in chosen):
+            log["idiom_in_a_chosen_passage"] += 1
             continue
-        new = [i for i in p["countable"] if i not in used]
-        if not new:
-            log["idiom_taken"] += 1
-            continue
-        if p["pid"] in excluded:
-            log["excluded"] += 1
-            continue
-        if overlap[p["pid"]]:
-            log["train_13gram"] += 1
-            continue
-        author, licensed = page_facts(p["link"])
-        time.sleep(1)
-        if not author or not licensed:
-            log["page_without_author_or_licence"] += 1
-            continue
-        hits = [h for h in p["idioms"] if h["idiom"] in new]
-        chosen.append(p | {"author": author, "licence": "CC BY 3.0", "expressions": hits})
-        posts.add(p["post_id"])
-        used |= {h["idiom"] for h in hits}
+        options = sorted(by_idiom[idiom], key=lambda p: p["pid"])
+        random.Random(f"{IDIOM_SEED}/{idiom}").shuffle(options)
+        for p in options:
+            if p["post_id"] in posts:
+                log["same_post"] += 1
+                continue
+            if p["pid"] in excluded:
+                log["excluded"] += 1
+                continue
+            if overlap[p["pid"]]:
+                log["train_13gram"] += 1
+                continue
+            author, licensed = page_facts(p["link"])
+            time.sleep(1)
+            if not author or not licensed:
+                log["page_without_author_or_licence"] += 1
+                continue
+            hits = [h for h in sorted(p["idioms"], key=lambda h: h["idiom"] != idiom) if h["idiom"] in p["countable"]]
+            chosen.append(p | {"author": author, "licence": "CC BY 3.0", "expressions": hits, "drawn": idiom})
+            posts.add(p["post_id"])
+            break
+        else:
+            log["idiom_without_a_usable_passage"] += 1
     if len(chosen) != N_IDIOM:
         raise SystemExit(f"only {len(chosen)} idiom passages: {dict(log)}")
     wmt_overlap = {r["id"]: overlap[r["id"]] for r in wmt if overlap[r["id"]]}
@@ -436,6 +453,7 @@ def select(args):
     idiom_rows = [{"id": p["pid"], "set": "idiom", "source": p["text"],
                    "meta": {"url": p["link"], "author": p["author"], "licence": "CC BY 3.0",
                             "title": p["title"], "date": p["date"], "paragraph": p["paragraph"], "words": p["words"],
+                            "drawn": p["drawn"],
                             "expressions": [{"idiom": h["idiom"], "span": h["span"], "gloss": h["gloss"]}
                                             for h in p["expressions"]]}} for p in chosen]
     rows = [{"id": f"flan:{r['host']}-{r['position']}", "set": "flan", "source": r["inputs"].strip(),
@@ -447,7 +465,8 @@ def select(args):
         r["blind_id"] = f"blind-{k:03d}"
     write_jsonl(out / "idiom30.jsonl", [r for r in rows if r["set"] == "idiom"])
     write_jsonl(out / "blind100.jsonl", rows)
-    report = {"pool": len(pool), "candidates": len(cands), "skipped": dict(log), "excluded": sorted(excluded),
+    report = {"pool": len(pool), "idioms_in_pool": len(by_idiom), "candidates": len(cands), "skipped": dict(log),
+              "excluded": sorted(excluded),
               "train_examples_scanned": scanned, "train": args.train,
               "train_13gram_overlap": {"idiom_chosen": sum(overlap[p["pid"]] > 0 for p in chosen),
                                        "wmt": len(wmt_overlap),
@@ -487,7 +506,8 @@ def blind_md(report, stats, manifest, rows, args):
         "van de selectie): Engelse lemma's van twee of meer woorden met een betekenis die Wiktionary `idiomatic` noemt "
         "of in de categorie \"English idioms\" zet.",
         f"- Weggelaten (letterlijk gebruik waar mogelijk uitsluiten): elke uitdrukking waarvoor Wiktionary ook een "
-        "letterlijke betekenis geeft (tag `literally` of de glosse \"Used other than figuratively or idiomatically\"); "
+        "letterlijke betekenis geeft (tag `literally` of de glosse \"Used other than figuratively or idiomatically\"), "
+        "of een betekenis die niet als idioom of figuurlijk is gemarkeerd (\"free lunch\": een gratis maaltijd); "
         "en grammaticale vaste verbindingen (regel: minstens twee inhoudswoorden, of drie of meer delen met minstens één "
         f"inhoudswoord; zo vallen \"of course\" en \"as well as\" af). Patronen: {stats.get('patterns')}, waarvan "
         f"{stats.get('patterns_rule')} volgens de regel, {stats.get('patterns_rule_not_literal')} daarvan zonder "
@@ -499,9 +519,11 @@ def blind_md(report, stats, manifest, rows, args):
         "embed, lijst of notitie in cursief; Engels; eindigt op een leesteken). Alinea's: "
         f"{stats.get('paragraphs')}; passages: {stats.get('passages')}; met een uitdrukking: "
         f"{stats.get('passages_with_idiom')}; met een uitdrukking die telt: {stats.get('passages_with_countable_idiom')}.",
-        f"- Keuze: de passages met een uitdrukking die telt, in een volgorde vastgelegd met seed `{IDIOM_SEED}`; de "
-        "eerste passage uit een artikel dat nog niet gekozen is en met een uitdrukking die nog niet gekozen is, die "
-        "geen 13-gram deelt met de trainingsdata en waarvan de pagina auteur en licentie noemt, tot 30. Overgeslagen: "
+        f"- Keuze: eerst de uitdrukking, dan de passage, zodat alledaagse verbindingen (\"in the world\") de keuze niet "
+        f"vullen. De {report['idioms_in_pool']} uitdrukkingen die tellen en in een passage voorkomen, in een volgorde "
+        f"vastgelegd met seed `{IDIOM_SEED}`; per uitdrukking de passages in een volgorde met seed "
+        f"`{IDIOM_SEED}/<uitdrukking>`, en daarvan de eerste uit een artikel dat nog niet gekozen is, die geen 13-gram "
+        "deelt met de trainingsdata en waarvan de pagina auteur en licentie noemt; tot 30. Overgeslagen: "
         + ", ".join(f"{k} {v}" for k, v in n.items()) + ".",
         f"- Met de hand uitgesloten (letterlijk gebruik, gelezen door de subagent die koos): "
         f"{', '.join(report['excluded']) or 'geen'}.", "",
@@ -520,7 +542,8 @@ def blind_md(report, stats, manifest, rows, args):
         "<details><summary>De 30 passages (niet lezen vóór de beoordeling)</summary>", ""]
     for r in idiom_rows:
         m = r["meta"]
-        expr = "; ".join(f"\"{e['idiom']}\" (in de tekst: \"{e['span']}\")" for e in m["expressions"])
+        expr = "; ".join(f"\"{e['idiom']}\" (in de tekst: \"{e['span']}\"; Wiktionary: {e['gloss']})"
+                         for e in m["expressions"])
         lines += [f"### {r['blind_id']}: {r['id']}", "", f"- URL: {m['url']}", f"- Auteur: {m['author']} (CC BY 3.0)",
                   f"- Uitdrukking: {expr}", "", "> " + r["source"], ""]
     lines += ["</details>", ""]

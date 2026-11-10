@@ -46,10 +46,15 @@ def test_the_idiom_list_marks_a_literal_sense():
         entry("red car", [("A car that is red.", [])]),
         entry("old hat", [("Old-fashioned.", ["idiomatic", "obsolete"])]),
         entry("ice", [("Frozen water.", ["idiomatic"])]),
+        entry("free lunch", [("A meal that costs nothing.", []), ("Something for nothing.", ["idiomatic"])]),
     ])
-    assert sorted(found) == ["break the ice", "on the ropes", "spill the beans"]
+    assert sorted(found) == ["break the ice", "free lunch", "on the ropes", "spill the beans"]
     assert found["break the ice"]["literal"] and not found["spill the beans"]["literal"]
     assert found["break the ice"]["gloss"] == "To start a conversation."
+    # a sense not marked idiomatic or figurative: the words may be meant literally
+    assert found["free lunch"]["plain_sense"] and not found["free lunch"]["literal"]
+    assert not found["spill the beans"]["plain_sense"]
+    assert found["on the ropes"]["plain_sense"]  # only the entry is in the category, its sense is not marked
 
 
 def test_patterns_and_the_rule():

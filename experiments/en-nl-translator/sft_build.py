@@ -206,6 +206,19 @@ class TokenCounter:
     def target_ids(self, nl):
         return self.tokenizer(nl + "<end_of_turn>\n", add_special_tokens=False)["input_ids"]
 
+    # A fast tokenizer encodes a batch in parallel; one string at a time costs ~1 ms (10 Nov), too slow for ~1M texts
+    def prompt_lengths(self, users, batch=4096):
+        return self._lengths([self.turn["prefix"] + u + self.turn["suffix"] for u in users], batch)
+
+    def target_lengths(self, nls, batch=4096):
+        return self._lengths([nl + "<end_of_turn>\n" for nl in nls], batch)
+
+    def _lengths(self, texts, batch):
+        out = []
+        for k in range(0, len(texts), batch):
+            out += [len(ids) for ids in self.tokenizer(texts[k:k + batch], add_special_tokens=False)["input_ids"]]
+        return out
+
 
 def candidates_bt(args, blocked, report):
     """The back-translation pairs of both runs with what the query says of them; the context examples' contexts."""
@@ -348,23 +361,32 @@ def build(args, tokenizer=None):
     flan_eval = pq.read_table(args.flan_eval, columns=["inputs", "targets"]).to_pylist()
     blocked = blocked_ngrams(evalsets, flan_eval)
     report["blocked_13grams"] = len(blocked)
+    print(f"PROGRESS {len(blocked)} blocked 13-grams", flush=True)
     rows = candidates_bt(args, blocked, report)
 
     # Tokens in every prompt the build uses: an example joins only when it fits MAX_TOKENS in all of them, so that the
     # arms keep the same pairs
     too_long = collections.Counter()
     eligible = [r for r in rows if not r["fails"]]
+
+    def longest_prompt(part):
+        lengths = [counter.prompt_lengths([user_turn(TAG_PROMPTS[t], r["en"], r["context"], r["label"]) for r in part])
+                   for t in tags]
+        return [max(x) for x in zip(*lengths)]
+
+    print(f"PROGRESS {len(eligible)} eligible pairs, counting tokens", flush=True)
+    for r, n in zip(eligible, counter.target_lengths([r["nl"].strip() for r in eligible])):
+        r["tokens_target"] = n
+    for r, n in zip(eligible, longest_prompt(eligible)):
+        r["fits"] = n + r["tokens_target"] <= MAX_TOKENS
+    # a context that makes an example too long goes; the passage stays, as a plain example
+    shortened = [r for r in eligible if not r["fits"] and r["context"]]
+    for r in shortened:
+        too_long[f"{r['split']}/context_too_long"] += 1
+        r["context"], r["context_ids"] = [], []
+    for r, n in zip(shortened, longest_prompt(shortened)):
+        r["fits"] = n + r["tokens_target"] <= MAX_TOKENS
     for r in eligible:
-        r["tokens_target"] = len(counter.target_ids(r["nl"].strip()))
-        r["tokens_prompt"] = {t: len(counter.prompt_ids(user_turn(TAG_PROMPTS[t], r["en"], r["context"], r["label"])))
-                              for t in tags}
-        r["fits"] = max(r["tokens_prompt"].values()) + r["tokens_target"] <= MAX_TOKENS
-        if not r["fits"] and r["context"]:
-            # the context is what makes it long: the passage stays, as a plain example
-            too_long[f"{r['split']}/context_too_long"] += 1
-            r["context"], r["context_ids"] = [], []
-            r["tokens_prompt"] = {t: len(counter.prompt_ids(user_turn(TAG_PROMPTS[t], r["en"]))) for t in tags}
-            r["fits"] = max(r["tokens_prompt"].values()) + r["tokens_target"] <= MAX_TOKENS
         if not r["fits"]:
             too_long[f"{r['split']}/too_long"] += 1
     report["too_long"] = dict(too_long)
@@ -385,27 +407,31 @@ def build(args, tokenizer=None):
     replay = []
     if any(with_replay for _, with_replay in sets.values()):
         pool = candidates_replay(args, blocked, report)
-        fitting = []
-        for r in pool:
-            prompt = len(counter.prompt_ids(user_turn(REPLAY_PROMPT, r["en"])))
-            target = len(counter.target_ids(r["nl"].strip()))
-            if prompt + target <= MAX_TOKENS:
-                fitting.append(r | {"tokens_prompt": prompt, "tokens_target": target})
+        print(f"PROGRESS {len(pool)} replay candidates, counting tokens", flush=True)
+        prompts = counter.prompt_lengths([user_turn(REPLAY_PROMPT, r["en"]) for r in pool])
+        targets = counter.target_lengths([r["nl"].strip() for r in pool])
+        fitting = [r | {"tokens_prompt": p, "tokens_target": t} for r, p, t in zip(pool, prompts, targets)
+                   if p + t <= MAX_TOKENS]
         report["replay"]["fitting"] = len(fitting)
         if n_replay > len(fitting):
             raise SystemExit(f"{n_replay} replay pairs wanted, {len(fitting)} candidates")
         replay = random.Random(f"{args.seed}/replay").sample(fitting, n_replay)
         report["replay"]["drawn"] = n_replay
 
-    def bt_example(r, tag, with_context):
+    def bt_examples(part, tag, with_context):
+        users = [user_turn(TAG_PROMPTS[tag], r["en"], r["context"] if c else [], r["label"])
+                 for r, c in zip(part, with_context)]
+        return [bt_example(r, tag, c, u, n)
+                for r, c, u, n in zip(part, with_context, users, counter.prompt_lengths(users))]
+
+    def bt_example(r, tag, with_context, user, tokens_prompt):
         context = r["context"] if with_context else []
         prompt = TAG_PROMPTS[tag]
-        user = user_turn(prompt, r["en"], context, r["label"])
         return ({"messages": [{"role": "user", "content": user}, {"role": "assistant", "content": r["nl"].strip()}]},
                 {"id": r["id"], "kind": "bt_context" if context else "bt", "source": r["source"],
                  "length_class": r["length_class"], "tag": tag, "prompt": prompt, "en": r["en"].strip(),
                  "context": context, "context_ids": r["context_ids"] if context else [],
-                 "label": r["label"] if context else None, "tokens_prompt": len(counter.prompt_ids(user)),
+                 "label": r["label"] if context else None, "tokens_prompt": tokens_prompt,
                  "tokens_target": r["tokens_target"], "qe_en_nl": r["qe_en_nl"], "chrf": r["chrf"]})
 
     def replay_example(r):
@@ -419,11 +445,11 @@ def build(args, tokenizer=None):
     for name, (tag, with_replay) in sets.items():
         d = out / name
         d.mkdir(parents=True, exist_ok=True)
-        examples = [bt_example(r, tag, r["pid"] in ctx_set) for r in bt_rows]
+        examples = bt_examples(bt_rows, tag, [r["pid"] in ctx_set for r in bt_rows])
         if with_replay:
             examples += [replay_example(r) for r in replay]
         random.Random(f"{args.seed}/shuffle").shuffle(examples)
-        eval_examples = [bt_example(r, tag, bool(r["context"])) for r in evals]
+        eval_examples = bt_examples(evals, tag, [bool(r["context"]) for r in evals])
         for split, part in (("train", examples), ("eval", eval_examples)):
             pq.write_table(pa.table({"messages": [m["messages"] for m, _ in part]}), d / f"{split}.parquet")
             pq.write_table(pa.Table.from_pylist([meta for _, meta in part]), d / f"{split}-meta.parquet")

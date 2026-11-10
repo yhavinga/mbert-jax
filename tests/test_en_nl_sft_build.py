@@ -32,6 +32,8 @@ class CharTokenizer:
 
     def __call__(self, text, add_special_tokens=False):
         assert not add_special_tokens
+        if isinstance(text, list):
+            return {"input_ids": [self(t)["input_ids"] for t in text]}
         return {"input_ids": [self.convert_tokens_to_ids(t) if len(t) > 1 else 1000 + ord(t)
                               for t in SPECIAL.findall(text)]}
 
@@ -87,6 +89,13 @@ def test_context_keeps_the_turns_nearest_the_passage_up_to_one_that_fails():
     assert sb.context_of(p, pairs, turns, set()) == ([], [])
     with pytest.raises(SystemExit):
         sb.context_of(passage("x", context_ids=["h:d:t9"]), pairs, turns, set())
+
+
+def test_batched_counts_equal_single_ones():
+    counter = sb.TokenCounter(CharTokenizer())
+    users = [sb.user_turn("chat-v1-tag-token", "A text."), sb.user_turn("chat-v1", "Another one, longer.")]
+    assert counter.prompt_lengths(users, batch=1) == [len(counter.prompt_ids(u)) for u in users]
+    assert counter.target_lengths(["Een.", "Twee drie."]) == [len(counter.target_ids(t)) for t in ("Een.", "Twee drie.")]
 
 
 def test_speaker_label():

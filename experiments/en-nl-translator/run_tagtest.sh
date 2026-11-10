@@ -63,7 +63,7 @@ build)
   mkdir -p "$IN/run" "$IN/long" "$IN/replay" "$IN/flan-eval" "$IN/eval"
   cat > ~/job_body_build_$TAG.sh <<EOF
 set -euo pipefail
-export OMP_NUM_THREADS=8 TOKENIZERS_PARALLELISM=false
+export OMP_NUM_THREADS=8 TOKENIZERS_PARALLELISM=true
 [ -s $IN/run/pairs.parquet ] || gsutil -q cp $M/run/pairs/pairs.parquet $IN/run/
 [ -s $IN/run/passages.parquet ] || gsutil -q cp $M/run/select/passages.parquet $IN/run/
 [ -s $IN/run/context-turns.parquet ] || gsutil -q cp $M/run/select/context-turns.parquet $IN/run/

@@ -50,8 +50,10 @@ if [ ! -s res/kaikki-English.jsonl ]; then
   modified=\$(curl -fsSI $KAIKKI_URL | tr -d '\r' | sed -n 's/^[Ll]ast-[Mm]odified: //p')
   curl -fsSL $KAIKKI_URL -o res/kaikki-English.jsonl.part
   mv res/kaikki-English.jsonl.part res/kaikki-English.jsonl
-  echo "kaikki-English.jsonl $KAIKKI_URL last-modified '\$modified' sha256 \$(sha256sum res/kaikki-English.jsonl | cut -c1-64)" > src/manifest.txt
+  echo "kaikki-English.jsonl $KAIKKI_URL last-modified '\$modified' sha256 \$(sha256sum res/kaikki-English.jsonl | cut -c1-64)" > res/kaikki.manifest
 fi
+[ -s res/kaikki.manifest ] || { echo "no res/kaikki.manifest beside res/kaikki-English.jsonl"; exit 1; }
+cp res/kaikki.manifest src/manifest.txt
 $D/venv/bin/python -I -u $CODE/blind.py idioms --kaikki res/kaikki-English.jsonl --out src/idioms.jsonl
 $D/venv/bin/python -I -u $CODE/blind.py gv-fetch --after $AFTER --before $BEFORE --out src/gv-posts.jsonl
 echo "gv-posts.jsonl https://globalvoices.org/wp-json/wp/v2/posts after $AFTER before $BEFORE fetched \$(date -u +%FT%TZ) sha256 \$(sha256sum src/gv-posts.jsonl | cut -c1-64)" >> src/manifest.txt

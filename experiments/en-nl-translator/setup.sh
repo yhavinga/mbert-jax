@@ -7,6 +7,7 @@
 # the MetricX port). resources/: OpenTaal's word list at a fixed commit, and kaikki.org's extract of the English
 # Wiktionary's Dutch entries (the source of the idiom list; not versioned upstream, so its Last-Modified and sha256 go
 # into resources/manifest.txt). Needs ~/.cache/huggingface/token; the token is never printed.
+# RESOURCES=0 builds only the venv (the evaluation of run_baseline.sh needs no word lists).
 set -euo pipefail
 SHM=/dev/shm/translator
 VENV=$SHM/venv
@@ -26,6 +27,10 @@ VIRTUAL_ENV=$VENV uv pip install -q "jax[tpu]==0.11.1" numpy==2.1.3 pyarrow==25.
 VIRTUAL_ENV=$VENV UV_TORCH_BACKEND=cpu uv pip install -q torch==2.9.1
 "$PY" -c "import importlib.metadata as m; print('$(hostname):', {p: m.version(p) for p in ('jax', 'libtpu', 'transformers', 'tokenizers', 'pyarrow', 'langid', 'sacrebleu', 'torch')})"
 
+if [ "${RESOURCES:-1}" = 0 ]; then
+  echo "$(hostname): venv ready in $VENV (no word lists: RESOURCES=0), $(df -h /dev/shm | tail -1 | awk '{print $4}') free in /dev/shm"
+  exit 0
+fi
 if [ ! -s "$RES/opentaal-wordlist.txt" ]; then
   curl -fsSL "https://raw.githubusercontent.com/OpenTaal/opentaal-wordlist/$OPENTAAL_COMMIT/wordlist.txt" -o "$RES/opentaal-wordlist.txt.part"
   mv "$RES/opentaal-wordlist.txt.part" "$RES/opentaal-wordlist.txt"

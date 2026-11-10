@@ -21,6 +21,7 @@ KAIKKI_URL=https://kaikki.org/dictionary/English/kaikki.org-dictionary-English.j
 SPACY=spacy==3.8.7
 SPACY_MODEL=https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl
 BS4=beautifulsoup4==4.13.4
+CLICK=click==8.1.8  # spacy.cli imports click; the typer that spaCy 3.8.7 pulls in no longer brings it
 AFTER=2025-01-01T00:00:00
 BEFORE=2026-01-01T00:00:00
 mkdir -p "$D" ~/logs
@@ -41,10 +42,9 @@ prepare)
 set -euo pipefail
 cd $D
 mkdir -p res src
-if [ ! -x $D/venv/bin/python ]; then
-  ~/.local/bin/uv venv -q --python 3.12 $D/venv
-  ~/.local/bin/uv pip install -q --python $D/venv/bin/python $SPACY $BS4 $SPACY_MODEL
-fi
+[ -x $D/venv/bin/python ] || ~/.local/bin/uv venv -q --python 3.12 $D/venv
+~/.local/bin/uv pip install -q --python $D/venv/bin/python $SPACY $CLICK $BS4 $SPACY_MODEL
+$D/venv/bin/python -c "import spacy, bs4; spacy.load('en_core_web_sm')"
 ~/.local/bin/uv pip freeze --python $D/venv/bin/python > src/venv-freeze.txt
 if [ ! -s res/kaikki-English.jsonl ]; then
   modified=\$(curl -fsSI $KAIKKI_URL | tr -d '\r' | sed -n 's/^[Ll]ast-[Mm]odified: //p')

@@ -23,7 +23,8 @@ that common phrases do not crowd the choice), and per idiom, in an order fixed b
 passage of a post not chosen yet that shares no 13-gram with the training sets (--train) and whose page names its
 author and the CC BY 3.0 licence, until N_IDIOM; N_WMT WMT24++ segments without is_bad_source and outside the tag
 test's 300 (their translations are shown in examples-qe-rule.md), drawn with WMT_SEED; FLAN's 35 rows of set yeb.
---exclude leaves passages out by pid (a literal use found by reading), so that the choice stays one command.
+--exclude leaves passages out by pid (a literal use found by reading), --exclude-idioms idioms ("a|b") that reading found
+used literally passage after passage, so that the choice stays one command.
 """
 
 import argparse
@@ -389,8 +390,12 @@ def select(args):
 
     cands = [json.loads(line) for line in open(args.candidates, encoding="utf-8")]
     excluded = set(args.exclude or [])
+    excluded_idioms = {i.strip() for i in (args.exclude_idioms or "").split("|") if i.strip()}
+    known = {h["idiom"] for p in cands for h in p["idioms"]}
+    if excluded_idioms - known:
+        raise SystemExit(f"--exclude-idioms: not in the candidates: {sorted(excluded_idioms - known)}")
     for p in cands:
-        p["countable"] = sorted({h["idiom"] for h in p["idioms"] if h["rule"] and not h["literal"]})
+        p["countable"] = sorted({h["idiom"] for h in p["idioms"] if h["rule"] and not h["literal"]} - excluded_idioms)
     pool = sorted((p for p in cands if p["countable"]), key=lambda p: p["pid"])
     # WMT24++: outside the tag test's segments (shown with translations in examples-qe-rule.md)
     tagtest = {r["id"] for r in pq.read_table(args.tagtest_items, columns=["id"]).to_pylist()}
@@ -468,7 +473,7 @@ def select(args):
     write_jsonl(out / "idiom30.jsonl", [r for r in rows if r["set"] == "idiom"])
     write_jsonl(out / "blind100.jsonl", rows)
     report = {"pool": len(pool), "idioms_in_pool": len(by_idiom), "candidates": len(cands), "skipped": dict(log),
-              "excluded": sorted(excluded),
+              "excluded": sorted(excluded), "excluded_idioms": sorted(excluded_idioms),
               "train_examples_scanned": scanned, "train": args.train,
               "train_13gram_overlap": {"idiom_chosen": sum(overlap[p["pid"]] > 0 for p in chosen),
                                        "wmt": len(wmt_overlap),
@@ -527,8 +532,10 @@ def blind_md(report, stats, manifest, rows, args):
         f"`{IDIOM_SEED}/<uitdrukking>`, en daarvan de eerste uit een artikel dat nog niet gekozen is, die geen 13-gram "
         "deelt met de trainingsdata en waarvan de pagina auteur en licentie noemt; tot 30. Overgeslagen: "
         + ", ".join(f"{k} {v}" for k, v in n.items()) + ".",
-        f"- Met de hand uitgesloten (letterlijk gebruik, gelezen door de subagent die koos): "
-        f"{', '.join(report['excluded']) or 'geen'}.", "",
+        f"- Met de hand uitgesloten na het nalezen van de gekozen passages (letterlijk gebruik of een andere betekenis "
+        f"dan het idioom; gelezen door de subagent die koos): passages {', '.join(report['excluded']) or 'geen'}; "
+        f"uitdrukkingen die telkens letterlijk bleken: "
+        f"{', '.join(chr(34) + i + chr(34) for i in report['excluded_idioms']) or 'geen'}.", "",
         "## Controle op de trainingsdata (13-gram)", "",
         f"Tegen alle {report['train_examples_scanned']} trainvoorbeelden van {', '.join(report['train'])} (Engels, "
         "Nederlands en contextbeurten): gekozen idioompassages met een gedeeld 13-gram: "
@@ -579,6 +586,7 @@ def main(argv=None):
     s.add_argument("--tagtest-items", required=True)
     s.add_argument("--train", nargs="+", required=True, help="set directories with train.parquet, train-meta.parquet")
     s.add_argument("--exclude", nargs="*", default=[])
+    s.add_argument("--exclude-idioms", default="", help="idioms to leave out, separated by |")
     s.add_argument("--manifest", default=None, help="the sources' manifest of run_blind.sh prepare")
     s.add_argument("--after-label", default="2025-01-01 tot 2026-01-01")
     s.add_argument("--out", required=True)

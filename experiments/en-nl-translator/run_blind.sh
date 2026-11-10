@@ -6,7 +6,8 @@
 #                                of Wiktionary, the English posts of Global Voices of 2025 (WordPress API), the idiom
 #                                list and the candidates, to $S/blind/source/                  (job blind_prepare_$TAG)
 #   SETS="dir ..." bash run_blind.sh select   the worker that holds the training sets (w3: the arms' build output):
-#                                blind.py select, to $S/blind/; EXCLUDE="pid ..." leaves passages out (job blind_select_$TAG)
+#                                blind.py select, to $S/blind/; EXCLUDE="pid ..." leaves passages out, EXCLUDE_IDIOMS="a|b"
+#                                idioms                                                     (job blind_select_$TAG)
 set -euo pipefail
 STAGE=${1:?prepare or select}
 S=gs://t5-dutch-english-usc2/mbert/translator/sft
@@ -72,7 +73,7 @@ set -euo pipefail
 mkdir -p $D/in $O
 gsutil -m -q cp $S/blind/source/candidates.jsonl $S/blind/source/candidates.jsonl.stats.json $S/blind/source/manifest.txt $D/in/
 gsutil -q cp $M/flan-eval/eval-rows.parquet $E/data/evalsets.parquet $S/tagtest/segments/items.parquet $D/in/
-$PY -I -u $CODE/blind.py select --candidates $D/in/candidates.jsonl --flan-eval $D/in/eval-rows.parquet --evalsets $D/in/evalsets.parquet --tagtest-items $D/in/items.parquet --train $SETS --manifest $D/in/manifest.txt --exclude ${EXCLUDE:-} --out $O
+$PY -I -u $CODE/blind.py select --candidates $D/in/candidates.jsonl --flan-eval $D/in/eval-rows.parquet --evalsets $D/in/evalsets.parquet --tagtest-items $D/in/items.parquet --train $SETS --manifest $D/in/manifest.txt --exclude ${EXCLUDE:-} --exclude-idioms "${EXCLUDE_IDIOMS:-}" --out $O
 gsutil -m -q cp $O/idiom30.jsonl $O/blind100.jsonl $O/select-report.json $O/blind-idiom-30.md $S/blind/
 echo "SELECTED: $S/blind/"
 EOF

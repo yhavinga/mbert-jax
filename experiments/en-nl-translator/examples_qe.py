@@ -159,7 +159,10 @@ def rule(args):
     stats = {
         "n": n, "mean_diff": statistics.mean(diffs), "median_diff": statistics.median(diffs),
         "sd_diff": statistics.stdev(diffs), **{f"p{q}": quantile(diffs, q / 100) for q in (5, 25, 75, 95)},
-        "same_text": sum(s["same_text"] for s in segs), "worse": sum(d > 0 for d in diffs),
+        "same_text": sum(s["same_text"] for s in segs),
+        "same_text_absdiff_max": max((abs(s["diff"]) for s in segs if s["same_text"]), default=None),
+        "same_text_absdiff_mean": statistics.mean([abs(s["diff"]) for s in segs if s["same_text"]] or [0.0]),
+        "worse": sum(d > 0 for d in diffs),
         "better": sum(d < 0 for d in diffs), "equal": sum(d == 0 for d in diffs),
         "over": {str(c): sum(d > c for d in diffs) for c in (0.2, 0.5, 1, 2)},
         "under_-0.5": sum(d < -0.5 for d in diffs),
@@ -206,6 +209,9 @@ def rule_md(st, chosen, segs):
         f"hogere QE (slechter), {st['better']} met een lagere, {st['equal']} gelijk. Meer dan 0,2 slechter: "
         f"{st['over']['0.2']}; meer dan 0,5: {st['over']['0.5']}; meer dan 1: {st['over']['1']}; meer dan 2: "
         f"{st['over']['2']}. Meer dan 0,5 beter: {st['under_-0.5']}.",
+        f"- Ruis: bij de {st['same_text']} segmenten met letterlijk dezelfde vertaling verschilt de QE toch, gemiddeld "
+        f"{nl(st['same_text_absdiff_mean'], 3)} en hoogstens {nl(st['same_text_absdiff_max'], 3)}: MetricX rekent in "
+        "bf16, en een segment staat in elke run in een andere batch [gemeten; de oorzaak is een gevolgtrekking].",
         f"- Het gemiddelde komt vooral uit een staart: de 10 grootste verschillen dragen "
         f"{nl(100 * st['share_of_sum_top10'], 0)}% van de som; zonder de 5, 10 of 20 grootste is het gemiddelde "
         f"{nl(st['mean_without_top']['5'], 3)}, {nl(st['mean_without_top']['10'], 3)} of "

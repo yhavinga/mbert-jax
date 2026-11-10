@@ -310,14 +310,13 @@ def candidates_replay(args, blocked, report, flan_grams=frozenset()):
         if r["id"] in eval_segments:
             stats["eval_segment"] += 1
             continue
-        grams = sp.ngrams(r["nl"]) | sp.ngrams(r["en"])
-        if grams & blocked:
+        if (sp.ngrams(r["nl"]) | sp.ngrams(r["en"])) & blocked:
             stats["eval_13gram"] += 1
             continue
-        if grams & flan_grams:
-            stats["kept_sharing_a_13gram_with_flan_eval_rows"] += 1
         out.append(r)
-    report["replay"] = {"pairs": len(replay), "dropped": dict(stats), "candidates": len(out)}
+    report["replay"] = {"pairs": len(replay), "dropped": dict(stats), "candidates": len(out),
+                        "kept_sharing_a_13gram_with_flan_eval_rows": sum(
+                            bool((sp.ngrams(r["nl"]) | sp.ngrams(r["en"])) & flan_grams) for r in out)}
     return out
 
 
@@ -359,7 +358,7 @@ def build(args, tokenizer=None):
             tokenizer(TAG_TOKEN, add_special_tokens=False)["input_ids"] != [tag_id]:
         raise SystemExit(f"{TAG_TOKEN} is not one token of {args.tokenizer}")
     report = {"query": QUERY, "context_share": CONTEXT_SHARE, "replay_share": REPLAY_SHARE, "max_tokens": MAX_TOKENS,
-              "seed": args.seed, "bt": args.bt, "sets": {}, "tag_token": {"text": TAG_TOKEN, "id": tag_id},
+              "seed": args.seed, "bt_arg": args.bt, "sets": {}, "tag_token": {"text": TAG_TOKEN, "id": tag_id},
               "tag_sentence": TAG_SENTENCE, "tag_prompts": TAG_PROMPTS,
               "inputs": {k: {"path": str(v), "sha256": sha256(v)} for k, v in (
                   ("pairs_main", Path(args.run) / "pairs.parquet"), ("pairs_long", Path(args.long) / "pairs.parquet"),
@@ -502,7 +501,7 @@ def report_md(report):
     lines = ["# Trainingsdata van de fine-tune (sft_build.py)", "",
              f"Query: {json.dumps(report['query'], ensure_ascii=False)}; contextaandeel {report['context_share']}, "
              f"replay-aandeel {report['replay_share']} (arm N), hoogstens {report['max_tokens']} tokens per voorbeeld; "
-             f"seed `{report['seed']}`, `--bt {report['bt']}`. Geblokkeerde 13-grammen van de evaluatiesets: "
+             f"seed `{report['seed']}`, `--bt {report['bt_arg']}`. Geblokkeerde 13-grammen van de evaluatiesets: "
              f"{_n(report['blocked_13grams'])}.", "",
              "## Wat elke grens kost (passages; `first_failed`: de eerste grens die een paar niet haalt, in de volgorde "
              "hard_fails, bronscore, herkomst, QE, 13-gram; `alone`: alle paren die die grens niet halen)", "",

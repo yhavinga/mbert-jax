@@ -1,0 +1,34 @@
+{
+ "checkpoint": "gs://t5-dutch-english-usc2/mbert/culturax-gptnl-nl-230m-chunk1024/ckpt_keep/300000",
+ "data": "/home/yeb/dumbx/data/blimp-nl/large.parquet",
+ "tokenizer": "yhavinga/dutch-llama-tokenizer",
+ "metric": "PLL-word-l2r",
+ "export_head": 0,
+ "prediction_heads": 1,
+ "compute_dtype": "float32",
+ "vocab_size": 32128,
+ "mask_token_id": 32000,
+ "max_pairs": null,
+ "sentences": 16800,
+ "tokens": 219150,
+ "masked_copies": 219150,
+ "rows": 6903,
+ "batches": 108,
+ "accuracy": 0.920952380952381,
+ "pairs": 8400,
+ "ties": 1,
+ "paradigm_mean_accuracy": 0.920952380952381,
+ "subsets": {
+  "handcrafted": {
+   "accuracy": 0.919047619047619,
+   "pairs": 840,
+   "ties": 0
+  },
+  "generated": {
+   "accuracy": 0.9211640211640212,
+   "pairs": 7560,
+   "ties": 1
+  }
+ },
+ "seconds": 37.500344038009644
+}

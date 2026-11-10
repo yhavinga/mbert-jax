@@ -1,0 +1,72 @@
+{
+  "task": "pos-lassysmall",
+  "checkpoint": "/home/yeb/dumbx/ckpt300000",
+  "best_val_accuracy": 0.9714529489139322,
+  "test_accuracy": 0.9712019313674771,
+  "test_loss": 0.09488106454296945,
+  "epochs": 3,
+  "learning_rate": 5e-05,
+  "batch_size": 8,
+  "total_batch_size": 32,
+  "gradient_accumulation_steps": 1,
+  "num_devices": 4,
+  "max_length": 512,
+  "pad_to_multiple_of": 128,
+  "metric": "accuracy",
+  "test_metric": 0.9712019313674771,
+  "best_val_metric": 0.9714529489139322,
+  "test": {
+    "loss": 0.09488106454296945,
+    "accuracy": 0.9712019313674771,
+    "words": 28995,
+    "sentences": 1761,
+    "rows": 1761,
+    "metric": 0.9712019313674771
+  },
+  "validation": [
+    {
+      "epoch": 1,
+      "train_loss": 0.28007752099992783,
+      "loss": 0.10257062050171596,
+      "accuracy": 0.9685378079562018,
+      "words": 28129,
+      "sentences": 1542,
+      "rows": 1542,
+      "metric": 0.9685378079562018
+    },
+    {
+      "epoch": 2,
+      "train_loss": 0.04755647297464571,
+      "loss": 0.09664946611996031,
+      "accuracy": 0.9707774894237264,
+      "words": 28129,
+      "sentences": 1542,
+      "rows": 1542,
+      "metric": 0.9707774894237264
+    },
+    {
+      "epoch": 3,
+      "train_loss": 0.018943801121418895,
+      "loss": 0.10018125407682239,
+      "accuracy": 0.9714529489139322,
+      "words": 28129,
+      "sentences": 1542,
+      "rows": 1542,
+      "metric": 0.9714529489139322
+    }
+  ],
+  "seed": 44,
+  "update_size": 32,
+  "updates": 1293,
+  "lr_schedule": "linear",
+  "warmup_steps": 0,
+  "weight_decay": 0.01,
+  "train_examples": 13817,
+  "data": {
+    "dir": "ud-nl-lassysmall",
+    "revision": "tag r2.18, commit b8cdca9661408608945133e80bb566a6a58146ea",
+    "max_train_examples": null,
+    "max_eval_examples": null
+  },
+  "seconds": 81.15572953224182
+}

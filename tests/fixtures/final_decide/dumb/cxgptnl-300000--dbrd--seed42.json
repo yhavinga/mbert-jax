@@ -1,0 +1,15 @@
+{
+  "task": "dbrd",
+  "checkpoint": "/home/yeb/dumb/ckptcxgptnl-300000",
+  "best_val_accuracy": 0.921875,
+  "test_accuracy": 0.9289772727272727,
+  "test_loss": 0.19938165796074,
+  "epochs": 3,
+  "learning_rate": 2e-05,
+  "batch_size": 24,
+  "total_batch_size": 96,
+  "gradient_accumulation_steps": 2,
+  "num_devices": 4,
+  "max_length": 512,
+  "pad_to_multiple_of": 1
+}

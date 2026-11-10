@@ -1,0 +1,13 @@
+{
+  "task": "dbrd",
+  "checkpoint": "/home/yeb/dumb/ckpt300000",
+  "best_val_accuracy": 0.9270833333333334,
+  "test_accuracy": 0.931344696969697,
+  "test_loss": 0.2657388552854007,
+  "epochs": 3,
+  "learning_rate": 2e-05,
+  "batch_size": 24,
+  "total_batch_size": 96,
+  "gradient_accumulation_steps": 2,
+  "num_devices": 4
+}

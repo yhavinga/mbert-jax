@@ -1,0 +1,15 @@
+{
+  "task": "sicknl",
+  "checkpoint": "/home/yeb/dumb/ckptfw2rh3-300000",
+  "best_val_accuracy": 0.71484375,
+  "test_accuracy": 0.7177220394736842,
+  "test_loss": 0.6197522972759447,
+  "epochs": 3,
+  "learning_rate": 2e-05,
+  "batch_size": 64,
+  "total_batch_size": 256,
+  "gradient_accumulation_steps": 1,
+  "num_devices": 4,
+  "max_length": 512,
+  "pad_to_multiple_of": 1
+}

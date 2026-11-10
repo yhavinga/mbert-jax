@@ -1,0 +1,83 @@
+{
+  "task": "squadnl",
+  "checkpoint": "/home/yeb/dumbx/ckptcxgptnl-300000",
+  "best_val_accuracy": 0.7047974413646055,
+  "test_accuracy": 0.6762468300929839,
+  "test_loss": 1.557240675702273,
+  "epochs": 3,
+  "learning_rate": 5e-05,
+  "batch_size": 8,
+  "total_batch_size": 32,
+  "gradient_accumulation_steps": 1,
+  "num_devices": 4,
+  "max_length": 384,
+  "pad_to_multiple_of": 128,
+  "metric": "f1",
+  "test_metric": 0.7957571375406852,
+  "best_val_metric": 0.8182586087460891,
+  "test": {
+    "loss": 1.557240675702273,
+    "accuracy": 0.6762468300929839,
+    "exact_match": 0.6762468300929839,
+    "f1": 0.7957571375406852,
+    "metric": 0.7957571375406852,
+    "questions": 1183,
+    "features": 1251,
+    "no_valid_span": 0
+  },
+  "validation": [
+    {
+      "epoch": 1,
+      "train_loss": 1.5195137763680038,
+      "loss": 1.234033425006617,
+      "accuracy": 0.7047974413646055,
+      "exact_match": 0.7047974413646055,
+      "f1": 0.8182586087460891,
+      "metric": 0.8182586087460891,
+      "questions": 9380,
+      "features": 9808,
+      "no_valid_span": 0
+    },
+    {
+      "epoch": 2,
+      "train_loss": 0.7713673526926313,
+      "loss": 1.3129355704343102,
+      "accuracy": 0.6859275053304904,
+      "exact_match": 0.6859275053304904,
+      "f1": 0.8099421881287683,
+      "metric": 0.8099421881287683,
+      "questions": 9380,
+      "features": 9808,
+      "no_valid_span": 0
+    },
+    {
+      "epoch": 3,
+      "train_loss": 0.3485894882446418,
+      "loss": 1.702983089564038,
+      "accuracy": 0.6540511727078892,
+      "exact_match": 0.6540511727078892,
+      "f1": 0.7903772189163629,
+      "metric": 0.7903772189163629,
+      "questions": 9380,
+      "features": 9808,
+      "no_valid_span": 0
+    }
+  ],
+  "seed": 44,
+  "update_size": 32,
+  "updates": 8496,
+  "lr_schedule": "linear",
+  "warmup_steps": 0,
+  "weight_decay": 0.01,
+  "train_examples": 90653,
+  "data": {
+    "dir": "squad-nl-v1.1",
+    "revision": "7e1167c6ba074b3aedcd11061b0a921d5383106d",
+    "max_train_examples": null,
+    "max_eval_examples": null
+  },
+  "seconds": 679.0840532779694,
+  "doc_stride": 128,
+  "n_best": 20,
+  "max_answer_length": 30
+}

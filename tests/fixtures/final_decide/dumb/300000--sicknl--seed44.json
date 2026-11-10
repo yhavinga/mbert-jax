@@ -1,0 +1,13 @@
+{
+  "task": "sicknl",
+  "checkpoint": "/home/yeb/dumb/ckpt300000",
+  "best_val_accuracy": 0.80078125,
+  "test_accuracy": 0.776110197368421,
+  "test_loss": 0.5131383099054035,
+  "epochs": 3,
+  "learning_rate": 2e-05,
+  "batch_size": 64,
+  "total_batch_size": 256,
+  "gradient_accumulation_steps": 1,
+  "num_devices": 4
+}

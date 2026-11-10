@@ -1,0 +1,72 @@
+{
+  "task": "pos-alpino",
+  "checkpoint": "/home/yeb/dumbx/ckpt300000",
+  "best_val_accuracy": 0.9789446321809202,
+  "test_accuracy": 0.972388194821655,
+  "test_loss": 0.08870180367467509,
+  "epochs": 3,
+  "learning_rate": 5e-05,
+  "batch_size": 8,
+  "total_batch_size": 32,
+  "gradient_accumulation_steps": 1,
+  "num_devices": 4,
+  "max_length": 512,
+  "pad_to_multiple_of": 128,
+  "metric": "accuracy",
+  "test_metric": 0.972388194821655,
+  "best_val_metric": 0.9789446321809202,
+  "test": {
+    "loss": 0.08870180367467509,
+    "accuracy": 0.972388194821655,
+    "words": 11046,
+    "sentences": 596,
+    "rows": 596,
+    "metric": 0.972388194821655
+  },
+  "validation": [
+    {
+      "epoch": 1,
+      "train_loss": 0.3048446028066489,
+      "loss": 0.08530932425694615,
+      "accuracy": 0.9745256043670393,
+      "words": 11541,
+      "sentences": 718,
+      "rows": 718,
+      "metric": 0.9745256043670393
+    },
+    {
+      "epoch": 2,
+      "train_loss": 0.04955428348572847,
+      "loss": 0.07551043474706569,
+      "accuracy": 0.9761719088467203,
+      "words": 11541,
+      "sentences": 718,
+      "rows": 718,
+      "metric": 0.9761719088467203
+    },
+    {
+      "epoch": 3,
+      "train_loss": 0.02065169007497995,
+      "loss": 0.07312933762005941,
+      "accuracy": 0.9789446321809202,
+      "words": 11541,
+      "sentences": 718,
+      "rows": 718,
+      "metric": 0.9789446321809202
+    }
+  ],
+  "seed": 42,
+  "update_size": 32,
+  "updates": 1152,
+  "lr_schedule": "linear",
+  "warmup_steps": 0,
+  "weight_decay": 0.01,
+  "train_examples": 12289,
+  "data": {
+    "dir": "ud-nl-alpino",
+    "revision": "tag r2.18, commit d64749ac918f18d31dd4c4e75ff56626432d9ba3",
+    "max_train_examples": null,
+    "max_eval_examples": null
+  },
+  "seconds": 69.19285106658936
+}

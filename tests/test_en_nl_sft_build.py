@@ -345,3 +345,116 @@ def test_a_lower_qe_bound_gives_a_smaller_set(tmp_path):
     args.qe_max, args.out = 10.0, str(tmp_path / "out10")
     sb.build(args, tokenizer=CharTokenizer())
     assert len(pq.read_table(Path(args.out) / "B" / "train-meta.parquet")) == 69  # the outlier with QE 9.0 joins
+
+
+# ---------------------------------------------------------------------------------------------------- arm R2
+
+def test_the_length_bound_is_a_factor_around_the_sources_median():
+    rows = [pair(f"h{i}", nl="x" * n, en="y" * 100) for i, n in enumerate((80, 90, 100, 110, 120))]
+    bounds = sb.length_bounds(rows, 1.25)
+    assert bounds == {"handelingen": {"median": 1.0, "lo": 0.8, "hi": 1.25, "n": 5}}
+    p = passage("a")
+    assert sb.query_fails(pair("a", nl="x" * 80, en="y" * 100), p, set(), bounds=bounds) == []
+    assert sb.query_fails(pair("a", nl="x" * 79, en="y" * 100), p, set(), bounds=bounds) == ["length"]
+    assert sb.query_fails(pair("a", nl="x" * 126, en="y" * 100), p, set(), bounds=bounds) == ["length"]
+    assert sb.query_fails(pair("a", nl="x" * 126, en="y" * 100), p, set()) == []  # no bound without --len-factor
+    with pytest.raises(SystemExit, match="no length bound"):
+        sb.query_fails(pair("a", source="raad"), passage("a", source="raad"), set(), bounds=bounds)
+    assert sb.word_ratio("een twee drie", "one two") == 1.5 and sb.char_ratio(" abcd ", "ab") == 2.0
+
+
+def test_parse_sets_with_real_pairs():
+    assert sb.parse_sets(["R2=none+real"]) == {"R2": ("none", "real")}
+
+
+def test_the_draw_of_real_pairs_takes_every_global_voices_pair_first():
+    eligible = [{"id": f"gv:{i}", "source": "globalvoices"} for i in range(5)] + \
+        [{"id": f"europarl:{i}", "source": "europarl"} for i in range(50)]
+    chosen, info = sb.real_draw(eligible, 12, "s")
+    assert info["chosen"] == {"globalvoices": 5, "europarl": 7}
+    assert {r["id"] for r in chosen} >= {f"gv:{i}" for i in range(5)}
+    assert sb.real_draw(eligible, 100, "s")[1]["chosen"] == {"globalvoices": 5, "europarl": 50}  # fewer: all
+    assert sb.real_draw(eligible, 3, "s")[1]["chosen"] == {"globalvoices": 3}
+    assert [r["id"] for r in sb.real_draw(eligible, 12, "s")[0]] == [r["id"] for r in chosen]  # the seed
+
+
+def real_pairs_table(path, with_qe=True):
+    rows = []
+    for i in range(30):
+        source = "globalvoices" if i < 4 else "europarl"
+        en, nl = f"The real English sentence number {i} here.", f"De echte Nederlandse zin nummer {i} hier."
+        fails = []
+        if i == 5:
+            fails = ["short"]
+        if i == 6:
+            nl = nl * 3  # a length outlier
+        if i == 7:  # an evaluation 13-gram (the Dutch as long, so that the length bound does not take it first)
+            en = "the quick brown fox jumps over the lazy dog near the river bank today again"
+            nl = "de snelle bruine vos springt over de luie hond bij de rivieroever vandaag weer"
+        if i == 8:  # a blind passage's 13-gram
+            en = "one two three four five six seven eight nine ten eleven twelve thirteen"
+            nl = "een twee drie vier vijf zes zeven acht negen tien elf twaalf dertien"
+        row = {"id": f"{source}:{i}", "source": source, "en": en, "nl": nl, "fails": fails}
+        if with_qe:
+            row["qe_en_nl"] = None if fails else (9.0 if i == 9 else 1.0)
+        rows.append(row)
+    write(path, rows)
+
+
+def test_a_build_of_arm_r2(tmp_path):
+    """BT with the length bound and a lower QE bound; real pairs at most 20%, Global Voices first, in TranslateGemma's
+    own prompt; the blind passages' 13-grams blocked."""
+    args = tables(tmp_path)
+    real_pairs_table(tmp_path / "real.parquet")
+    (tmp_path / "blind.jsonl").write_text(__import__("json").dumps(
+        {"blind_id": "b1", "source": "one two three four five six seven eight nine ten eleven twelve thirteen"}) + "\n")
+    args.bt, args.sets, args.qe_max = "all", ["R2=none+real"], 5.0
+    args.len_factor, args.real, args.real_share = 1.25, str(tmp_path / "real.parquet"), 0.2
+    args.block_jsonl, args.real_without_qe = str(tmp_path / "blind.jsonl"), False
+    sb.build(args, tokenizer=CharTokenizer())
+    out = Path(args.out)
+    meta = pq.read_table(out / "R2" / "train-meta.parquet").to_pylist()
+    msgs = pq.read_table(out / "R2" / "train.parquet").column("messages").to_pylist()
+    bt = [m for m in meta if m["kind"] in ("bt", "bt_context")]
+    real = [m for m in meta if m["kind"] == "real"]
+    assert len(bt) == 68  # every pair of the tables has the same length: the bound costs nothing here
+    # 17 = 68 x 0.25 at most; eligible: 4 Global Voices, 21 Europarl (short, length, 13-gram, blind, QE 9 out)
+    assert len(real) == 17 and sum(m["source"] == "globalvoices" for m in real) == 4
+    assert not {m["id"] for m in real} & {"europarl:5", "europarl:6", "europarl:7", "europarl:8", "europarl:9"}
+    for m, row in zip(meta, msgs):
+        if m["kind"] == "real":
+            assert m["tag"] == "none" and m["prompt"] == "chat-v1" and m["context"] == []
+            assert row[0]["content"] == sb.user_turn("chat-v1", m["en"]) and row[0]["content"].startswith(TG_HEAD)
+            assert sb.CONVENTIONAL_SENTENCE not in row[0]["content"]
+    report = __import__("json").loads((out / "report.json").read_text())
+    real_cost = report["real"]["query_cost"]["first_failed"]
+    assert real_cost == {"europarl/hard:short": 1, "europarl/length": 1, "europarl/eval_13gram": 2, "europarl/qe": 1}
+    assert report["real"]["draw"]["chosen"] == {"globalvoices": 4, "europarl": 13}
+    assert report["sets"]["R2"]["train"]["real_share"] == round(17 / 85, 4)
+    lengths = report["sets"]["R2"]["train"]["length_ratio"]
+    assert set(lengths) >= {"bt", "real", "all", "source/globalvoices", "source/handelingen"}
+    assert lengths["real"]["n"] == 17 and lengths["all"]["n"] == 85
+    assert report["query"]["len_factor"] == 1.25 and report["length_bounds_bt"]["handelingen"]["median"] > 0
+    md = (out / "report.md").read_text()
+    assert "## Echte vertaalparen" in md and "## Lengteverhouding" in md and "Proefbouw" not in md
+    manifest = __import__("json").loads((out / "R2" / "manifest.json").read_text())
+    assert manifest["real"] is True and manifest["real_without_qe"] is False
+    # eval stays the back-translations'
+    assert all(m["kind"].startswith("bt") for m in pq.read_table(out / "R2" / "eval-meta.parquet").to_pylist())
+
+
+def test_real_pairs_without_qe_only_in_a_dry_run(tmp_path):
+    args = tables(tmp_path)
+    real_pairs_table(tmp_path / "real.parquet", with_qe=False)
+    args.bt, args.sets, args.qe_max = "all", ["R2=none+real"], 5.0
+    args.len_factor, args.real, args.real_share = 1.25, str(tmp_path / "real.parquet"), 0.2
+    args.block_jsonl, args.real_without_qe = None, False
+    with pytest.raises(SystemExit, match="no qe_en_nl"):
+        sb.build(args, tokenizer=CharTokenizer())
+    args.real_without_qe = True
+    sb.build(args, tokenizer=CharTokenizer())
+    assert "Proefbouw" in (Path(args.out) / "report.md").read_text()
+    # a set with +real needs --real, and --real a set with +real
+    args.sets = ["B=none"]
+    with pytest.raises(SystemExit, match="--real goes with"):
+        sb.build(args, tokenizer=CharTokenizer())

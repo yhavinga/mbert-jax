@@ -154,8 +154,9 @@ def gv_fetch(args):
     print(json.dumps({"posts": n, "pages": total, "after": args.after, "before": args.before}))
 
 
-def paragraphs(html):
-    """The post's own paragraphs: <p> outside quotes, captions, embeds, tables and lists; not mostly italic (notes)"""
+def paragraphs(html, links=False):
+    """The post's own paragraphs: <p> outside quotes, captions, embeds, tables and lists; not mostly italic (notes).
+    With links, (text, the hrefs of its <a> elements) per paragraph (real_pairs.py aligns on them)."""
     from bs4 import BeautifulSoup
 
     soup = BeautifulSoup(html, "html.parser")
@@ -173,7 +174,7 @@ def paragraphs(html):
         italic = sum(len(" ".join(i.get_text().split())) for i in p.find_all(["em", "i"], recursive=False))
         if not text or italic >= 0.8 * len(text):
             continue
-        out.append(text)
+        out.append((text, [a.get("href") for a in p.find_all("a") if a.get("href")]) if links else text)
     return out
 
 

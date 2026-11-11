@@ -5,7 +5,8 @@ run, the FLAN-nl replay, and the user turn of translate.user_text.
 
     python sft_build.py build --run RUN --long LONG --replay REPLAY.parquet --flan-eval EVAL-ROWS.parquet \\
         --evalsets EVALSETS.parquet --tokenizer TOK --bt auto|all|N [--qe-max 7.5] [--replay-tag none|conventional] \\
-        --sets B=none N-token=token+replay ... --out OUT
+        [--len-factor F] [--block-jsonl blind100.jsonl] [--real REAL.parquet [--real-share 0.2] [--real-without-qe]] \\
+        --sets B=none N-token=token+replay R2=none+real ... --out OUT
     python sft_build.py check --data OUT/<set> --tokenizer TOK   (SFT venv: MaxText's own SFT steps on every example)
 
 RUN holds the main run's pairs.parquet (mainset/run/pairs/), passages.parquet and context-turns.parquet
@@ -22,8 +23,21 @@ eligible when
   reference). FLAN's evaluation rows are kept out of the replay by their segments (as the design has it), not by
   13-grams: their templates' fixed sentences recur in a quarter of the replay (131,273 of 521,329 pairs shared a
   13-gram with them, 10 Nov), so a 13-gram block would take whole tasks out; the report counts that overlap;
+- with --len-factor F (arm R2, amendment of 11 Nov): its length ratio, the Dutch characters over the English ones, lies
+  within a factor F of the median ratio of its source (median / F to median x F; the medians over the source's
+  training passages that pass hard_fails), a bound against outliers on both sides that leaves each source's own level
+  as it is;
+- it shares no 13-gram with the passages of --block-jsonl (the blind assessment's sources);
 - the whole example fits MAX_TOKENS in every prompt of the build.
 The split is the selection's (per document): train pairs train, eval pairs eval.
+
+Real pairs (--real, arm R2): English-original text with a human Dutch translation (real_pairs.py: Global Voices,
+Europarl-direct after 2003), in TranslateGemma's own prompt without context or tag, all in train. A real pair is eligible
+when it passed real_pairs.py's hard checks (its fails empty), its MetricX-24-QE en->nl is <= --qe-max (unless
+--real-without-qe, a dry run whose report says so), its length ratio lies within --len-factor of its source's median
+(over the source's pairs that pass the hard checks), it shares no 13-gram with an evaluation set or --block-jsonl, and it
+fits MAX_TOKENS. A set with +real takes at most --real-share of its examples from them (real = BT x share / (1 -
+share)): every eligible Global Voices pair first, then Europarl drawn with a seed to fill the share; fewer, then all.
 
 Context examples (design §9): a training passage the selection marked as a context example keeps its turns before it,
 nearest first, as long as each turn is eligible by the same query; the first that fails ends the context there. Without
@@ -74,6 +88,9 @@ QUERY = {"hard_fails": "empty", "source_score_min": SOURCE_MIN, "origin_score_mi
          "qe_en_nl_max": QE_MAX, "chrf_min": None, "eval_13gram": "none shared"}
 CONTEXT_SHARE = 0.2
 REPLAY_SHARE = 0.2
+REAL_SHARE = 0.2  # arm R2: real pairs at most this share of the examples (Yeb's main session, 11 Nov)
+REAL_FIRST = "globalvoices"  # every eligible pair of this source first, the others fill the share
+REAL_PROMPT = "chat-v1"  # TranslateGemma's own prompt, no tag (amendment of 11 Nov)
 MAX_TOKENS = 2048  # the fine-tune's sequence length (design §7 point 7)
 TAG_PROMPTS = {"none": "chat-v1", "token": "chat-v1-tag-token", "instruction": "chat-v1-tag-instruction",
                "conventional": "chat-v1-tag-conventional"}
@@ -130,9 +147,45 @@ def flan_eval_ngrams(flan_eval):
     return grams
 
 
-def query_fails(pair, passage, blocked, qe_max=QE_MAX):
+def char_ratio(nl, en):
+    """The Dutch characters over the English ones (stripped)"""
+    return len(nl.strip()) / max(1, len(en.strip()))
+
+
+def word_ratio(nl, en):
+    """The Dutch words over the English ones (split on white space), the measure of the main session (11 Nov)"""
+    return len(nl.split()) / max(1, len(en.split()))
+
+
+def median(values):
+    return quantile(sorted(values), 0.5)
+
+
+def length_bounds(rows, factor):
+    """{source: {median, lo, hi}}: the bounds of --len-factor around the median char_ratio of each source's rows"""
+    by = collections.defaultdict(list)
+    for r in rows:
+        by[r["source"]].append(char_ratio(r["nl"], r["en"]))
+    out = {}
+    for source, values in sorted(by.items()):
+        m = median(values)
+        out[source] = {"median": round(m, 4), "lo": round(m / factor, 4), "hi": round(m * factor, 4), "n": len(values)}
+    return out
+
+
+def length_fails(pair, bounds):
+    """True when the pair's char_ratio lies outside its source's bounds (no bounds: no length bound)"""
+    if bounds is None:
+        return False
+    b = bounds.get(pair["source"])
+    if b is None:
+        raise SystemExit(f"{pair.get('id')}: no length bound for source {pair['source']}")
+    return not b["lo"] <= char_ratio(pair["nl"], pair["en"]) <= b["hi"]
+
+
+def query_fails(pair, passage, blocked, qe_max=QE_MAX, bounds=None):
     """The parts of the query a back-translation pair fails (empty: eligible). passage is its row of the selection
-    (None for a context turn, whose score is in context-turns.parquet)."""
+    (None for a context turn, whose score is in context-turns.parquet). bounds: length_bounds, or None for none."""
     fails = []
     if pair["hard_fails"]:
         fails.append("hard_fails")
@@ -143,12 +196,14 @@ def query_fails(pair, passage, blocked, qe_max=QE_MAX):
             fails.append("origin_score")
     if pair["qe_en_nl"] is None or pair["qe_en_nl"] > qe_max:
         fails.append("qe")
+    if length_fails(pair, bounds):
+        fails.append("length")
     if (sp.ngrams(pair["nl"]) | sp.ngrams(pair["en"])) & blocked:
         fails.append("eval_13gram")
     return fails
 
 
-def context_of(passage, context_pairs, turns, blocked, qe_max=QE_MAX):
+def context_of(passage, context_pairs, turns, blocked, qe_max=QE_MAX, bounds=None):
     """(context for user_text, turn ids): the passage's earlier turns, oldest first, cut at the nearest turn that fails
     the query (a turn with a source score below SOURCE_MIN fails too)."""
     kept = []
@@ -156,7 +211,8 @@ def context_of(passage, context_pairs, turns, blocked, qe_max=QE_MAX):
         pair, turn = context_pairs.get(turn_id), turns.get(turn_id)
         if pair is None or turn is None:
             raise SystemExit(f"{passage['pid']}: context turn {turn_id} has no pair or no row in context-turns.parquet")
-        if query_fails(pair, None, blocked, qe_max) or turn["source_score"] is None or turn["source_score"] < SOURCE_MIN:
+        if query_fails(pair, None, blocked, qe_max, bounds) or turn["source_score"] is None or \
+                turn["source_score"] < SOURCE_MIN:
             break
         kept.append((turn_id, {"label": speaker_label(turn["speaker"], turn["party"]), "source": pair["en"].strip(),
                                "translation": pair["nl"].strip()}))
@@ -265,13 +321,17 @@ def candidates_bt(args, blocked, report):
     fails = collections.Counter()
     alone = collections.Counter()
     by_split = collections.Counter()
+    bounds = None
+    if getattr(args, "len_factor", None):
+        bounds = length_bounds([r for r in rows if r["split"] == "train" and not r["hard_fails"]], args.len_factor)
+        report["length_bounds_bt"] = bounds
     for r in rows:
         p = passages.get(r["pid"])
         if p is None:
             raise SystemExit(f"{r['pid']}: a pair without a passage in the selections")
         if p["split"] != r["split"]:
             raise SystemExit(f"{r['pid']}: split {r['split']} in the pairs, {p['split']} in the selection")
-        r["fails"] = query_fails(r, p, blocked, args.qe_max)
+        r["fails"] = query_fails(r, p, blocked, args.qe_max, bounds)
         r["passage"] = p
         by_split[r["split"]] += 1
         for f in r["fails"]:
@@ -286,7 +346,8 @@ def candidates_bt(args, blocked, report):
         "qe_train_after_hard": {"n": len(qe_hard), **{f"p{q}": round(quantile(qe_hard, q / 100), 3)
                                                       for q in (50, 90, 95, 99, 99.5, 99.9)},
                                 "max": qe_hard[-1] if qe_hard else None,
-                                "over": {str(c): sum(v > c for v in qe_hard) for c in (6, 7, 7.5, 8, 9, 10, 12, 15)}},
+                                "over": {str(c): sum(v > c for v in qe_hard)
+                                         for c in (3, 4, 5, 6, 7, 7.5, 8, 9, 10, 12, 15)}},
     }
     ctx_stats = collections.Counter()
     for r in rows:
@@ -296,7 +357,7 @@ def candidates_bt(args, blocked, report):
         if r["fails"] or not r["passage"]["context_ids"]:
             continue
         ctx_stats[f"{r['split']}/marked"] += 1
-        r["context"], r["context_ids"] = context_of(r["passage"], context_pairs, turns, blocked, args.qe_max)
+        r["context"], r["context_ids"] = context_of(r["passage"], context_pairs, turns, blocked, args.qe_max, bounds)
         dropped = len(r["passage"]["context_ids"]) - len(r["context_ids"])
         ctx_stats[f"{r['split']}/turns_dropped"] += dropped
         ctx_stats[f"{r['split']}/{'with_context' if r['context'] else 'no_turn_left'}"] += 1
@@ -329,6 +390,76 @@ def candidates_replay(args, blocked, report, flan_grams=frozenset()):
     return out
 
 
+def candidates_real(args, blocked, report):
+    """The real pairs of --real with what the query says of them (first and alone per source, as for the
+    back-translations); returns the eligible ones (tokens are counted in build)."""
+    import pyarrow.parquet as pq
+
+    rows = pq.read_table(args.real).to_pylist()
+    if len({r["id"] for r in rows}) != len(rows):
+        raise SystemExit(f"{args.real}: real pairs with the same id")
+    without_qe = getattr(args, "real_without_qe", False)
+    if not without_qe and "qe_en_nl" not in rows[0]:
+        raise SystemExit(f"{args.real} has no qe_en_nl (real_pairs.py join-qe), and --real-without-qe is not set")
+    hard_ok = [r for r in rows if not r["fails"]]
+    bounds = length_bounds(hard_ok, args.len_factor) if getattr(args, "len_factor", None) else None
+    first, alone, out = collections.Counter(), collections.Counter(), []
+    for r in rows:
+        for side in ("nl", "en"):
+            if "<unused" in r[side]:
+                raise SystemExit(f"real {r['id']}: its {side} has the tag token's text")
+        fails = ["hard:" + f for f in r["fails"]]
+        if not r["fails"]:
+            if not without_qe:
+                if r["qe_en_nl"] is None:
+                    raise SystemExit(f"real {r['id']}: passed the hard checks without a MetricX-QE")
+                if r["qe_en_nl"] > args.qe_max:
+                    fails.append("qe")
+            if length_fails(r, bounds):
+                fails.append("length")
+            if (sp.ngrams(r["nl"]) | sp.ngrams(r["en"])) & blocked:
+                fails.append("eval_13gram")
+        for f in fails:
+            alone[f"{r['source']}/{f}"] += 1
+        if fails:
+            first[f"{r['source']}/{fails[0]}"] += 1
+        else:
+            out.append(r)
+    report["real"] = {"pairs": dict(collections.Counter(r["source"] for r in rows)),
+                      "query_cost": {"first_failed": dict(sorted(first.items())), "alone": dict(sorted(alone.items()))},
+                      "eligible": dict(collections.Counter(r["source"] for r in out)), "without_qe": without_qe,
+                      "length_bounds": bounds,
+                      "qe_hard_ok": None if without_qe else {
+                          s: {"n": len(v), **{f"p{q}": round(quantile(v, q / 100), 3) for q in (50, 90, 95, 99)},
+                              "over": {str(c): sum(x > c for x in v) for c in (3, 4, 5, 7.5, 10)}}
+                          for s, v in sorted(_by_source(hard_ok, "qe_en_nl").items())}}
+    return out
+
+
+def _by_source(rows, key):
+    by = collections.defaultdict(list)
+    for r in rows:
+        if r.get(key) is not None:
+            by[r["source"]].append(r[key])
+    return {s: sorted(v) for s, v in by.items()}
+
+
+def real_draw(eligible, cap, seed):
+    """(chosen real pairs, info): every eligible pair of REAL_FIRST (a draw of cap when there are more), then the other
+    sources' pairs drawn to fill cap; fewer than cap: all of them."""
+    first = sorted((r for r in eligible if r["source"] == REAL_FIRST), key=lambda r: r["id"])
+    rest = sorted((r for r in eligible if r["source"] != REAL_FIRST), key=lambda r: r["id"])
+    if len(first) > cap:
+        first = random.Random(f"{seed}/real/{REAL_FIRST}").sample(first, cap)
+    need = cap - len(first)
+    if len(rest) > need:
+        rest = random.Random(f"{seed}/real/rest").sample(rest, need)
+    chosen = first + rest
+    info = {"cap": cap, "eligible": dict(collections.Counter(r["source"] for r in eligible)),
+            "chosen": dict(collections.Counter(r["source"] for r in chosen))}
+    return chosen, info
+
+
 def quantile(values, q):
     if not values:
         return None
@@ -338,14 +469,14 @@ def quantile(values, q):
 
 
 def parse_sets(specs):
-    """'N-token=token+replay' -> {name: (tag, replay)}"""
+    """'N-token=token+replay' -> {name: (tag, replay)}; 'R2=none+real' -> {name: (tag, 'real')} (the real pairs)"""
     sets = {}
     for spec in specs:
         name, _, form = spec.partition("=")
         tag, _, extra = form.partition("+")
-        if not name or tag not in TAG_PROMPTS or extra not in ("", "replay"):
-            raise SystemExit(f"--sets: NAME=TAG[+replay] with TAG one of {sorted(TAG_PROMPTS)}, not {spec!r}")
-        sets[name] = (tag, extra == "replay")
+        if not name or tag not in TAG_PROMPTS or extra not in ("", "replay", "real"):
+            raise SystemExit(f"--sets: NAME=TAG[+replay|+real] with TAG one of {sorted(TAG_PROMPTS)}, not {spec!r}")
+        sets[name] = (tag, "real") if extra == "real" else (tag, extra == "replay")
     return sets
 
 
@@ -367,6 +498,12 @@ def build(args, tokenizer=None):
             tokenizer(TAG_TOKEN, add_special_tokens=False)["input_ids"] != [tag_id]:
         raise SystemExit(f"{TAG_TOKEN} is not one token of {args.tokenizer}")
     query = QUERY | {"qe_en_nl_max": args.qe_max}
+    len_factor = getattr(args, "len_factor", None)
+    if len_factor:
+        query |= {"len_factor": len_factor}
+    real_path = getattr(args, "real", None)
+    if any(extra == "real" for _, extra in sets.values()) != bool(real_path):
+        raise SystemExit("--real goes with a set NAME=TAG+real, and such a set needs --real")
     replay_prompt = TAG_PROMPTS[args.replay_tag]
     report = {"query": query, "context_share": CONTEXT_SHARE, "replay_share": REPLAY_SHARE, "max_tokens": MAX_TOKENS,
               "seed": args.seed, "bt_arg": args.bt, "sets": {}, "tag_token": {"text": TAG_TOKEN, "id": tag_id},
@@ -377,10 +514,20 @@ def build(args, tokenizer=None):
                   ("passages_long", Path(args.long) / "passages.parquet"),
                   ("context_turns", Path(args.run) / "context-turns.parquet"), ("replay", Path(args.replay)),
                   ("flan_eval", Path(args.flan_eval)), ("evalsets", Path(args.evalsets)))}}
+    for key in ("real", "block_jsonl"):
+        if getattr(args, key, None):
+            report["inputs"][key] = {"path": str(getattr(args, key)), "sha256": sha256(getattr(args, key))}
     evalsets = pq.read_table(args.evalsets, columns=["source", "reference"]).to_pylist()
     flan_eval = pq.read_table(args.flan_eval, columns=["inputs", "targets"]).to_pylist()
     blocked = blocked_ngrams(evalsets)
     report["blocked_13grams"] = len(blocked)
+    if getattr(args, "block_jsonl", None):
+        extra = set()
+        for line in Path(args.block_jsonl).read_text(encoding="utf-8").split("\n"):
+            if line.strip():
+                extra |= sp.ngrams(json.loads(line)["source"] or "")
+        report["blocked_13grams_extra"] = len(extra - blocked)
+        blocked |= extra
     print(f"PROGRESS {len(blocked)} blocked 13-grams", flush=True)
     rows = candidates_bt(args, blocked, report)
 
@@ -425,7 +572,7 @@ def build(args, tokenizer=None):
     bt_rows = [by_pid[p] for p in chosen_ctx] + [by_pid[p] for s in sorted(plain) for p in plain[s]]
     n_replay = round(info["bt_total"] * REPLAY_SHARE / (1 - REPLAY_SHARE))
     replay = []
-    if any(with_replay for _, with_replay in sets.values()):
+    if any(extra is True for _, extra in sets.values()):
         pool = candidates_replay(args, blocked, report, flan_eval_ngrams(flan_eval))
         print(f"PROGRESS {len(pool)} replay candidates, counting tokens", flush=True)
         prompts = counter.prompt_lengths([user_turn(replay_prompt, r["en"]) for r in pool])
@@ -437,6 +584,33 @@ def build(args, tokenizer=None):
             raise SystemExit(f"{n_replay} replay pairs wanted, {len(fitting)} candidates")
         replay = random.Random(f"{args.seed}/replay").sample(fitting, n_replay)
         report["replay"]["drawn"] = n_replay
+
+    real = []
+    if real_path:
+        pool = candidates_real(args, blocked, report)
+        print(f"PROGRESS {len(pool)} eligible real pairs, counting tokens", flush=True)
+        prompts = counter.prompt_lengths([user_turn(REAL_PROMPT, r["en"]) for r in pool])
+        targets = counter.target_lengths([r["nl"].strip() for r in pool])
+        fitting = []
+        for r, n_prompt, n_target in zip(pool, prompts, targets):
+            if n_prompt + n_target <= MAX_TOKENS:
+                fitting.append(r | {"tokens_prompt": n_prompt, "tokens_target": n_target})
+            else:
+                report["real"]["query_cost"]["first_failed"][f"{r['source']}/too_long"] = \
+                    report["real"]["query_cost"]["first_failed"].get(f"{r['source']}/too_long", 0) + 1
+        share = getattr(args, "real_share", REAL_SHARE)
+        cap = round(info["bt_total"] * share / (1 - share))
+        real, draw = real_draw(fitting, cap, args.seed)
+        report["real"]["share"] = share
+        report["real"]["draw"] = draw
+
+    def real_example(r):
+        user = user_turn(REAL_PROMPT, r["en"])
+        return ({"messages": [{"role": "user", "content": user}, {"role": "assistant", "content": r["nl"].strip()}]},
+                {"id": r["id"], "kind": "real", "source": r["source"], "length_class": None, "tag": "none",
+                 "prompt": REAL_PROMPT, "en": r["en"].strip(), "context": [], "context_ids": [], "label": None,
+                 "tokens_prompt": r["tokens_prompt"], "tokens_target": r["tokens_target"],
+                 "qe_en_nl": r.get("qe_en_nl"), "chrf": None})
 
     def bt_examples(part, tag, with_context):
         users = [user_turn(TAG_PROMPTS[tag], r["en"], r["context"] if c else [], r["label"])
@@ -462,12 +636,15 @@ def build(args, tokenizer=None):
                  "label": None, "tokens_prompt": r["tokens_prompt"], "tokens_target": r["tokens_target"],
                  "qe_en_nl": None, "chrf": None})
 
-    for name, (tag, with_replay) in sets.items():
+    for name, (tag, extra) in sets.items():
+        with_replay = extra is True
         d = out / name
         d.mkdir(parents=True, exist_ok=True)
         examples = bt_examples(bt_rows, tag, [r["pid"] in ctx_set for r in bt_rows])
         if with_replay:
             examples += [replay_example(r) for r in replay]
+        if extra == "real":
+            examples += [real_example(r) for r in real]
         random.Random(f"{args.seed}/shuffle").shuffle(examples)
         eval_examples = bt_examples(evals, tag, [bool(r["context"]) for r in evals])
         for split, part in (("train", examples), ("eval", eval_examples)):
@@ -477,11 +654,13 @@ def build(args, tokenizer=None):
         stats = set_stats(examples, eval_examples)
         manifest = {"set": name, "tag": tag, "replay": with_replay, "prompts": sorted({m["prompt"] for _, m in examples}),
                     "replay_tag": args.replay_tag if with_replay else None, "query": query, "seed": args.seed,
-                    "bt": args.bt, **stats,
+                    "bt": args.bt, "real": extra == "real",
+                    "real_without_qe": bool(getattr(args, "real_without_qe", False)) if extra == "real" else None,
+                    **stats,
                     "files": {f.name: sha256(f) for f in sorted(d.iterdir()) if f.suffix in (".parquet", ".jinja")}}
         (d / "manifest.json").write_text(json.dumps(manifest, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
         report["sets"][name] = {"tag": tag, "replay": with_replay, "replay_tag": args.replay_tag if with_replay else None,
-                                **stats}
+                                "real": extra == "real", **stats}
         print(f"SET {name} {json.dumps(stats['train'])}", flush=True)
     (out / "report.json").write_text(json.dumps(report, indent=1, ensure_ascii=False, default=str) + "\n",
                                      encoding="utf-8")
@@ -501,7 +680,17 @@ def set_stats(train, evals):
             s = by_source[m["source"] if m["kind"] != "replay" else "replay"]
             s[0] += m["tokens_prompt"] + m["tokens_target"]
             s[1] += m["tokens_target"]
+        ratios = collections.defaultdict(lambda: ([], []))
+        for msgs, m in rows:
+            nl = msgs["messages"][1]["content"]
+            group = "real" if m["kind"] == "real" else "replay" if m["kind"] == "replay" else "bt"
+            for key in (group, "all", f"source/{m['source'] if m['kind'] != 'replay' else 'replay'}"):
+                ratios[key][0].append(word_ratio(nl, m["en"]))
+                ratios[key][1].append(char_ratio(nl, m["en"]))
+        length = {k: {"n": len(w), "median_words": round(median(w), 4), "median_chars": round(median(c), 4)}
+                  for k, (w, c) in sorted(ratios.items())}
         return {"examples": len(metas), "kinds": dict(sorted(kinds.items())), "sources": dict(sorted(sources.items())),
+                "length_ratio": length, "real_share": round(kinds["real"] / len(metas), 4) if metas else None,
                 "tokens_by_source": {k: v[0] for k, v in sorted(by_source.items())},
                 "loss_tokens_by_source": {k: v[1] for k, v in sorted(by_source.items())},
                 "long": sum(m["length_class"] == "long" for m in metas),
@@ -533,10 +722,36 @@ def report_md(report):
     lines += ["", f"MetricX-24-QE van de trainpassages die door de harde controles komen (n = {_n(q['n'])}): "
               + ", ".join(f"{k} {q[k]}" for k in ("p50", "p90", "p95", "p99", "p99.5", "p99.9", "max")) + ".", "",
               "| QE > | paren |", "|---:|---:|"] + [f"| {c} | {_n(n)} |" for c, n in q["over"].items()]
+    if "length_bounds_bt" in report:
+        lines += ["", "Lengtegrens (`--len-factor`, tekens Nederlands / tekens Engels binnen een factor van de mediaan van de "
+                  "bron; de medianen over de trainpassages die door `hard_fails` komen):", "",
+                  "| bron | n | mediaan | ondergrens | bovengrens |", "|---|---:|---:|---:|---:|"]
+        lines += [f"| {k} | {_n(v['n'])} | {v['median']} | {v['lo']} | {v['hi']} |"
+                  for k, v in report["length_bounds_bt"].items()]
+    if "blocked_13grams_extra" in report:
+        lines += ["", f"13-grammen van `--block-jsonl` (de blinde passages) erbij: {_n(report['blocked_13grams_extra'])}."]
     lines += ["", f"Context: {json.dumps(report['context'])}; te lang: {json.dumps(report['too_long'])}.",
               f"BT: {json.dumps(report['bt'], ensure_ascii=False)}."]
     if "replay" in report:
         lines.append(f"Replay: {json.dumps(report['replay'])}.")
+    if "real" in report:
+        r = report["real"]
+        lines += ["", "## Echte vertaalparen (`--real`)", ""]
+        if r["without_qe"]:
+            lines += ["**Proefbouw zonder MetricX-QE op de echte paren (`--real-without-qe`): niet de set voor de "
+                      "training.**", ""]
+        lines += ["Wat elke grens kost (paren; `hard:` = de harde controles van `real_pairs.py`; eerste grens die faalt / "
+                  "alle paren die hem niet halen):", "", "| bron/grens | eerste | alleen |", "|---|---:|---:|"]
+        cost = r["query_cost"]
+        for key in sorted(set(cost["first_failed"]) | set(cost["alone"])):
+            lines.append(f"| {key} | {_n(cost['first_failed'].get(key, 0))} | {_n(cost['alone'].get(key, 0))} |")
+        lines += ["", f"Paren: {json.dumps(r['pairs'])}; in aanmerking: {json.dumps(r['eligible'])}; getrokken "
+                  f"(hoogstens {r.get('share')} van de voorbeelden, {REAL_FIRST} eerst): {json.dumps(r.get('draw'))}."]
+        if r["length_bounds"]:
+            lines += ["", "| bron | n | mediaan | ondergrens | bovengrens |", "|---|---:|---:|---:|---:|"]
+            lines += [f"| {k} | {_n(v['n'])} | {v['median']} | {v['lo']} | {v['hi']} |" for k, v in r["length_bounds"].items()]
+        if r["qe_hard_ok"]:
+            lines += ["", f"MetricX-24-QE van de paren die door de harde controles komen: {json.dumps(r['qe_hard_ok'])}."]
     lines += ["", "## Sets", "", f"Tag van de replay (`--replay-tag`): {report['replay_tag']} "
               f"(`{report['tag_prompts'][report['replay_tag']]}`).", "",
               "| set | tag | replay | split | voorbeelden | bt | bt_context | replay | lang | "
@@ -558,6 +773,11 @@ def report_md(report):
             loss = p["loss_tokens_by_source"][source]
             lines.append(f"| {name} | {source} | {_n(n)} | {_n(p['tokens_by_source'][source])} | {_n(loss)} | "
                          f"{loss / n:.0f} |")
+    lines += ["", "## Lengteverhouding (train; mediaan per voorbeeld: woorden Nederlands / woorden Engels, en tekens)", "",
+              "| set | deel | n | woorden | tekens |", "|---|---|---:|---:|---:|"]
+    for name, s in report["sets"].items():
+        for key, v in s["train"].get("length_ratio", {}).items():
+            lines.append(f"| {name} | {key} | {_n(v['n'])} | {v['median_words']:.3f} | {v['median_chars']:.3f} |")
     lines.append("")
     return "\n".join(lines)
 
@@ -637,7 +857,15 @@ def main(argv=None):
                    "(every eligible training passage) or a total")
     b.add_argument("--qe-max", type=float, default=QE_MAX, help="the query's bound on MetricX-24-QE en->nl")
     b.add_argument("--replay-tag", default="none", choices=sorted(TAG_PROMPTS), help="the tag of the replay's prompt")
-    b.add_argument("--sets", nargs="+", required=True, help="NAME=TAG[+replay], TAG none, token or instruction")
+    b.add_argument("--len-factor", type=float, default=None,
+                   help="the bound on the length ratio (Dutch / English characters): within this factor of its "
+                   "source's median; none by default")
+    b.add_argument("--block-jsonl", default=None, help="JSONL with a source per line (blind100.jsonl): 13-grams blocked")
+    b.add_argument("--real", default=None, help="real_pairs.py's real pairs (with qe_en_nl from join-qe)")
+    b.add_argument("--real-share", type=float, default=REAL_SHARE)
+    b.add_argument("--real-without-qe", action="store_true", help="a dry run: no MetricX-QE bound on the real pairs")
+    b.add_argument("--sets", nargs="+", required=True,
+                   help="NAME=TAG[+replay|+real], TAG none, token, instruction or conventional")
     b.add_argument("--seed", default=SEED)
     b.add_argument("--out", required=True)
     c = sub.add_parser("check")

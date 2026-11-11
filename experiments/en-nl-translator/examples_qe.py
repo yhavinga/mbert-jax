@@ -8,6 +8,8 @@ tables.
         --scores metricx.parquet --comet comet.parquet --out examples-qe-rule.md --json examples-qe-rule.json
     python examples_qe.py cutoff --run RUN --long LONG --evalsets evalsets.parquet --tokenizer TOK \\
         --out examples-qe-cutoff.md --json examples-qe-cutoff.json
+    python examples_qe.py length --run RUN --long LONG [--real real.parquet] --qe-max 5 --factor 1.3333 \\
+        --out examples-r2-length.md --json examples-r2-length.json
 
 rule-pairs: the tag test's WMT24++ translations of the base model 12B and of the adapter with the instruction sentence,
 with its tag (variant instruction_tag), beside the WMT24++ reference: the input of metricx_qe.py (source:hypothesis:
@@ -18,6 +20,11 @@ with source, reference, both translations, QE, MetricX-24 with the reference and
 cutoff: the training passages of both runs that pass every other bound of the query (sft_build.py), what each QE bound
 would cost, and pairs drawn with a fixed seed per QE band, each with the synthetic English, the original Dutch, QE,
 chrF and its source.
+length (arm R2, protocol §9, amendment of 11 Nov): the bound on the length ratio (Dutch over English characters within a
+factor of the source's median, sft_build.py --len-factor): per source the medians (characters and words), what each
+factor costs on either side, and pairs drawn with a fixed seed just outside and just inside the chosen bound, for the
+back-translation pairs (training passages that pass hard_fails and QE <= --qe-max) and the real pairs (real_pairs.py
+candidates that pass the hard checks; their QE where real.parquet has it).
 """
 
 import argparse
@@ -367,6 +374,111 @@ def cutoff_md(o):
     return "\n".join(lines) + "\n"
 
 
+LENGTH_FACTORS = [1.2, 1.25, 1.3333, 1.5]
+LENGTH_PER_SIDE = (4, 2)  # pairs just outside, just inside the bound, per side and group
+LENGTH_BAND = 1.06        # "just": within this factor of the bound
+
+
+def length_groups(args):
+    """{group: rows (id, source, en, nl, qe_en_nl)}: 'bt' (training passages, hard_fails empty, QE <= qe_max) and per
+    real source 'real/<source>' (hard checks passed; QE <= qe_max where measured)"""
+    import pyarrow.parquet as pq
+
+    cols = ["id", "pid", "kind", "source", "split", "nl", "en", "hard_fails", "qe_en_nl"]
+    rows = pq.read_table(Path(args.run) / "pairs.parquet", columns=cols).to_pylist() + \
+        pq.read_table(Path(args.long) / "pairs.parquet", columns=cols).to_pylist()
+    bt_all = [r for r in rows if r["kind"] == "passage" and r["split"] == "train" and not r["hard_fails"]]
+    groups = {"bt": (bt_all, [r for r in bt_all if r["qe_en_nl"] is not None and r["qe_en_nl"] <= args.qe_max])}
+    if args.real:
+        real = [r for r in pq.read_table(args.real).to_pylist() if not r["fails"]]
+        for source in sorted({r["source"] for r in real}):
+            mine = [r for r in real if r["source"] == source]
+            kept = [r for r in mine if r.get("qe_en_nl") is None or r["qe_en_nl"] <= args.qe_max]
+            groups[f"real/{source}"] = (mine, kept)
+    return groups
+
+
+def length(args):
+    import sft_build as sb
+
+    out = {"factor": args.factor, "qe_max": args.qe_max, "groups": {}}
+    for group, (base_rows, rows) in length_groups(args).items():
+        bounds = sb.length_bounds(base_rows, args.factor)  # the medians over the hard checks, as sft_build.py
+        g = {"n": len(rows), "with_qe": sum(r.get("qe_en_nl") is not None for r in rows), "sources": {}, "costs": [],
+             "examples": {}}
+        for source, b in bounds.items():
+            mine = [r for r in rows if r["source"] == source]
+            cr = sorted(sb.char_ratio(r["nl"], r["en"]) for r in mine)
+            wr = sorted(sb.word_ratio(r["nl"], r["en"]) for r in mine)
+            g["sources"][source] = {"n": len(mine), "median_chars": b["median"], "median_words": sb.median(wr) if wr else None,
+                                    "lo": b["lo"], "hi": b["hi"], "below": sum(x < b["lo"] for x in cr),
+                                    "above": sum(x > b["hi"] for x in cr),
+                                    "p1": quantile(cr, 0.01), "p99": quantile(cr, 0.99)}
+        for f in LENGTH_FACTORS:
+            fb = sb.length_bounds(base_rows, f)
+            below = sum(sb.char_ratio(r["nl"], r["en"]) < fb[r["source"]]["lo"] for r in rows)
+            above = sum(sb.char_ratio(r["nl"], r["en"]) > fb[r["source"]]["hi"] for r in rows)
+            g["costs"].append({"factor": f, "below": below, "above": above})
+        rng = random.Random(f"{SEED}/length/{group}")
+        for side in ("below", "above"):
+            for where, k in zip(("outside", "inside"), LENGTH_PER_SIDE):
+                def near(r):
+                    x, b = sb.char_ratio(r["nl"], r["en"]), bounds[r["source"]]
+                    if side == "below":
+                        return b["lo"] / LENGTH_BAND <= x < b["lo"] if where == "outside" else b["lo"] <= x < b["lo"] * LENGTH_BAND
+                    return b["hi"] < x <= b["hi"] * LENGTH_BAND if where == "outside" else b["hi"] / LENGTH_BAND < x <= b["hi"]
+                pool = sorted((r for r in rows if near(r) and len(r["en"]) <= 1200), key=lambda r: r["id"])
+                pick = rng.sample(pool, min(k, len(pool)))
+                g["examples"][f"{side}/{where}"] = {"pool": len(pool), "pairs": [
+                    {"id": r["id"], "source": r["source"], "chars": sb.char_ratio(r["nl"], r["en"]),
+                     "words": sb.word_ratio(r["nl"], r["en"]), "qe": r.get("qe_en_nl"), "en": r["en"], "nl": r["nl"]}
+                    for r in pick]}
+        out["groups"][group] = g
+    if args.json:
+        Path(args.json).write_text(json.dumps(out, indent=1, ensure_ascii=False) + "\n")
+    Path(args.out).write_text(length_md(out), encoding="utf-8")
+    print("LENGTH " + json.dumps({k: {"n": g["n"], "costs": g["costs"]} for k, g in out["groups"].items()}))
+
+
+GROUP_NAMES = {"bt": "BT-paren (synthetisch Engels → origineel Nederlands)", "real/europarl": "Europarl-direct en→nl",
+               "real/globalvoices": "Global Voices en→nl"}
+
+
+def length_md(o):
+    f = o["factor"]
+    L = ["# Voorbeelden bij de lengtegrens van arm R2", "",
+         f"Maat per paar: tekens van het Nederlands gedeeld door tekens van het Engels. Grens: binnen een factor {nl(f, 4)} "
+         "van de mediaan van de bron (mediaan / factor tot mediaan × factor; de medianen over de paren die door de harde "
+         "controles komen), aan beide kanten. Tekens en niet woorden, omdat Nederlandse samenstellingen het aantal woorden "
+         "drukken (\"gladheidbestrijdingsplan\"); de mediaan in woorden staat ernaast. Gemaakt met `examples_qe.py length` "
+         f"(branch `en-nl-sft`); BT: trainpassages met lege `hard_fails` en MetricX-QE ≤ {nl(o['qe_max'], 1)}; echte paren: "
+         "kandidaten van `real_pairs.py` die door de harde controles komen, met QE-grens waar de QE gemeten is.", ""]
+    for group, g in o["groups"].items():
+        L += [f"## {GROUP_NAMES.get(group, group)}", "",
+              f"{n_(g['n'])} paren ({n_(g['with_qe'])} met MetricX-QE).", "",
+              "| bron | n | mediaan tekens | mediaan woorden | ondergrens | bovengrens | eronder | erboven | p1 | p99 |",
+              "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
+        for s, v in g["sources"].items():
+            L.append(f"| {s} | {n_(v['n'])} | {nl(v['median_chars'], 3)} | {nl(v['median_words'], 3)} | {nl(v['lo'], 3)} | "
+                     f"{nl(v['hi'], 3)} | {n_(v['below'])} | {n_(v['above'])} | {nl(v['p1'], 3)} | {nl(v['p99'], 3)} |")
+        L += ["", "Wat de grens kost bij andere factoren (paren eronder / erboven):", "",
+              "| factor | eronder | erboven | samen | aandeel |", "|---:|---:|---:|---:|---:|"]
+        for c in g["costs"]:
+            total = c["below"] + c["above"]
+            L.append(f"| {nl(c['factor'], 4)}{' (gekozen)' if abs(c['factor'] - f) < 1e-9 else ''} | {n_(c['below'])} | "
+                     f"{n_(c['above'])} | {n_(total)} | {nl(100 * total / g['n'], 2) if g['n'] else '–'}% |")
+        names = {"below/outside": "Net onder de ondergrens (valt af)", "below/inside": "Net boven de ondergrens (blijft)",
+                 "above/outside": "Net boven de bovengrens (valt af)", "above/inside": "Net onder de bovengrens (blijft)"}
+        for key, title in names.items():
+            e = g["examples"][key]
+            L += ["", f"### {title} ({n_(e['pool'])} paren binnen {nl(LENGTH_BAND, 2)} × de grens)", ""]
+            for x in e["pairs"]:
+                L += [f"**`{x['id']}`** ({x['source']}; tekens {nl(x['chars'], 3)}, woorden {nl(x['words'], 3)}; QE "
+                      f"{nl(x['qe'])})", "", "Engels:", "", quote(x["en"], 1500), "", "Nederlands:", "", quote(x["nl"], 1500), ""]
+        L.append("")
+    return "\n".join(L) + "\n"
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Examples for the QE rule and the QE bound")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -389,8 +501,16 @@ def main(argv=None):
     c.add_argument("--tokenizer", required=True)
     c.add_argument("--out", required=True)
     c.add_argument("--json", default=None)
+    g = sub.add_parser("length")
+    g.add_argument("--run", required=True)
+    g.add_argument("--long", required=True)
+    g.add_argument("--real", default=None, help="real_pairs.py candidates (real.parquet or real-qe.parquet)")
+    g.add_argument("--qe-max", type=float, default=5.0)
+    g.add_argument("--factor", type=float, default=1.3333)
+    g.add_argument("--out", required=True)
+    g.add_argument("--json", default=None)
     args = parser.parse_args(argv)
-    {"rule-pairs": rule_pairs, "rule": rule, "cutoff": cutoff}[args.command](args)
+    {"rule-pairs": rule_pairs, "rule": rule, "cutoff": cutoff, "length": length}[args.command](args)
 
 
 if __name__ == "__main__":

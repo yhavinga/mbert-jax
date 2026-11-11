@@ -396,3 +396,40 @@ def test_segments_against_the_base_model(tmp_path):
         ("grootste verslechtering", "wmt24pp-0"), ("mediaan", "wmt24pp-1"), ("grootste verbetering", "wmt24pp-3")]
     md = (tmp_path / "s.md").read_text()
     assert "| N50 | wmt24pp (960) | 4 | 0.750 | 50.0% | 25.0% |" in md and "  - N50: aaaaa" in md
+
+
+def test_report_of_one_arm_r2_with_the_length_table(small, tmp_path, monkeypatch):
+    """Arm R2 (protocol §9, amendment of 11 Nov): the arms come from --four, no instr kind; the length of the output
+    against the reference on the four sets is reported."""
+    monkeypatch.setattr(ae, "N_INDOMAIN", 0)
+    ev = evalsets_rows()
+    rows = [{"id": r["id"], "set": r["set"], "metricx_ref": 1.0, "metricx_qe": 1.0, "comet22": 0.85, "ended": True,
+             "decode_loop": False, "english_left": False, "empty": False, "over_512": False} for r in ev]
+    s4 = write(tmp_path / "s4.parquet", rows)
+
+    def texts(name, hyp):  # translations.parquet of evalsets.py summary
+        return write(tmp_path / f"{name}.parquet", [{**r, "hypothesis": hyp(r)} for r in ev])
+
+    base_t = texts("base-t", lambda r: r["reference"])
+    r2_t = texts("r2-t", lambda r: "kort" if r["set"] == "wmt24pp" else r["reference"])
+    x_data = write(tmp_path / "x.parquet", [{"id": "flan:0-0", "set": "flan", "meta": "{}"}])
+    for d in ("bx", "r2x"):
+        score_dir(tmp_path / d, [{"id": "flan:0-0", "set": "flan", "source": "s", "hypothesis": "h", "reference": None,
+                                  "ended": True, "decode_loop": False, "english_left": False, "empty": False,
+                                  "ref": None, "qe": 1.0}], comet=False)
+    (tmp_path / "results.json").write_text(json.dumps({"test_accuracy": 0.7, "test_examples": 400}))
+    ae.main(["report", "--evalsets", str(small["evalsets"]), "--baseline-scores", str(s4), "--four", f"R2={s4}",
+             "--four-texts", f"base={base_t}", f"R2={r2_t}", "--x-data", str(x_data), "--x", f"base={tmp_path / 'bx'}",
+             f"R2={tmp_path / 'r2x'}", "--title", "Fine-tune van de en→nl-vertaler: arm R2 op TranslateGemma 27B", "--classifier", str(tmp_path / "results.json"), "--out", str(tmp_path / "r.md"),
+             "--json", str(tmp_path / "r.json")])
+    r = json.loads((tmp_path / "r.json").read_text())
+    assert list(r["rule_a"]) == ["R2"] and r["rule_a"]["R2"]["holds"]
+    # WMT24++ (960 of the test: 3): "the house wk" -> "de kamer k": 3 words per 3; R2's "kort": 1 per 3 words
+    base, r2 = r["length"]["base"]["wmt24pp"], r["length"]["R2"]["wmt24pp"]
+    assert base["n"] == 3 and base["ref_per_source"] == 1.0 and base["out_per_ref"] == 1.0
+    assert r2["out_per_ref"] == 1 / 3 and r2["under_0_7_of_ref"] == 1.0
+    assert r["length"]["R2"]["flores"]["out_per_ref"] == 1.0
+    md = (tmp_path / "r.md").read_text()
+    assert md.startswith("# Fine-tune van de en→nl-vertaler: arm R2 op TranslateGemma 27B")
+    assert "## Lengte van de uitvoer tegenover de menselijke referentie" in md
+    assert "Controle van de modus" not in md and "- **R2**: (a) ja" in md

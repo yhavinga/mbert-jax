@@ -82,3 +82,34 @@ def test_spearman_and_ranks():
 
 def test_numbers_the_dutch_way():
     assert ex.nl(1234.5, 1) == "1.234,5" and ex.nl(-0.213, 3) == "-0,213" and ex.nl(None) == "–"
+
+
+def test_length_examples_and_what_each_factor_costs(tmp_path):
+    """Arm R2's length bound: Dutch over English characters within a factor of the source's median"""
+    (tmp_path / "run").mkdir()
+    (tmp_path / "long").mkdir()
+    rows = []
+    for k, n in enumerate([100] * 20 + [70, 74, 140, 128, 300]):  # medians 100/100 = 1.0; 300 fails hard_fails
+        rows.append({"id": f"h{k}", "pid": f"h{k}", "kind": "passage", "source": "handelingen", "split": "train",
+                     "en": "e" * 100, "nl": "n" * n, "hard_fails": ["len_ratio"] if n == 300 else [], "qe_en_nl": 1.0})
+    rows.append({"id": "q", "pid": "q", "kind": "passage", "source": "handelingen", "split": "train", "en": "e" * 100,
+                 "nl": "n" * 60, "hard_fails": [], "qe_en_nl": 9.0})  # above the QE bound: not counted
+    write(tmp_path / "run" / "pairs.parquet", rows)
+    write(tmp_path / "long" / "pairs.parquet", [rows[0] | {"id": "l0", "pid": "l0"}])
+    real = [{"id": f"europarl:{k}", "source": "europarl", "en": "e" * 100, "nl": "n" * n, "fails": [], "qe_en_nl": None}
+            for k, n in enumerate([115] * 10 + [80, 160])]
+    write(tmp_path / "real.parquet", real)
+    out = tmp_path / "length.md"
+    ex.main(["length", "--run", str(tmp_path / "run"), "--long", str(tmp_path / "long"), "--real",
+             str(tmp_path / "real.parquet"), "--factor", "1.3333", "--out", str(out), "--json", str(tmp_path / "l.json")])
+    o = json.loads((tmp_path / "l.json").read_text())
+    bt = o["groups"]["bt"]
+    assert bt["n"] == 25 and bt["sources"]["handelingen"]["median_chars"] == 1.0
+    chosen = [c for c in bt["costs"] if c["factor"] == 1.3333][0]
+    assert chosen == {"factor": 1.3333, "below": 2, "above": 1}  # 70 and 74 under 0.75; 140 over 1.3333; 128 stays
+    assert [c["below"] + c["above"] for c in bt["costs"]] == [4, 4, 3, 0]  # 1.2, 1.25, 1.3333, 1.5 (0.667 to 1.5)
+    ep = o["groups"]["real/europarl"]
+    assert ep["sources"]["europarl"]["median_chars"] == 1.15 and ep["sources"]["europarl"]["below"] == 1
+    md = out.read_text()
+    assert "# Voorbeelden bij de lengtegrens van arm R2" in md and "## Europarl-direct en→nl" in md
+    assert "1,3333 (gekozen)" in md

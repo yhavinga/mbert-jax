@@ -25,18 +25,36 @@
 #                                                scale_adapter.py, to $A/$ARM/ (protocol §9, amendment of 11 Nov)
 #   bash run_arms.sh report-scaled               a worker (CPU): armeval.py report for N50 and N25, to $A/report-scaled/
 # MODEL: base (TranslateGemma 27B), B, N, or Ninstr (arm N with the conventional sentence, chat-v1-tag-conventional);
-# N50 and N25 (N's adapter at 50% and 25%, §9). COLLECT=1 with score: only the pairs (evalsets.py collect), job
+# N50 and N25 (N's adapter at 50% and 25%, §9); R2 (below). COLLECT=1 with score: only the pairs (evalsets.py collect), job
 # arms_collect_...; NAT: the bucket directory of texts and predictions (default $A/naturalness; the classifier is always
-# $A/naturalness/classifier/); ARMS: the arms of blind (default "B N").
+# $BASE_A/naturalness/classifier/); ARMS: the arms of blind and report (default "B N").
 # DATA: four (the four sets of the baseline, $E/data), x (FLAN 1,000 + blind 100 + in-domain 4,519) or instr (WMT24++
 # 998 + FLAN 1,000). The code is beside this script (a copy of $A/scripts/). TAG names the jobs of one chain.
+# Arm R2 (protocol §9, amendment of 11 Nov; translator_sft_r2_run.sh) runs the same stages with ARMS_ROOT=$S/r2
+# SETS=$S/data/r2 RUN_PREFIX=arm27b_r2 ARMS=R2; the base model's translations of kind x, the extra sets and the
+# classifier stay the arms' ($BASE_A). Its data first, on CPU (nice, ionice) except r2qe:
+#   bash run_arms.sh r2data                      w3: Global Voices (gv-fetch, resumed), the MoTra checkout, data.py motra
+#                                                of en-nl-judge, real_pairs.py gv-align, europarl, candidates, to
+#                                                $REAL/                                         (job r2_data_$TAG)
+#   bash run_arms.sh r2qe                        every worker (its TPU): MetricX-24-QE en->nl of its share of the
+#                                                candidates, to $REAL/qe/                       (job r2_qe_$TAG)
+#   [DRY=1] bash run_arms.sh r2build             w3: join-qe and sft_build.py build of set R2 (DRY=1: without QE, to
+#                                                $S/data/r2-dry/), to $S/data/r2/               (job r2_build_$TAG)
+#   [DRY=1] bash run_arms.sh r2check             a worker: sft_build.py check of set R2         (job r2_check_$TAG)
 set -euo pipefail
-STAGE=${1:?a stage: setup, data, train, adapter, translate, score, summary, texts, classifier, classify, pll, blind, report}
+STAGE=${1:?a stage: setup, data, train, adapter, scale, translate, score, summary, texts, classifier, classify, pll, blind, report, report-scaled, r2data, r2qe, r2build, r2check}
 S=gs://t5-dutch-english-usc2/mbert/translator/sft
-A=$S/arms
+A=${ARMS_ROOT:-$S/arms}
+BASE_A=$S/arms                       # the base model on kind x, the extra sets, the classifier (the arms' chain)
 E=gs://t5-dutch-english-usc2/mbert/translator/eval
 M=gs://t5-dutch-english-usc2/mbert/translator/mainset
-SETS=$S/data/arms-v2
+SETS=${SETS:-$S/data/arms-v2}
+RUN_PREFIX=${RUN_PREFIX:-arm27b_v2}
+ARMS=${ARMS:-B N}                    # the arms of this chain (blind, report)
+REAL=$S/data/r2-real                 # arm R2's real pairs: candidates, MetricX-QE
+R2_QE_MAX=5                          # protocol §9, amendment of 11 Nov (Yeb): MetricX-QE en->nl <= 5
+R2_LEN_FACTOR=1.3333                 # the length bound: within 4/3 of the source's median ratio of characters
+IDIOMS=$S/blind/fixed-2026-11-10/idiom30.jsonl
 BLIND=$S/blind/fixed-2026-11-10/blind100.jsonl
 S653=gs://t5-dutch-english-usc2/mbert/culturax-nl-230m-chunk1024/ckpt_keep/653000
 SHM=/dev/shm/translator
@@ -82,21 +100,21 @@ dumb_ready() {
 
 model_dir() {  # model_dir MODEL DATA: the bucket directory of a model's output on a data kind. Its basename must be
   # unique: run_baseline.sh keeps a run's local files in $SHM/eval/<basename>
-  echo "$A/eval/$1-$2"
+  if [ "$1" = base ]; then echo "$BASE_A/eval/$1-$2"; else echo "$A/eval/$1-$2"; fi
 }
 
 data_dir() {  # data_dir DATA: the E of run_baseline.sh (its data in $E/data/)
   case $1 in
     four) echo "$E" ;;
-    x|instr) echo "$A/data/$1" ;;
+    x|instr) echo "$BASE_A/data/$1" ;;
     *) echo "unknown DATA $1" >&2; exit 1 ;;
   esac
 }
 
 check_model_data() {
   case "$MODEL/$DATA" in
-    base/x|B/four|B/x|N/four|N/x|Ninstr/instr|N50/four|N50/x|N25/four|N25/x) ;;
-    *) echo "MODEL/DATA $MODEL/$DATA is not one of the chain's: base/x, B/four, B/x, N/four, N/x, Ninstr/instr, N50/four, N50/x, N25/four, N25/x"; exit 1 ;;
+    base/x|B/four|B/x|N/four|N/x|Ninstr/instr|N50/four|N50/x|N25/four|N25/x|R2/four|R2/x) ;;
+    *) echo "MODEL/DATA $MODEL/$DATA is not one of the chains': base/x, B/four, B/x, N/four, N/x, Ninstr/instr, N50/four, N50/x, N25/four, N25/x, R2/four, R2/x"; exit 1 ;;
   esac
 }
 
@@ -118,6 +136,7 @@ setup)
   echo "READY w$W: boot disk $free GB free, /dev/shm $(df -h /dev/shm | tail -1 | awk '{print $4}') free"
   ;;
 data)
+  [ "$A" = "$BASE_A" ] || { echo "data: the extra sets are the arms' ($BASE_A/data/), not made again for $A"; exit 1; }
   ! gsutil -q stat "$A/data/x/data/manifest.json" || { echo "$A/data/x has a manifest.json: the data stay as they are"; exit 1; }
   IN=$SHM/sft/in
   D=$W_DIR/data-$TAG
@@ -144,18 +163,18 @@ EOF
 train)
   ARM=${ARM:?B or N}
   tpu_free
-  D=$SHM/sft/data/arms-v2-$ARM
+  D=$SHM/sft/data/$(basename "$SETS")-$ARM
   mkdir -p "$D"
   gsutil -m -q rsync -r "$SETS/$ARM" "$D"
   # One epoch (sft_lora.py's step_limit), sequences of 2,048, one per chip, over the 16 chips (protocol §3). TRAIN_EXTRA:
   # MaxText overrides of an amendment (protocol §9), after these
   # shellcheck disable=SC2086
-  MULTIHOST=1 NAME=arm27b_v2_$ARM MODEL=27b DATA=$D/train.parquet TEMPLATE=$D/template.jinja ROOT=$A \
+  MULTIHOST=1 NAME=${RUN_PREFIX}_$ARM MODEL=27b DATA=$D/train.parquet TEMPLATE=$D/template.jinja ROOT=$A \
     bash "$CODE/run_sft.sh" per_device_batch_size=1 max_target_length=2048 ${TRAIN_EXTRA:-}
   ;;
 adapter)
   ARM=${ARM:?B or N}
-  RUN=$A/runs/arm27b_v2_$ARM
+  RUN=$A/runs/${RUN_PREFIX}_$ARM
   # run_sft.sh copies the run's files after its log's EXIT line: give that copy up to 3 minutes
   for _ in $(seq 1 36); do
     gsutil -q stat "$RUN/adapter.npz" && gsutil -q stat "$RUN/adapter.json" && gsutil -q stat "$RUN/summary.json" && break
@@ -186,7 +205,7 @@ translate)
   tpu_free
   case $MODEL in
     base) ADAPTER=; PROMPT= ;;
-    B|N|N50|N25) ADAPTER=$A/$MODEL; PROMPT= ;;
+    B|N|N50|N25|R2) ADAPTER=$A/$MODEL; PROMPT= ;;
     Ninstr) ADAPTER=$A/N; PROMPT=chat-v1-tag-conventional ;;
   esac
   if [ -n "$ADAPTER" ]; then
@@ -250,7 +269,10 @@ EOF
   ;;
 summary)
   MODEL=${MODEL:?B or N}
-  label="TranslateGemma 27B + LoRA $MODEL (arms-v2, QE ≤ 7,5; protocol en-nl-sft)"
+  case $MODEL in
+    R2) label="TranslateGemma 27B + LoRA R2 (r2: BT QE ≤ 5 en lengtegrens, echt Engels; protocol en-nl-sft §9)" ;;
+    *) label="TranslateGemma 27B + LoRA $MODEL (arms-v2, QE ≤ 7,5; protocol en-nl-sft)" ;;
+  esac
   detach "arms_summary_${TAG}_$MODEL" env B="$(model_dir "$MODEL" four)" ADAPTER="$A/$MODEL" LABEL="$label" \
     TAG="${TAG}_${MODEL}_four" COMMIT="$COMMIT" bash "$CODE/run_baseline.sh" summary
   ;;
@@ -265,7 +287,7 @@ texts)
 gsutil -q cp $E/baseline-tg27b/translations.parquet $T/base-four.parquet
 gsutil -m -q cp '$(model_dir base x)/pairs/pairs-w*.parquet' $T/base-x/"
             wmt="$wmt 'base=$T/base-four.parquet'"; flan="$flan 'base=$T/base-x/pairs-w*.parquet'" ;;
-      B|N|N50|N25) fetch="$fetch
+      B|N|N50|N25|R2) fetch="$fetch
 mkdir -p $T/$m-x
 gsutil -q cp $(model_dir "$m" four)/translations.parquet $T/$m-four.parquet
 gsutil -m -q cp '$(model_dir "$m" x)/pairs/pairs-w*.parquet' $T/$m-x/"
@@ -337,7 +359,7 @@ $ONE_HOST
 export JAX_COMPILATION_CACHE_DIR=$W_DIR/jax_cache_s PYTHONPATH=src
 cd $DUMB
 mkdir -p $X/model
-gsutil -m -q cp $A/naturalness/classifier/params.pkl $A/naturalness/classifier/config.json $X/model/
+gsutil -m -q cp $BASE_A/naturalness/classifier/params.pkl $BASE_A/naturalness/classifier/config.json $X/model/
 gsutil -q cp $NAT/texts.parquet $X/texts.parquet
 $DPY -u $CODE/naturalness.py classify --dumb-code $DUMB --model $X/model --texts $X/texts.parquet --out $X/predictions.parquet
 gsutil -q cp $X/predictions.parquet $NAT/predictions.parquet
@@ -373,7 +395,8 @@ blind)
 set -euo pipefail
 mkdir -p $X/base $(for arm in $ARMS; do printf '%s ' "$X/$arm"; done)
 gsutil -q cp $BLIND $X/blind100.jsonl
-for m in base $ARMS; do gsutil -m -q cp "$A/eval/\$m-x/pairs/pairs-w*.parquet" $X/\$m/; done
+gsutil -m -q cp "$(model_dir base x)/pairs/pairs-w*.parquet" $X/base/
+for m in $ARMS; do gsutil -m -q cp "$A/eval/\$m-x/pairs/pairs-w*.parquet" $X/\$m/; done
 $PY -I -u $CODE/armeval.py blind --blind $X/blind100.jsonl --base "$X/base/pairs-w*.parquet" --arm $arm_args --out $X/out
 for arm in $ARMS; do gsutil -q cp $X/out/\$arm/judge-input.jsonl $X/out/\$arm/key.jsonl $S/blind/\$arm/; done
 echo "BLIND: $(for arm in $ARMS; do printf '%s ' "$S/blind/$arm/"; done)(judge-input.jsonl; key.jsonl)"
@@ -382,20 +405,39 @@ EOF
   ;;
 report)
   X=$W_DIR/report-$TAG
+  # arm N's chain also has N with the conventional sentence (kind instr)
+  case " $ARMS " in *" N "*) INSTR=Ninstr ;; *) INSTR= ;; esac
+  four=""; xs="base=$X/base-x"; texts="base=$X/base-four-texts.parquet"; fetch=""
+  for m in $ARMS; do
+    four="$four $m=$X/$m-four-scores.parquet"; xs="$xs $m=$X/$m-x"; texts="$texts $m=$X/$m-four-texts.parquet"
+    fetch="$fetch
+gsutil -q cp $A/eval/$m-four/scores.parquet $X/$m-four-scores.parquet
+gsutil -q cp $A/eval/$m-four/translations.parquet $X/$m-four-texts.parquet"
+  done
+  # the title names the chain's arms: "arm R2", "armen B en N"
+  read -ra arms_list <<< "$ARMS"
+  if [ ${#arms_list[@]} = 1 ]; then names="arm ${arms_list[0]}"
+  else last=${arms_list[-1]}; rest=$(IFS=,; echo "${arms_list[*]:0:${#arms_list[@]}-1}"); names="armen ${rest//,/, } en $last"; fi
+  title="Fine-tune van de en→nl-vertaler: $names op TranslateGemma 27B"
+  dirs="base-x=$(model_dir base x)"
+  for m in $ARMS; do dirs="$dirs $m-x=$A/eval/$m-x"; done
+  [ -z "$INSTR" ] || dirs="$dirs $INSTR-instr=$A/eval/$INSTR-instr"
   cat > ~/job_body_arms_report_$TAG.sh <<EOF
 set -euo pipefail
 mkdir -p $X
 gsutil -q cp $E/data/evalsets.parquet $X/evalsets.parquet
 gsutil -q cp $E/baseline-tg27b/scores.parquet $X/base-four-scores.parquet
-gsutil -q cp $A/data/x/data/evalsets.parquet $X/x-evalsets.parquet
-for m in B N; do gsutil -q cp $A/eval/\$m-four/scores.parquet $X/\$m-four-scores.parquet; done
-for d in base-x B-x N-x Ninstr-instr; do
+gsutil -q cp $E/baseline-tg27b/translations.parquet $X/base-four-texts.parquet
+gsutil -q cp $BASE_A/data/x/data/evalsets.parquet $X/x-evalsets.parquet
+$fetch
+for pair in $dirs; do
+  d=\${pair%%=*}; src=\${pair#*=}
   mkdir -p $X/\$d/pairs $X/\$d/scores
-  gsutil -m -q cp "$A/eval/\$d/pairs/pairs-w*.parquet" $X/\$d/pairs/
-  gsutil -m -q cp "$A/eval/\$d/scores/*.parquet" $X/\$d/scores/
+  gsutil -m -q cp "\$src/pairs/pairs-w*.parquet" $X/\$d/pairs/
+  gsutil -m -q cp "\$src/scores/*.parquet" $X/\$d/scores/
 done
-gsutil -m -q cp $A/naturalness/classifier/results.json $A/naturalness/predictions.parquet $A/naturalness/pll.parquet $A/naturalness/texts.parquet $X/
-$PY -I -u $CODE/armeval.py report --evalsets $X/evalsets.parquet --baseline-scores $X/base-four-scores.parquet --four B=$X/B-four-scores.parquet N=$X/N-four-scores.parquet --x-data $X/x-evalsets.parquet --x base=$X/base-x B=$X/B-x N=$X/N-x --instr Ninstr=$X/Ninstr-instr --classifier $X/results.json --predictions $X/predictions.parquet --pll $X/pll.parquet --texts $X/texts.parquet --commit $COMMIT --out $X/report.md --json $X/report.json
+gsutil -m -q cp $BASE_A/naturalness/classifier/results.json $A/naturalness/predictions.parquet $A/naturalness/pll.parquet $A/naturalness/texts.parquet $X/
+$PY -I -u $CODE/armeval.py report --title "$title" --evalsets $X/evalsets.parquet --baseline-scores $X/base-four-scores.parquet --four $four --four-texts $texts --x-data $X/x-evalsets.parquet --x $xs ${INSTR:+--instr $INSTR=$X/$INSTR-instr} --classifier $X/results.json --predictions $X/predictions.parquet --pll $X/pll.parquet --texts $X/texts.parquet --commit $COMMIT --out $X/report.md --json $X/report.json
 gsutil -q cp $X/report.md $X/report.json $A/report/
 echo "REPORT: $A/report/report.md"
 EOF
@@ -435,6 +477,107 @@ gsutil -q cp $X/report.md $X/report.json $A/report-scaled/
 echo "REPORT: $A/report-scaled/report.md"
 EOF
   detach "arms_report_scaled_$TAG" bash ~/job_body_arms_report_scaled_$TAG.sh
+  ;;
+r2data)
+  # CPU and the internet only (nice, ionice): the TPU may run someone else's job meanwhile
+  ! gsutil -q stat "$REAL/candidates/candidates.json" || { echo "$REAL has candidates: they stay as they are"; exit 1; }
+  R2D=$SHM/r2
+  NICE="nice -n 19 ionice -c3"
+  cat > ~/job_body_r2_data_$TAG.sh <<EOF
+set -euo pipefail
+mkdir -p $R2D/gv-raw $R2D/motra-out $R2D/out $R2D/in
+if [ ! -x $R2D/venv/bin/python ]; then
+  UV_CACHE_DIR=$SHM/uv-cache $NICE ~/.local/bin/uv venv -q --python 3.12 $R2D/venv
+  UV_CACHE_DIR=$SHM/uv-cache $NICE ~/.local/bin/uv pip install -q --python $R2D/venv/bin/python beautifulsoup4==4.13.4 pyarrow==25.0.1
+fi
+$R2D/venv/bin/python -c "import bs4, pyarrow"
+# Global Voices straight from the internet to this worker; what an earlier run fetched comes from the bucket
+if gsutil -q stat $REAL/gv-raw/manifest.json; then gsutil -m -q rsync -r $REAL/gv-raw $R2D/gv-raw; fi
+$NICE $R2D/venv/bin/python -I -u $CODE/real_pairs.py gv-fetch --out $R2D/gv-raw
+gsutil -m -q rsync -r $R2D/gv-raw $REAL/gv-raw
+# Europarl-direct: MoTra's XML straight from GitHub, paired as en-nl-judge's data.py motra does
+if [ ! -d $R2D/motra-repo/.git ]; then
+  $NICE git clone -q --depth 1 --filter=blob:none --sparse https://github.com/UDS-SFB-B6-Datasets/Multilingual-Parallel-Direct-Europarl $R2D/motra-repo
+  git -C $R2D/motra-repo sparse-checkout set proceedings/xml/en proceedings/xml/nl scripts
+fi
+[ -s $R2D/motra-out/manifest.json ] || $NICE $PY -I -u $CODE/judge_data.py motra --repo $R2D/motra-repo --out $R2D/motra-out --processes 16 --commit \$(git -C $R2D/motra-repo rev-parse HEAD)
+gsutil -q cp $BLIND $R2D/in/blind100.jsonl
+gsutil -q cp $IDIOMS $R2D/in/idiom30.jsonl
+$NICE $R2D/venv/bin/python -I -u $CODE/real_pairs.py gv-align --fetched $R2D/gv-raw --out $R2D/out/gv.parquet
+$NICE $R2D/venv/bin/python -I -u $CODE/real_pairs.py europarl --motra $R2D/motra-out --out $R2D/out/europarl.parquet
+# candidates imports publish.py (numpy): the translator's venv; gv-align needs Beautiful Soup: the R2 venv
+$NICE $PY -I -u $CODE/real_pairs.py candidates --gv $R2D/out/gv.parquet --europarl $R2D/out/europarl.parquet --blind $R2D/in/blind100.jsonl --idioms $R2D/in/idiom30.jsonl --out $R2D/out/candidates
+gsutil -q cp $R2D/motra-out/manifest.json $REAL/motra-manifest.json
+gsutil -m -q cp $R2D/out/gv.parquet $R2D/out/gv.parquet.stats.json $R2D/out/europarl.parquet $R2D/out/europarl.parquet.stats.json $REAL/
+gsutil -m -q cp $R2D/out/candidates/* $REAL/candidates/
+echo "R2DATA: $REAL/"
+EOF
+  detach "r2_data_$TAG" bash ~/job_body_r2_data_$TAG.sh
+  ;;
+r2qe)
+  tpu_free
+  L=$SHM/r2/qe-$TAG
+  cat > ~/job_body_r2_qe_$TAG.sh <<EOF
+set -euo pipefail
+if gsutil -q stat $REAL/qe/metricx-w$W.parquet; then echo "w$W: $REAL/qe/metricx-w$W.parquet is there before"; exit 0; fi
+mkdir -p $L
+gsutil -q cp $REAL/candidates/metricx-in-w$W.parquet $L/in.parquet
+(
+  $ONE_HOST
+  export JAX_COMPILATION_CACHE_DIR=$SHM/jax_cache_metricx
+  timeout 600 $PY -c "import jax; assert (jax.device_count(), jax.process_count()) == (4, 1), (jax.device_count(), jax.process_count())"
+  $PY -I -u $CODE/metricx_qe.py score --pairs $L/in.parquet --pair en:nl --model xxl --root $SHM/metricx --out $L/metricx-w$W.parquet
+)
+gsutil -q cp $L/metricx-w$W.parquet $REAL/qe/metricx-w$W.parquet
+echo "R2QE w$W: $REAL/qe/metricx-w$W.parquet"
+EOF
+  detach "r2_qe_$TAG" bash ~/job_body_r2_qe_$TAG.sh
+  ;;
+r2build)
+  # DRY=1: the real pairs without their MetricX-QE (a test of the build before the TPU is free), to $S/data/r2-dry
+  if [ "${DRY:-0}" = 1 ]; then OUTSET=$S/data/r2-dry; QE_FLAGS=--real-without-qe; else OUTSET=$S/data/r2; QE_FLAGS=; fi
+  ! gsutil -q stat "$OUTSET/report.json" || { echo "$OUTSET has a report.json: a new set takes a new place"; exit 1; }
+  IN=$SHM/sft/in
+  O=$SHM/r2/build-$TAG
+  cat > ~/job_body_r2_build_$TAG.sh <<EOF
+set -euo pipefail
+export OMP_NUM_THREADS=8 TOKENIZERS_PARALLELISM=true
+mkdir -p $IN/run $IN/long $IN/replay $IN/flan-eval $IN/eval $SHM/r2/real-$TAG
+[ -s $IN/run/pairs.parquet ] || gsutil -q cp $M/run/pairs/pairs.parquet $IN/run/
+[ -s $IN/run/passages.parquet ] || gsutil -q cp $M/run/select/passages.parquet $IN/run/
+[ -s $IN/run/context-turns.parquet ] || gsutil -q cp $M/run/select/context-turns.parquet $IN/run/
+[ -s $IN/long/pairs.parquet ] || gsutil -q cp $M/run-long/pairs/pairs.parquet $IN/long/
+[ -s $IN/long/passages.parquet ] || gsutil -q cp $M/run-long/select/passages.parquet $IN/long/
+[ -s $IN/replay/pairs.parquet ] || gsutil -q cp $M/replay/pairs.parquet $IN/replay/
+[ -s $IN/flan-eval/eval-rows.parquet ] || gsutil -q cp $M/flan-eval/eval-rows.parquet $IN/flan-eval/
+[ -s $IN/eval/evalsets.parquet ] || gsutil -q cp $E/data/evalsets.parquet $IN/eval/
+R=$SHM/r2/real-$TAG
+gsutil -q cp $REAL/candidates/real.parquet $BLIND \$R/
+if [ -z "$QE_FLAGS" ]; then
+  gsutil -m -q cp "$REAL/qe/metricx-w*.parquet" \$R/
+  $PY -I -u $CODE/real_pairs.py join-qe --real \$R/real.parquet --qe \$R/metricx-w0.parquet \$R/metricx-w1.parquet \$R/metricx-w2.parquet \$R/metricx-w3.parquet --out \$R/real-qe.parquet
+  REALP=\$R/real-qe.parquet
+else
+  REALP=\$R/real.parquet
+fi
+[ ! -e $O ] || { echo "$O exists"; exit 1; }
+nice -n 19 ionice -c3 $PY -I -u $CODE/sft_build.py build --run $IN/run --long $IN/long --replay $IN/replay/pairs.parquet --flan-eval $IN/flan-eval/eval-rows.parquet --evalsets $IN/eval/evalsets.parquet --tokenizer /dev/shm/flan_nl/tokenizer-27b --bt all --qe-max $R2_QE_MAX --len-factor $R2_LEN_FACTOR --block-jsonl \$R/blind100.jsonl --real \$REALP $QE_FLAGS --sets R2=none+real --out $O
+gsutil -m -q rsync -r $O $OUTSET
+echo "BUILT: $OUTSET"
+EOF
+  detach "r2_build_$TAG" bash ~/job_body_r2_build_$TAG.sh
+  ;;
+r2check)
+  if [ "${DRY:-0}" = 1 ]; then OUTSET=$S/data/r2-dry; else OUTSET=$S/data/r2; fi
+  D=$SHM/r2/check-$TAG
+  cat > ~/job_body_r2_check_$TAG.sh <<EOF
+set -euo pipefail
+mkdir -p $D
+gsutil -m -q rsync -r $OUTSET/R2 $D
+JAX_PLATFORMS=cpu TOKENIZERS_PARALLELISM=false HF_HUB_OFFLINE=1 nice -n 19 ionice -c3 $SFT_PY -u $CODE/sft_build.py check --data $D --tokenizer /dev/shm/flan_nl/tokenizer-27b | tee $D/check.txt
+gsutil -q cp $D/check.txt $OUTSET/check.txt
+EOF
+  detach "r2_check_$TAG" bash ~/job_body_r2_check_$TAG.sh
   ;;
 *)
   echo "unknown stage $STAGE"

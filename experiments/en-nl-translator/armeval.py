@@ -470,7 +470,25 @@ def pct(x):
     return "–" if x is None else f"{100 * x:.1f}%"
 
 
-MODEL_NAMES = {"base": "basis (TG 27B)", "B": "B", "N": "N", "Ninstr": "N met instructiezin"}
+MODEL_NAMES = {"base": "basis (TG 27B)", "B": "B", "N": "N", "Ninstr": "N met instructiezin", "R2": "R2"}
+
+
+def words(text):
+    return len((text or "").split())
+
+
+def length_ratios(rows):
+    """The length of the output against the human reference (protocol §9, amendment R2; reported, not deciding):
+    medians per segment of Dutch words per English word for the reference and the output, of output words per
+    reference word, and the share of outputs under 0.7 of their reference's words (the main session's measure, 11 Nov)"""
+    with_ref = [r for r in rows if r.get("reference") and words(r["source"]) and words(r["reference"])]
+    if not with_ref:
+        return None
+    ref = [words(r["reference"]) / words(r["source"]) for r in with_ref]
+    hyp = [words(r["hypothesis"]) / words(r["source"]) for r in with_ref]
+    vs = [words(r["hypothesis"]) / words(r["reference"]) for r in with_ref]
+    return {"n": len(with_ref), "ref_per_source": statistics.median(ref), "out_per_source": statistics.median(hyp),
+            "out_per_ref": statistics.median(vs), "under_0_7_of_ref": sum(v < 0.7 for v in vs) / len(vs)}
 
 
 def report(args):
@@ -489,6 +507,11 @@ def report(args):
         result["rule_a"][m] = rule_a(four["base"], four[m])
     for m, sets in four.items():
         result["four"][m] = {s: metrics(rows) for s, rows in sets.items()}
+    # the length of the output against the reference on the four sets (texts of evalsets.py summary)
+    result["length"] = {}
+    for m, path in parse_named(getattr(args, "four_texts", None) or []).items():
+        sets = four_sets(path, evalsets)
+        result["length"][m] = {s: length_ratios(rows) for s, rows in sets.items()}
     # in-domain, per source and together
     for m, rows in x.items():
         dom = [r for r in rows.values() if r["set"] == "indomain"]
@@ -645,6 +668,18 @@ def report_md(r, args):
                 L.append(f"| {s} | {MODEL_NAMES.get(m, m)} | {v['n']} | {f3(v['metricx_ref'])} | {f3(v['metricx_qe'])} | "
                          f"{f3(v['comet22'])} | {v['not_ended']} | {v['decode_loop']} | {v['english_left']} | {v['empty']} |")
     L += ["", "`wmt24pp` = de 960 zonder `is_bad_source`, `wmt24pp_all` = alle 998.", ""]
+    if r.get("length"):
+        L += ["## Lengte van de uitvoer tegenover de menselijke referentie (gerapporteerd, beslist niet mee)", "",
+              "Medianen per segment: Nederlandse woorden per Engels woord (referentie en uitvoer), woorden van de uitvoer per "
+              "woord van de referentie, en het aandeel uitvoer korter dan 0,7 × de referentie.", "",
+              "| set | model | n | ref / bron | uitvoer / bron | uitvoer / ref | < 0,7 × ref |", "|---|---|---:|---:|---:|---:|---:|"]
+        for s in sets:
+            for m, d in r["length"].items():
+                v = d.get(s)
+                if v:
+                    L.append(f"| {s} | {MODEL_NAMES.get(m, m)} | {v['n']} | {v['ref_per_source']:.3f} | "
+                             f"{v['out_per_source']:.3f} | {v['out_per_ref']:.3f} | {pct(v['under_0_7_of_ref'])} |")
+        L.append("")
     L += ["## Regel (b): classifier \"origineel of vertaald\" (S @ 653k)", ""]
     c = r["classifier"]
     if c is None:
@@ -674,9 +709,10 @@ def report_md(r, args):
                 L.append(f"| {SOURCE_NAMES.get(s, 'samen')} | {MODEL_NAMES.get(m, m)} | {v['n']} | {f3(v['metricx_ref'])} | "
                          f"{f3(v['metricx_qe'])} | {f3(v['comet22'])} | {f2(v['chrf'])} | {f2(v['chrf_corpus'])} | "
                          f"{v['not_ended']} | {v['decode_loop']} |")
-    L += ["", "## Controle van de modus: N met de instructiezin (beslist niet mee, §4.1)", "",
+    L += ["", "## Controle van de modus: N met de instructiezin (beslist niet mee, §4.1)" if r["mode_check"] else
+          "## MetricX-QE op de FLAN-rijen (gerapporteerd)", "",
           "| set | model | n | MetricX ref | MetricX QE | COMET-22 | niet af | lus |", "|---|---|---:|---:|---:|---:|---:|---:|"]
-    for m in ("base", "N"):
+    for m in (("base", "N") if r["mode_check"] else ()):
         if m in r["four"] and "wmt24pp" in r["four"][m]:
             v = r["four"][m]["wmt24pp"]
             L.append(f"| wmt24pp (960) | {MODEL_NAMES[m]} | {v['n']} | {f3(v['metricx_ref'])} | {f3(v['metricx_qe'])} | "
@@ -744,6 +780,8 @@ def main(argv=None):
     p.add_argument("--baseline-scores", required=True)
     p.add_argument("--four", nargs="+", required=True, help="ARM=scores.parquet of evalsets.py summary")
     p.add_argument("--title", default="Fine-tune van de en→nl-vertaler: armen B en N op TranslateGemma 27B")
+    p.add_argument("--four-texts", nargs="*", default=[],
+                   help="MODEL=translations.parquet of evalsets.py summary (base too): the length table")
     p.add_argument("--x-data", default=None, help="evalsets.parquet of kind x (the in-domain sources); needed with --x")
     p.add_argument("--x", nargs="*", default=[], help="MODEL=directory with pairs/ and scores/ of kind x")
     p.add_argument("--instr", nargs="*", default=[], help="MODEL=directory with pairs/ and scores/ of kind instr")

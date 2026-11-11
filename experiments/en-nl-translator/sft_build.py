@@ -6,7 +6,7 @@ run, the FLAN-nl replay, and the user turn of translate.user_text.
     python sft_build.py build --run RUN --long LONG --replay REPLAY.parquet --flan-eval EVAL-ROWS.parquet \\
         --evalsets EVALSETS.parquet --tokenizer TOK --bt auto|all|N [--qe-max 7.5] [--replay-tag none|conventional] \\
         [--len-factor F] [--block-jsonl blind100.jsonl] [--real REAL.parquet [--real-share 0.2 | --real-all] \\
-        [--real-without-qe]] \\
+        [--real-without-qe] [--real-qe-max Q] [--bt-per-real K]] \\
         --sets B=none N-token=token+replay R2=none+real ... --out OUT
     python sft_build.py check --data OUT/<set> --tokenizer TOK   (SFT venv: MaxText's own SFT steps on every example)
 
@@ -40,7 +40,10 @@ when it passed real_pairs.py's hard checks (its fails empty), its MetricX-24-QE 
 fits MAX_TOKENS. A set with +real takes at most --real-share of its examples from them (real = BT x share / (1 -
 share)): every eligible Global Voices pair first, then Europarl drawn with a seed to fill the share; fewer, then all.
 With --real-all (arm RB, amendment of 11 Nov ~12:00: the Dutch books) it takes every eligible real pair, whatever share
-they make.
+they make. --real-qe-max gives the real pairs a MetricX-QE bound of their own (arm RB2, amendment of 11 Nov ~21:30: the
+books at 7.5, the back-translations at --qe-max 5). --bt-per-real K (arm RB2: 4, back-translations : books 80 : 20), with
+--bt all and --real-all, then draws K back-translation examples per real pair from every eligible one, uniformly with the
+seed: a passage drawn with its context stays a context example, so the context share is that of --bt all in expectation.
 
 Context examples (design §9): a training passage the selection marked as a context example keeps its turns before it,
 nearest first, as long as each turn is eligible by the same query; the first that fails ends the context there. Without
@@ -406,6 +409,7 @@ def candidates_real(args, blocked, report):
         raise SystemExit(f"{args.real} has no qe_en_nl (real_pairs.py join-qe), and --real-without-qe is not set")
     hard_ok = [r for r in rows if not r["fails"]]
     bounds = length_bounds(hard_ok, args.len_factor) if getattr(args, "len_factor", None) else None
+    qe_max = real_qe_max(args)
     first, alone, out = collections.Counter(), collections.Counter(), []
     for r in rows:
         for side in ("nl", "en"):
@@ -416,7 +420,7 @@ def candidates_real(args, blocked, report):
             if not without_qe:
                 if r["qe_en_nl"] is None:
                     raise SystemExit(f"real {r['id']}: passed the hard checks without a MetricX-QE")
-                if r["qe_en_nl"] > args.qe_max:
+                if r["qe_en_nl"] > qe_max:
                     fails.append("qe")
             if length_fails(r, bounds):
                 fails.append("length")
@@ -431,12 +435,32 @@ def candidates_real(args, blocked, report):
     report["real"] = {"pairs": dict(collections.Counter(r["source"] for r in rows)),
                       "query_cost": {"first_failed": dict(sorted(first.items())), "alone": dict(sorted(alone.items()))},
                       "eligible": dict(collections.Counter(r["source"] for r in out)), "without_qe": without_qe,
+                      "qe_max": None if without_qe else qe_max,
                       "length_bounds": bounds,
                       "qe_hard_ok": None if without_qe else {
                           s: {"n": len(v), **{f"p{q}": round(quantile(v, q / 100), 3) for q in (50, 90, 95, 99)},
                               "over": {str(c): sum(x > c for x in v) for c in (3, 4, 5, 7.5, 10)}}
                           for s, v in sorted(_by_source(hard_ok, "qe_en_nl").items())}}
     return out
+
+
+def real_qe_max(args):
+    """The real pairs' bound on MetricX-QE: --real-qe-max, else the back-translations' --qe-max"""
+    own = getattr(args, "real_qe_max", None)
+    return args.qe_max if own is None else own
+
+
+def bt_per_real_draw(bt_rows, n_real, per_real, seed):
+    """(the back-translation rows kept, in their order, info): round(per_real x n_real) of bt_rows, drawn uniformly by
+    pid with the seed; more wanted than there are: SystemExit"""
+    want = round(per_real * n_real)
+    if want > len(bt_rows):
+        raise SystemExit(f"--bt-per-real {per_real}: {want} back-translation examples wanted for {n_real} real pairs, "
+                         f"{len(bt_rows)} eligible")
+    keep = set(random.Random(f"{seed}/bt-per-real").sample(sorted(r["pid"] for r in bt_rows), want))
+    kept = [r for r in bt_rows if r["pid"] in keep]
+    return kept, {"per_real": per_real, "real": n_real, "drawn": want, "of": len(bt_rows),
+                  "drawn_by_source": dict(sorted(collections.Counter(r["source"] for r in kept).items()))}
 
 
 def _by_source(rows, key):
@@ -504,6 +528,8 @@ def build(args, tokenizer=None):
     len_factor = getattr(args, "len_factor", None)
     if len_factor:
         query |= {"len_factor": len_factor}
+    if getattr(args, "real_qe_max", None) is not None:
+        query |= {"real_qe_en_nl_max": args.real_qe_max}
     real_path = getattr(args, "real", None)
     if any(extra == "real" for _, extra in sets.values()) != bool(real_path):
         raise SystemExit("--real goes with a set NAME=TAG+real, and such a set needs --real")
@@ -611,6 +637,12 @@ def build(args, tokenizer=None):
             real, draw = real_draw(fitting, cap, args.seed)
         report["real"]["share"] = share
         report["real"]["draw"] = draw
+    if getattr(args, "bt_per_real", None):
+        if args.bt != "all" or not getattr(args, "real_all", False) or \
+                any(extra != "real" for _, extra in sets.values()):
+            raise SystemExit("--bt-per-real draws from --bt all against --real-all's real pairs, in sets with +real only")
+        bt_rows, report["bt"]["per_real_draw"] = bt_per_real_draw(bt_rows, len(real), args.bt_per_real, args.seed)
+        report["bt"]["per_real_draw"]["context"] = sum(r["pid"] in ctx_set for r in bt_rows)
 
     def real_example(r):
         user = user_turn(REAL_PROMPT, r["en"])
@@ -757,6 +789,13 @@ def report_md(report):
                  f"getrokken (hoogstens {r.get('share')} van de voorbeelden, {REAL_FIRST} eerst)")
         lines += ["", f"Paren: {json.dumps(r['pairs'])}; in aanmerking: {json.dumps(r['eligible'])}; {drawn}: "
                   f"{json.dumps(r.get('draw'))}."]
+        if r.get("qe_max") is not None:
+            lines += ["", f"MetricX-24-QE-grens van de echte paren: {r['qe_max']}."]
+        if "per_real_draw" in report["bt"]:
+            d = report["bt"]["per_real_draw"]
+            lines += ["", f"BT getrokken (`--bt-per-real {d['per_real']}`): {_n(d['drawn'])} van {_n(d['of'])} "
+                      f"BT-voorbeelden die in aanmerking komen ({d['per_real']} × {_n(d['real'])} echte paren; "
+                      f"{_n(d['context'])} met context); per bron {json.dumps(d['drawn_by_source'])}."]
         if r["length_bounds"]:
             lines += ["", "| bron | n | mediaan | ondergrens | bovengrens |", "|---|---:|---:|---:|---:|"]
             lines += [f"| {k} | {_n(v['n'])} | {v['median']} | {v['lo']} | {v['hi']} |" for k, v in r["length_bounds"].items()]
@@ -875,6 +914,10 @@ def main(argv=None):
     b.add_argument("--real-share", type=float, default=REAL_SHARE)
     b.add_argument("--real-all", action="store_true", help="every eligible real pair, no share (arm RB)")
     b.add_argument("--real-without-qe", action="store_true", help="a dry run: no MetricX-QE bound on the real pairs")
+    b.add_argument("--real-qe-max", type=float, default=None,
+                   help="the real pairs' own bound on MetricX-24-QE en->nl (arm RB2: 7.5); --qe-max by default")
+    b.add_argument("--bt-per-real", type=float, default=None,
+                   help="with --bt all and --real-all: draw this many back-translation examples per real pair (arm RB2: 4)")
     b.add_argument("--sets", nargs="+", required=True,
                    help="NAME=TAG[+replay|+real], TAG none, token, instruction or conventional")
     b.add_argument("--seed", default=SEED)
@@ -887,6 +930,11 @@ def main(argv=None):
         parser.error("--bt is 'auto', 'all' or a positive number")
     if args.command == "build" and args.real_all and args.real_share != REAL_SHARE:
         parser.error("--real-all takes every eligible real pair: no --real-share with it")
+    if args.command == "build" and args.bt_per_real is not None and (args.bt != "all" or not args.real_all
+                                                                     or args.bt_per_real <= 0):
+        parser.error("--bt-per-real is a positive number, with --bt all and --real-all")
+    if args.command == "build" and args.real_without_qe and args.real_qe_max is not None:
+        parser.error("--real-without-qe has no QE bound on the real pairs: no --real-qe-max with it")
     {"build": build, "check": check}[args.command](args)
 
 

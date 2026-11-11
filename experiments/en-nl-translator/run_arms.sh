@@ -52,8 +52,14 @@
 #   [DRY=1] bash run_arms.sh rbcheck             as r2check                                     (job rb_check_$TAG)
 #   bash run_arms.sh rbedges                     w3 (CPU): examples_qe.py real-edges of the books after rbqe, to
 #                                                $S/examples/                                   (job rb_edges_$TAG)
+# Arm RB2 (protocol §9, amendment of 11 Nov ~21:30; translator_sft_night2_run.sh) runs the same stages with
+# ARMS_ROOT=$S/rb2 SETS=$S/data/rb2 RUN_PREFIX=arm27b_rb2 ARMS=RB2. Its books are RB's candidates and MetricX-QE
+# ($S/data/rb-real, not fetched or scored again), at QE <= 7.5; the back-translations 4 per book pair (80 : 20):
+#   [DRY=1] bash run_arms.sh rb2build            as rbbuild, with --real-qe-max 7.5 --bt-per-real 4, set RB2, to
+#                                                $S/data/rb2/                                   (job rb2_build_$TAG)
+#   [DRY=1] bash run_arms.sh rb2check            as rbcheck                                     (job rb2_check_$TAG)
 set -euo pipefail
-STAGE=${1:?a stage: setup, data, train, adapter, scale, translate, score, summary, texts, classifier, classify, pll, blind, report, report-scaled, r2data, r2qe, r2build, r2check, rbdata, rbqe, rbbuild, rbcheck, rbedges}
+STAGE=${1:?a stage: setup, data, train, adapter, scale, translate, score, summary, texts, classifier, classify, pll, blind, report, report-scaled, r2data, r2qe, r2build, r2check, rbdata, rbqe, rbbuild, rbcheck, rbedges, rb2build, rb2check}
 S=gs://t5-dutch-english-usc2/mbert/translator/sft
 A=${ARMS_ROOT:-$S/arms}
 BASE_A=$S/arms                       # the base model on kind x, the extra sets, the classifier (the arms' chain)
@@ -63,8 +69,13 @@ SETS=${SETS:-$S/data/arms-v2}
 RUN_PREFIX=${RUN_PREFIX:-arm27b_v2}
 ARMS=${ARMS:-B N}                    # the arms of this chain (blind, report)
 # the real pairs' stages of arm R2 (r2*) and arm RB (rb*): their candidates and MetricX-QE (REAL), the set's name and
-# place, the jobs' prefix, and how the build takes the real pairs (R2: at most 20%; RB: all)
+# place, the jobs' prefix, and how the build takes the real pairs (R2: at most 20%; RB: all; RB2: all, at their own QE
+# bound, with 4 back-translations per real pair). rb2* before rb*, which it would match
+RB2_BOOKS_QE_MAX=7.5                 # protocol §9, amendment RB2 (Yeb): the books at MetricX-QE en->nl <= 7.5
+RB2_BT_PER_REAL=4                    # back-translations : books = 80 : 20 in examples
 case $STAGE in
+  rb2*) REAL=$S/data/rb-real; XSET=RB2; XOUT=$S/data/rb2; XJOB=rb2
+        XREAL="--real-all --real-qe-max $RB2_BOOKS_QE_MAX --bt-per-real $RB2_BT_PER_REAL" ;;
   rb*) REAL=$S/data/rb-real; XSET=RB; XOUT=$S/data/rb; XJOB=rb; XREAL=--real-all ;;
   *) REAL=$S/data/r2-real; XSET=R2; XOUT=$S/data/r2; XJOB=r2; XREAL= ;;
 esac
@@ -129,8 +140,8 @@ data_dir() {  # data_dir DATA: the E of run_baseline.sh (its data in $E/data/)
 
 check_model_data() {
   case "$MODEL/$DATA" in
-    base/x|B/four|B/x|N/four|N/x|Ninstr/instr|N50/four|N50/x|N25/four|N25/x|N75/four|N75/x|R2/four|R2/x|RB/four|RB/x) ;;
-    *) echo "MODEL/DATA $MODEL/$DATA is not one of the chains': base/x, B/four, B/x, N/four, N/x, Ninstr/instr, N50/four, N50/x, N25/four, N25/x, N75/four, N75/x, R2/four, R2/x, RB/four, RB/x"; exit 1 ;;
+    base/x|B/four|B/x|N/four|N/x|Ninstr/instr|N50/four|N50/x|N25/four|N25/x|N75/four|N75/x|R2/four|R2/x|RB/four|RB/x|RB2/four|RB2/x) ;;
+    *) echo "MODEL/DATA $MODEL/$DATA is not one of the chains': base/x, B/four, B/x, N/four, N/x, Ninstr/instr, N50/four, N50/x, N25/four, N25/x, N75/four, N75/x, R2/four, R2/x, RB/four, RB/x, RB2/four, RB2/x"; exit 1 ;;
   esac
 }
 
@@ -222,7 +233,7 @@ translate)
   tpu_free
   case $MODEL in
     base) ADAPTER=; PROMPT= ;;
-    B|N|N50|N25|N75|R2|RB) ADAPTER=$A/$MODEL; PROMPT= ;;
+    B|N|N50|N25|N75|R2|RB|RB2) ADAPTER=$A/$MODEL; PROMPT= ;;
     Ninstr) ADAPTER=$A/N; PROMPT=chat-v1-tag-conventional ;;
   esac
   if [ -n "$ADAPTER" ]; then
@@ -289,6 +300,7 @@ summary)
   case $MODEL in
     R2) label="TranslateGemma 27B + LoRA R2 (r2: BT QE ≤ 5 en lengtegrens, echt Engels; protocol en-nl-sft §9)" ;;
     RB) label="TranslateGemma 27B + LoRA RB (rb: BT QE ≤ 5 en lengtegrens, Nederlandse boeken: echt Engels → origineel Nederlands; protocol en-nl-sft §9)" ;;
+    RB2) label="TranslateGemma 27B + LoRA RB2 (rb2: BT : boeken 80 : 20, BT QE ≤ 5 en lengtegrens, boeken QE ≤ 7,5; rank uit de geheugentest; protocol en-nl-sft §9)" ;;
     *) label="TranslateGemma 27B + LoRA $MODEL (arms-v2, QE ≤ 7,5; protocol en-nl-sft)" ;;
   esac
   detach "arms_summary_${TAG}_$MODEL" env B="$(model_dir "$MODEL" four)" ADAPTER="$A/$MODEL" LABEL="$label" \
@@ -305,7 +317,7 @@ texts)
 gsutil -q cp $E/baseline-tg27b/translations.parquet $T/base-four.parquet
 gsutil -m -q cp '$(model_dir base x)/pairs/pairs-w*.parquet' $T/base-x/"
             wmt="$wmt 'base=$T/base-four.parquet'"; flan="$flan 'base=$T/base-x/pairs-w*.parquet'" ;;
-      B|N|N50|N25|N75|R2|RB) fetch="$fetch
+      B|N|N50|N25|N75|R2|RB|RB2) fetch="$fetch
 mkdir -p $T/$m-x
 gsutil -q cp $(model_dir "$m" four)/translations.parquet $T/$m-four.parquet
 gsutil -m -q cp '$(model_dir "$m" x)/pairs/pairs-w*.parquet' $T/$m-x/"
@@ -591,7 +603,7 @@ echo "${XJOB^^}QE w$W: $REAL/qe/metricx-w$W.parquet"
 EOF
   detach "${XJOB}_qe_$TAG" bash ~/job_body_${XJOB}_qe_$TAG.sh
   ;;
-r2build|rbbuild)
+r2build|rbbuild|rb2build)
   # DRY=1: the real pairs without their MetricX-QE (a test of the build before the TPU is free), to $XOUT-dry
   if [ "${DRY:-0}" = 1 ]; then OUTSET=$XOUT-dry; QE_FLAGS=--real-without-qe; else OUTSET=$XOUT; QE_FLAGS=; fi
   ! gsutil -q stat "$OUTSET/report.json" || { echo "$OUTSET has a report.json: a new set takes a new place"; exit 1; }
@@ -625,7 +637,7 @@ echo "BUILT: $OUTSET"
 EOF
   detach "${XJOB}_build_$TAG" bash ~/job_body_${XJOB}_build_$TAG.sh
   ;;
-r2check|rbcheck)
+r2check|rbcheck|rb2check)
   if [ "${DRY:-0}" = 1 ]; then OUTSET=$XOUT-dry; else OUTSET=$XOUT; fi
   D=$SHM/$XJOB/check-$TAG
   cat > ~/job_body_${XJOB}_check_$TAG.sh <<EOF

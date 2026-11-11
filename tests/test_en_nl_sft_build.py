@@ -492,3 +492,78 @@ def test_a_build_of_arm_rb_takes_every_eligible_real_pair(tmp_path):
         sb.main(["build", "--run", "r", "--long", "l", "--replay", "x", "--flan-eval", "f", "--evalsets", "e",
                  "--tokenizer", "t", "--sets", "RB=none+real", "--real", "x", "--real-all", "--real-share", "0.3",
                  "--out", "o"])
+
+
+def test_a_build_of_arm_rb2_draws_four_back_translations_per_book_pair(tmp_path):
+    """Arm RB2: the books with their own QE bound (7.5, the back-translations at 5) and every eligible one of them; the
+    back-translation examples drawn from every eligible one, 4 per book pair (80 : 20), the same draw for the same seed"""
+    args = tables(tmp_path)
+    rows = []
+    for i in range(16):
+        en, nl = f"The English of book passage {i} here.", f"Het Nederlands van boekpassage {i} hier."
+        fails = ["not_dutch_original"] if i == 0 else []
+        qe = None if fails else {1: 8.0, 2: 7.0, 3: 6.0}.get(i, 1.0)
+        rows.append({"id": f"books:{i}", "source": "books", "en": en, "nl": nl, "fails": fails, "qe_en_nl": qe})
+    write(tmp_path / "real.parquet", rows)
+    args.bt, args.sets, args.qe_max = "all", ["RB2=none+real"], 5.0
+    args.len_factor, args.real, args.real_share, args.real_all = 1.25, str(tmp_path / "real.parquet"), 0.2, True
+    args.block_jsonl, args.real_without_qe, args.real_qe_max, args.bt_per_real = None, False, 7.5, 4.0
+    sb.build(args, tokenizer=CharTokenizer())
+    out = Path(args.out)
+    meta = pq.read_table(out / "RB2" / "train-meta.parquet").to_pylist()
+    real = [m for m in meta if m["kind"] == "real"]
+    bt = [m for m in meta if m["kind"] in ("bt", "bt_context")]
+    # 14 of 16 books: not a Dutch original, QE 8 out; QE 7 and 6 in (they were out at 5)
+    assert len(real) == 14 and not {m["id"] for m in real} & {"books:0", "books:1"}
+    assert {"books:2", "books:3"} <= {m["id"] for m in real}
+    # 56 = 4 x 14 of the 68 eligible back-translations; the QE outlier and the hard fail stay out
+    assert len(bt) == 56 and len({m["id"] for m in bt}) == 56
+    assert not {m["id"] for m in bt} & {"fineweb:d0:0:0", "handelingen:d39:t5:0"}
+    # a passage drawn with its context keeps it
+    assert all(len(m["context"]) == 2 for m in bt if m["kind"] == "bt_context")
+    assert all(m["id"].startswith("handelingen:d") and int(m["id"].split(":")[1][1:]) < 10
+               for m in bt if m["kind"] == "bt_context")
+    report = __import__("json").loads((out / "report.json").read_text())
+    assert report["real"]["qe_max"] == 7.5 and report["query"]["qe_en_nl_max"] == 5.0
+    assert report["query"]["real_qe_en_nl_max"] == 7.5
+    assert report["real"]["query_cost"]["first_failed"] == {"books/hard:not_dutch_original": 1, "books/qe": 1}
+    draw = report["bt"]["per_real_draw"]
+    assert (draw["per_real"], draw["real"], draw["drawn"], draw["of"]) == (4.0, 14, 56, 68)
+    assert draw["context"] == sum(m["kind"] == "bt_context" for m in bt) and sum(draw["drawn_by_source"].values()) == 56
+    assert report["sets"]["RB2"]["train"]["real_share"] == 0.2
+    assert "`--bt-per-real 4.0`" in (out / "report.md").read_text()
+    # the same seed, the same draw; another seed, another draw of the same size
+    first = sorted(m["id"] for m in bt)
+    sb.build(args, tokenizer=CharTokenizer())
+    assert sorted(m["id"] for m in pq.read_table(out / "RB2" / "train-meta.parquet").to_pylist()
+                  if m["kind"] != "real") == first
+    args.seed, args.out = "other", str(tmp_path / "out-other")
+    sb.build(args, tokenizer=CharTokenizer())
+    other = sorted(m["id"] for m in pq.read_table(Path(args.out) / "RB2" / "train-meta.parquet").to_pylist()
+                   if m["kind"] != "real")
+    assert len(other) == 56 and other != first
+
+
+def test_bt_per_real_needs_enough_back_translations_and_every_real_pair(tmp_path):
+    rows = [{"pid": f"p{i}", "source": "raad"} for i in range(10)]
+    kept, info = sb.bt_per_real_draw(rows, 2, 4, "s")
+    assert len(kept) == 8 and [r["pid"] for r in kept] == sorted(r["pid"] for r in kept)
+    assert info["drawn_by_source"] == {"raad": 8}
+    with pytest.raises(SystemExit, match="12 back-translation examples wanted for 3 real pairs, 10 eligible"):
+        sb.bt_per_real_draw(rows, 3, 4, "s")
+    base = ["build", "--run", "r", "--long", "l", "--replay", "x", "--flan-eval", "f", "--evalsets", "e",
+            "--tokenizer", "t", "--sets", "RB2=none+real", "--real", "x", "--out", "o"]
+    for extra in (["--bt", "all", "--bt-per-real", "4"], ["--bt", "auto", "--real-all", "--bt-per-real", "4"],
+                  ["--bt", "all", "--real-all", "--bt-per-real", "0"],
+                  ["--bt", "all", "--real-all", "--real-without-qe", "--real-qe-max", "7.5"]):
+        with pytest.raises(SystemExit):
+            sb.main(base + extra)
+    # in build too (a set without +real would lose its back-translations to the draw)
+    args = tables(tmp_path)
+    write(tmp_path / "real.parquet", [{"id": "books:1", "source": "books", "en": "The English of a book passage.",
+                                       "nl": "Het Nederlands van een boekpassage.", "fails": [], "qe_en_nl": 1.0}])
+    args.bt, args.sets, args.qe_max = "all", ["B=none", "RB2=none+real"], 5.0
+    args.len_factor, args.real, args.real_share, args.real_all = None, str(tmp_path / "real.parquet"), 0.2, True
+    args.block_jsonl, args.real_without_qe, args.real_qe_max, args.bt_per_real = None, False, 7.5, 4.0
+    with pytest.raises(SystemExit, match="sets with \\+real only"):
+        sb.build(args, tokenizer=CharTokenizer())

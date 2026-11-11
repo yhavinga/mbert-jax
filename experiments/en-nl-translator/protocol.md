@@ -721,6 +721,14 @@ vertaling geeft echt, idiomatisch Engels met een **origineel** Nederlands doel. 
   rand ("Okay." bij Bakker 5,63). De QE-grens kost dus ook goede paren, en het meest bij ouder of literair Nederlands:
   over blijven van Couperus 18,7%, Nescio 21,6%, Mortier 36,1%, Slauerhoff 43,8%, tegen Koch 90,1%, Brokken 89,7% en
   Van der Vlugt (2017) 89,9%. De grens van 5 blijft zoals Yeb besliste.
+
+  **De set** [gemeten 11 nov 12:14, `$S/data/rb/report.md`, code `21239f0`]: 217.563 trainvoorbeelden: BT 208.726
+  (12.540 met context, 6,0%; gelijk aan het BT-deel van de proefbouw van R2) en boeken 8.837 (4,1% van de voorbeelden);
+  103.897.723 tokens, 44.144.213 doeltokens (boeken 4.666.527 tokens, 249 doeltokens per voorbeeld; BT 201); eval 4.167
+  BT-passages. Mediane verhouding woorden NL / EN (tekens): hele set 0,968 (1,006), BT 0,967 (1,004), boeken 0,990
+  (1,037). Gecontroleerd met `sft_build.py check` (MaxText's eigen SFT-stappen op elk voorbeeld; de boekvoorbeelden met
+  de token-id's van TranslateGemma's eigen prompt): EXIT 0, train 217.563, eval 4.167, max 2.048 tokens
+  (`$S/data/rb/check.txt`, 11 nov 12:31).
 - **Training** gelijk aan N en R2 [besluit Yeb]: LoRA rank 16, alpha 16, op attentie en MLP, LR 1e-5 cosine naar 0 met
   10% warmup, één epoch (`step_limit`), sequenties van 2.048, 1 per chip, 16 chips. Uitvoer `$S/rb/runs/arm27b_rb_RB/`,
   adapter `$S/rb/RB/`. De keten (`translator_sft_rb_run.sh`, `LORA_RANK`, `LORA_ALPHA`, `LR`) weigert te starten als de

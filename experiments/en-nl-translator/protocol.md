@@ -621,7 +621,7 @@ instructiezin. Eén nieuwe arm, **R2**; B, N, N50 en N25 blijven zoals ze zijn.
     de keten (`translator_sft_r2_run.sh`, `LORA_RANK`, `LORA_ALPHA`, `LR`) weigert te starten als die regel niet
     letterlijk gelijk is aan zijn startwaarden, en controleert na de training de rank in `adapter.json`.
 
-R2-instellingen: open
+R2-instellingen: lora_rank=16 lora_alpha=16 learning_rate=1e-5
 
   - Geheugen bij een hogere rank [schatting, niet gemeten]: de LoRA-parameters groeien lineair met de rank
     (gemeten bij rank 16: 113.516.544, `summary.json` van B): rank 32 227,0 M, rank 64 454,1 M. In float32, met

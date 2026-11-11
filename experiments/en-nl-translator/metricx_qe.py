@@ -295,8 +295,13 @@ def score(args):
         src, cand, ref, name = parse_pair(pair)
         rows = rows_to_score(table, src, cand, ref, args.empty_candidates)
         started = time.time()
-        scores, lengths = scorer.score([table[src][k] for k in rows], [table[cand][k] for k in rows],
-                                       [table[ref][k] for k in rows] if ref else None)
+        if rows:
+            scores, lengths = scorer.score([table[src][k] for k in rows], [table[cand][k] for k in rows],
+                                           [table[ref][k] for k in rows] if ref else None)
+        else:
+            # A worker's share can have no row for a pair (no reference in it): the tokenizer fails on an empty list,
+            # so the column stays all None.
+            scores, lengths = [], []
         column = [None] * len(table["id"])
         for k, s in zip(rows, scores):
             column[k] = round(float(s), 4)

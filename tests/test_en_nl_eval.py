@@ -65,6 +65,31 @@ def test_metricx_score_writes_a_column_per_pair(tmp_path, monkeypatch):
     assert seen == [["r1", "r2"], None]
 
 
+def test_metricx_score_leaves_a_pair_without_rows_empty(tmp_path, monkeypatch):
+    seen = []
+
+    class FakeScorer:
+        def __init__(self, *a, **k):
+            pass
+
+        def score(self, sources, candidates, references=None):
+            if not sources:
+                raise IndexError("the tokenizer fails on an empty list")
+            seen.append(references)
+            return [float(len(c)) for c in candidates], [10] * len(sources)
+
+    monkeypatch.setattr(mx, "Scorer", FakeScorer)
+    pairs = tmp_path / "pairs.parquet"
+    pq.write_table(pa.table({"id": ["a", "b"], "source": ["s1", "s2"], "hypothesis": ["hyp", "hy"],
+                             "reference": ["", None]}), pairs)
+    out = tmp_path / "mx.parquet"
+    mx.main(["score", "--pairs", str(pairs), "--pair", "source:hypothesis:reference", "--pair", "source:hypothesis",
+             "--out", str(out)])
+    got = pq.read_table(out).to_pydict()
+    assert got == {"id": ["a", "b"], "ref_source_hypothesis_reference": [None, None], "qe_source_hypothesis": [3.0, 2.0]}
+    assert seen == [None]
+
+
 # ---------------------------------------------------------------- reading the sources
 
 

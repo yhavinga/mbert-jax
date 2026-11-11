@@ -621,7 +621,10 @@ instructiezin. Eén nieuwe arm, **R2**; B, N, N50 en N25 blijven zoals ze zijn.
     de keten (`translator_sft_r2_run.sh`, `LORA_RANK`, `LORA_ALPHA`, `LR`) weigert te starten als die regel niet
     letterlijk gelijk is aan zijn startwaarden, en controleert na de training de rank in `adapter.json`.
 
-R2-instellingen: lora_rank=16 lora_alpha=16 learning_rate=1e-5
+R2-instellingen: lora_rank=die van RB2 (geheugentest) lora_alpha=rank/2 learning_rate=1e-5
+
+  [Aangepast 11 nov ~21:45 CET, vóór de start van R2, door het amendement "R2 met de rank van RB2" onderaan §9; was
+  `lora_rank=16 lora_alpha=16 learning_rate=1e-5` (`9082ee6`).]
 
   - Geheugen bij een hogere rank [schatting, niet gemeten]: de LoRA-parameters groeien lineair met de rank
     (gemeten bij rank 16: 113.516.544, `summary.json` van B): rank 32 227,0 M, rank 64 454,1 M. In float32, met
@@ -747,3 +750,73 @@ RB-instellingen: lora_rank=16 lora_alpha=16 learning_rate=1e-5
   lengte van de uitvoer tegenover de menselijke referentie op de vier sets (`armeval.py report --four-texts`). (a)
   MetricX-24-QE(RB) − QE(basis) ≤ 0,20 op WMT24++ (960), FLORES-200 en NTREX-128; (b) aandeel "origineel" ≥ basis +
   0,10; (c) de blinde beoordeling, alleen als (a) en (b) gelden. RB helpt als (a), (b) en (c) alle drie gelden.
+
+**Amendement 11 nov 2026 ~21:45 CET: arm RB2, BT-paren en boeken 80 : 20, met de grootste LoRA-rank die past**
+[besluit Yeb 11 nov ~21:15; vastgelegd vóór de geheugentest en vóór de eerste trainingsstap van RB2; RB blijft zoals
+hij is]. Aanleiding: RB haalt (a) niet (MetricX-24-QE +1,62 / +0,75 / +1,03 op WMT24++ (960) / FLORES / NTREX,
+`$S/rb/report/report.md`). De uitvoer van RB heeft per Engels bronwoord mediaan 1,000 Nederlandse woorden, terwijl
+de menselijke referenties er 1,05–1,10 hebben; 8.837 boekparen (4,1% van de voorbeelden) waren te weinig om de
+compressie van de BT-paren te corrigeren. RB2 geeft de boeken een vijfde van de voorbeelden en traint met een grotere
+rank. Eén nieuwe arm, **RB2**.
+
+- **Trainingsdata** (`$S/data/rb2/RB2/`; `sft_build.py build --bt all --qe-max 5 --len-factor 1.3333 --block-jsonl
+  blind100.jsonl --real real-qe.parquet --real-all --real-qe-max 7.5 --bt-per-real 4 --sets RB2=none+real`; keten
+  `run_arms.sh rb2build`, `rb2check`, code `ae66022`):
+  1. **Boeken** [besluit Yeb]: alle boekparen van `yhavinga/nedd_x_dataset_nlbooks_b1` zoals bij RB (punt 2 van het
+     amendement RB: zonder de vijf auteurs die niet in het Nederlands schreven, de harde controles, de lengtegrens
+     factor 4/3 rond de mediaan van de boeken, geen 13-gram met een evaluatieset of blinde passage, ≤ 2.048 tokens,
+     TranslateGemma's eigen prompt zonder instructiezin), maar met **MetricX-24-QE en→nl ≤ 7,5** in plaats van 5. De
+     kandidaten en hun QE-scores zijn die van RB (`$S/data/rb-real/candidates/real.parquet`,
+     `$S/data/rb-real/qe/metricx-w{0..3}.parquet`); niets wordt opnieuw opgehaald of gescoord. Verwacht volgens de
+     kosten van RB [schatting]: boven 7,5 liggen 941 van de 12.883 paren die door de harde controles komen (boven 5:
+     4.033), dus ~3.100 paren meer dan bij RB, ~11.900 samen.
+  2. **BT-paren** [besluit Yeb]: de BT-voorbeelden die bij RB en R2 in aanmerking komen (§2.1 met QE ≤ 5, de lengtegrens,
+     geen 13-gram met een evaluatieset of blinde passage, en de contextvoorbeelden volgens §2.2 zoals bij `--bt all`),
+     daaruit willekeurig getrokken met een vaste seed (`en-nl-sft/0/bt-per-real`) **4 × het aantal boekparen**, zodat
+     BT : boeken = **80 : 20** in voorbeelden. De trekking is uniform over alle BT-voorbeelden die in aanmerking komen
+     [keuze: niet per bron gestratificeerd; elke bron houdt in verwachting haar aandeel; een passage die met haar context
+     getrokken wordt, blijft een contextvoorbeeld, zodat het aandeel contextvoorbeelden in verwachting dat van RB is,
+     6,0%].
+  3. **Geen** Europarl, **geen** Global Voices, **geen** FLAN-replay, nergens een instructiezin [besluit Yeb].
+- **Training** zoals RB (§3 en het amendement RB: LoRA op attentie en MLP, LR 1e-5 cosine naar 0 met 10% warmup, één
+  epoch (`step_limit`), sequenties van 2.048, 1 per chip, 16 chips), met een andere rank en alpha. Uitvoer
+  `$S/rb2/runs/arm27b_rb2_RB2/`, adapter `$S/rb2/RB2/`.
+  - **Keuzeregel voor de rank** [besluit Yeb, vastgelegd vóór de test]: een geheugentest van 8 stappen op de set RB2,
+    eerst met rank 128 en alpha 64, dan met rank 64 en alpha 32, verder gelijk aan de training (multi-host over de 16
+    chips, `per_device_batch_size=1`, `max_target_length=2048`; runs `$S/rb2/runs/arm27b_rb2m128_RB2/` en
+    `…/arm27b_rb2m64_RB2/`). Maat: de piek per chip, `peak_bytes_in_use` van `memory_stats` na de 8 stappen
+    (`peak_gib_max` in de regel `SUMMARY`), het maximum over de 16 chips. **Gekozen wordt de grootste rank waarvan die
+    piek ≤ 29,5 GiB is** (marge onder de grens van 30,75 GiB). Een test die faalt op geheugen (`RESOURCE_EXHAUSTED` of
+    "out of memory" in het log van een worker) telt als "past niet". **Past geen van beide, dan rank 32 met alpha
+    16.** Faalt een test om een andere reden, dan stopt de keten zonder keuze (`FAILED`).
+  - **Alpha = rank/2** [besluit Yeb]. Yeb motiveerde dat met rsLoRA: alpha/√rank gelijk aan die van rank 16 met alpha
+    16 (16/√16 = 4). Dat geldt precies voor rank 64 (32/√64 = 4); bij rank 128 is 64/√128 ≈ 5,66 en bij rank 32 is
+    16/√32 ≈ 2,83 [eigen berekening]. MaxText/qwix schaalt de LoRA-bijdrage met alpha/rank (`adapter.json`, `scale`):
+    met alpha = rank/2 is die schaal bij elke rank 0,5, tegen 1,0 bij rank 16 met alpha 16. Dit protocol volgt de
+    letterlijke waarden van het besluit (alpha = rank/2; terugval rank 32 met alpha 16).
+  - De keten (`mbert-ops/scripts/translator_sft_night2_run.sh`) voert de test uit, kiest de rank volgens deze regel,
+    logt beide pieken en de keuze (regel `RANK`), traint RB2 en daarna R2 met die rank, en controleert na elke
+    training rank en alpha in `adapter.json`. Hij weigert te starten als de regel hieronder niet letterlijk gelijk is
+    aan de zijne.
+
+RB2-instellingen: lora_rank=geheugentest(128,64; piek per chip <= 29.5 GiB; anders 32) lora_alpha=rank/2 learning_rate=1e-5
+
+- **Evaluatie en beslisregel gelijk aan die van B, N, RB en R2** (§4, §5; de amendementen R2 en RB), tegen hetzelfde
+  uitgangspunt (`$E/baseline-tg27b/scores.parquet`): de vier sets met dezelfde code (MetricX-24 met referentie en QE,
+  COMET-22; niet af, lus, Engels over, leeg); de extra sets van soort `x` (FLAN 1.000, blind 100, in-domein 4.519 van
+  `$S/arms/data/x/`, het basismodel uit `$S/arms/eval/base-x/`); de classifier van 10 nov
+  (`$S/arms/naturalness/classifier/`, 0,9575; niet opnieuw getraind) op de WMT24++ (960) en de 1.000 FLAN-rijen,
+  basismodel en RB2 in één classify-run; PLL en MTLD; het blinde pakket `$S/blind/RB2/` (A/B met seed
+  `en-nl-sft/blind/ab/RB2/<blind_id>`, sleutel alleen in de bucket); het rapport `$S/rb2/report/report.md` met regel
+  (a), (b), de stand van (c) en, gerapporteerd zonder mee te beslissen, de lengte van de uitvoer tegenover de menselijke
+  referentie op de vier sets. (a) MetricX-24-QE(RB2) − QE(basis) ≤ 0,20 op WMT24++ (960), FLORES-200 en NTREX-128
+  (grenzen 1,747 / 1,022 / 1,282); (b) aandeel "origineel" ≥ basis + 0,10; (c) de blinde beoordeling, alleen als (a)
+  en (b) gelden. RB2 helpt als (a), (b) en (c) alle drie gelden.
+
+**Amendement 11 nov 2026 ~21:45 CET: R2 met de rank van RB2** [besluit Yeb 11 nov ~21:15; vastgelegd vóór de start van
+R2]. R2 met rank 16 (regel `R2-instellingen` van `9082ee6`, 11 nov ~10:45) vervalt. R2 traint na RB2, in dezelfde
+keten, met de rank die de geheugentest van RB2 kiest (amendement RB2 hierboven) en **alpha = rank/2**, LR 1e-5; data,
+grenzen, training verder, evaluatie en beslisregel zoals het amendement R2. De regel `R2-instellingen` in het amendement
+R2 is daarom aangepast: de waarden volgen uit de geheugentest; de keten vult ze in, weigert te starten als die regel
+niet letterlijk gelijk is aan de zijne, en controleert na de training rank en alpha in `adapter.json` van
+`$S/r2/R2/`.

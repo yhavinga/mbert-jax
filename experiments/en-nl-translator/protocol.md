@@ -653,3 +653,11 @@ R2-instellingen: open
   MetricX-24-QE(R2) − QE(basis) ≤ 0,20 op WMT24++ (960), FLORES-200 en NTREX-128 (grenzen 1,747 / 1,022 / 1,282);
   (b) aandeel "origineel" ≥ basis + 0,10 met dezelfde classifier; (c) de blinde beoordeling, alleen als (a) en (b)
   gelden. R2 helpt als (a), (b) en (c) alle drie gelden.
+- **Aanvulling 11 nov ~10:30 CET: arm N75** (N met de bijdrage van de LoRA × 0,75; elke `kernel_lora_b` × 0,75, in
+  float32 met één afronding per element), verkennend toegevoegd na het zien van N50 en N25, op 11 nov ~10:25 op verzoek
+  van Yeb; vastgelegd vóór de eerste vertaling van N75. Gezien op dat moment [gemeten, keten tag `s11110816`]: N50
+  haalt (a) (MetricX-24-QE +0,029 / +0,033 / +0,034) en niet (b) (aandeel "origineel" 20,20% tegen 19,13%, +1,1 pp;
+  WMT24++ 34,3% tegen 32,3%, FLAN 6,7% tegen 6,5%); N25 haalt (a) (−0,012 / +0,007 / +0,003) en niet (b) (+0,5 pp).
+  Zelfde regels (a) en (b), zelfde uitgangspunt, sets en classifier als N50 en N25. Haalt N75 (a) en (b), dan gaat N75
+  door naar (c) (zoals hierboven; N50 en N25 halen (b) niet). Volgorde vóór 12:45: N75 op de vier sets (vertalen,
+  scoren), dan classify; de scores van soort `x` (in-domein, alleen gerapporteerd) van N75 vervallen als ze niet passen.

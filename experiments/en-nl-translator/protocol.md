@@ -486,3 +486,28 @@ chips van mbert-mix; code `e8979e1`, `sft_lora.py` en `run_sft.sh` gelijk aan `c
   2 × 1.024: 4.018); ~29.900 van de 32.768 tokenplaatsen per stap gevuld;
 - `EPOCH`: batches per proces [3.638, 3.625, 3.649, 3.629], `step_limit` 3.588: de volledige epoch van B wordt
   3.588 stappen, ~7,1–7,5 uur, plus ~12 min tellen, ~2 min laden en ~6 min compileren.
+
+**Amendement 11 nov 2026 ~09:30 CET: armen N50 en N25, arm N met een afgezwakte adapter** [besluit Yeb 11 nov,
+vastgelegd vóór de eerste vertaling; niets wordt getraind]. Aanleiding: de uitslag van 11 nov
+(`$S/arms/report/report.md`, code `998b34e`): N haalt (a) niet (MetricX-24-QE +1,177 / +0,688 / +0,746 op WMT24++
+(960) / FLORES / NTREX, grens +0,20) en (b) wel (+0,127). Yeb: meet N met de LoRA op 50% en 25% sterkte, als
+tussenpunt tussen natuurlijk en nauwkeurig.
+- **Armen.** N50 en N25 = de adapter van N (`$S/arms/N/`, 4.143 stappen) met de bijdrage van de LoRA × 0,5 en
+  × 0,25: elke `kernel_lora_b` vermenigvuldigd met de factor s, `kernel_lora_a`, rank, alpha en `scale` ongewijzigd,
+  zodat de update van elke kernel (A·B·scale, `translate.py --lora`) s × die van N is [keuze: B × s; een factor 0,5 of
+  0,25 is in float32 exact]. Adapters in `$S/arms/N50/` en `$S/arms/N25/`; hun `adapter.json` noemt de bron en s.
+- **Vertalen en meten zoals §4.1**: dezelfde vier sets (WMT24++, FLORES-200, NTREX-128, Europarl-direct), dezelfde
+  code, TranslateGemma's eigen prompt zonder instructiezin, greedy; MetricX-24 met referentie en QE, COMET-22; niet af,
+  lus, Engels over, leeg.
+- **Beslisregel zoals §5, ongewijzigd.** (a): tegen hetzelfde uitgangspunt (`$E/baseline-tg27b/scores.parquet`, grenzen
+  1,747 / 1,022 / 1,282) op dezelfde drie sets, drempel 0,20. (b): dezelfde classifier (S @ 653k,
+  `$S/arms/naturalness/classifier/`, nauwkeurigheid 0,9575; niet opnieuw getraind) op de WMT24++ (960) en de 1.000
+  FLAN-rijen (uit de vertaling van soort `x`, zoals bij N), aandeel "origineel" min dat van het basismodel ≥ 0,10
+  [keuze: de teksten van het basismodel gaan opnieuw door dezelfde classify-run, naast N50 en N25; ter controle tegen
+  de 19,1% van 11 nov]. (c): alleen voor een arm die (a) en (b) haalt, zoals §5 en §4.2.4 (dezelfde 100 passages, A/B
+  met seed `en-nl-sft/blind/ab/<arm>/<blind_id>`, `<arm>` = N50 of N25).
+- **Halen N50 en N25 allebei (a) en (b), dan gaat alleen N50 (de sterkere bijdrage) door naar (c).**
+- Volgorde [keuze, door de deadline: mbert-mix moet om 12:45 CET vrij zijn voor tak 1 van de eindrun]: eerst de vier
+  sets (regel (a)), dan FLAN en classify (regel (b)); de scores van het in-domeindeel worden gerapporteerd als ze
+  passen en beslissen niet mee. Niet gemeten: PLL, MTLD (behalve wat het rapport uit de teksten berekent), N50/N25 met
+  de instructiezin. Wat niet past, staat als niet gemeten in het rapport.

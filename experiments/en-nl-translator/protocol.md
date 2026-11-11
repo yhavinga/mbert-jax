@@ -605,8 +605,10 @@ instructiezin. Eén nieuwe arm, **R2**; B, N, N50 en N25 blijven zoals ze zijn.
   **Proefbouw** (`$S/data/r2-dry/`, `--real-without-qe`, niet voor de training): 260.908 trainvoorbeelden (BT 208.726,
   waarvan 12.540 met context; Global Voices 11.831; Europarl 40.351; echt 20,0%), 112,6 M tokens, 47,6 M doeltokens;
   eval 4.167. Mediane verhouding woorden NL / EN (tekens): hele set 0,980 (1,020), BT 0,967 (1,004), echt 1,062
-  (1,139). De set voor de training wordt vannacht gebouwd met de QE-grens op de echte paren; Europarl vult dan aan tot
-  20%.
+  (1,139). Gecontroleerd met `sft_build.py check` (MaxText's eigen SFT-stappen op elk voorbeeld; de echte voorbeelden
+  met de token-id's van TranslateGemma's eigen prompt): EXIT 0, train 260.908, eval 4.167, max 2.048 tokens
+  (`$S/data/r2-dry/check.txt`). De set voor de training wordt vannacht gebouwd met de QE-grens op de echte paren;
+  Europarl vult dan aan tot 20%.
 
 - **Training** zoals arm N (§3), behalve wat hieronder open staat: LoRA op attentie en MLP, cosine naar 0 met 10%
   warmup, één epoch (`step_limit`), sequenties van 2.048, 1 per chip, 16 chips. Uitvoer `$S/r2/runs/arm27b_r2_R2/`,

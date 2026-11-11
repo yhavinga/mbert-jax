@@ -5,7 +5,8 @@ run, the FLAN-nl replay, and the user turn of translate.user_text.
 
     python sft_build.py build --run RUN --long LONG --replay REPLAY.parquet --flan-eval EVAL-ROWS.parquet \\
         --evalsets EVALSETS.parquet --tokenizer TOK --bt auto|all|N [--qe-max 7.5] [--replay-tag none|conventional] \\
-        [--len-factor F] [--block-jsonl blind100.jsonl] [--real REAL.parquet [--real-share 0.2] [--real-without-qe]] \\
+        [--len-factor F] [--block-jsonl blind100.jsonl] [--real REAL.parquet [--real-share 0.2 | --real-all] \\
+        [--real-without-qe]] \\
         --sets B=none N-token=token+replay R2=none+real ... --out OUT
     python sft_build.py check --data OUT/<set> --tokenizer TOK   (SFT venv: MaxText's own SFT steps on every example)
 
@@ -38,6 +39,8 @@ when it passed real_pairs.py's hard checks (its fails empty), its MetricX-24-QE 
 (over the source's pairs that pass the hard checks), it shares no 13-gram with an evaluation set or --block-jsonl, and it
 fits MAX_TOKENS. A set with +real takes at most --real-share of its examples from them (real = BT x share / (1 -
 share)): every eligible Global Voices pair first, then Europarl drawn with a seed to fill the share; fewer, then all.
+With --real-all (arm RB, amendment of 11 Nov ~12:00: the Dutch books) it takes every eligible real pair, whatever share
+they make.
 
 Context examples (design §9): a training passage the selection marked as a context example keeps its turns before it,
 nearest first, as long as each turn is eligible by the same query; the first that fails ends the context there. Without
@@ -598,9 +601,14 @@ def build(args, tokenizer=None):
             else:
                 report["real"]["query_cost"]["first_failed"][f"{r['source']}/too_long"] = \
                     report["real"]["query_cost"]["first_failed"].get(f"{r['source']}/too_long", 0) + 1
-        share = getattr(args, "real_share", REAL_SHARE)
-        cap = round(info["bt_total"] * share / (1 - share))
-        real, draw = real_draw(fitting, cap, args.seed)
+        if getattr(args, "real_all", False):
+            real = sorted(fitting, key=lambda r: r["id"])
+            by_source = dict(collections.Counter(r["source"] for r in real))
+            share, draw = "all", {"cap": None, "eligible": by_source, "chosen": by_source}
+        else:
+            share = getattr(args, "real_share", REAL_SHARE)
+            cap = round(info["bt_total"] * share / (1 - share))
+            real, draw = real_draw(fitting, cap, args.seed)
         report["real"]["share"] = share
         report["real"]["draw"] = draw
 
@@ -745,8 +753,10 @@ def report_md(report):
         cost = r["query_cost"]
         for key in sorted(set(cost["first_failed"]) | set(cost["alone"])):
             lines.append(f"| {key} | {_n(cost['first_failed'].get(key, 0))} | {_n(cost['alone'].get(key, 0))} |")
-        lines += ["", f"Paren: {json.dumps(r['pairs'])}; in aanmerking: {json.dumps(r['eligible'])}; getrokken "
-                  f"(hoogstens {r.get('share')} van de voorbeelden, {REAL_FIRST} eerst): {json.dumps(r.get('draw'))}."]
+        drawn = ("alle paren die in aanmerking komen (`--real-all`)" if r.get("share") == "all" else
+                 f"getrokken (hoogstens {r.get('share')} van de voorbeelden, {REAL_FIRST} eerst)")
+        lines += ["", f"Paren: {json.dumps(r['pairs'])}; in aanmerking: {json.dumps(r['eligible'])}; {drawn}: "
+                  f"{json.dumps(r.get('draw'))}."]
         if r["length_bounds"]:
             lines += ["", "| bron | n | mediaan | ondergrens | bovengrens |", "|---|---:|---:|---:|---:|"]
             lines += [f"| {k} | {_n(v['n'])} | {v['median']} | {v['lo']} | {v['hi']} |" for k, v in r["length_bounds"].items()]
@@ -863,6 +873,7 @@ def main(argv=None):
     b.add_argument("--block-jsonl", default=None, help="JSONL with a source per line (blind100.jsonl): 13-grams blocked")
     b.add_argument("--real", default=None, help="real_pairs.py's real pairs (with qe_en_nl from join-qe)")
     b.add_argument("--real-share", type=float, default=REAL_SHARE)
+    b.add_argument("--real-all", action="store_true", help="every eligible real pair, no share (arm RB)")
     b.add_argument("--real-without-qe", action="store_true", help="a dry run: no MetricX-QE bound on the real pairs")
     b.add_argument("--sets", nargs="+", required=True,
                    help="NAME=TAG[+replay|+real], TAG none, token, instruction or conventional")
@@ -874,6 +885,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.command == "build" and args.bt not in ("auto", "all") and not re.fullmatch(r"[1-9]\d*", args.bt):
         parser.error("--bt is 'auto', 'all' or a positive number")
+    if args.command == "build" and args.real_all and args.real_share != REAL_SHARE:
+        parser.error("--real-all takes every eligible real pair: no --real-share with it")
     {"build": build, "check": check}[args.command](args)
 
 

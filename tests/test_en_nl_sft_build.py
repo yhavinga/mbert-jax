@@ -458,3 +458,37 @@ def test_real_pairs_without_qe_only_in_a_dry_run(tmp_path):
     args.sets = ["B=none"]
     with pytest.raises(SystemExit, match="--real goes with"):
         sb.build(args, tokenizer=CharTokenizer())
+
+
+def test_a_build_of_arm_rb_takes_every_eligible_real_pair(tmp_path):
+    """Arm RB: R2's query on BT and real pairs, but --real-all takes every eligible real pair (the Dutch books), above
+    the 20% of R2"""
+    args = tables(tmp_path)
+    rows = []
+    for i in range(40):
+        en, nl = f"The English of book passage {i} here.", f"Het Nederlands van boekpassage {i} hier."
+        fails = ["not_dutch_original"] if i == 0 else []
+        qe = None if fails else (7.0 if i == 1 else 1.0)
+        rows.append({"id": f"books:{i}", "source": "books", "en": en, "nl": nl, "fails": fails, "qe_en_nl": qe})
+    write(tmp_path / "real.parquet", rows)
+    args.bt, args.sets, args.qe_max = "all", ["RB=none+real"], 5.0
+    args.len_factor, args.real, args.real_share, args.real_all = 1.25, str(tmp_path / "real.parquet"), 0.2, True
+    args.block_jsonl, args.real_without_qe = None, False
+    sb.build(args, tokenizer=CharTokenizer())
+    out = Path(args.out)
+    meta = pq.read_table(out / "RB" / "train-meta.parquet").to_pylist()
+    real = [m for m in meta if m["kind"] == "real"]
+    assert len([m for m in meta if m["kind"] in ("bt", "bt_context")]) == 68
+    # 38 of 40: not a Dutch original, QE 7 out; more than R2's 17 (68 x 0.25)
+    assert len(real) == 38 and {m["source"] for m in real} == {"books"}
+    assert not {m["id"] for m in real} & {"books:0", "books:1"}
+    report = __import__("json").loads((out / "report.json").read_text())
+    assert report["real"]["share"] == "all" and report["real"]["draw"]["chosen"] == {"books": 38}
+    assert report["real"]["query_cost"]["first_failed"] == {"books/hard:not_dutch_original": 1, "books/qe": 1}
+    assert report["sets"]["RB"]["train"]["real_share"] == round(38 / 106, 4)
+    assert "`--real-all`" in (out / "report.md").read_text()
+    # --real-all and a --real-share are not both given
+    with pytest.raises(SystemExit):
+        sb.main(["build", "--run", "r", "--long", "l", "--replay", "x", "--flan-eval", "f", "--evalsets", "e",
+                 "--tokenizer", "t", "--sets", "RB=none+real", "--real", "x", "--real-all", "--real-share", "0.3",
+                 "--out", "o"])

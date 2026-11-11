@@ -10,6 +10,8 @@ tables.
         --out examples-qe-cutoff.md --json examples-qe-cutoff.json
     python examples_qe.py length --run RUN --long LONG [--real real.parquet] --qe-max 5 --factor 1.3333 \\
         --out examples-r2-length.md --json examples-r2-length.json
+    python examples_qe.py real-edges --real real-qe.parquet --source books --qe-max 5 --factor 1.3333 \\
+        --out examples-rb-books.md --json examples-rb-books.json
 
 rule-pairs: the tag test's WMT24++ translations of the base model 12B and of the adapter with the instruction sentence,
 with its tag (variant instruction_tag), beside the WMT24++ reference: the input of metricx_qe.py (source:hypothesis:
@@ -25,6 +27,11 @@ factor of the source's median, sft_build.py --len-factor): per source the median
 factor costs on either side, and pairs drawn with a fixed seed just outside and just inside the chosen bound, for the
 back-translation pairs (training passages that pass hard_fails and QE <= --qe-max) and the real pairs (real_pairs.py
 candidates that pass the hard checks; their QE where real.parquet has it).
+real-edges (arm RB, protocol §9, amendment of 11 Nov ~12:00): for one source of real pairs (the Dutch books), what the
+hard checks, the QE bound and the length bound cost, in that order as sft_build.py applies them, in total and per
+author (meta "author"); what other QE bounds would cost; and pairs drawn with a fixed seed just outside and just inside
+the QE bound and the length bound, and the pairs with the highest QE (where a misaligned passage shows). The 13-grams
+and the tokens come after these in sft_build.py and cost what its report says.
 """
 
 import argparse
@@ -479,6 +486,130 @@ def length_md(o):
     return "\n".join(L) + "\n"
 
 
+EDGE_QE_BOUNDS = [3, 4, 5, 6, 7.5, 10]
+EDGE_PER_SIDE = 3      # pairs just outside and just inside a bound, per side
+EDGE_QE_BAND = 1.0     # "just" at the QE bound: within this many points of it
+EDGE_HIGHEST = 3       # the pairs with the highest QE
+
+
+def real_edges(args):
+    import pyarrow.parquet as pq
+    import sft_build as sb
+
+    rows = [r for r in pq.read_table(args.real).to_pylist() if r["source"] == args.source]
+    if not rows:
+        raise SystemExit(f"{args.real}: no pair of source {args.source}")
+    hard_ok = [r for r in rows if not r["fails"]]
+    missing = [r["id"] for r in hard_ok if r.get("qe_en_nl") is None]
+    if missing:
+        raise SystemExit(f"{len(missing)} pairs that pass the hard checks have no MetricX-QE, e.g. {missing[0]}")
+    b = sb.length_bounds(hard_ok, args.factor)[args.source]  # the median over the hard checks, as sft_build.py
+
+    def author(r):
+        return json.loads(r["meta"] or "{}").get("author") or "–"
+
+    def ratio(r):
+        return sb.char_ratio(r["nl"], r["en"])
+
+    def length_ok(r):
+        return b["lo"] <= ratio(r) <= b["hi"]
+
+    per = collections.defaultdict(collections.Counter)
+    for r in rows:
+        c = per[author(r)]
+        c["rows"] += 1
+        if r["fails"]:
+            c["hard:" + r["fails"][0]] += 1
+        elif r["qe_en_nl"] > args.qe_max:
+            c["qe"] += 1
+        elif not length_ok(r):
+            c["length"] += 1
+        else:
+            c["kept"] += 1
+    total = collections.Counter()
+    for c in per.values():
+        total.update(c)
+    qe = sorted(r["qe_en_nl"] for r in hard_ok)
+    qe_ok = [r for r in hard_ok if r["qe_en_nl"] <= args.qe_max]
+    rng = random.Random(f"{SEED}/real-edges/{args.source}")
+
+    def pick(pool, k=EDGE_PER_SIDE):
+        pool = sorted(pool, key=lambda r: r["id"])
+        return [{"id": r["id"], "author": author(r), "qe": r["qe_en_nl"], "chars": ratio(r),
+                 "words": sb.word_ratio(r["nl"], r["en"]), "en": r["en"], "nl": r["nl"]}
+                for r in rng.sample(pool, min(k, len(pool)))]
+
+    examples = {
+        "qe/outside": pick([r for r in hard_ok if length_ok(r) and args.qe_max < r["qe_en_nl"] <= args.qe_max + EDGE_QE_BAND]),
+        "qe/inside": pick([r for r in hard_ok if length_ok(r) and args.qe_max - EDGE_QE_BAND < r["qe_en_nl"] <= args.qe_max]),
+        "qe/highest": [{"id": r["id"], "author": author(r), "qe": r["qe_en_nl"], "chars": ratio(r),
+                        "words": sb.word_ratio(r["nl"], r["en"]), "en": r["en"], "nl": r["nl"]}
+                       for r in sorted(hard_ok, key=lambda r: (-r["qe_en_nl"], r["id"]))[:EDGE_HIGHEST]],
+        "length/below_outside": pick([r for r in qe_ok if b["lo"] / LENGTH_BAND <= ratio(r) < b["lo"]]),
+        "length/below_inside": pick([r for r in qe_ok if b["lo"] <= ratio(r) < b["lo"] * LENGTH_BAND]),
+        "length/above_outside": pick([r for r in qe_ok if b["hi"] < ratio(r) <= b["hi"] * LENGTH_BAND]),
+        "length/above_inside": pick([r for r in qe_ok if b["hi"] / LENGTH_BAND < ratio(r) <= b["hi"]]),
+    }
+    out = {"source": args.source, "rows": len(rows), "hard_ok": len(hard_ok), "qe_max": args.qe_max,
+           "factor": args.factor, "bounds": b,
+           "qe": {f"p{q}": quantile(qe, q / 100) for q in (10, 25, 50, 75, 90, 95, 99)},
+           "qe_costs": {str(c): sum(x > c for x in qe) for c in EDGE_QE_BOUNDS},
+           "length_costs_after_qe": {"below": sum(ratio(r) < b["lo"] for r in qe_ok),
+                                     "above": sum(ratio(r) > b["hi"] for r in qe_ok)},
+           "length_costs_alone": {"below": sum(ratio(r) < b["lo"] for r in hard_ok),
+                                  "above": sum(ratio(r) > b["hi"] for r in hard_ok)},
+           "total": dict(total), "authors": {a: dict(c) for a, c in sorted(per.items())}, "examples": examples}
+    if args.json:
+        Path(args.json).write_text(json.dumps(out, indent=1, ensure_ascii=False) + "\n")
+    Path(args.out).write_text(real_edges_md(out), encoding="utf-8")
+    print("REAL_EDGES " + json.dumps({k: out[k] for k in ("source", "rows", "hard_ok", "qe_costs",
+                                                         "length_costs_after_qe", "total")}))
+
+
+def real_edges_md(o):
+    t = o["total"]
+    hard = sum(v for k, v in t.items() if k.startswith("hard:"))
+    L = [f"# Grenzen op de echte paren van bron {o['source']} (arm RB)", "",
+         f"Gemaakt met `examples_qe.py real-edges` (branch `en-nl-sft`). Volgorde zoals `sft_build.py`: harde controles "
+         f"(`real_pairs.py`), dan MetricX-24-QE en→nl ≤ {nl(o['qe_max'], 1)}, dan de lengtegrens (tekens NL / tekens EN "
+         f"binnen een factor {nl(o['factor'], 4)} van de mediaan {nl(o['bounds']['median'], 3)}: "
+         f"{nl(o['bounds']['lo'], 3)} tot {nl(o['bounds']['hi'], 3)}; de mediaan over de {n_(o['hard_ok'])} paren die "
+         "door de harde controles komen). De 13-grammen en de tokens volgen in `sft_build.py` (zijn rapport).", "",
+         f"Van {n_(o['rows'])} paren: harde controles {n_(hard)}, QE {n_(t.get('qe', 0))}, lengtegrens "
+         f"{n_(t.get('length', 0))}; over {n_(t.get('kept', 0))}.", "",
+         "| auteur | paren | harde controles | QE > grens | lengtegrens | over | aandeel over |",
+         "|---|---:|---:|---:|---:|---:|---:|"]
+    for a, c in sorted(o["authors"].items(), key=lambda x: -x[1]["rows"]):
+        h = sum(v for k, v in c.items() if k.startswith("hard:"))
+        hk = ", ".join(f"{k[5:]} {v}" for k, v in sorted(c.items()) if k.startswith("hard:"))
+        L.append(f"| {a} | {n_(c['rows'])} | {n_(h)}{f' ({hk})' if hk else ''} | {n_(c.get('qe', 0))} | "
+                 f"{n_(c.get('length', 0))} | {n_(c.get('kept', 0))} | {nl(100 * c.get('kept', 0) / c['rows'], 1)}% |")
+    L += ["", "MetricX-24-QE van de paren die door de harde controles komen: "
+          + ", ".join(f"{k} {nl(v)}" for k, v in o["qe"].items()) + ".", "",
+          "| QE > | paren (na de harde controles) |", "|---:|---:|"]
+    L += [f"| {nl(float(c), 1)}{' (grens)' if abs(float(c) - o['qe_max']) < 1e-9 else ''} | {n_(n)} |"
+          for c, n in o["qe_costs"].items()]
+    la, lq = o["length_costs_alone"], o["length_costs_after_qe"]
+    L += ["", f"Lengtegrens: eronder / erboven {n_(la['below'])} / {n_(la['above'])} van de paren na de harde controles; "
+          f"{n_(lq['below'])} / {n_(lq['above'])} van die ook de QE-grens halen.", ""]
+    names = {"qe/outside": f"Net boven de QE-grens (valt af; QE tot {nl(o['qe_max'] + EDGE_QE_BAND, 1)})",
+             "qe/inside": f"Net onder de QE-grens (blijft; QE vanaf {nl(o['qe_max'] - EDGE_QE_BAND, 1)})",
+             "qe/highest": "De hoogste QE (valt af)",
+             "length/below_outside": "Net onder de ondergrens van de lengte (valt af)",
+             "length/below_inside": "Net boven de ondergrens van de lengte (blijft)",
+             "length/above_outside": "Net boven de bovengrens van de lengte (valt af)",
+             "length/above_inside": "Net onder de bovengrens van de lengte (blijft)"}
+    for key, title in names.items():
+        L += [f"## {title}", ""]
+        for x in o["examples"][key]:
+            L += [f"**`{x['id']}`** ({x['author']}; QE {nl(x['qe'])}; tekens {nl(x['chars'], 3)}, woorden "
+                  f"{nl(x['words'], 3)})", "", "Engels:", "", quote(x["en"], 1500), "", "Nederlands:", "",
+                  quote(x["nl"], 1500), ""]
+        if not o["examples"][key]:
+            L += ["(geen paar in deze band)", ""]
+    return "\n".join(L) + "\n"
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Examples for the QE rule and the QE bound")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -509,8 +640,16 @@ def main(argv=None):
     g.add_argument("--factor", type=float, default=1.3333)
     g.add_argument("--out", required=True)
     g.add_argument("--json", default=None)
+    e = sub.add_parser("real-edges")
+    e.add_argument("--real", required=True, help="real_pairs.py join-qe (real-qe.parquet)")
+    e.add_argument("--source", required=True)
+    e.add_argument("--qe-max", type=float, default=5.0)
+    e.add_argument("--factor", type=float, default=1.3333)
+    e.add_argument("--out", required=True)
+    e.add_argument("--json", default=None)
     args = parser.parse_args(argv)
-    {"rule-pairs": rule_pairs, "rule": rule, "cutoff": cutoff, "length": length}[args.command](args)
+    {"rule-pairs": rule_pairs, "rule": rule, "cutoff": cutoff, "length": length,
+     "real-edges": real_edges}[args.command](args)
 
 
 if __name__ == "__main__":

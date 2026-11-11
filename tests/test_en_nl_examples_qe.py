@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "experiments" / "en-nl-translator"))
@@ -113,3 +114,34 @@ def test_length_examples_and_what_each_factor_costs(tmp_path):
     md = out.read_text()
     assert "# Voorbeelden bij de lengtegrens van arm R2" in md and "## Europarl-direct en→nl" in md
     assert "1,3333 (gekozen)" in md
+
+
+def test_real_edges_cost_per_author_and_examples_on_the_bounds(tmp_path):
+    """Arm RB: the books' hard checks, QE bound and length bound in sft_build.py's order, per author, with examples"""
+    rows = []
+    for k in range(20):
+        author = "Nescio" if k < 10 else "Harry Mulisch"
+        qe = 4.5 if k == 3 else 5.5 if k == 4 else 12.0 if k == 5 else 1.0
+        nl_chars = 60 if k == 6 else 100
+        rows.append({"id": f"books:{k}", "source": "books", "en": "e" * 100, "nl": "n" * nl_chars, "fails": [],
+                     "qe_en_nl": qe, "meta": json.dumps({"author": author})})
+    rows.append({"id": "books:x", "source": "books", "en": "e" * 100, "nl": "n" * 100, "fails": ["not_dutch_original"],
+                 "qe_en_nl": None, "meta": json.dumps({"author": "Paulo Coelho"})})
+    write(tmp_path / "real-qe.parquet", rows)
+    out = tmp_path / "edges.md"
+    ex.main(["real-edges", "--real", str(tmp_path / "real-qe.parquet"), "--source", "books", "--qe-max", "5",
+             "--factor", "1.3333", "--out", str(out), "--json", str(tmp_path / "e.json")])
+    o = json.loads((tmp_path / "e.json").read_text())
+    assert o["rows"] == 21 and o["hard_ok"] == 20 and o["bounds"]["median"] == 1.0
+    assert o["total"] == {"rows": 21, "hard:not_dutch_original": 1, "qe": 2, "length": 1, "kept": 17}
+    assert o["authors"]["Nescio"] == {"rows": 10, "qe": 2, "length": 1, "kept": 7}
+    assert o["qe_costs"]["5"] == 2 and o["qe_costs"]["10"] == 1
+    assert [x["id"] for x in o["examples"]["qe/outside"]] == ["books:4"]
+    assert [x["id"] for x in o["examples"]["qe/highest"]][0] == "books:5"
+    md = out.read_text()
+    assert "# Grenzen op de echte paren van bron books (arm RB)" in md and "| Paulo Coelho | 1 | 1 (not_dutch_original 1) |" in md
+    # a pair that passed the hard checks without a QE: an error
+    rows[0]["qe_en_nl"] = None
+    write(tmp_path / "real-qe.parquet", rows)
+    with pytest.raises(SystemExit, match="no MetricX-QE"):
+        ex.main(["real-edges", "--real", str(tmp_path / "real-qe.parquet"), "--source", "books", "--out", str(out)])

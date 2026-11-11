@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 """The real translation pairs of arm R2 (protocol.md §9, amendment of 11 Nov: English-original text with a human Dutch
-translation, in TranslateGemma's own prompt): Global Voices en->nl and Europarl-direct en->nl after 2003.
+translation, in TranslateGemma's own prompt): Global Voices en->nl and Europarl-direct en->nl after 2003. And those of
+arm RB (§9, amendment of 11 Nov ~12:00): Dutch books with their published English translation, the English as the
+source and the Dutch original as the target.
 
     python real_pairs.py gv-fetch --out DIR                 (the internet: nl.globalvoices.org and globalvoices.org)
     python real_pairs.py gv-align --fetched DIR --out gv.parquet
     python real_pairs.py europarl --motra DIR --out europarl.parquet       (DIR: data.py motra of en-nl-judge)
-    python real_pairs.py candidates --gv gv.parquet --europarl europarl.parquet --blind blind100.jsonl \\
-        --idioms idiom30.jsonl --out DIR                    (real.parquet, metricx-in-w<k>.parquet, candidates.json)
+    python real_pairs.py books-fetch --out DIR              (the internet: the private HF dataset BOOKS_REPO; the
+                                                            worker's own token, ~/.cache/huggingface/token)
+    python real_pairs.py books --data DIR/data/train-00000-of-00001.parquet --out books.parquet
+    python real_pairs.py candidates [--gv gv.parquet] [--europarl europarl.parquet] [--books books.parquet] \\
+        --blind blind100.jsonl --idioms idiom30.jsonl --out DIR (real.parquet, metricx-in-w<k>.parquet, candidates.json)
     python real_pairs.py join-qe --real DIR/real.parquet --qe metricx-w0.parquet ... --out real-qe.parquet
 
 gv-fetch: every post of Global Voices in Dutch (WordPress API), and per post its page, where the list "Lees dit artikel
@@ -21,9 +26,12 @@ shared numbers and position; unpaired paragraphs (translator's notes, skipped pa
 linked page's language ("[en]", "[en – alle links]") are taken out of both sides.
 europarl: the en->nl paragraphs of data.py motra (sl="en" in the English file, paired by key) from FROM_YEAR on; the
 evaluation's Europarl-direct is the 640 nl->en paragraphs of 1999-2003 (design §6: train after 2003, by period).
+books: the rows of BOOKS_REPO (a passage of a few paragraphs, newlines kept, per row) as real pairs of source "books";
+an author in NOT_DUTCH_ORIGINAL wrote in another language, so the Dutch is a translation (meta "original").
 candidates: the hard checks of a real pair (real_fails): too short, Dutch equal to the English, English left in the
 Dutch (publish.english_left), length ratio in characters > LEN_RATIO_MAX (as pairs.py); and the English source of an
-article of the blind assessment or the idiom set, or of the third subagent's pool (Global Voices posts of 2025) out.
+article of the blind assessment or the idiom set, or of the third subagent's pool (Global Voices posts of 2025) out;
+and a book whose original is not Dutch (not_dutch_original).
 The rest of the query (MetricX-QE, the bound on the length ratio in words, the 13-grams of the evaluation sets and the
 blind passages, the tokens) is sft_build.py's, as for the back-translation pairs.
 """
@@ -55,6 +63,14 @@ MIN_WORDS = 5          # English words of a pair, at least
 LEN_RATIO_MAX = 1.5    # longer over shorter in characters, as pairs.py's hard check
 SLUG_BATCH = 50
 WORKERS = 4
+BOOKS_REPO = "yhavinga/nedd_x_dataset_nlbooks_b1"  # private (Yeb): 15,004 rows, Dutch books and their English translation
+BOOKS_FILE = "data/train-00000-of-00001.parquet"
+BOOKS_REVISION = "0270fc91384501f7baaeee37036b9110bfd80c74"  # the dataset's head on 11 Nov 2026
+# Authors of the books set who did not write in Dutch (their original language): the Dutch of their rows is a
+# translation, not the original target arm RB is for (11 Nov: 2,025 of the 15,004 rows; the set's README selects books
+# by id, not by language)
+NOT_DUTCH_ORIGINAL = {"Eric Van Lustbader": "en", "Matthew Pearl": "en", "Morgan Rice": "en", "Paulo Coelho": "pt",
+                      "Giovanni Guareschi": "it"}
 
 
 def sha256_text(text):
@@ -334,6 +350,40 @@ def europarl(args):
     print("EUROPARL " + json.dumps(dict(stats)), flush=True)
 
 
+# ---------------------------------------------------------------------------------------------------- books
+
+def books_fetch(args):
+    from huggingface_hub import hf_hub_download
+
+    # the token is the one huggingface_hub finds itself (~/.cache/huggingface/token): never an argument, never printed
+    path = hf_hub_download(BOOKS_REPO, BOOKS_FILE, repo_type="dataset", revision=BOOKS_REVISION, local_dir=args.out)
+    digest = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    print(f"BOOKS_FETCHED {BOOKS_REPO}@{BOOKS_REVISION} {path} sha256 {digest}", flush=True)
+
+
+def books(args):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    rows, stats = [], collections.Counter()
+    for r in pq.read_table(args.data).to_pylist():
+        original = NOT_DUTCH_ORIGINAL.get(r["author"], "nl")
+        published = r["published"]
+        stats["rows"] += 1
+        stats[f"original/{original}"] += 1
+        rows.append({"id": f"books:{r['id']}", "source": "books", "en": r["translation"]["en"],
+                     "nl": r["translation"]["nl"], "date": published,
+                     "year": int(published[:4]) if published else None,
+                     "meta": json.dumps({"author": r["author"], "published": published, "original": original,
+                                         "book": "-".join(r["id"].split("-")[:2])}, ensure_ascii=False)})
+    if len({r["id"] for r in rows}) != len(rows):
+        raise SystemExit(f"{args.data}: rows with the same id")
+    stats["authors"] = len({json.loads(r["meta"])["author"] for r in rows})
+    pq.write_table(pa.Table.from_pylist(rows), args.out)
+    Path(args.out + ".stats.json").write_text(json.dumps(dict(stats), indent=1) + "\n")
+    print("BOOKS " + json.dumps(dict(stats)), flush=True)
+
+
 # ---------------------------------------------------------------------------------------------------- candidates
 
 def real_fails(en, nl):
@@ -372,7 +422,12 @@ def candidates(args):
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    rows = pq.read_table(args.gv).to_pylist() + pq.read_table(args.europarl).to_pylist()
+    rows = []
+    for path in (args.gv, args.europarl, getattr(args, "books", None)):
+        if path:
+            rows += pq.read_table(path).to_pylist()
+    if not rows:
+        raise SystemExit("candidates: no pairs (--gv, --europarl, --books)")
     ids = [r["id"] for r in rows]
     if len(set(ids)) != len(ids):
         raise SystemExit("real pairs with the same id")
@@ -387,6 +442,8 @@ def candidates(args):
                 fails.insert(0, "blind_article")
             elif r["date"][:4] == POOL_YEAR:
                 fails.insert(0, "blind_pool_year")
+        elif r["source"] == "books" and json.loads(r["meta"])["original"] != "nl":
+            fails.insert(0, "not_dutch_original")
         r["fails"] = fails
         r["words_en"], r["words_nl"] = len(r["en"].split()), len(r["nl"].split())
         r["chars_en"], r["chars_nl"] = len(r["en"]), len(r["nl"])
@@ -405,6 +462,7 @@ def candidates(args):
                                  "nl": [r["nl"] for r in part]}), out / f"metricx-in-w{w}.parquet")
     report = {"stats": dict(sorted(stats.items())), "blind_posts": sorted(blind_ids), "blind_links": sorted(blind_links),
               "min_words": MIN_WORDS, "len_ratio_max": LEN_RATIO_MAX, "from_year": FROM_YEAR, "pool_year": POOL_YEAR,
+              "not_dutch_original": NOT_DUTCH_ORIGINAL, "books": f"{BOOKS_REPO}@{BOOKS_REVISION}",
               "to_score": len(passed), "workers": args.workers}
     (out / "candidates.json").write_text(json.dumps(report, indent=1) + "\n", encoding="utf-8")
     print("CANDIDATES " + json.dumps(report["stats"]), flush=True)
@@ -448,9 +506,15 @@ def main(argv=None):
     p = sub.add_parser("europarl")
     p.add_argument("--motra", required=True, help="the shards of en-nl-judge's data.py motra")
     p.add_argument("--out", required=True)
+    p = sub.add_parser("books-fetch")
+    p.add_argument("--out", required=True)
+    p = sub.add_parser("books")
+    p.add_argument("--data", required=True, help="BOOKS_FILE of BOOKS_REPO")
+    p.add_argument("--out", required=True)
     p = sub.add_parser("candidates")
-    p.add_argument("--gv", required=True)
-    p.add_argument("--europarl", required=True)
+    p.add_argument("--gv", default=None)
+    p.add_argument("--europarl", default=None)
+    p.add_argument("--books", default=None)
     p.add_argument("--blind", required=True, help="blind100.jsonl")
     p.add_argument("--idioms", required=True, help="idiom30.jsonl")
     p.add_argument("--workers", type=int, default=WORKERS)
@@ -460,8 +524,8 @@ def main(argv=None):
     p.add_argument("--qe", nargs="+", required=True)
     p.add_argument("--out", required=True)
     args = parser.parse_args(argv)
-    {"gv-fetch": gv_fetch, "gv-align": gv_align, "europarl": europarl, "candidates": candidates,
-     "join-qe": join_qe}[args.command](args)
+    {"gv-fetch": gv_fetch, "gv-align": gv_align, "europarl": europarl, "books-fetch": books_fetch, "books": books,
+     "candidates": candidates, "join-qe": join_qe}[args.command](args)
 
 
 if __name__ == "__main__":

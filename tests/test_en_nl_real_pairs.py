@@ -176,3 +176,48 @@ def test_global_voices_language_markers_go():
     # an omission mark, a one-letter bracket and a longer bracket stay
     for text in ("Hij zei [...] dat [s] het [some sensitive tuna] was.", "Zie [1] en […]."):
         assert rp.strip_lang_marks(text) == text
+
+
+def test_the_books_become_real_pairs_and_a_book_not_written_in_dutch_fails(tmp_path):
+    """Arm RB: the rows of the books set (English source, Dutch original), newlines kept; an author who did not write in
+    Dutch (NOT_DUTCH_ORIGINAL) fails as not_dutch_original, the hard checks hold as for R2"""
+    en = "He stood up and spread his arms wide.\nThen he sat down again and said that we never would get it."
+    nl = "Hij stond overeind en breidde z'n armen uit.\nDaarna ging hij weer zitten en zei dat we het nooit zouden snappen."
+    hf = [{"id": "62981-137352-b1-81", "nl_len": 1, "en_len": 1, "nl_pp": 1, "en_pp": 1, "author": "Nescio",
+           "published": "2012-03-20", "translation": {"en": en, "nl": nl}},
+          {"id": "47711-123704-b1-398", "nl_len": 1, "en_len": 1, "nl_pp": 1, "en_pp": 1,
+           "author": "Eric Van Lustbader", "published": "1985", "translation": {"en": en + " A", "nl": nl + " A"}},
+          {"id": "57595-137389-b1-152", "nl_len": 1, "en_len": 1, "nl_pp": 1, "en_pp": 1, "author": "Jan Brokken",
+           "published": None, "translation": {"en": "Thank you.", "nl": "Dank u."}}]
+    write(tmp_path / "hf.parquet", hf)
+    rp.books(type("A", (), {"data": str(tmp_path / "hf.parquet"), "out": str(tmp_path / "books.parquet")}))
+    rows = {r["id"]: r for r in pq.read_table(tmp_path / "books.parquet").to_pylist()}
+    first = rows["books:62981-137352-b1-81"]
+    assert first["source"] == "books" and first["en"] == en and first["nl"] == nl and first["year"] == 2012
+    assert json.loads(first["meta"]) == {"author": "Nescio", "published": "2012-03-20", "original": "nl",
+                                         "book": "62981-137352"}
+    assert json.loads(rows["books:47711-123704-b1-398"]["meta"])["original"] == "en"
+    assert rows["books:57595-137389-b1-152"]["year"] is None
+    stats = json.loads((tmp_path / "books.parquet.stats.json").read_text())
+    assert stats == {"rows": 3, "original/nl": 2, "original/en": 1, "authors": 3}
+
+    (tmp_path / "blind.jsonl").write_text("")
+    (tmp_path / "idioms.jsonl").write_text("")
+    args = type("A", (), {"gv": None, "europarl": None, "books": str(tmp_path / "books.parquet"),
+                          "blind": str(tmp_path / "blind.jsonl"), "idioms": str(tmp_path / "idioms.jsonl"),
+                          "workers": 4, "out": str(tmp_path / "out")})
+    rp.candidates(args)
+    real = {r["id"]: r for r in pq.read_table(tmp_path / "out" / "real.parquet").to_pylist()}
+    assert real["books:62981-137352-b1-81"]["fails"] == []
+    assert real["books:47711-123704-b1-398"]["fails"] == ["not_dutch_original"]
+    assert real["books:57595-137389-b1-152"]["fails"] == ["short"]
+    parts = [pq.read_table(tmp_path / "out" / f"metricx-in-w{w}.parquet").to_pylist() for w in range(4)]
+    assert [r["id"] for p in parts for r in p] == ["books:62981-137352-b1-81"]
+    assert parts[0][0]["en"] == en  # the newline stays for MetricX and the prompt
+    report = json.loads((tmp_path / "out" / "candidates.json").read_text())
+    assert report["stats"]["books/first/not_dutch_original"] == 1 and report["to_score"] == 1
+    assert report["not_dutch_original"]["Paulo Coelho"] == "pt"
+    # no source at all: an error, not an empty set
+    args.books = None
+    with pytest.raises(SystemExit, match="no pairs"):
+        rp.candidates(args)

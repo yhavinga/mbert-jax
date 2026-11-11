@@ -42,8 +42,18 @@
 #   [DRY=1] bash run_arms.sh r2build             w3: join-qe and sft_build.py build of set R2 (DRY=1: without QE, to
 #                                                $S/data/r2-dry/), to $S/data/r2/               (job r2_build_$TAG)
 #   [DRY=1] bash run_arms.sh r2check             a worker: sft_build.py check of set R2         (job r2_check_$TAG)
+# Arm RB (protocol §9, amendment of 11 Nov ~12:00; translator_sft_rb_run.sh) runs the same stages with ARMS_ROOT=$S/rb
+# SETS=$S/data/rb RUN_PREFIX=arm27b_rb ARMS=RB. Its real pairs are the Dutch books (English source, Dutch original),
+# all of them that pass R2's query, no share; R2's stages under their own names, with $S/data/rb-real and set RB:
+#   bash run_arms.sh rbdata                      w3: the books set from HF (the worker's own token), real_pairs.py
+#                                                books and candidates, to $S/data/rb-real/    (job rb_data_$TAG)
+#   bash run_arms.sh rbqe                        as r2qe                                        (job rb_qe_$TAG)
+#   [DRY=1] bash run_arms.sh rbbuild             as r2build, with --real-all, set RB, to $S/data/rb/ (job rb_build_$TAG)
+#   [DRY=1] bash run_arms.sh rbcheck             as r2check                                     (job rb_check_$TAG)
+#   bash run_arms.sh rbedges                     w3 (CPU): examples_qe.py real-edges of the books after rbqe, to
+#                                                $S/examples/                                   (job rb_edges_$TAG)
 set -euo pipefail
-STAGE=${1:?a stage: setup, data, train, adapter, scale, translate, score, summary, texts, classifier, classify, pll, blind, report, report-scaled, r2data, r2qe, r2build, r2check}
+STAGE=${1:?a stage: setup, data, train, adapter, scale, translate, score, summary, texts, classifier, classify, pll, blind, report, report-scaled, r2data, r2qe, r2build, r2check, rbdata, rbqe, rbbuild, rbcheck, rbedges}
 S=gs://t5-dutch-english-usc2/mbert/translator/sft
 A=${ARMS_ROOT:-$S/arms}
 BASE_A=$S/arms                       # the base model on kind x, the extra sets, the classifier (the arms' chain)
@@ -52,7 +62,12 @@ M=gs://t5-dutch-english-usc2/mbert/translator/mainset
 SETS=${SETS:-$S/data/arms-v2}
 RUN_PREFIX=${RUN_PREFIX:-arm27b_v2}
 ARMS=${ARMS:-B N}                    # the arms of this chain (blind, report)
-REAL=$S/data/r2-real                 # arm R2's real pairs: candidates, MetricX-QE
+# the real pairs' stages of arm R2 (r2*) and arm RB (rb*): their candidates and MetricX-QE (REAL), the set's name and
+# place, the jobs' prefix, and how the build takes the real pairs (R2: at most 20%; RB: all)
+case $STAGE in
+  rb*) REAL=$S/data/rb-real; XSET=RB; XOUT=$S/data/rb; XJOB=rb; XREAL=--real-all ;;
+  *) REAL=$S/data/r2-real; XSET=R2; XOUT=$S/data/r2; XJOB=r2; XREAL= ;;
+esac
 R2_QE_MAX=5                          # protocol §9, amendment of 11 Nov (Yeb): MetricX-QE en->nl <= 5
 R2_LEN_FACTOR=1.3333                 # the length bound: within 4/3 of the source's median ratio of characters
 IDIOMS=$S/blind/fixed-2026-11-10/idiom30.jsonl
@@ -114,8 +129,8 @@ data_dir() {  # data_dir DATA: the E of run_baseline.sh (its data in $E/data/)
 
 check_model_data() {
   case "$MODEL/$DATA" in
-    base/x|B/four|B/x|N/four|N/x|Ninstr/instr|N50/four|N50/x|N25/four|N25/x|N75/four|N75/x|R2/four|R2/x) ;;
-    *) echo "MODEL/DATA $MODEL/$DATA is not one of the chains': base/x, B/four, B/x, N/four, N/x, Ninstr/instr, N50/four, N50/x, N25/four, N25/x, N75/four, N75/x, R2/four, R2/x"; exit 1 ;;
+    base/x|B/four|B/x|N/four|N/x|Ninstr/instr|N50/four|N50/x|N25/four|N25/x|N75/four|N75/x|R2/four|R2/x|RB/four|RB/x) ;;
+    *) echo "MODEL/DATA $MODEL/$DATA is not one of the chains': base/x, B/four, B/x, N/four, N/x, Ninstr/instr, N50/four, N50/x, N25/four, N25/x, N75/four, N75/x, R2/four, R2/x, RB/four, RB/x"; exit 1 ;;
   esac
 }
 
@@ -207,7 +222,7 @@ translate)
   tpu_free
   case $MODEL in
     base) ADAPTER=; PROMPT= ;;
-    B|N|N50|N25|N75|R2) ADAPTER=$A/$MODEL; PROMPT= ;;
+    B|N|N50|N25|N75|R2|RB) ADAPTER=$A/$MODEL; PROMPT= ;;
     Ninstr) ADAPTER=$A/N; PROMPT=chat-v1-tag-conventional ;;
   esac
   if [ -n "$ADAPTER" ]; then
@@ -273,6 +288,7 @@ summary)
   MODEL=${MODEL:?B or N}
   case $MODEL in
     R2) label="TranslateGemma 27B + LoRA R2 (r2: BT QE ≤ 5 en lengtegrens, echt Engels; protocol en-nl-sft §9)" ;;
+    RB) label="TranslateGemma 27B + LoRA RB (rb: BT QE ≤ 5 en lengtegrens, Nederlandse boeken: echt Engels → origineel Nederlands; protocol en-nl-sft §9)" ;;
     *) label="TranslateGemma 27B + LoRA $MODEL (arms-v2, QE ≤ 7,5; protocol en-nl-sft)" ;;
   esac
   detach "arms_summary_${TAG}_$MODEL" env B="$(model_dir "$MODEL" four)" ADAPTER="$A/$MODEL" LABEL="$label" \
@@ -289,7 +305,7 @@ texts)
 gsutil -q cp $E/baseline-tg27b/translations.parquet $T/base-four.parquet
 gsutil -m -q cp '$(model_dir base x)/pairs/pairs-w*.parquet' $T/base-x/"
             wmt="$wmt 'base=$T/base-four.parquet'"; flan="$flan 'base=$T/base-x/pairs-w*.parquet'" ;;
-      B|N|N50|N25|N75|R2) fetch="$fetch
+      B|N|N50|N25|N75|R2|RB) fetch="$fetch
 mkdir -p $T/$m-x
 gsutil -q cp $(model_dir "$m" four)/translations.parquet $T/$m-four.parquet
 gsutil -m -q cp '$(model_dir "$m" x)/pairs/pairs-w*.parquet' $T/$m-x/"
@@ -521,10 +537,45 @@ echo "R2DATA: $REAL/"
 EOF
   detach "r2_data_$TAG" bash ~/job_body_r2_data_$TAG.sh
   ;;
-r2qe)
+rbdata)
+  # CPU and the internet only (nice, ionice): the TPU may run someone else's job meanwhile
+  ! gsutil -q stat "$REAL/candidates/candidates.json" || { echo "$REAL has candidates: they stay as they are"; exit 1; }
+  RBD=$SHM/rb
+  NICE="nice -n 19 ionice -c3"
+  cat > ~/job_body_rb_data_$TAG.sh <<EOF
+set -euo pipefail
+mkdir -p $RBD/hf $RBD/in $RBD/out-$TAG
+# the private books set straight from HF to this worker; huggingface_hub reads the worker's own token itself
+HF_HUB_DISABLE_TELEMETRY=1 $NICE $PY -I -u $CODE/real_pairs.py books-fetch --out $RBD/hf
+gsutil -q cp $BLIND $RBD/in/blind100.jsonl
+gsutil -q cp $IDIOMS $RBD/in/idiom30.jsonl
+$NICE $PY -I -u $CODE/real_pairs.py books --data $RBD/hf/data/train-00000-of-00001.parquet --out $RBD/out-$TAG/books.parquet
+$NICE $PY -I -u $CODE/real_pairs.py candidates --books $RBD/out-$TAG/books.parquet --blind $RBD/in/blind100.jsonl --idioms $RBD/in/idiom30.jsonl --out $RBD/out-$TAG/candidates
+gsutil -m -q cp $RBD/out-$TAG/books.parquet $RBD/out-$TAG/books.parquet.stats.json $REAL/
+gsutil -m -q cp $RBD/out-$TAG/candidates/* $REAL/candidates/
+echo "RBDATA: $REAL/"
+EOF
+  detach "rb_data_$TAG" bash ~/job_body_rb_data_$TAG.sh
+  ;;
+rbedges)
+  # the books' bounds and examples on them (protocol §9, amendment RB), after rbqe; CPU
+  X=$SHM/rb/edges-$TAG
+  cat > ~/job_body_rb_edges_$TAG.sh <<EOF
+set -euo pipefail
+mkdir -p $X
+gsutil -q cp $REAL/candidates/real.parquet $X/
+gsutil -m -q cp "$REAL/qe/metricx-w*.parquet" $X/
+$PY -I -u $CODE/real_pairs.py join-qe --real $X/real.parquet --qe $X/metricx-w0.parquet $X/metricx-w1.parquet $X/metricx-w2.parquet $X/metricx-w3.parquet --out $X/real-qe.parquet
+$PY -I -u $CODE/examples_qe.py real-edges --real $X/real-qe.parquet --source books --qe-max $R2_QE_MAX --factor $R2_LEN_FACTOR --out $X/examples-rb-books.md --json $X/examples-rb-books.json
+gsutil -q cp $X/examples-rb-books.md $X/examples-rb-books.json $S/examples/
+echo "RBEDGES: $S/examples/examples-rb-books.md"
+EOF
+  detach "rb_edges_$TAG" bash ~/job_body_rb_edges_$TAG.sh
+  ;;
+r2qe|rbqe)
   tpu_free
-  L=$SHM/r2/qe-$TAG
-  cat > ~/job_body_r2_qe_$TAG.sh <<EOF
+  L=$SHM/$XJOB/qe-$TAG
+  cat > ~/job_body_${XJOB}_qe_$TAG.sh <<EOF
 set -euo pipefail
 if gsutil -q stat $REAL/qe/metricx-w$W.parquet; then echo "w$W: $REAL/qe/metricx-w$W.parquet is there before"; exit 0; fi
 mkdir -p $L
@@ -536,20 +587,20 @@ gsutil -q cp $REAL/candidates/metricx-in-w$W.parquet $L/in.parquet
   $PY -I -u $CODE/metricx_qe.py score --pairs $L/in.parquet --pair en:nl --model xxl --root $SHM/metricx --out $L/metricx-w$W.parquet
 )
 gsutil -q cp $L/metricx-w$W.parquet $REAL/qe/metricx-w$W.parquet
-echo "R2QE w$W: $REAL/qe/metricx-w$W.parquet"
+echo "${XJOB^^}QE w$W: $REAL/qe/metricx-w$W.parquet"
 EOF
-  detach "r2_qe_$TAG" bash ~/job_body_r2_qe_$TAG.sh
+  detach "${XJOB}_qe_$TAG" bash ~/job_body_${XJOB}_qe_$TAG.sh
   ;;
-r2build)
-  # DRY=1: the real pairs without their MetricX-QE (a test of the build before the TPU is free), to $S/data/r2-dry
-  if [ "${DRY:-0}" = 1 ]; then OUTSET=$S/data/r2-dry; QE_FLAGS=--real-without-qe; else OUTSET=$S/data/r2; QE_FLAGS=; fi
+r2build|rbbuild)
+  # DRY=1: the real pairs without their MetricX-QE (a test of the build before the TPU is free), to $XOUT-dry
+  if [ "${DRY:-0}" = 1 ]; then OUTSET=$XOUT-dry; QE_FLAGS=--real-without-qe; else OUTSET=$XOUT; QE_FLAGS=; fi
   ! gsutil -q stat "$OUTSET/report.json" || { echo "$OUTSET has a report.json: a new set takes a new place"; exit 1; }
   IN=$SHM/sft/in
-  O=$SHM/r2/build-$TAG
-  cat > ~/job_body_r2_build_$TAG.sh <<EOF
+  O=$SHM/$XJOB/build-$TAG
+  cat > ~/job_body_${XJOB}_build_$TAG.sh <<EOF
 set -euo pipefail
 export OMP_NUM_THREADS=8 TOKENIZERS_PARALLELISM=true
-mkdir -p $IN/run $IN/long $IN/replay $IN/flan-eval $IN/eval $SHM/r2/real-$TAG
+mkdir -p $IN/run $IN/long $IN/replay $IN/flan-eval $IN/eval $SHM/$XJOB/real-$TAG
 [ -s $IN/run/pairs.parquet ] || gsutil -q cp $M/run/pairs/pairs.parquet $IN/run/
 [ -s $IN/run/passages.parquet ] || gsutil -q cp $M/run/select/passages.parquet $IN/run/
 [ -s $IN/run/context-turns.parquet ] || gsutil -q cp $M/run/select/context-turns.parquet $IN/run/
@@ -558,7 +609,7 @@ mkdir -p $IN/run $IN/long $IN/replay $IN/flan-eval $IN/eval $SHM/r2/real-$TAG
 [ -s $IN/replay/pairs.parquet ] || gsutil -q cp $M/replay/pairs.parquet $IN/replay/
 [ -s $IN/flan-eval/eval-rows.parquet ] || gsutil -q cp $M/flan-eval/eval-rows.parquet $IN/flan-eval/
 [ -s $IN/eval/evalsets.parquet ] || gsutil -q cp $E/data/evalsets.parquet $IN/eval/
-R=$SHM/r2/real-$TAG
+R=$SHM/$XJOB/real-$TAG
 gsutil -q cp $REAL/candidates/real.parquet $BLIND \$R/
 if [ -z "$QE_FLAGS" ]; then
   gsutil -m -q cp "$REAL/qe/metricx-w*.parquet" \$R/
@@ -568,23 +619,23 @@ else
   REALP=\$R/real.parquet
 fi
 [ ! -e $O ] || { echo "$O exists"; exit 1; }
-nice -n 19 ionice -c3 $PY -I -u $CODE/sft_build.py build --run $IN/run --long $IN/long --replay $IN/replay/pairs.parquet --flan-eval $IN/flan-eval/eval-rows.parquet --evalsets $IN/eval/evalsets.parquet --tokenizer /dev/shm/flan_nl/tokenizer-27b --bt all --qe-max $R2_QE_MAX --len-factor $R2_LEN_FACTOR --block-jsonl \$R/blind100.jsonl --real \$REALP $QE_FLAGS --sets R2=none+real --out $O
+nice -n 19 ionice -c3 $PY -I -u $CODE/sft_build.py build --run $IN/run --long $IN/long --replay $IN/replay/pairs.parquet --flan-eval $IN/flan-eval/eval-rows.parquet --evalsets $IN/eval/evalsets.parquet --tokenizer /dev/shm/flan_nl/tokenizer-27b --bt all --qe-max $R2_QE_MAX --len-factor $R2_LEN_FACTOR --block-jsonl \$R/blind100.jsonl --real \$REALP $QE_FLAGS ${XREAL:+$XREAL }--sets $XSET=none+real --out $O
 gsutil -m -q rsync -r $O $OUTSET
 echo "BUILT: $OUTSET"
 EOF
-  detach "r2_build_$TAG" bash ~/job_body_r2_build_$TAG.sh
+  detach "${XJOB}_build_$TAG" bash ~/job_body_${XJOB}_build_$TAG.sh
   ;;
-r2check)
-  if [ "${DRY:-0}" = 1 ]; then OUTSET=$S/data/r2-dry; else OUTSET=$S/data/r2; fi
-  D=$SHM/r2/check-$TAG
-  cat > ~/job_body_r2_check_$TAG.sh <<EOF
+r2check|rbcheck)
+  if [ "${DRY:-0}" = 1 ]; then OUTSET=$XOUT-dry; else OUTSET=$XOUT; fi
+  D=$SHM/$XJOB/check-$TAG
+  cat > ~/job_body_${XJOB}_check_$TAG.sh <<EOF
 set -euo pipefail
 mkdir -p $D
-gsutil -m -q rsync -r $OUTSET/R2 $D
+gsutil -m -q rsync -r $OUTSET/$XSET $D
 JAX_PLATFORMS=cpu TOKENIZERS_PARALLELISM=false HF_HUB_OFFLINE=1 nice -n 19 ionice -c3 $SFT_PY -u $CODE/sft_build.py check --data $D --tokenizer /dev/shm/flan_nl/tokenizer-27b | tee $D/check.txt
 gsutil -q cp $D/check.txt $OUTSET/check.txt
 EOF
-  detach "r2_check_$TAG" bash ~/job_body_r2_check_$TAG.sh
+  detach "${XJOB}_check_$TAG" bash ~/job_body_${XJOB}_check_$TAG.sh
   ;;
 *)
   echo "unknown stage $STAGE"

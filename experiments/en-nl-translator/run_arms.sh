@@ -21,11 +21,12 @@
 #   bash run_arms.sh pll                         a worker (its TPU): naturalness.py pll, to $A/naturalness/
 #   bash run_arms.sh blind                       a worker (CPU): armeval.py blind, to $S/blind/{B,N}/
 #   bash run_arms.sh report                      a worker (CPU): armeval.py report, to $A/report/
-#   ARM=N50 bash run_arms.sh scale               a worker (CPU): N's adapter with every kernel_lora_b x 0.5 (N25: x 0.25),
+#   ARM=N50 bash run_arms.sh scale               a worker (CPU): N's adapter with every kernel_lora_b x 0.5 (N25: x 0.25, N75: x 0.75),
 #                                                scale_adapter.py, to $A/$ARM/ (protocol §9, amendment of 11 Nov)
-#   bash run_arms.sh report-scaled               a worker (CPU): armeval.py report for N50 and N25, to $A/report-scaled/
+#   bash run_arms.sh report-scaled               a worker (CPU): armeval.py report for SCALED (default N50 N25), to RDIR
+#                                                (default $A/report-scaled/)
 # MODEL: base (TranslateGemma 27B), B, N, or Ninstr (arm N with the conventional sentence, chat-v1-tag-conventional);
-# N50 and N25 (N's adapter at 50% and 25%, §9); R2 (below). COLLECT=1 with score: only the pairs (evalsets.py collect), job
+# N50, N25 and N75 (N's adapter at 50%, 25% and 75%, §9); R2 (below). COLLECT=1 with score: only the pairs (evalsets.py collect), job
 # arms_collect_...; NAT: the bucket directory of texts and predictions (default $A/naturalness; the classifier is always
 # $BASE_A/naturalness/classifier/); ARMS: the arms of blind and report (default "B N").
 # DATA: four (the four sets of the baseline, $E/data), x (FLAN 1,000 + blind 100 + in-domain 4,519) or instr (WMT24++
@@ -113,8 +114,8 @@ data_dir() {  # data_dir DATA: the E of run_baseline.sh (its data in $E/data/)
 
 check_model_data() {
   case "$MODEL/$DATA" in
-    base/x|B/four|B/x|N/four|N/x|Ninstr/instr|N50/four|N50/x|N25/four|N25/x|R2/four|R2/x) ;;
-    *) echo "MODEL/DATA $MODEL/$DATA is not one of the chains': base/x, B/four, B/x, N/four, N/x, Ninstr/instr, N50/four, N50/x, N25/four, N25/x, R2/four, R2/x"; exit 1 ;;
+    base/x|B/four|B/x|N/four|N/x|Ninstr/instr|N50/four|N50/x|N25/four|N25/x|N75/four|N75/x|R2/four|R2/x) ;;
+    *) echo "MODEL/DATA $MODEL/$DATA is not one of the chains': base/x, B/four, B/x, N/four, N/x, Ninstr/instr, N50/four, N50/x, N25/four, N25/x, N75/four, N75/x, R2/four, R2/x"; exit 1 ;;
   esac
 }
 
@@ -184,11 +185,12 @@ adapter)
   echo "ADAPTER $ARM: $A/$ARM/ $(gsutil cat "$A/$ARM/adapter.json" | tr -d '\n ' | cut -c1-300)"
   ;;
 scale)
-  ARM=${ARM:?N50 or N25}
+  ARM=${ARM:?N50, N25 or N75}
   case $ARM in
     N50) FACTOR=0.5 ;;
     N25) FACTOR=0.25 ;;
-    *) echo "ARM is N50 or N25, not $ARM"; exit 1 ;;
+    N75) FACTOR=0.75 ;;
+    *) echo "ARM is N50, N25 or N75, not $ARM"; exit 1 ;;
   esac
   ! gsutil -q stat "$A/$ARM/adapter.npz" || { echo "$A/$ARM has an adapter.npz: it stays as it is"; exit 1; }
   X=$W_DIR/scale-$TAG-$ARM
@@ -205,7 +207,7 @@ translate)
   tpu_free
   case $MODEL in
     base) ADAPTER=; PROMPT= ;;
-    B|N|N50|N25|R2) ADAPTER=$A/$MODEL; PROMPT= ;;
+    B|N|N50|N25|N75|R2) ADAPTER=$A/$MODEL; PROMPT= ;;
     Ninstr) ADAPTER=$A/N; PROMPT=chat-v1-tag-conventional ;;
   esac
   if [ -n "$ADAPTER" ]; then
@@ -287,7 +289,7 @@ texts)
 gsutil -q cp $E/baseline-tg27b/translations.parquet $T/base-four.parquet
 gsutil -m -q cp '$(model_dir base x)/pairs/pairs-w*.parquet' $T/base-x/"
             wmt="$wmt 'base=$T/base-four.parquet'"; flan="$flan 'base=$T/base-x/pairs-w*.parquet'" ;;
-      B|N|N50|N25|R2) fetch="$fetch
+      B|N|N50|N25|N75|R2) fetch="$fetch
 mkdir -p $T/$m-x
 gsutil -q cp $(model_dir "$m" four)/translations.parquet $T/$m-four.parquet
 gsutil -m -q cp '$(model_dir "$m" x)/pairs/pairs-w*.parquet' $T/$m-x/"
@@ -444,16 +446,21 @@ EOF
   detach "arms_report_$TAG" bash ~/job_body_arms_report_$TAG.sh
   ;;
 report-scaled)
-  # armeval.py report for N50 and N25 (protocol §9, amendment of 11 Nov): rule (a) against the baseline on the four sets;
-  # WITH_X=1: the extra sets of kind x beside the base model's (base-x of the first chain); WITH_B=1: rule (b) from
-  # $NAT (texts and predictions of base, N50 and N25; the classifier of $A/naturalness/classifier/)
+  # armeval.py report for the arms SCALED (default "N50 N25"; protocol §9, amendment of 11 Nov and its addition N75):
+  # rule (a) against the baseline on the four sets; WITH_X=1: the extra sets of kind x of XARMS (default SCALED) beside
+  # the base model's (base-x of the first chain); WITH_B=1: rule (b) from $NAT (texts and predictions of base and the
+  # arms; the classifier of $A/naturalness/classifier/). RDIR: the report's bucket directory (default $A/report-scaled)
+  SCALED=${SCALED:-N50 N25}
+  XARMS=${XARMS:-$SCALED}
+  RDIR=${RDIR:-$A/report-scaled}
   X=$W_DIR/report-scaled-$TAG
   extra=""
   fetch=""
+  four_args=$(for m in $SCALED; do printf '%s=%s/%s-four-scores.parquet ' "$m" "$X" "$m"; done)
   if [ -n "${WITH_X:-}" ]; then
-    extra="--x-data $X/x-evalsets.parquet --x base=$X/base-x N50=$X/N50-x N25=$X/N25-x"
+    extra="--x-data $X/x-evalsets.parquet --x base=$X/base-x $(for m in $XARMS; do printf '%s=%s/%s-x ' "$m" "$X" "$m"; done)"
     fetch="gsutil -q cp $A/data/x/data/evalsets.parquet $X/x-evalsets.parquet"
-    for d in base-x N50-x N25-x; do
+    for d in base-x $(for m in $XARMS; do printf '%s-x ' "$m"; done); do
       fetch="$fetch
 mkdir -p $X/$d/pairs $X/$d/scores
 gsutil -m -q cp '$A/eval/$d/pairs/pairs-w*.parquet' $X/$d/pairs/
@@ -470,11 +477,11 @@ set -euo pipefail
 mkdir -p $X
 gsutil -q cp $E/data/evalsets.parquet $X/evalsets.parquet
 gsutil -q cp $E/baseline-tg27b/scores.parquet $X/base-four-scores.parquet
-for m in N50 N25; do gsutil -q cp $A/eval/\$m-four/scores.parquet $X/\$m-four-scores.parquet; done
+for m in $SCALED; do gsutil -q cp $A/eval/\$m-four/scores.parquet $X/\$m-four-scores.parquet; done
 $fetch
-$PY -I -u $CODE/armeval.py report --title "Fine-tune van de en→nl-vertaler: N met afgezwakte adapter (N50, N25) op TranslateGemma 27B" --evalsets $X/evalsets.parquet --baseline-scores $X/base-four-scores.parquet --four N50=$X/N50-four-scores.parquet N25=$X/N25-four-scores.parquet $extra --commit $COMMIT --out $X/report.md --json $X/report.json
-gsutil -q cp $X/report.md $X/report.json $A/report-scaled/
-echo "REPORT: $A/report-scaled/report.md"
+$PY -I -u $CODE/armeval.py report --title "Fine-tune van de en→nl-vertaler: N met afgezwakte adapter ($(echo $SCALED | sed 's/ /, /g')) op TranslateGemma 27B" --evalsets $X/evalsets.parquet --baseline-scores $X/base-four-scores.parquet --four $four_args $extra --commit $COMMIT --out $X/report.md --json $X/report.json
+gsutil -q cp $X/report.md $X/report.json $RDIR/
+echo "REPORT: $RDIR/report.md"
 EOF
   detach "arms_report_scaled_$TAG" bash ~/job_body_arms_report_scaled_$TAG.sh
   ;;

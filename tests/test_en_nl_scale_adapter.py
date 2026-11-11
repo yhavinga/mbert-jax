@@ -90,3 +90,15 @@ def test_main_refuses_an_existing_output_and_a_scaled_source(tmp_path):
         sa.main(["--adapter", str(tmp_path / "N"), "--factor", "0.5", "--source", "s", "--out", str(tmp_path / "N50")])
     with pytest.raises(SystemExit, match="already scaled"):
         sa.main(["--adapter", str(tmp_path / "N50"), "--factor", "0.5", "--source", "s", "--out", str(tmp_path / "x")])
+
+
+def test_three_quarters_rounds_once_per_element():
+    # N75 (protocol §9, addition of 11 Nov): 0.75 is not a power of two; each lora_b element is rounded once in float32
+    src = adapter()
+    scaled = sa.scale_adapter(src, 0.75)
+    for module, (shape, _, _) in SHAPES.items():
+        b = src[f"{module}/kernel_lora_b"]
+        assert np.array_equal(scaled[f"{module}/kernel_lora_b"], (b * np.float32(0.75)).astype(np.float32))
+        a = src[f"{module}/kernel_lora_a"]
+        np.testing.assert_allclose(translate.lora_delta(a, scaled[f"{module}/kernel_lora_b"], shape, 1.0),
+                                   0.75 * translate.lora_delta(a, b, shape, 1.0), rtol=1e-5, atol=1e-6)

@@ -39,6 +39,17 @@ def dumb_paths(code):
         sys.path.insert(0, str(p))
 
 
+def warm_rotary_cache(model, params, max_length):
+    """One eager forward pass at max_length. mmbjax's rotary cache is global and keeps what its first build made; built
+    inside the first pmap trace that is a tracer, which a later trace of another padded length reuses
+    (UnexpectedTracerError, classify on 11 Nov). Built eagerly it holds concrete arrays for every length up to
+    max_length; finetune.py's eager model.init does the same up to 128."""
+    import jax.numpy as jnp
+
+    ones = jnp.ones((1, max_length), jnp.int32)
+    model.apply({"params": params}, ones, attention_mask=ones, deterministic=True)
+
+
 def make_predict(model):
     import jax
 
@@ -158,6 +169,7 @@ def classify(args):
     from mmbjax.heads.classification import ModernBertForSequenceClassification
 
     model = ModernBertForSequenceClassification(config=config)
+    warm_rotary_cache(model, params, args.max_length)
     tokenizer = AutoTokenizer.from_pretrained(config.tokenizer_name or "yhavinga/dutch-llama-tokenizer")
     rows = pq.read_table(args.texts).to_pylist()
     ids = tokenizer([r["text"] for r in rows], truncation=True, max_length=args.max_length)["input_ids"]

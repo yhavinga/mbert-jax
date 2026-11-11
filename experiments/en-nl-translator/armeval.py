@@ -22,6 +22,7 @@ reference, tokens, over_512, length_class, meta), segments-w<k>.parquet, classes
 classifier-data: §4.2.1's 2,000 passages (eval, without context, by sha256 of the pid), original against back.
 texts: the translations the naturalness measures read, per model: WMT24++ (the 960 without is_bad_source) and FLAN.
 blind: per arm judge-input.jsonl (blind_id, source, A, B) and key.jsonl (which of A and B is the base model).
+segments: per segment against the base model on the four sets (output length, MetricX-QE, English left), examples.
 report: rule (a) from the per-segment scores, rule (b) from the classifier, the in-domain table per source, the
 check of N's mode, PLL and MTLD; rule (c) waits for the blind judge.
 """
@@ -541,6 +542,86 @@ def report(args):
     print(f"RULE_B {json.dumps(result['rule_b'])}", flush=True)
 
 
+SEGMENT_SETS = ["wmt24pp", "flores", "ntrex", "europarl"]
+SHORT_SOURCE = 200  # characters: the examples are short sources
+
+
+def segment_rows(directory):
+    """{id: translations row + metricx_qe} of a model's four sets (translations.parquet and scores.parquet of evalsets.py
+    summary in one directory); WMT24++ only the 960 without is_bad_source."""
+    tr = read_rows(f"{directory}/translations.parquet", ["id", "set", "source", "hypothesis", "english_left", "meta"])
+    sc = read_rows(f"{directory}/scores.parquet", ["id", "metricx_qe"])
+    if set(tr) != set(sc):
+        raise SystemExit(f"{directory}: translations and scores of different segments")
+    return {i: {**r, "metricx_qe": sc[i]["metricx_qe"]} for i, r in tr.items()
+            if r["set"] in SEGMENT_SETS and not (r["set"] == "wmt24pp" and bad_source(r["meta"]))}
+
+
+def segment_compare(base, arm):
+    """Per set and over the four sets: the arm's output length against the base model's per segment (characters,
+    median of arm/base, shares below 0.7 and above 1.3), the shares with MetricX-QE more than 1 worse or better, the
+    segments with English left (arm and base) and the segments equal to the base model's."""
+    if set(base) != set(arm):
+        raise SystemExit("the arm and the base model have different segments")
+    out = {}
+    for s in SEGMENT_SETS + ["all"]:
+        ids = sorted(i for i in arm if s == "all" or arm[i]["set"] == s)
+        if not ids:
+            continue
+        ratios = [len(arm[i]["hypothesis"]) / len(base[i]["hypothesis"]) for i in ids if base[i]["hypothesis"]]
+        deltas = [arm[i]["metricx_qe"] - base[i]["metricx_qe"] for i in ids]
+        out[s] = {"n": len(ids), "length_median": statistics.median(ratios),
+                  "length_below_0.7": sum(x < 0.7 for x in ratios) / len(ratios),
+                  "length_above_1.3": sum(x > 1.3 for x in ratios) / len(ratios),
+                  "qe_worse_1": sum(d > 1 for d in deltas) / len(ids), "qe_better_1": sum(d < -1 for d in deltas) / len(ids),
+                  "english_left": sum(bool(arm[i]["english_left"]) for i in ids),
+                  "english_left_base": sum(bool(base[i]["english_left"]) for i in ids),
+                  "same_as_base": sum(arm[i]["hypothesis"] == base[i]["hypothesis"] for i in ids)}
+    return out
+
+
+def segment_examples(base, arm):
+    """Three WMT24++ segments (of the 960) with a source of at most SHORT_SOURCE characters where the arm's output
+    differs from the base model's: the largest, the median and the smallest MetricX-QE difference (arm - base); ties
+    by id."""
+    pool = sorted((arm[i]["metricx_qe"] - base[i]["metricx_qe"], i) for i in arm
+                  if arm[i]["set"] == "wmt24pp" and len(arm[i]["source"]) <= SHORT_SOURCE
+                  and arm[i]["hypothesis"] != base[i]["hypothesis"])
+    if not pool:
+        return []
+    picks = [("grootste verslechtering", pool[-1]), ("mediaan", pool[(len(pool) - 1) // 2]),
+             ("grootste verbetering", pool[0])]
+    return [{"kind": kind, "id": i, "delta_qe": d, "source": arm[i]["source"], "base": base[i]["hypothesis"],
+             "arm": arm[i]["hypothesis"], "qe_base": base[i]["metricx_qe"], "qe_arm": arm[i]["metricx_qe"]}
+            for kind, (d, i) in picks]
+
+
+def segments(args):
+    models = parse_named(args.model)
+    if "base" not in models:
+        raise SystemExit("--model needs base=DIR")
+    rows = {m: segment_rows(d) for m, d in models.items()}
+    result = {m: {"compare": segment_compare(rows["base"], r), "examples": segment_examples(rows["base"], r)}
+              for m, r in rows.items() if m != "base"}
+    Path(args.json).write_text(json.dumps(result, indent=1, ensure_ascii=False))
+    L = ["| arm | set | n | lengte arm/basis (mediaan) | < 0,7 | > 1,3 | QE > 1 slechter | QE > 1 beter | Engels over "
+         "(basis) | gelijk aan basis |", "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|"]
+    for m, r in result.items():
+        for s, v in r["compare"].items():
+            L.append(f"| {m} | {'samen' if s == 'all' else s + (' (960)' if s == 'wmt24pp' else '')} | {v['n']} | "
+                     f"{v['length_median']:.3f} | {pct(v['length_below_0.7'])} | {pct(v['length_above_1.3'])} | "
+                     f"{pct(v['qe_worse_1'])} | {pct(v['qe_better_1'])} | {v['english_left']} ({v['english_left_base']}) | "
+                     f"{v['same_as_base']} |")
+    for m, r in result.items():
+        L += ["", f"Voorbeelden {m} (WMT24++, bron ≤ {SHORT_SOURCE} tekens, uitvoer anders dan het basismodel):", ""]
+        for e in r["examples"]:
+            L += [f"- **{e['kind']}** (`{e['id']}`, QE {e['qe_base']:.2f} → {e['qe_arm']:.2f}, {e['delta_qe']:+.2f})",
+                  f"  - bron: {e['source']}", f"  - basis: {e['base']}", f"  - {m}: {e['arm']}"]
+    Path(args.out).write_text("\n".join(L) + "\n", encoding="utf-8")
+    for m, r in result.items():
+        print(f"SEGMENTS {m}: {json.dumps({s: round(v['length_median'], 3) for s, v in r['compare'].items()})}", flush=True)
+
+
 def report_md(r, args):
     L = [f"# {args.title}", "",
          f"Gemaakt {r['created']} door `armeval.py report` (mbert-jax `en-nl-sft` @ `{r['commit']}`), volgens "
@@ -673,6 +754,11 @@ def main(argv=None):
     p.add_argument("--commit", default="unknown")
     p.add_argument("--out", required=True)
     p.add_argument("--json", required=True)
+    p = sub.add_parser("segments")
+    p.add_argument("--model", nargs="+", required=True,
+                   help="MODEL=directory with translations.parquet and scores.parquet of the four sets; base= required")
+    p.add_argument("--out", required=True)
+    p.add_argument("--json", required=True)
     args = parser.parse_args(argv)
     if args.command == "data" and args.kind == "x" and not (args.blind and args.eval_meta and args.eval):
         parser.error("--kind x needs --blind, --eval-meta and --eval")
@@ -684,7 +770,8 @@ def main(argv=None):
         args.x_sources = {r["id"]: json.loads(r["meta"]).get("source")
                            for r in pq.read_table(args.x_data, columns=["id", "set", "meta"]).to_pylist()
                            if r["set"] == "indomain"} if args.x_data else {}
-    {"data": data, "classifier-data": classifier_data, "texts": texts, "blind": blind, "report": report}[args.command](args)
+    {"data": data, "classifier-data": classifier_data, "texts": texts, "blind": blind, "report": report,
+     "segments": segments}[args.command](args)
 
 
 if __name__ == "__main__":

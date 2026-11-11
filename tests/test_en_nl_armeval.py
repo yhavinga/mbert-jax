@@ -359,3 +359,40 @@ def test_report_x_needs_x_data(small, tmp_path):
     with pytest.raises(SystemExit):
         ae.main(["report", "--evalsets", str(small["evalsets"]), "--baseline-scores", "b", "--four", "N50=a",
                  "--x", f"base={tmp_path}", "--out", "o", "--json", "j"])
+
+
+def test_segments_against_the_base_model(tmp_path):
+    def model_dir(name, hyps, qes, english=()):
+        d = tmp_path / name
+        d.mkdir()
+        ids = sorted(hyps)
+        sets = {i: i.split("-")[0] for i in ids}
+        write(d / "translations.parquet",
+              [{"id": i, "set": sets[i], "source": "short source" if i != "wmt24pp-2" else "x" * 300,
+                "hypothesis": hyps[i], "english_left": i in english,
+                "meta": json.dumps({"is_bad_source": i == "wmt24pp-9"}) if sets[i] == "wmt24pp" else "{}"} for i in ids])
+        write(d / "scores.parquet", [{"id": i, "metricx_qe": qes[i]} for i in ids])
+        return d
+
+    ids = ["wmt24pp-0", "wmt24pp-1", "wmt24pp-2", "wmt24pp-3", "wmt24pp-9", "flores-0", "ntrex-0", "europarl-0"]
+    base = model_dir("base", {i: "aaaaaaaaaa" for i in ids}, {i: 1.0 for i in ids})
+    arm_h = {**{i: "aaaaaaaaaa" for i in ids}, "wmt24pp-0": "aaaaa", "wmt24pp-1": "aaaaaaaaaaaaaa", "wmt24pp-2": "b",
+             "wmt24pp-3": "aaaaaaaaab", "flores-0": "aaaaaa"}
+    arm_q = {**{i: 1.0 for i in ids}, "wmt24pp-0": 3.5, "wmt24pp-1": 0.5, "wmt24pp-2": 9.0, "wmt24pp-3": -0.5,
+             "flores-0": 1.5}
+    arm = model_dir("n50", arm_h, arm_q, english={"ntrex-0"})
+    ae.main(["segments", "--model", f"base={base}", f"N50={arm}", "--out", str(tmp_path / "s.md"), "--json",
+             str(tmp_path / "s.json")])
+    r = json.loads((tmp_path / "s.json").read_text())["N50"]
+    w = r["compare"]["wmt24pp"]
+    assert w["n"] == 4  # wmt24pp-9 has is_bad_source
+    assert w["length_median"] == pytest.approx((0.5 + 1.0) / 2)  # ratios 0.5, 1.4, 0.1, 1.0
+    assert w["length_below_0.7"] == 0.5 and w["length_above_1.3"] == 0.25
+    assert w["qe_worse_1"] == 0.5 and w["qe_better_1"] == 0.25 and w["same_as_base"] == 0
+    assert r["compare"]["ntrex"]["english_left"] == 1 and r["compare"]["ntrex"]["english_left_base"] == 0
+    assert r["compare"]["all"]["n"] == 7 and r["compare"]["all"]["same_as_base"] == 2
+    # examples: short WMT24++ sources whose output differs (not wmt24pp-2, 300 characters): worst, median, best
+    assert [(e["kind"], e["id"]) for e in r["examples"]] == [
+        ("grootste verslechtering", "wmt24pp-0"), ("mediaan", "wmt24pp-1"), ("grootste verbetering", "wmt24pp-3")]
+    md = (tmp_path / "s.md").read_text()
+    assert "| N50 | wmt24pp (960) | 4 | 0.750 | 50.0% | 25.0% |" in md and "  - N50: aaaaa" in md

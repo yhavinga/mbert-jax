@@ -480,7 +480,7 @@ def report(args):
     four.update({m: four_sets(p, evalsets) for m, p in parse_named(args.four).items()})
     x = {m: scored(d) for m, d in parse_named(args.x).items()}
     instr = {m: scored(d) for m, d in parse_named(args.instr).items()}
-    arms = [m for m in ("B", "N") if m in four]
+    arms = [m for m in four if m != "base"]
     result = {"created": time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime()), "commit": args.commit, "rule_a": {},
               "four": {}, "rule_b": None, "classifier": None, "indomain": {}, "flan_qe": {}, "mode_check": {},
               "pll": {}, "mtld": {}, "counts": {}}
@@ -542,7 +542,7 @@ def report(args):
 
 
 def report_md(r, args):
-    L = [f"# Fine-tune van de en→nl-vertaler: armen B en N op TranslateGemma 27B", "",
+    L = [f"# {args.title}", "",
          f"Gemaakt {r['created']} door `armeval.py report` (mbert-jax `en-nl-sft` @ `{r['commit']}`), volgens "
          "`experiments/en-nl-translator/protocol.md` (vastgelegd 10 nov). MetricX-24 hybrid XXL: lager is beter; "
          "COMET-22 en chrF: hoger is beter. Gemiddelden over de segmenten, onafgerond berekend.", ""]
@@ -662,8 +662,9 @@ def main(argv=None):
     p.add_argument("--evalsets", required=True, help="evalsets.parquet of the four sets")
     p.add_argument("--baseline-scores", required=True)
     p.add_argument("--four", nargs="+", required=True, help="ARM=scores.parquet of evalsets.py summary")
-    p.add_argument("--x-data", required=True, help="evalsets.parquet of kind x (the in-domain sources)")
-    p.add_argument("--x", nargs="+", required=True, help="MODEL=directory with pairs/ and scores/ of kind x")
+    p.add_argument("--title", default="Fine-tune van de en→nl-vertaler: armen B en N op TranslateGemma 27B")
+    p.add_argument("--x-data", default=None, help="evalsets.parquet of kind x (the in-domain sources); needed with --x")
+    p.add_argument("--x", nargs="*", default=[], help="MODEL=directory with pairs/ and scores/ of kind x")
     p.add_argument("--instr", nargs="*", default=[], help="MODEL=directory with pairs/ and scores/ of kind instr")
     p.add_argument("--classifier", default=None, help="results.json of naturalness.py classifier")
     p.add_argument("--predictions", default=None)
@@ -675,12 +676,14 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.command == "data" and args.kind == "x" and not (args.blind and args.eval_meta and args.eval):
         parser.error("--kind x needs --blind, --eval-meta and --eval")
+    if args.command == "report" and args.x and not args.x_data:
+        parser.error("--x needs --x-data")
     if args.command == "report":
         import pyarrow.parquet as pq
 
         args.x_sources = {r["id"]: json.loads(r["meta"]).get("source")
                            for r in pq.read_table(args.x_data, columns=["id", "set", "meta"]).to_pylist()
-                           if r["set"] == "indomain"}
+                           if r["set"] == "indomain"} if args.x_data else {}
     {"data": data, "classifier-data": classifier_data, "texts": texts, "blind": blind, "report": report}[args.command](args)
 
 

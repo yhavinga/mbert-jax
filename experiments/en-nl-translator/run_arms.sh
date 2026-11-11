@@ -21,7 +21,13 @@
 #   bash run_arms.sh pll                         a worker (its TPU): naturalness.py pll, to $A/naturalness/
 #   bash run_arms.sh blind                       a worker (CPU): armeval.py blind, to $S/blind/{B,N}/
 #   bash run_arms.sh report                      a worker (CPU): armeval.py report, to $A/report/
-# MODEL: base (TranslateGemma 27B), B, N, or Ninstr (arm N with the conventional sentence, chat-v1-tag-conventional).
+#   ARM=N50 bash run_arms.sh scale               a worker (CPU): N's adapter with every kernel_lora_b x 0.5 (N25: x 0.25),
+#                                                scale_adapter.py, to $A/$ARM/ (protocol §9, amendment of 11 Nov)
+#   bash run_arms.sh report-scaled               a worker (CPU): armeval.py report for N50 and N25, to $A/report-scaled/
+# MODEL: base (TranslateGemma 27B), B, N, or Ninstr (arm N with the conventional sentence, chat-v1-tag-conventional);
+# N50 and N25 (N's adapter at 50% and 25%, §9). COLLECT=1 with score: only the pairs (evalsets.py collect), job
+# arms_collect_...; NAT: the bucket directory of texts and predictions (default $A/naturalness; the classifier is always
+# $A/naturalness/classifier/); ARMS: the arms of blind (default "B N").
 # DATA: four (the four sets of the baseline, $E/data), x (FLAN 1,000 + blind 100 + in-domain 4,519) or instr (WMT24++
 # 998 + FLAN 1,000). The code is beside this script (a copy of $A/scripts/). TAG names the jobs of one chain.
 set -euo pipefail
@@ -45,6 +51,7 @@ CODE=$(cd "$(dirname "$0")" && pwd)
 W=$(hostname | sed 's/.*-w-//')
 TAG=${TAG:-manual}
 COMMIT=${COMMIT:-unknown}
+NAT=${NAT:-$A/naturalness}
 mkdir -p "$W_DIR" ~/logs
 
 detach() {  # detach NAME COMMAND...: the command in the background, log ~/logs/NAME.log ending in EXIT <code>
@@ -88,8 +95,8 @@ data_dir() {  # data_dir DATA: the E of run_baseline.sh (its data in $E/data/)
 
 check_model_data() {
   case "$MODEL/$DATA" in
-    base/x|B/four|B/x|N/four|N/x|Ninstr/instr) ;;
-    *) echo "MODEL/DATA $MODEL/$DATA is not one of the chain's: base/x, B/four, B/x, N/four, N/x, Ninstr/instr"; exit 1 ;;
+    base/x|B/four|B/x|N/four|N/x|Ninstr/instr|N50/four|N50/x|N25/four|N25/x) ;;
+    *) echo "MODEL/DATA $MODEL/$DATA is not one of the chain's: base/x, B/four, B/x, N/four, N/x, Ninstr/instr, N50/four, N50/x, N25/four, N25/x"; exit 1 ;;
   esac
 }
 
@@ -157,6 +164,21 @@ adapter)
   gsutil -q cp "$RUN/adapter.npz" "$RUN/adapter.json" "$RUN/summary.json" "$A/$ARM/"
   echo "ADAPTER $ARM: $A/$ARM/ $(gsutil cat "$A/$ARM/adapter.json" | tr -d '\n ' | cut -c1-300)"
   ;;
+scale)
+  ARM=${ARM:?N50 or N25}
+  case $ARM in
+    N50) FACTOR=0.5 ;;
+    N25) FACTOR=0.25 ;;
+    *) echo "ARM is N50 or N25, not $ARM"; exit 1 ;;
+  esac
+  ! gsutil -q stat "$A/$ARM/adapter.npz" || { echo "$A/$ARM has an adapter.npz: it stays as it is"; exit 1; }
+  X=$W_DIR/scale-$TAG-$ARM
+  mkdir -p "$X/in"
+  gsutil -q cp "$A/N/adapter.npz" "$A/N/adapter.json" "$X/in/"
+  "$PY" -I -u "$CODE/scale_adapter.py" --adapter "$X/in" --factor "$FACTOR" --source "$A/N" --out "$X/out"
+  gsutil -q cp "$X/out/adapter.npz" "$X/out/adapter.json" "$A/$ARM/"
+  echo "ADAPTER $ARM: $A/$ARM/ $(gsutil cat "$A/$ARM/adapter.json" | tr -d '\n ' | cut -c1-500)"
+  ;;
 translate)
   MODEL=${MODEL:?base, B, N or Ninstr}
   DATA=${DATA:?four, x or instr}
@@ -164,7 +186,7 @@ translate)
   tpu_free
   case $MODEL in
     base) ADAPTER=; PROMPT= ;;
-    B|N) ADAPTER=$A/$MODEL; PROMPT= ;;
+    B|N|N50|N25) ADAPTER=$A/$MODEL; PROMPT= ;;
     Ninstr) ADAPTER=$A/N; PROMPT=chat-v1-tag-conventional ;;
   esac
   if [ -n "$ADAPTER" ]; then
@@ -185,6 +207,8 @@ score)
   OUT=$(model_dir "$MODEL" "$DATA")
   XE=$(data_dir "$DATA")
   name=arms_score_${TAG}_${MODEL}_$DATA
+  [ -z "${COLLECT:-}" ] || [ "$DATA" != four ] || { echo "COLLECT is for x and instr; four collects in run_baseline.sh score"; exit 1; }
+  [ -z "${COLLECT:-}" ] || name=arms_collect_${TAG}_${MODEL}_$DATA
   if [ "$DATA" = four ]; then
     # the baseline's score stage, unchanged (it skips scores already in $OUT/scores/)
     detach "$name" env B="$OUT" TAG="${TAG}_${MODEL}_$DATA" bash "$CODE/run_baseline.sh" score
@@ -198,6 +222,7 @@ gsutil -q cp $XE/data/evalsets.parquet $XE/data/manifest.json $XE/data/segments-
 gsutil -m -q rsync -r $OUT/translations/w$W $L/translations
 $PY -I $CODE/evalsets.py collect --data $L/data --worker $W --shards $L/translations --out $L/out/pairs-w$W.parquet
 gsutil -q cp $L/out/pairs-w$W.parquet $OUT/pairs/pairs-w$W.parquet
+${COLLECT:+echo "COLLECTED w$W: $OUT/pairs/pairs-w$W.parquet"; exit 0}
 if gsutil -q stat $OUT/scores/metricx-w$W.parquet; then
   echo "w$W: MetricX scores are in $OUT/scores/ before"
 else
@@ -240,7 +265,8 @@ texts)
 gsutil -q cp $E/baseline-tg27b/translations.parquet $T/base-four.parquet
 gsutil -m -q cp '$(model_dir base x)/pairs/pairs-w*.parquet' $T/base-x/"
             wmt="$wmt 'base=$T/base-four.parquet'"; flan="$flan 'base=$T/base-x/pairs-w*.parquet'" ;;
-      B|N) fetch="$fetch
+      B|N|N50|N25) fetch="$fetch
+mkdir -p $T/$m-x
 gsutil -q cp $(model_dir "$m" four)/translations.parquet $T/$m-four.parquet
 gsutil -m -q cp '$(model_dir "$m" x)/pairs/pairs-w*.parquet' $T/$m-x/"
            wmt="$wmt '$m=$T/$m-four.parquet'"; flan="$flan '$m=$T/$m-x/pairs-w*.parquet'" ;;
@@ -256,8 +282,8 @@ mkdir -p $T/base-x $T/B-x $T/N-x $T/Ninstr-instr
 $fetch
 gsutil -q cp $E/data/evalsets.parquet $T/evalsets.parquet
 $PY -I -u $CODE/armeval.py texts --evalsets $T/evalsets.parquet --wmt $wmt --flan $flan --out $T/texts.parquet
-gsutil -q cp $T/texts.parquet $A/naturalness/texts.parquet
-echo "TEXTS: $A/naturalness/texts.parquet"
+gsutil -q cp $T/texts.parquet $NAT/texts.parquet
+echo "TEXTS: $NAT/texts.parquet"
 EOF
   detach "arms_texts_$TAG" bash ~/job_body_arms_texts_$TAG.sh
   ;;
@@ -312,10 +338,10 @@ export JAX_COMPILATION_CACHE_DIR=$W_DIR/jax_cache_s PYTHONPATH=src
 cd $DUMB
 mkdir -p $X/model
 gsutil -m -q cp $A/naturalness/classifier/params.pkl $A/naturalness/classifier/config.json $X/model/
-gsutil -q cp $A/naturalness/texts.parquet $X/texts.parquet
+gsutil -q cp $NAT/texts.parquet $X/texts.parquet
 $DPY -u $CODE/naturalness.py classify --dumb-code $DUMB --model $X/model --texts $X/texts.parquet --out $X/predictions.parquet
-gsutil -q cp $X/predictions.parquet $A/naturalness/predictions.parquet
-echo "CLASSIFIED: $A/naturalness/predictions.parquet"
+gsutil -q cp $X/predictions.parquet $NAT/predictions.parquet
+echo "CLASSIFIED: $NAT/predictions.parquet"
 EOF
   detach "arms_classify_$TAG" bash ~/job_body_arms_classify_$TAG.sh
   ;;
@@ -337,16 +363,20 @@ EOF
   detach "arms_pll_$TAG" bash ~/job_body_arms_pll_$TAG.sh
   ;;
 blind)
-  ! gsutil -q stat "$S/blind/B/key.jsonl" || { echo "$S/blind/B has a key.jsonl: the package stays as it is"; exit 1; }
+  ARMS=${ARMS:-B N}
+  for arm in $ARMS; do
+    ! gsutil -q stat "$S/blind/$arm/key.jsonl" || { echo "$S/blind/$arm has a key.jsonl: the package stays as it is"; exit 1; }
+  done
   X=$W_DIR/blind-$TAG
+  arm_args=$(for arm in $ARMS; do printf '"%s=%s/%s/pairs-w*.parquet" ' "$arm" "$X" "$arm"; done)
   cat > ~/job_body_arms_blind_$TAG.sh <<EOF
 set -euo pipefail
-mkdir -p $X/base $X/B $X/N
+mkdir -p $X/base $(for arm in $ARMS; do printf '%s ' "$X/$arm"; done)
 gsutil -q cp $BLIND $X/blind100.jsonl
-for m in base B N; do gsutil -m -q cp "$A/eval/\$m-x/pairs/pairs-w*.parquet" $X/\$m/; done
-$PY -I -u $CODE/armeval.py blind --blind $X/blind100.jsonl --base "$X/base/pairs-w*.parquet" --arm "B=$X/B/pairs-w*.parquet" "N=$X/N/pairs-w*.parquet" --out $X/out
-for arm in B N; do gsutil -q cp $X/out/\$arm/judge-input.jsonl $X/out/\$arm/key.jsonl $S/blind/\$arm/; done
-echo "BLIND: $S/blind/B/, $S/blind/N/ (judge-input.jsonl; key.jsonl)"
+for m in base $ARMS; do gsutil -m -q cp "$A/eval/\$m-x/pairs/pairs-w*.parquet" $X/\$m/; done
+$PY -I -u $CODE/armeval.py blind --blind $X/blind100.jsonl --base "$X/base/pairs-w*.parquet" --arm $arm_args --out $X/out
+for arm in $ARMS; do gsutil -q cp $X/out/\$arm/judge-input.jsonl $X/out/\$arm/key.jsonl $S/blind/\$arm/; done
+echo "BLIND: $(for arm in $ARMS; do printf '%s ' "$S/blind/$arm/"; done)(judge-input.jsonl; key.jsonl)"
 EOF
   detach "arms_blind_$TAG" bash ~/job_body_arms_blind_$TAG.sh
   ;;
@@ -370,6 +400,41 @@ gsutil -q cp $X/report.md $X/report.json $A/report/
 echo "REPORT: $A/report/report.md"
 EOF
   detach "arms_report_$TAG" bash ~/job_body_arms_report_$TAG.sh
+  ;;
+report-scaled)
+  # armeval.py report for N50 and N25 (protocol §9, amendment of 11 Nov): rule (a) against the baseline on the four sets;
+  # WITH_X=1: the extra sets of kind x beside the base model's (base-x of the first chain); WITH_B=1: rule (b) from
+  # $NAT (texts and predictions of base, N50 and N25; the classifier of $A/naturalness/classifier/)
+  X=$W_DIR/report-scaled-$TAG
+  extra=""
+  fetch=""
+  if [ -n "${WITH_X:-}" ]; then
+    extra="--x-data $X/x-evalsets.parquet --x base=$X/base-x N50=$X/N50-x N25=$X/N25-x"
+    fetch="gsutil -q cp $A/data/x/data/evalsets.parquet $X/x-evalsets.parquet"
+    for d in base-x N50-x N25-x; do
+      fetch="$fetch
+mkdir -p $X/$d/pairs $X/$d/scores
+gsutil -m -q cp '$A/eval/$d/pairs/pairs-w*.parquet' $X/$d/pairs/
+gsutil -m -q cp '$A/eval/$d/scores/*.parquet' $X/$d/scores/"
+    done
+  fi
+  if [ -n "${WITH_B:-}" ]; then
+    extra="$extra --classifier $X/results.json --predictions $X/predictions.parquet --texts $X/texts.parquet"
+    fetch="$fetch
+gsutil -m -q cp $A/naturalness/classifier/results.json $NAT/predictions.parquet $NAT/texts.parquet $X/"
+  fi
+  cat > ~/job_body_arms_report_scaled_$TAG.sh <<EOF
+set -euo pipefail
+mkdir -p $X
+gsutil -q cp $E/data/evalsets.parquet $X/evalsets.parquet
+gsutil -q cp $E/baseline-tg27b/scores.parquet $X/base-four-scores.parquet
+for m in N50 N25; do gsutil -q cp $A/eval/\$m-four/scores.parquet $X/\$m-four-scores.parquet; done
+$fetch
+$PY -I -u $CODE/armeval.py report --title "Fine-tune van de en→nl-vertaler: N met afgezwakte adapter (N50, N25) op TranslateGemma 27B" --evalsets $X/evalsets.parquet --baseline-scores $X/base-four-scores.parquet --four N50=$X/N50-four-scores.parquet N25=$X/N25-four-scores.parquet $extra --commit $COMMIT --out $X/report.md --json $X/report.json
+gsutil -q cp $X/report.md $X/report.json $A/report-scaled/
+echo "REPORT: $A/report-scaled/report.md"
+EOF
+  detach "arms_report_scaled_$TAG" bash ~/job_body_arms_report_scaled_$TAG.sh
   ;;
 *)
   echo "unknown stage $STAGE"

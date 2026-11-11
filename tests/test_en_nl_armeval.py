@@ -328,3 +328,34 @@ def test_report_without_a_usable_classifier(small, tmp_path, monkeypatch):
     r = json.loads((tmp_path / "r.json").read_text())
     assert r["rule_b"] is None
     assert "NIET gehaald: regel (b) is niet te meten" in (tmp_path / "r.md").read_text()
+
+
+def test_report_of_other_arms_without_x(small, tmp_path):
+    # the amendment of 11 Nov (protocol §9): arms N50 and N25, rule (a) on the four sets; no extra sets, no classifier
+    ev = evalsets_rows()
+
+    def scores(qe):
+        return [{"id": r["id"], "set": r["set"], "metricx_ref": 1.0, "metricx_qe": qe, "comet22": 0.85, "ended": True,
+                 "decode_loop": False, "english_left": r["set"] == "flores", "empty": False, "over_512": False}
+                for r in ev]
+
+    base4 = write(tmp_path / "base4.parquet", scores(1.0))
+    n50 = write(tmp_path / "n50.parquet", scores(1.3))
+    n25 = write(tmp_path / "n25.parquet", scores(1.2))
+    out = tmp_path / "r.md"
+    ae.main(["report", "--title", "Armen N50 en N25", "--evalsets", str(small["evalsets"]), "--baseline-scores",
+             str(base4), "--four", f"N50={n50}", f"N25={n25}", "--out", str(out), "--json", str(tmp_path / "r.json")])
+    r = json.loads((tmp_path / "r.json").read_text())
+    assert list(r["rule_a"]) == ["N50", "N25"]
+    assert not r["rule_a"]["N50"]["holds"] and r["rule_a"]["N25"]["holds"]
+    assert r["four"]["N25"]["flores"]["english_left"] == r["four"]["N25"]["flores"]["n"]
+    assert r["rule_b"] is None and r["indomain"] == {}
+    md = out.read_text()
+    assert md.startswith("# Armen N50 en N25\n")
+    assert "**N50**: (a) nee, (b) niet te meten" in md and "**N25**: (a) ja" in md
+
+
+def test_report_x_needs_x_data(small, tmp_path):
+    with pytest.raises(SystemExit):
+        ae.main(["report", "--evalsets", str(small["evalsets"]), "--baseline-scores", "b", "--four", "N50=a",
+                 "--x", f"base={tmp_path}", "--out", "o", "--json", "j"])

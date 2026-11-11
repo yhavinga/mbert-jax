@@ -661,3 +661,81 @@ R2-instellingen: lora_rank=16 lora_alpha=16 learning_rate=1e-5
   Zelfde regels (a) en (b), zelfde uitgangspunt, sets en classifier als N50 en N25. Haalt N75 (a) en (b), dan gaat N75
   door naar (c) (zoals hierboven; N50 en N25 halen (b) niet). Volgorde vóór 12:45: N75 op de vier sets (vertalen,
   scoren), dan classify; de scores van soort `x` (in-domein, alleen gerapporteerd) van N75 vervallen als ze niet passen.
+
+**Amendement 11 nov 2026 ~12:00 CET: arm RB, de BT-paren plus Nederlandse boeken** [besluit Yeb 11 nov ~12:00;
+vastgelegd vóór de eerste trainingsstap van RB; los van R2, waarvan data en instellingen ongewijzigd blijven].
+Aanleiding: arm N comprimeert op echt Engels: hij schrijft ~5% korter dan menselijke vertalers en laat stukken weg
+[meting van de hoofdsessie, 11 nov]. Het synthetische Engels van de BT-paren is omslachtiger dan het
+Nederlandse origineel, dus het model leert comprimeren. Een set Nederlandse boeken met hun gepubliceerde Engelse
+vertaling geeft echt, idiomatisch Engels met een **origineel** Nederlands doel. Eén nieuwe arm, **RB**.
+
+- **Trainingsdata** (`$S/data/rb/RB/`; `sft_build.py build --bt all --qe-max 5 --len-factor 1.3333 --block-jsonl
+  blind100.jsonl --real real-qe.parquet --real-all --sets RB=none+real`; keten `run_arms.sh rbdata`, `rbqe`, `rbedges`,
+  `rbbuild`, `rbcheck`):
+  1. **Alle BT-paren met de query van R2** [besluit Yeb]: punt 1 van het amendement R2 (§2.1 met MetricX-24-QE en→nl
+     ≤ 5, de lengtegrens factor 4/3 rond de mediaan van de bron, geen 13-gram met een evaluatieset of een blinde
+     passage) en de contextvoorbeelden zoals R2. Hetzelfde BT-deel als R2 (proefbouw R2: 208.726 voorbeelden, 12.540 met
+     context).
+  2. **Alle boekparen** [besluit Yeb] uit `yhavinga/nedd_x_dataset_nlbooks_b1` (privé HF-dataset, revisie `0270fc9`,
+     15.004 rijen van een paar alinea's, kolom `translation{nl,en}`; rechtstreeks van HF naar w3 van mbert-mix met het
+     token van de worker). Richting: Engels (bron) → Nederlands origineel (doel), met TranslateGemma's eigen prompt
+     (`chat-v1` zonder context) en **zonder** instructiezin; de regeleinden binnen een rij blijven staan. **Alles in
+     train, geen held-out** [besluit Yeb]; wel geen 13-gram gedeeld met een evaluatieset of een blinde passage, en
+     ≤ 2.048 tokens. `real_pairs.py books-fetch`, `books`, `candidates --books`.
+     - **Boeken die niet in het Nederlands geschreven zijn, eruit** [keuze, ter bevestiging aan Yeb]: vijf auteurs van
+       de set schreven niet in het Nederlands: Eric Van Lustbader (956 rijen), Matthew Pearl (626) en Morgan Rice (167)
+       in het Engels, Paulo Coelho (187) in het Portugees, Giovanni Guareschi (89) in het Italiaans; samen 2.025 rijen.
+       Hun Nederlands is een vertaling, niet het originele doel waarvoor RB er is (de README van de set kiest boeken op
+       id, niet op taal). Harde fout `not_dutch_original` (`real_pairs.NOT_DUTCH_ORIGINAL`). Over: 12.979 rijen van 19
+       auteursnamen (o.a. Wieringa, Koch, Mulisch, Hermans, Couperus, Nescio, Bossenbroek, Brokken, Van Iperen;
+       Gerbrand Bakker en Simone van der Vlugt staan er onder meer dan één spelling in).
+     - **Harde controles** zoals de echte paren van R2 (`real_pairs.real_fails`): minstens 5 Engelse woorden,
+       Nederlands ≠ Engels, geen Engels in het Nederlands (`publish.english_left`), lengteverhouding ≤ 1,5 in tekens.
+     - **Uitlijnfouten eruit** [besluit Yeb; in een steekproef begon een Engelse alinea twee zinnen eerder dan de
+       Nederlandse]: dezelfde query als de echte paren van R2: MetricX-24-QE en→nl ≤ **5** (stap `rbqe`, MetricX-24
+       hybrid XXL) en de **lengtegrens** (tekens NL / tekens EN binnen een factor 4/3 van de mediaan van de boeken,
+       over de paren die door de harde controles komen).
+     - **Omvang**: alle paren die in aanmerking komen (`--real-all`), geen aandeel [besluit Yeb].
+  3. **Geen** Europarl, **geen** Global Voices, **geen** FLAN-replay, nergens een instructiezin [besluit Yeb].
+- **Wat elke grens kost bij de boeken** [gemeten 11 nov ~12:10, `$S/data/rb-real/`, code `21239f0`; volgorde zoals
+  `sft_build.py`, eerste grens die faalt; voorbeelden op beide grenzen en per auteur:
+  `mbert-ops/translator-sft/examples-rb-books.md` (`$S/examples/examples-rb-books.md`)]:
+
+  | grens | rijen |
+  |---|---:|
+  | rijen in de set | 15.004 |
+  | niet in het Nederlands geschreven (`not_dutch_original`) | 2.025 |
+  | harde controles: Engels over / lengte > 1,5 / kort | 80 / 15 / 1 |
+  | door de harde controles | 12.883 |
+  | MetricX-QE > 5 | 4.033 (31,3%) |
+  | lengtegrens (mediaan 1,033: 0,774–1,377) | 13 (alle 13 boven de grens) |
+  | over vóór 13-grammen en tokens | 8.837 |
+
+  MetricX-24-QE van de 12.883 paren: p10 1,81, p25 2,73, mediaan 4,00, p75 5,38, p90 6,96, p99 12,40. Kosten bij
+  andere QE-grenzen (paren boven de grens): 3: 9.002; 4: 6.443; **5: 4.033**; 6: 2.287; 7,5: 941; 10: 300. De
+  lengtegrens alleen (zonder QE) zou 13 paren eronder en 32 erboven kosten; de QE-grens neemt de meeste daarvan al.
+  **Wat de grenzen raken.** De hoogste QE (23–25) zijn verschoven passages: het Nederlands begint met een of twee
+  zinnen die in het Engels ontbreken (Mulisch `books:74768-137379-b1-950`, Hermans `…-b1-217`, Koch `…-b1-223`). De
+  lengtegrens vangt die niet, omdat de lengte van een verschoven passage nauwelijks verandert. Net boven QE 5 staan
+  vooral correcte, vrije literaire vertalingen (Gerritsen 5,02, Wieringa 5,33), soms met een weggevallen zin aan de
+  rand ("Okay." bij Bakker 5,63). De QE-grens kost dus ook goede paren, en het meest bij ouder of literair Nederlands:
+  over blijven van Couperus 18,7%, Nescio 21,6%, Mortier 36,1%, Slauerhoff 43,8%, tegen Koch 90,1%, Brokken 89,7% en
+  Van der Vlugt (2017) 89,9%. De grens van 5 blijft zoals Yeb besliste.
+- **Training** gelijk aan N en R2 [besluit Yeb]: LoRA rank 16, alpha 16, op attentie en MLP, LR 1e-5 cosine naar 0 met
+  10% warmup, één epoch (`step_limit`), sequenties van 2.048, 1 per chip, 16 chips. Uitvoer `$S/rb/runs/arm27b_rb_RB/`,
+  adapter `$S/rb/RB/`. De keten (`translator_sft_rb_run.sh`, `LORA_RANK`, `LORA_ALPHA`, `LR`) weigert te starten als de
+  regel hieronder niet letterlijk gelijk is aan zijn startwaarden, en controleert na de training de rank in
+  `adapter.json`.
+
+RB-instellingen: lora_rank=16 lora_alpha=16 learning_rate=1e-5
+
+- **Evaluatie en beslisregel gelijk aan die van B, N en R2** (§4, §5; het amendement R2), tegen hetzelfde uitgangspunt
+  (`$E/baseline-tg27b/scores.parquet`): de vier sets met dezelfde code (MetricX-24 met referentie en QE, COMET-22; niet
+  af, lus, Engels over, leeg); de extra sets van soort `x` (FLAN 1.000, blind 100, in-domein 4.519 van `$S/arms/data/x/`,
+  het basismodel uit `$S/arms/eval/base-x/`); de classifier van 10 nov (`$S/arms/naturalness/classifier/`, 0,9575; niet
+  opnieuw getraind) op de WMT24++ (960) en de 1.000 FLAN-rijen, basismodel en RB in één classify-run; PLL en MTLD; het
+  blinde pakket `$S/blind/RB/` (A/B met seed `en-nl-sft/blind/ab/RB/<blind_id>`, sleutel alleen in de bucket); het
+  rapport `$S/rb/report/report.md` met regel (a), (b), de stand van (c) en, gerapporteerd zonder mee te beslissen, de
+  lengte van de uitvoer tegenover de menselijke referentie op de vier sets (`armeval.py report --four-texts`). (a)
+  MetricX-24-QE(RB) − QE(basis) ≤ 0,20 op WMT24++ (960), FLORES-200 en NTREX-128; (b) aandeel "origineel" ≥ basis +
+  0,10; (c) de blinde beoordeling, alleen als (a) en (b) gelden. RB helpt als (a), (b) en (c) alle drie gelden.

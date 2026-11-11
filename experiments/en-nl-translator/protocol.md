@@ -778,6 +778,26 @@ rank. Eén nieuwe arm, **RB2**.
      getrokken wordt, blijft een contextvoorbeeld, zodat het aandeel contextvoorbeelden in verwachting dat van RB is,
      6,0%].
   3. **Geen** Europarl, **geen** Global Voices, **geen** FLAN-replay, nergens een instructiezin [besluit Yeb].
+- **De set** [gemeten 11 nov ~22:00, `$S/data/rb2/report.md`, code `8fed60b`; vóór de geheugentest en de eerste
+  trainingsstap]: boeken 15.004 rijen → niet in het Nederlands geschreven 2.025 → harde controles (Engels over 80,
+  lengte > 1,5 15, kort 1) → 12.883 → **MetricX-QE > 7,5: 941** → **lengtegrens 19** (mediaan 1,033: 0,774–1,377) →
+  13-gram 0, te lang 0 → **11.923 boekparen**. BT: **47.692** = 4 × 11.923, getrokken uit de 208.726 van RB (2.937 met
+  context, 6,2%). Samen **59.615 trainvoorbeelden** (boeken 20,0%), 29.092.196 tokens (boeken 6.359.249, 21,9%),
+  12.588.433 doeltokens (boeken 2.998.433, 23,8%); eval 4.167 BT-passages.
+
+  | bron | voorbeelden | tokens | doeltokens | doeltokens per voorbeeld |
+  |---|---:|---:|---:|---:|
+  | boeken | 11.923 | 6.359.249 | 2.998.433 | 251 |
+  | Handelingen | 18.344 | 10.192.443 | 3.798.828 | 207 |
+  | FineWeb-2 | 12.366 | 5.261.986 | 2.388.377 | 193 |
+  | raad | 9.578 | 4.048.636 | 1.887.878 | 197 |
+  | dpc | 3.708 | 1.519.316 | 695.659 | 188 |
+  | rechtspraak | 3.696 | 1.710.566 | 819.258 | 222 |
+
+  Mediane verhouding woorden NL / EN (tekens): hele set 0,972 (1,010), BT 0,967 (1,004), boeken 0,988 (1,034).
+  Gecontroleerd met `sft_build.py check` (MaxText's eigen SFT-stappen op elk voorbeeld): EXIT 0, train 59.615, eval
+  4.167, max 2.038 tokens (`$S/data/rb2/check.txt`). Verwachte epoch [schatting, tokens per stap als bij RB]: ~950
+  stappen.
 - **Training** zoals RB (§3 en het amendement RB: LoRA op attentie en MLP, LR 1e-5 cosine naar 0 met 10% warmup, één
   epoch (`step_limit`), sequenties van 2.048, 1 per chip, 16 chips), met een andere rank en alpha. Uitvoer
   `$S/rb2/runs/arm27b_rb2_RB2/`, adapter `$S/rb2/RB2/`.

@@ -511,3 +511,143 @@ tussenpunt tussen natuurlijk en nauwkeurig.
   sets (regel (a)), dan FLAN en classify (regel (b)); de scores van het in-domeindeel worden gerapporteerd als ze
   passen en beslissen niet mee. Niet gemeten: PLL, MTLD (behalve wat het rapport uit de teksten berekent), N50/N25 met
   de instructiezin. Wat niet past, staat als niet gemeten in het rapport.
+
+**Amendement 11 nov 2026: arm R2, een tweede trainingsronde** [besluit Yeb 11 nov ~09:15, met de keuzes van de
+hoofdsessie; vastgelegd vóór de eerste trainingsstap van R2; los van het amendement N50/N25 hierboven]. Aanleiding: B
+en N halen (a) ruim niet (`$S/arms/report/report.md`): de uitvoer is ~10% korter, er vallen stukken weg, er staan
+letterlijke calques in en Engels blijft staan; echt Engels zag het model alleen in de replay van N, en alleen mét de
+instructiezin. Eén nieuwe arm, **R2**; B, N, N50 en N25 blijven zoals ze zijn.
+
+- **Trainingsdata** (`$S/data/r2/R2/`; `sft_build.py build --bt all --qe-max 5 --len-factor 1.3333 --block-jsonl
+  blind100.jsonl --real real-qe.parquet --sets R2=none+real`, keten `run_arms.sh r2data`, `r2qe`, `r2build`, `r2check`):
+  1. **BT-paren**: de query van §2.1 en de contextvoorbeelden van §2.2, met drie wijzigingen: (i) MetricX-24-QE
+     en→nl ≤ **5** in plaats van 7,5 [besluit Yeb: niet 3, omdat de en→nl-QE ook vrije, idiomatische formuleringen
+     afstraft]; (ii) een **lengtegrens** [besluit Yeb; vorm: keuze]: de verhouding tekens Nederlands / tekens Engels ligt
+     binnen een factor 4/3 van de mediaan van de bron (mediaan / 1,3333 tot mediaan × 1,3333; de medianen over de
+     trainpassages van die bron die door `hard_fails` komen), aan beide kanten; een grens tegen uitschieters, geen
+     correctie van het niveau van een bron; (iii) geen 13-gram gedeeld met de bronnen van de 100 blinde passages
+     (`$S/blind/fixed-2026-11-10/blind100.jsonl`; voor B en N gold dat al als gemeten, niet als grens). Zonder tag;
+     contextvoorbeelden met `chat-v1` met context, zoals §2.4.
+  2. **Echt Engels** [besluit Yeb]: Engels-originele tekst met een menselijke Nederlandse vertaling, met
+     TranslateGemma's eigen prompt (`chat-v1` zonder context) en **zonder** instructiezin; alles in train (`real_pairs.py`):
+     - **Global Voices en→nl** (CC BY 3.0): alle berichten van `nl.globalvoices.org` (WordPress-API) waarvan de pagina
+       een Engelse versie noemt; die Engelse versie is zelf geen vertaling (geen regel "post-source-date" op haar
+       pagina), geen overgenomen partnertekst (`blind.REPUBLISHED`, zoals bij de blinde passages), en beide pagina's
+       noemen CC BY 3.0. Per artikel de eigen alinea's van beide kanten (`blind.paragraphs`: geen citaten, bijschriften,
+       embeds, tabellen, lijsten of cursieve noten), monotoon gekoppeld (`real_pairs.align`: lengte, gedeelde links en
+       getallen, plaats; een alinea zonder tegenhanger valt weg); geen boilerplate ("Noot van de vertaler", "Lees
+       ook"). Uitgesloten: de artikelen van de blinde beoordeling en de idioomset, en alle Engelse berichten van 2025
+       (de pool van de derde subagent) [keuze].
+     - **Europarl-direct en→nl**: de XML van de MoTra-repo (`UDS-SFB-B6-Datasets/Multilingual-Parallel-Direct-Europarl`
+       @ `4e284f1`), gekoppeld zoals `en-nl-judge/data.py motra` (alinea's met `sl="en"`), **2004–2011** [keuze:
+       "na 2003"; de evaluatie is 1999–2003, ontwerp §6]; de rol van de spreker vóór de eerste alinea ("lid van de
+       Commissie . – ") weggehaald, aan beide kanten (2004–2011: aan de Nederlandse kant in 4.893 eerste alinea's, aan
+       de Engelse in 81) [keuze: metadata, geen tekst].
+     - **Harde controles** (`real_pairs.real_fails`): minstens 5 Engelse woorden, Nederlands ≠ Engels, geen Engels in het
+       Nederlands (`publish.english_left`), lengteverhouding ≤ 1,5 in tekens (als `pairs.py`).
+     - **Dezelfde query als de BT-paren**: MetricX-24-QE en→nl ≤ 5 (gemeten in de keten vóór de build, stap `r2qe`,
+       MetricX-24 hybrid XXL), de lengtegrens (factor 4/3 rond de mediaan van de bron), geen 13-gram met een
+       evaluatieset of een blinde passage, ≤ 2.048 tokens.
+     - **Omvang** [keuze hoofdsessie]: hoogstens **20% van de voorbeelden** (echt ≤ BT × 0,25): alle bruikbare Global
+       Voices-paren, Europarl als aanvulling, willekeurig getrokken (seed `en-nl-sft/0/real/rest`; Global Voices met
+       `en-nl-sft/0/real/globalvoices` als het er meer zijn dan de grens). Is er minder, dan alles.
+  3. **Geen FLAN-replay** en nergens een instructiezin [besluit Yeb].
+- **Wat elke grens kost** en de verhoudingen: zie de tabellen hieronder (gemeten 11 nov); de kosten van de QE-grens op
+  de echte paren meet de keten vannacht (stap `r2qe`) en staan dan in `$S/data/r2/report.md` (kopie
+  `mbert-ops/translator-sft/data-r2-report.md`).
+
+  **BT-paren, train** [gemeten 11 nov, proefbouw `$S/data/r2-dry/report.md`; eerste grens die faalt, tussen haakjes
+  alle paren die de grens niet halen]:
+
+  | grens | R2 | (arms-v2, §2.1) |
+  |---|---:|---:|
+  | passages vóór de query | 229.472 | 229.472 |
+  | `hard_fails` niet leeg | 2.113 | 2.113 |
+  | bronscore / herkomst | 0 / 0 | 0 / 0 |
+  | MetricX-QE > 5 (> 7,5) | 18.270 (18.604) | 2.117 |
+  | lengtegrens (factor 4/3) | 363 (528) | – |
+  | 13-gram met een evaluatieset of blinde passage | 0 | 0 |
+  | langer dan 2.048 tokens | 0 (186 contexten weg) | 0 (261) |
+  | **komt in aanmerking** | **208.726** (6,0% met context) | 225.242 |
+  | eval | 4.167 | 4.519 |
+
+  Lengtegrens per bron (tekens NL / EN; medianen over de trainpassages zonder `hard_fails`): dpc 0,984 (0,738–1,311),
+  FineWeb-2 1,003 (0,752–1,337), Handelingen 1,006 (0,755–1,341), raad 0,993 (0,745–1,324), rechtspraak 1,029
+  (0,772–1,372). Kosten bij andere factoren (BT met QE ≤ 5, onder / boven): 1,2: 3.281 / 1.390 (2,2%); 1,25: 1.346 /
+  450 (0,9%); **4/3: 309 / 54 (0,17%)**; 1,5: 2 / 0. Voorbeelden op de grens: `mbert-ops/translator-sft/examples-r2-length.md`
+  (`$S/examples/examples-r2-length.md`). Daar blijkt: de BT-paren net buiten de grens zijn meestal correcte
+  vertalingen waarin het synthetische Engels een afkorting uitschrijft ("Works Council Act (WOR)", "mavo-havo-vwo") of
+  het Nederlands compact is; een strengere factor zou vooral dat compacte Nederlands wegsnijden. Daarom 4/3: een grens
+  tegen uitschieters, die het niveau van een bron laat staan [keuze, met de aanvulling van de hoofdsessie van 11 nov].
+
+  **Echte paren** [gemeten 11 nov; `$S/data/r2-real/`; QE-grens nog niet gemeten]:
+
+  | | Global Voices | Europarl-direct |
+  |---|---:|---:|
+  | bron | 2.282 Nederlandse berichten; 1.245 met Engelse versie; 224 artikelen overgenomen partnertekst, 4 Engels zelf vertaling, 3 niet in de API: 1.014 artikelen | 126.362 en→nl-alinea's; 2004–2011 |
+  | gekoppelde paren | 13.604 | 87.745 |
+  | blinde artikelen / pool 2025 | 32 / 1.082 | – |
+  | harde controles: kort / lengte > 1,5 / gelijk / Engels over | 348 / 123 / 9 / 3 | 71 / 719 / 15 / 22 |
+  | door de harde controles | 12.007 | 86.918 |
+  | lengtegrens (factor 4/3 rond mediaan 1,110 / 1,147) | 176 | 406 |
+  | 13-gram | 0 | 2 |
+  | MetricX-QE > 5 | vannacht (`r2qe`) | vannacht |
+  | in aanmerking zonder QE-grens | 11.831 | 86.510 |
+
+  De Global Voices-teksten verliezen ook de taalmarkering van links ("[en]", "[en – alle links]"): aan de Nederlandse
+  kant in 2.150 van de 13.604 paren, aan de Engelse in 226 [keuze: metadata, geen tekst]. Bevatten de bronnen zelf
+  weglatingen? Ja, in de staart: onder de ondergrens (0,75 × de mediaan) liggen 151 Global Voices-paren (1,26%) en 406
+  Europarl-paren (0,47%), onder 0,7 × de mediaan 68 (0,57%) en 148 (0,17%); daar laat de vertaler een zin of bijzin weg
+  of vat samen ("Some industries are already showing signs of a major slow-down." ontbreekt; "not only to you, Madam
+  President, for delighting us with your presence" ontbreekt). De mediaan is 1,05 (Global Voices) en 1,07 (Europarl)
+  Nederlandse woorden per Engels woord.
+
+  **Proefbouw** (`$S/data/r2-dry/`, `--real-without-qe`, niet voor de training): 260.908 trainvoorbeelden (BT 208.726,
+  waarvan 12.540 met context; Global Voices 11.831; Europarl 40.351; echt 20,0%), 112,6 M tokens, 47,6 M doeltokens;
+  eval 4.167. Mediane verhouding woorden NL / EN (tekens): hele set 0,980 (1,020), BT 0,967 (1,004), echt 1,062
+  (1,139). De set voor de training wordt vannacht gebouwd met de QE-grens op de echte paren; Europarl vult dan aan tot
+  20%.
+
+- **Training** zoals arm N (§3), behalve wat hieronder open staat: LoRA op attentie en MLP, cosine naar 0 met 10%
+  warmup, één epoch (`step_limit`), sequenties van 2.048, 1 per chip, 16 chips. Uitvoer `$S/r2/runs/arm27b_r2_R2/`,
+  adapter `$S/r2/R2/`.
+  - **Open parameter, vóór de start vast te leggen**: LoRA-rank, alpha en LR. De standaard is die van N (rank 16,
+    alpha 16, LR 1e-5); Yeb oppert een grotere rank en minder hard ingrijpen; de hoofdsessie beslist na de meting van
+    N50/N25. Regel: vóór de start vervangt de hoofdsessie `open` in de regel hieronder door de waarden, in de vorm
+    `R2-instellingen: lora_rank=<r> lora_alpha=<a> learning_rate=<lr>` (bijv. `lora_rank=16 lora_alpha=16
+    learning_rate=1e-5`), in een gepushte commit;
+    de keten (`translator_sft_r2_run.sh`, `LORA_RANK`, `LORA_ALPHA`, `LR`) weigert te starten als die regel niet
+    letterlijk gelijk is aan zijn startwaarden, en controleert na de training de rank in `adapter.json`.
+
+R2-instellingen: open
+
+  - Geheugen bij een hogere rank [schatting, niet gemeten]: de LoRA-parameters groeien lineair met de rank
+    (gemeten bij rank 16: 113.516.544, `summary.json` van B): rank 32 227,0 M, rank 64 454,1 M. In float32, met
+    gradiënt en de twee momenten van AdamW, op elke chip gerepliceerd (`sft_lora.py` eist gerepliceerde LoRA-parameters):
+    16 bytes per parameter, dus 1,69 GiB per chip bij rank 16 (zit in de gemeten piek van 21,23 GiB), 3,38 GiB bij 32
+    en 6,77 GiB bij 64. Verwachte piek: rank 32 ~22,9 GiB, rank 64 ~26,3 GiB per chip (grens 30,75); als de stap van de
+    optimizer die toestand tijdelijk verdubbelt, ~24,6 en ~31,4 GiB. Rank 32 past dus; rank 64 waarschijnlijk, maar in
+    het slechtste geval niet. Een te hoge piek faalt in de eerste ~20 minuten (tellen ~12, compileren ~6) en stopt de
+    keten met `FAILED`. De extra rekentijd per stap is klein: ~0,5% (rank 32) en ~2% (rank 64) meer matrixproducten.
+- **Evaluatie, gelijk aan die van B en N** (§4; keten `translator_sft_r2_run.sh`, rapport `$S/r2/report/report.md`):
+  - de **vier sets** (WMT24++ 998 en de 960, FLORES-200, NTREX-128, Europarl-direct) met dezelfde code: MetricX-24 met
+    referentie en QE, COMET-22; niet af, lus, Engels over, leeg;
+  - de **extra sets** van soort `x` (FLAN 1.000, blind 100, in-domein 4.519): dezelfde 4.519 passages als bij B en N
+    (`$S/arms/data/x/`), niet de kleinere eval-split van R2 [keuze: vergelijkbaar met B, N en het basismodel]; de
+    vertalingen van het basismodel van 10 nov (`$S/arms/eval/base-x/`) [keuze: dezelfde code, greedy];
+  - de **classifier** van 10 nov (S @ 653k, `$S/arms/naturalness/classifier/`, nauwkeurigheid 0,9575; niet opnieuw
+    getraind), op de WMT24++ (960) en de 1.000 FLAN-rijen; de teksten van basismodel en R2 in één classify-run;
+  - **PLL en MTLD** zoals §4.2.3;
+  - het **blinde pakket** `$S/blind/R2/` (`judge-input.jsonl`, sleutel `key.jsonl` alleen in de bucket; A/B met seed
+    `en-nl-sft/blind/ab/R2/<blind_id>`), dezelfde 100 passages;
+  - het **rapport** met regel (a), (b) en de stand van (c), zoals voor B en N.
+  - **Gerapporteerd, beslist niet mee** [aanvulling hoofdsessie, 11 nov]: de lengte van de uitvoer tegenover de
+    menselijke referentie op de vier sets (`armeval.py report --four-texts`): per segment Nederlandse woorden per
+    Engels woord van referentie en uitvoer (mediaan), woorden van de uitvoer per woord van de referentie (mediaan) en
+    het aandeel onder 0,7 × de referentie, voor het basismodel en R2. Ook in het rapport van de set: de mediane
+    verhouding van de hele set, van het BT-deel en van het echte-Engelsdeel.
+  - Niet: R2 met de instructiezin (R2 heeft er geen).
+- **Beslisregel zoals §5, ongewijzigd, tegen hetzelfde uitgangspunt** (`$E/baseline-tg27b/scores.parquet`): (a)
+  MetricX-24-QE(R2) − QE(basis) ≤ 0,20 op WMT24++ (960), FLORES-200 en NTREX-128 (grenzen 1,747 / 1,022 / 1,282);
+  (b) aandeel "origineel" ≥ basis + 0,10 met dezelfde classifier; (c) de blinde beoordeling, alleen als (a) en (b)
+  gelden. R2 helpt als (a), (b) en (c) alle drie gelden.

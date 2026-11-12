@@ -1132,3 +1132,51 @@ QE-grens, wel de uitlijncontrole).
 - De keten (`mbert-ops/scripts/translator_sft_rl_run.sh`) start opnieuw met een nieuwe tag, op de set in
   `$S/data/rl-b5/`, en weigert te starten zonder deze aanvulling en zonder `b258cc4`. De arm heet verder RL (paden
   `$S/rl/`, `$S/blind/RL/`).
+- **De set met 5 bakken** [gemeten 12 nov ~15:40, `$S/data/rl-b5/report.md` (kopie
+  `mbert-ops/translator-sft/data-rl-report.md`; die van de eerste bouw: `data-rl-b10-report.md`), code `3da9b70`;
+  vóór de eerste trainingsstap; gebouwd op w3 (tag `rl11121433`) en gecontroleerd op w2 van mbert-mix, alleen CPU
+  (`nice -n 19`, `ionice -c3`), terwijl R2 op de TPU trainde]:
+  - **Boeken**: gelijk aan de eerste bouw, **12.521** (uitlijning 317, verder als hierboven).
+  - **BT**: gewenst 4 × 12.521 = 50.084, **hoogstens en getrokken 12.763** (1,02 per boekpaar) uit de 208.726; 1.021
+    met context (8,0%). De bovenste bak (boven 1,1613 woord per woord, 20,0% van het doel) heeft onder de BT-voorbeelden
+    2.557 voorbeelden, en die zitten er alle 2.557 in. Grenzen van de bakken (kwintielen van het doel): 0,9737 /
+    1,0351 / 1,0909 / 1,1613; getrokken per bak 2.547 / 2.556 / 2.537 / 2.566 / 2.557.
+  - Verdeling woorden NL / EN (p5 / p10 / p25 / p50 / p75 / p90 / p95; vóór = de 208.726, na = de getrokken):
+
+    | deel | n | p5 | p10 | p25 | p50 | p75 | p90 | p95 |
+    |---|---:|---:|---:|---:|---:|---:|---:|---:|
+    | doel: echte voorbeelden R2 | 52.182 | 0,889 | 0,927 | 1,000 | 1,062 | 1,141 | 1,222 | 1,278 |
+    | BT samen vóór | 208.726 | 0,833 | 0,867 | 0,917 | 0,967 | 1,017 | 1,065 | 1,097 |
+    | BT samen na (5 bakken) | 12.763 | 0,880 | 0,921 | 0,986 | 1,057 | 1,132 | 1,194 | 1,227 |
+    | BT samen na (10 bakken, eerste bouw) | 7.267 | 0,886 | 0,927 | 1,000 | 1,062 | 1,138 | 1,222 | 1,250 |
+    | Handelingen vóór / na | 79.734 / 5.933 | 0,871 / 0,919 | 0,900 / 0,958 | 0,943 / 1,009 | 0,988 / 1,073 | 1,034 / 1,146 | 1,081 / 1,196 | 1,112 / 1,231 |
+    | FineWeb-2 vóór / na | 54.475 / 3.269 | 0,837 / 0,875 | 0,869 / 0,918 | 0,917 / 0,984 | 0,966 / 1,058 | 1,015 / 1,134 | 1,062 / 1,195 | 1,095 / 1,229 |
+    | raad vóór / na | 42.144 / 1.908 | 0,803 / 0,836 | 0,837 / 0,871 | 0,887 / 0,936 | 0,938 / 1,018 | 0,987 / 1,105 | 1,036 / 1,182 | 1,068 / 1,214 |
+    | dpc vóór / na | 16.478 / 661 | 0,795 / 0,839 | 0,829 / 0,872 | 0,880 / 0,931 | 0,931 / 1,000 | 0,980 / 1,079 | 1,027 / 1,163 | 1,058 / 1,196 |
+    | rechtspraak vóór / na | 15.895 / 992 | 0,845 / 0,891 | 0,875 / 0,930 | 0,921 / 0,990 | 0,970 / 1,059 | 1,020 / 1,131 | 1,067 / 1,194 | 1,100 / 1,235 |
+    | boeken (niet getrokken) | 12.521 | 0,882 | 0,907 | 0,945 | 0,988 | 1,034 | 1,082 | 1,114 |
+    | hele set | 25.284 | 0,881 | 0,911 | 0,960 | 1,015 | 1,087 | 1,167 | 1,199 |
+
+    Met 5 bakken volgt de trekking het doel minder precies aan de bovenkant (p90 1,194 tegen 1,222 in het doel; met 10
+    bakken 1,222), omdat de bovenste bak breder is en de BT-voorbeelden daarin naar zijn ondergrens liggen [eigen
+    gevolgtrekking]; de mediaan ligt op 1,057 (doel 1,062, BT vóór 0,967).
+  - Samen **25.284 trainvoorbeelden**: BT 12.763 (50,5%), boeken 12.521 (49,5%); 12.411.900 tokens (BT 5.724.708,
+    46,1%; boeken 6.687.192, 53,9%), 5.460.048 doeltokens (BT 2.305.927, 42,2%; boeken 3.154.121, 57,8%); eval 4.167
+    BT-passages.
+
+    | bron | voorbeelden | tokens | doeltokens | doeltokens per voorbeeld |
+    |---|---:|---:|---:|---:|
+    | boeken | 12.521 | 6.687.192 | 3.154.121 | 252 |
+    | Handelingen | 5.933 | 3.060.063 | 1.082.251 | 182 |
+    | FineWeb-2 | 3.269 | 1.258.360 | 567.777 | 174 |
+    | raad | 1.908 | 719.397 | 331.202 | 174 |
+    | rechtspraak | 992 | 435.729 | 210.328 | 212 |
+    | dpc | 661 | 251.159 | 114.369 | 173 |
+
+    Bronnen in de BT-trekking: Handelingen 46,5%, FineWeb-2 25,6%, raad 14,9%, rechtspraak 7,8%, dpc 5,2% (eerste bouw
+    46,7 / 25,7 / 14,6 / 7,8 / 5,2%; RB2 38,5 / 25,9 / 20,1 / 7,7 / 7,8%). Ter vergelijking RB3: 23.846
+    trainvoorbeelden, 11.923 boeken + 11.923 BT, 12,0 M tokens.
+  - Mediane verhouding woorden NL / EN (tekens): hele set 1,015 (1,045), BT 1,057 (1,060), boeken 0,988 (1,032).
+  - Gecontroleerd met `sft_build.py check`: EXIT 0, train 25.284 (bt 11.742, bt_context 1.021, real 12.521),
+    12.411.900 tokens, max 2.047; eval 4.167, max 2.006 (`$S/data/rl-b5/check.txt`).
+  - Verwachte epoch [schatting, tokens per stap als bij RB2: 29,09 M tokens in 950 stappen]: ~405 stappen.

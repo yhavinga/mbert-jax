@@ -14,12 +14,17 @@
 # --lr-schedule wsd --decay-steps --decay-shape 1-sqrt instead of cosine, --skip-nonfinite-updates, the data above, its
 # --max-steps and --stop-at-step, and its names; PRINT_RUN_SCRIPT=1 prints it without starting anything.
 # A checkpoint in the run's bucket directory makes it a resume (also after a preemption); one of another data setup
-# is refused by the data state. Environment: COMMIT (required, ~/mbert-final must be at it), PY, STOP_AT.
+# is refused by the data state. Environment: COMMIT (required, ~/mbert-final must be at it), PY, STOP_AT, COMPUTE_DTYPE.
+# Past a self-stop on non-finite gradients in bf16 (RuntimeError: n steps in a row ...), which a resume from the same
+# checkpoint meets again on the same data: COMPUTE_DTYPE=float32 with STOP_AT the next checkpoint step, then a resume
+# without it (as start_mc4.sh).
 set -euo pipefail
 VARIANT=${1:?usage: start_final.sh culturax|culturax+gptnl stable|smoke|epoch1|epoch2}
 LEG=${2:?usage: start_final.sh culturax|culturax+gptnl stable|smoke|epoch1|epoch2}
 COMMIT=${COMMIT:?set COMMIT to the commit of commands.txt}
 PY=${PY:-\$HOME/mbert-jax/.venv/bin/python}
+COMPUTE_DTYPE=${COMPUTE_DTYPE:-}
+case $COMPUTE_DTYPE in ""|float32|bfloat16) ;; *) echo "COMPUTE_DTYPE must be float32 or bfloat16, not $COMPUTE_DTYPE"; exit 1 ;; esac
 M=gs://t5-dutch-english-usc2/mbert
 case $VARIANT in
   culturax) BASE=final-culturax-230m; LIST=culturax_nl_files.txt; NFILES=32; BLOCK=" --url-blocklist hebban.nl"
@@ -43,7 +48,7 @@ OUT=$M/$RUN
 run_script() {
   cat <<EOF
 cd ~/mbert-final
-TRACKIO_DIR=\$HOME/trackio TOKENIZERS_PARALLELISM=false PYTHONPATH=src $PY -u scripts/train_minimal.py --dataset uonlp/CulturaX --dataset-config nl --tokenizer yhavinga/dutch-llama-tokenizer --use-packing --max-length 1024 --hidden-size 1024 --num-layers 22 --num-heads 16 --intermediate-size 1536 --global-attn-every-n-layers 3 --lr-schedule wsd --decay-steps $DECAY --decay-shape 1-sqrt --min-lr 1e-6 --weight-decay 0.01 --layer-norm-lr-factor 1.0 --log-every 10 --dataset-num-rows $ROWS --per-device-batch-size 8 --learning-rate 4.8e-4 --warmup-steps 1250 --max-steps $MAX${STOP:+ --stop-at-step $STOP} --skip-nonfinite-updates${BLOCK} --checkpoint-every $CHECKPOINT_EVERY --checkpoint-dir $OUT/ckpt --wandb-project $RUN --wandb-run-name $RUN --tracking-sync-dir $OUT/tracking --system-metrics-every 1000 --eval-file \$HOME/heldout.parquet --eval-every $EVAL_EVERY --eval-batches 50 --data-files-list \$HOME/$LIST >> ~/logs/$RUN.log 2>&1
+TRACKIO_DIR=\$HOME/trackio TOKENIZERS_PARALLELISM=false PYTHONPATH=src $PY -u scripts/train_minimal.py --dataset uonlp/CulturaX --dataset-config nl --tokenizer yhavinga/dutch-llama-tokenizer --use-packing --max-length 1024 --hidden-size 1024 --num-layers 22 --num-heads 16 --intermediate-size 1536 --global-attn-every-n-layers 3 --lr-schedule wsd --decay-steps $DECAY --decay-shape 1-sqrt --min-lr 1e-6 --weight-decay 0.01 --layer-norm-lr-factor 1.0 --log-every 10 --dataset-num-rows $ROWS --per-device-batch-size 8 --learning-rate 4.8e-4 --warmup-steps 1250 --max-steps $MAX${STOP:+ --stop-at-step $STOP}${COMPUTE_DTYPE:+ --compute-dtype $COMPUTE_DTYPE} --skip-nonfinite-updates${BLOCK} --checkpoint-every $CHECKPOINT_EVERY --checkpoint-dir $OUT/ckpt --wandb-project $RUN --wandb-run-name $RUN --tracking-sync-dir $OUT/tracking --system-metrics-every 1000 --eval-file \$HOME/heldout.parquet --eval-every $EVAL_EVERY --eval-batches 50 --data-files-list \$HOME/$LIST >> ~/logs/$RUN.log 2>&1
 echo EXIT \$? > ~/logs/$RUN.exit
 EOF
 }

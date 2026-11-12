@@ -292,3 +292,14 @@ bevoordeelt 15%-masking en CulturaX.
      128; SICK-NL 64 × 4 × 1 zonder opvullen; een vaste verdeling van de jobs over de workers, gelijk voor de drie armen.
    - Keten `mbert-ops/scripts/final_eval.sh` met het deel per worker `experiments/final/eval_final.sh` (`f510292`) en
      de beslisregel in `experiments/final/decide.py` (`8954a5c`).
+
+2. **12 nov 2026, ~22:40 CET, hoofdrun bij stap 1.012.690** (hoofdsessie, volgens Yebs vooraf gegeven regel van 10 nov
+   "bij zelfstop float32-herstart"; Yeb afwezig): de trainer stopte zichzelf om 22:31 na 57 stappen op rij met
+   niet-eindige gradiënten (`RuntimeError: 57 steps in a row up to optimizer_step 1012690 …`; de parameters zijn die
+   van vóór die stappen; 1.251 overgeslagen stappen in totaal sinds 520k, eerder hoogstens 9 op rij).
+   - Hervat vanaf checkpoint 1.010.000 (met zijn datastand) met `--compute-dtype float32` tot 1.020.000
+     (`COMPUTE_DTYPE=float32 STOP_AT=1020000`, `start_final.sh` @ `1c8f2c7`: zonder `COMPUTE_DTYPE` is het commando
+     van elke tak byte voor byte dat van `f958d01`; de trainercode is ongewijzigd). Daarna verder in bf16 tot
+     1.040.000. Stopt bf16 opnieuw vanzelf, dan weer float32 tot het volgende checkpoint.
+   - Geen wijziging van schema, data, toetsen of drempels. De stappen 1.010.000–1.020.000 rekenen in float32 in plaats
+     van bf16; tak 2 begint zoals gepland bij 1.040.000.

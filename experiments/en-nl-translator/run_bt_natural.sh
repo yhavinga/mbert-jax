@@ -7,8 +7,8 @@
 #                                them MetricX-QE of the four sets' human references (refqe, the calibration of rule (a))
 # The v6e-8 runs as two TPUs of 4 chips (Gemma 4 31B allows at most 4-way tensor parallelism):
 #   half 0: nl->en natural-v1 (the 5,000 passages), then MetricX of TranslateGemma's and natural-v1's English
-#   half 1: en->nl natural-v1 on the four sets and FLAN, then nl->en bare-v1, then MetricX of bare-v1 and the en->nl
-#   evaluation; COMET-22 on the CPU beside it
+#   half 1: en->nl natural-v1 on the four sets and FLAN and their MetricX, then nl->en bare-v1 and its MetricX;
+#   COMET-22 of the four sets on the CPU beside it
 # Everything done is in the bucket, and every step skips it there: a preempted spot VM loses at most a shard. Each run's
 # logs go to $O/logs/ under their own name.
 set -euo pipefail
@@ -101,9 +101,6 @@ half1() {
   local part
   for part in four flan; do
     translate "eval-$part" natural-v1 en nl "$D/eval/$part/segments-w0.parquet" "$O/en-nl/$part" "$(cat "$D/eval/$part/classes.txt")"
-  done
-  translate bare bare-v1 nl en "$D/segments-nl.parquet" "$O/nl-en/bare" "$(cat "$D/classes.txt")"
-  for part in four flan; do
     shards "$O/en-nl/$part" "$D/eval/shards-$part"
     "$PY" -u "$C/evalsets.py" collect --data "$D/eval/$part" --worker 0 --shards "$D/eval/shards-$part" \
       --out "$D/eval/pairs-$part.parquet"
@@ -111,6 +108,7 @@ half1() {
   done
   metricx "$D/eval/pairs-four.parquet" "$D/eval/metricx-four.parquet" source:hypothesis:reference source:hypothesis
   metricx "$D/eval/pairs-flan.parquet" "$D/eval/metricx-flan.parquet" source:hypothesis
+  translate bare bare-v1 nl en "$D/segments-nl.parquet" "$O/nl-en/bare" "$(cat "$D/classes.txt")"
   shards "$O/nl-en/bare" "$D/shards/bare"
   "$PY" -u "$C/bt_natural.py" merge --sample "$D/sample.parquet" --shards "bare=$D/shards/bare" --out "$D/compare-bare.parquet"
   metricx "$D/compare-bare.parquet" "$D/qe-bare.parquet" nl:en_bare en_bare:nl
@@ -168,7 +166,8 @@ all)
     date -u +%FT%TZ | gsutil -q cp - "$O/data/done.txt"
   fi
   [ -d "$D/eval-input" ] || { mkdir -p "$D/eval-input" && gsutil -m -q rsync -r "$O/eval-input" "$D/eval-input"; }
-  cat "$D/sample.json" | head -c 3000; echo
+  # head on the file, not after cat: with pipefail cat's SIGPIPE would end the script
+  head -c 3000 "$D/sample.json"; echo
   echo "== probe $(date -u +%T)"
   if ! gsutil -q stat "$O/probe/show.txt"; then
     job 0 bt_probe_0 probe0 & a=$!

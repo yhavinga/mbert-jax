@@ -256,3 +256,43 @@ def test_evalcompare_against_translategemma(tmp_path):
     assert r["sets"]["flores"]["gemma4"]["length"]["out_per_ref"] == pytest.approx((7 / 8 + 1) / 2)
     assert r["flan"]["qe_mean"] == 2.5
     assert "Regel (a)" in out.read_text() and "| bron (Engels) |" in out.read_text()
+
+
+def test_fullset_counts_every_passage_and_a_context_turn_beyond_the_largest_class(tmp_path):
+    for key in bn.SOURCES:
+        write([{"nl": "een twee drie"}], tmp_path / key / "data" / "train-00000-of-00001.parquet")
+        write([{"nl": "vier"}], tmp_path / key / "data" / "validation-00000-of-00001.parquet")
+    write([{"nl": "x " * 900}, {"nl": "kort"}], tmp_path / "handelingen" / "context_turns" / "train-00000-of-00001.parquet")
+    write([{"nl": "kort"}], tmp_path / "handelingen" / "context_turns" / "validation-00000-of-00001.parquet")
+
+    class Words:
+        def many(self, texts):
+            return [len(t.split()) for t in texts]
+
+    full = bn.fullset(tmp_path, Words(), tr.MODELS["gemma4-31b"]["length_classes"])
+    assert full["dpc"] == {"tiny": {"passages": 2, "tokens": 4}}
+    assert full["handelingen_context"] == {"over_largest": {"passages": 1, "tokens": 900}, "tiny": {"passages": 2, "tokens": 2}}
+
+
+@pytest.mark.skipif(not (GEMMA4_TOKENIZER / "tokenizer.json").exists(), reason="Gemma 4's tokenizer is not here")
+def test_sample_writes_the_segments_the_probe_and_the_fullset(tmp_path):
+    medium = "De Kamer heeft vandaag uitgebreid gesproken over de begroting van het ministerie. " * 12
+    for key in bn.SOURCES:
+        rows = [dict(row(i, qe=6.0 if i % 7 == 0 else 1.0, length_class="long" if i % 5 == 0 else "short"),
+                     id=f"{key}:{i:03d}", nl=medium if i % 2 else "Een korte zin over de begroting van dit jaar.",
+                     hard_fails=[], ended=True, tokens_nl=150, tokens_en=150) for i in range(40)]
+        write(rows, tmp_path / "hf" / key / "data" / "train-00000-of-00001.parquet")
+        write(rows[:2], tmp_path / "hf" / key / "data" / "validation-00000-of-00001.parquet")
+    write([{"nl": "kort"}], tmp_path / "hf" / "handelingen" / "context_turns" / "train-00000-of-00001.parquet")
+    write([{"nl": "kort"}], tmp_path / "hf" / "handelingen" / "context_turns" / "validation-00000-of-00001.parquet")
+    bn.main(["sample", "--data", str(tmp_path / "hf"), "--tokenizer", str(GEMMA4_TOKENIZER), "--out", str(tmp_path / "out")])
+    out = tmp_path / "out"
+    sample = bn.read_rows(out / "sample.parquet")
+    assert len(sample) == 5 * 40 and len({r["id"] for r in sample}) == 200
+    segments = bn.read_rows(out / "segments-nl.parquet")
+    assert [s["id"] for s in segments] == [r["id"] for r in sample]
+    probe = bn.read_rows(out / "probe-nl.parquet")
+    assert len(probe) == 6 and len({p["id"] for p in probe}) == 6
+    assert all(129 <= p["tokens"] <= 256 for p in probe)
+    assert set(json.loads((out / "fullset.json").read_text())) == set(bn.SOURCES) | {"handelingen_context"}
+    assert (out / "classes.txt").read_text().split() == ["tiny", "medium"]

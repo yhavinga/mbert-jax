@@ -222,10 +222,11 @@ class Counter:
 
 def fullset(data, count, classes):
     """{source: {class: {passages, tokens}}} of every published passage (train, validation; the Handelingen's context
-    turns under handelingen_context), in Gemma 4 tokens"""
+    turns under handelingen_context), in Gemma 4 tokens; a turn beyond the largest class under over_largest"""
     import pyarrow.parquet as pq
 
     out = {}
+    largest = max(c["max_source"] for c in classes.values())
     parts = [(k, k, "data") for k in SOURCES] + [("handelingen_context", "handelingen", "context_turns")]
     for name, key, part in parts:
         per = collections.defaultdict(lambda: {"passages": 0, "tokens": 0})
@@ -233,7 +234,8 @@ def fullset(data, count, classes):
             for path in source_files(data, key, part, split):
                 texts = pq.read_table(path, columns=["nl"]).column("nl").to_pylist()
                 for n in count.many(texts):
-                    c = per[class_of(n, classes)]
+                    # a context turn is a whole turn and may be longer than the largest class
+                    c = per[class_of(n, classes) if n <= largest else "over_largest"]
                     c["passages"] += 1
                     c["tokens"] += n
         out[name] = dict(per)

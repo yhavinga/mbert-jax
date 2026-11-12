@@ -674,3 +674,180 @@ def test_rbr_refuses_r2_pairs_that_fail_its_query_and_too_few_of_them(tmp_path):
                   ["--real-all", "--real2-from", "m", "--real2-per-real", "1"]):
         with pytest.raises(SystemExit):
             sb.main(base + extra)
+
+
+# Arm RL (protocol §9, amendment of 12 Nov ~15:45): the books without a QE bound, with a check of their alignment, and
+# the back-translations drawn to the word ratio of R2's real pairs
+
+EN_SENTENCES = ["The sexton came out of the sacristy and asked something of someone in the front row.",
+                "He turned around.",
+                "Onno felt himself stiffening and immediately thought of Quinten, who was far away in the mountains of "
+                "the south.",
+                "Tell me what has happened, he said, and sat down on the bench near the door of the old church."]
+NL_SENTENCES = ["De koster kwam uit de sacristie en vroeg iets aan iemand op de voorste rij van de kerk.",
+                "Die draaide zich om.",
+                "Onno voelde zich verstijven en dacht meteen aan Quinten, die ver weg was in de bergen van het zuiden van "
+                "het land.",
+                "Zeg het maar, wat is er gebeurd, zei hij, en ging zitten op de bank bij de deur van de oude kerk aan het "
+                "plein."]
+NL_EXTRA = "Hij zou zich natuurlijk weer helemaal moeten inwerken, ook de vakliteratuur had hij niet meer bijgehouden."
+
+
+def test_sentences_end_at_a_full_stop_but_not_after_an_abbreviation_an_initial_or_a_note_number():
+    text = ("If Mr. L. was prepared to wait, fine. 'No.' She left.\n5. Stuart Cloete, African Portraits.\n"
+            "He said: \"Go!\" Then _silence._ And more… who knows? Mevr. Jansen bijv. niet.")
+    assert sb.sentences(text) == ["If Mr. L. was prepared to wait, fine.", "'No.'", "She left.",
+                                  "5. Stuart Cloete, African Portraits.", 'He said: "Go!"', "Then _silence._",
+                                  "And more… who knows?", "Mevr. Jansen bijv. niet."]
+    assert sb.sentences("\n\n  One line.  \n") == ["One line."]
+
+
+def test_the_alignment_check_sees_a_passage_shifted_by_a_sentence():
+    en = " ".join(EN_SENTENCES)
+    aligned = sb.align_edges(en, " ".join(NL_SENTENCES), 1.033)
+    # the Dutch begins with a sentence the English lacks and lacks the English's last: about as long in total
+    shifted = sb.align_edges(en, " ".join([NL_EXTRA] + NL_SENTENCES[:3]), 1.033)
+    assert max(aligned) < 1.0 and max(shifted) > 3.0
+    beads = sb.sentence_alignment(sb.sentences(en), sb.sentences(" ".join(NL_SENTENCES)), 1.033)
+    assert [(a, b) for a, b, _ in beads] == [(1, 1)] * 4
+    # a sentence the translator split in two is a 1-2 bead, at a low cost
+    split = NL_SENTENCES[2].replace(", die ver", ". Die was ver").replace("die ver weg was", "ver weg")
+    beads = sb.sentence_alignment(sb.sentences(en), sb.sentences(" ".join(NL_SENTENCES[:2] + [split, NL_SENTENCES[3]])),
+                                  1.033)
+    assert [(a, b) for a, b, _ in beads] == [(1, 1), (1, 1), (1, 2), (1, 1)]
+    # one sentence a side: the one bead is both edges
+    start, end = sb.align_edges(EN_SENTENCES[0], NL_SENTENCES[0], 1.033)
+    assert start == end < 1.0
+    with pytest.raises(ValueError):
+        sb.sentence_alignment([], ["Een zin."], 1.0)
+    assert [sb.qe_band(q) for q in (1.0, 5.0, 5.01, 7.5, 9.0, 23.0, 25.0)] == \
+        ["<=5", "<=5", "5-7.5", "5-7.5", "7.5-10", "20-23", ">23"]
+
+
+def ratio_rows(spec):
+    """back-translation rows with a given ratio of Dutch to English words: spec [(pid, words_nl, words_en)]"""
+    return [{"pid": p, "source": "raad", "nl": " ".join(["nl"] * a), "en": " ".join(["en"] * b)} for p, a, b in spec]
+
+
+def test_the_matching_draw_follows_the_target_and_takes_what_fits():
+    target = [("europarl", 1.0)] * 10 + [("globalvoices", 1.5)] * 10
+    pool = ratio_rows([(f"lo{i:02d}", 4, 4) for i in range(30)] + [(f"hi{i}", 6, 4) for i in range(6)])
+    # two bins at the target's median; 8 wanted: 4 from each
+    kept, info = sb.bt_match_draw(pool, target, 8, 2, "s")
+    assert len(kept) == 8 and sum(r["pid"].startswith("hi") for r in kept) == 4 and not info["limited"]
+    assert [b["drawn"] for b in info["per_bin"]] == [4, 4] and [b["pool"] for b in info["per_bin"]] == [30, 6]
+    assert [r["pid"] for r in kept] == [r["pid"] for r in pool if r["pid"] in {k["pid"] for k in kept}]
+    assert info["ratio"]["drawn"]["p50"] == 1.25 and info["ratio"]["target"]["n"] == 20
+    assert info["target_by_source"] == {"europarl": 10, "globalvoices": 10}
+    # 40 wanted: the upper bin holds 6, half of the target, so at most 12
+    kept, info = sb.bt_match_draw(pool, target, 40, 2, "s")
+    assert (len(kept), info["most"], info["drawn"], info["limited"]) == (12, 12, 12, True)
+    assert sum(r["pid"].startswith("hi") for r in kept) == 6
+    # the same seed, the same draw; another seed, another one
+    first = [r["pid"] for r in sb.bt_match_draw(pool, target, 8, 2, "s")[0]]
+    assert first == [r["pid"] for r in sb.bt_match_draw(pool, target, 8, 2, "s")[0]]
+    assert first != [r["pid"] for r in sb.bt_match_draw(pool, target, 8, 2, "other")[0]]
+    # a bin of the target without back-translations: no draw
+    with pytest.raises(SystemExit, match="no back-translation in bin"):
+        sb.bt_match_draw(ratio_rows([(f"lo{i}", 4, 4) for i in range(30)]), target, 8, 2, "s")
+    # equal cuts merge: a target of one ratio is one bin
+    kept, info = sb.bt_match_draw(pool, [("europarl", 1.0)] * 20, 8, 10, "s")
+    assert info["bins"] == 2 and info["bins_asked"] == 10 and len(kept) == 8
+
+
+def rl_tables(tmp_path):
+    """tables() with back-translations of three word ratios (Handelingen d10-d15 at 1.5, d16-d19 at 0.75, the rest at
+    1.0), books (aligned, shifted, high QE, not a Dutch original) and a set R2 of 20 real examples at 1.0 and 1.5"""
+    args = tables(tmp_path)
+    path = Path(args.run) / "pairs.parquet"
+    rows = pq.read_table(path).to_pylist()
+    for r in rows:
+        if r["kind"] == "passage" and r["pid"].startswith("handelingen:d"):
+            i = int(r["pid"].split(":")[1][1:])
+            if 10 <= i <= 15:
+                r["nl"] = f"Een twee drie vier vijf {r['pid']}."
+            elif 16 <= i <= 19:
+                r["nl"] = f"Nederlandse versie {r['pid']}."
+    write(path, rows)
+    books = []
+    for i in range(12):
+        nl = NL_SENTENCES[:3] + [NL_SENTENCES[3] + f" ({i})"]
+        if i == 1:  # shifted
+            nl = [NL_EXTRA] + NL_SENTENCES[:3]
+        books.append({"id": f"books:{i}", "source": "books", "en": " ".join(EN_SENTENCES[:3] + [EN_SENTENCES[3] + f" ({i})"]),
+                      "nl": " ".join(nl), "fails": ["not_dutch_original"] if i == 0 else [],
+                      "qe_en_nl": None if i == 0 else 20.0 if i == 2 else 1.0})
+    write(tmp_path / "books.parquet", books)
+    real = [{"en": "one two three four", "nl": "een twee drie vier", "source": "europarl"}] * 10 + \
+        [{"en": "one two three four", "nl": "een twee drie vier vijf zes", "source": "globalvoices"}] * 10
+    write(tmp_path / "r2set" / "train.parquet",
+          [{"messages": [{"role": "user", "content": "u"}, {"role": "assistant", "content": r["nl"]}]} for r in real]
+          + [{"messages": [{"role": "user", "content": "u"}, {"role": "assistant", "content": "x"}]}])
+    write(tmp_path / "r2set" / "train-meta.parquet",
+          [{"id": f"r{k}", "kind": "real", "source": r["source"], "en": r["en"]} for k, r in enumerate(real)]
+          + [{"id": "bt1", "kind": "bt", "source": "raad", "en": "one two three four five six seven eight"}])
+    args.bt, args.sets, args.qe_max, args.len_factor = "all", ["RL=none+real"], 5.0, 1.25
+    args.real, args.real_share, args.real_all, args.block_jsonl = str(tmp_path / "books.parquet"), 0.2, True, None
+    args.real_without_qe, args.real_qe_max, args.real_qe_unbounded, args.real_align_max = False, None, True, 2.0
+    args.bt_per_real, args.bt_match_set, args.bt_match_bins = 4.0, str(tmp_path / "r2set"), 2
+    return args
+
+
+def test_a_build_of_arm_rl(tmp_path):
+    """Arm RL: the books without a QE bound but with the alignment check; the back-translations drawn to the word
+    ratio of R2's real examples, 4 per book pair or as many as the bins hold"""
+    import json
+
+    args = rl_tables(tmp_path)
+    assert [r for _, r in sb.match_target(args.bt_match_set)] == [1.0] * 10 + [1.5] * 10
+    sb.build(args, tokenizer=CharTokenizer())
+    out = Path(args.out)
+    meta = pq.read_table(out / "RL" / "train-meta.parquet").to_pylist()
+    books = [m for m in meta if m["kind"] == "real"]
+    bt = [m for m in meta if m["kind"] in ("bt", "bt_context")]
+    # 10 of 12 books: not a Dutch original, the shifted one out; QE 20 in (no bound)
+    assert sorted(m["id"] for m in books) == sorted(f"books:{i}" for i in range(2, 12))
+    # 40 wanted (4 x 10); the upper bin (ratio 1.5, half of the target) holds the 6 of d10-d15: 12 drawn
+    assert len(bt) == 12 and {f"handelingen:d{i}:t5:0" for i in range(10, 16)} <= {m["id"] for m in bt}
+    report = json.loads((out / "report.json").read_text())
+    real = report["real"]
+    assert real["qe_max"] is None and real["qe_unbounded"] and report["query"]["real_qe_en_nl_max"] is None
+    assert real["query_cost"]["first_failed"] == {"books/hard:not_dutch_original": 1, "books/align": 1}
+    assert (real["align"]["max"], real["align"]["checked"], real["align"]["failed"]) == (2.0, 11, 1)
+    assert real["align"]["by_qe"] == {"<=5": {"pairs": 10, "failed": 1}, "15-20": {"pairs": 1, "failed": 0}}
+    assert report["query"]["real_align_max"] == 2.0 and report["query"]["bt_match"] == {"bins": 2, "per_real": 4.0}
+    d = report["bt"]["match_draw"]
+    assert (d["want"], d["most"], d["drawn"], d["limited"]) == (40, 12, 12, True)
+    assert d["context"] == sum(m["kind"] == "bt_context" for m in bt) and "per_real_draw" not in report["bt"]
+    assert report["inputs"]["bt_match_set"]["path"] == args.bt_match_set
+    md = (out / "report.md").read_text()
+    assert "Uitlijncontrole" in md and "BT hersampled" in md and "Geen MetricX-24-QE-grens" in md
+    # the same seed, the same set
+    first = sorted(m["id"] for m in meta)
+    sb.build(args, tokenizer=CharTokenizer())
+    assert sorted(m["id"] for m in pq.read_table(out / "RL" / "train-meta.parquet").to_pylist()) == first
+    # 1 per book pair fits: 10, 5 from each bin
+    args.bt_per_real, args.out = 1.0, str(tmp_path / "out-1")
+    sb.build(args, tokenizer=CharTokenizer())
+    d = json.loads((Path(args.out) / "report.json").read_text())["bt"]["match_draw"]
+    assert (d["want"], d["drawn"], d["limited"]) == (10, 10, False) and [b["drawn"] for b in d["per_bin"]] == [5, 5]
+
+
+def test_rl_options_go_together(tmp_path):
+    base = ["build", "--run", "r", "--long", "l", "--replay", "x", "--flan-eval", "f", "--evalsets", "e",
+            "--tokenizer", "t", "--sets", "RL=none+real", "--bt", "all", "--real-all", "--out", "o"]
+    for extra in (["--real", "x", "--real-qe-unbounded", "--real-qe-max", "7.5"],
+                  ["--real", "x", "--real-qe-unbounded", "--real-without-qe"], ["--real-qe-unbounded"],
+                  ["--real", "x", "--real-align-max", "4.39"],
+                  ["--real", "x", "--len-factor", "1.3333", "--real-align-max", "0"],
+                  ["--real", "x", "--bt-match-set", "s"], ["--real", "x", "--bt-per-real", "4", "--bt-match-bins", "5"],
+                  ["--real", "x", "--bt-per-real", "4", "--bt-match-set", "s", "--bt-match-bins", "1"]):
+        with pytest.raises(SystemExit):
+            sb.main(base + extra)
+    # without --len-factor in build too (no median to align at)
+    write(tmp_path / "books.parquet", [{"id": "books:1", "source": "books", "en": EN_SENTENCES[0],
+                                        "nl": NL_SENTENCES[0], "fails": [], "qe_en_nl": 1.0}])
+    args = argparse.Namespace(real=str(tmp_path / "books.parquet"), real_align_max=2.0, len_factor=None,
+                              real_without_qe=False, qe_max=5.0)
+    with pytest.raises(SystemExit, match="needs --len-factor"):
+        sb.candidates_real(args, set(), {})

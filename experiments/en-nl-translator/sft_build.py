@@ -6,7 +6,8 @@ run, the FLAN-nl replay, and the user turn of translate.user_text.
     python sft_build.py build --run RUN --long LONG --replay REPLAY.parquet --flan-eval EVAL-ROWS.parquet \\
         --evalsets EVALSETS.parquet --tokenizer TOK --bt auto|all|N [--qe-max 7.5] [--replay-tag none|conventional] \\
         [--len-factor F] [--block-jsonl blind100.jsonl] [--real REAL.parquet [--real-share 0.2 | --real-all] \\
-        [--real-without-qe] [--real-qe-max Q] [--bt-per-real K] \\
+        [--real-without-qe] [--real-qe-max Q | --real-qe-unbounded] [--real-align-max A] [--bt-per-real K \\
+        [--bt-match-set SET [--bt-match-bins B]]] \\
         [--real2 REAL2.parquet --real2-from SET/train-meta.parquet --real2-per-real K2]] \\
         --sets B=none N-token=token+replay R2=none+real ... --out OUT
     python sft_build.py check --data OUT/<set> --tokenizer TOK   (SFT venv: MaxText's own SFT steps on every example)
@@ -50,6 +51,14 @@ of real pairs to a --real-all build: the query of --real at the back-translation
 bound around each of its own sources' medians, as R2's build had them; of those, only the real examples of
 --real2-from (R2's train-meta.parquet), each of which must pass that query here; round(--real2-per-real x the --real
 pairs) of them drawn uniformly with the seed, so their sources keep R2's shares in expectation.
+Arm RL (amendment of 12 Nov ~15:30): --real-qe-unbounded takes the real pairs (the books) without a bound on MetricX-QE
+(their QE is still read and reported); --real-align-max A fails a real pair whose sentence alignment (align_edges: Gale
+and Church's alignment by length) costs more than A at its start or its end, the shifted passages a QE bound caught
+before. --bt-match-set SET draws the --bt-per-real back-translation examples so that their ratio of Dutch to English
+words follows that of the real examples of SET's train split (R2's: Europarl-direct and Global Voices), by histogram
+matching on log(ratio) (bt_match_draw): --bt-match-bins bins at the target's quantiles, each filled to its share of the
+target, without replacement and with the seed; fewer than K per real pair when the sparsest bin for its share does not
+hold that many.
 
 Context examples (design §9): a training passage the selection marked as a context example keeps its turns before it,
 nearest first, as long as each turn is eligible by the same query; the first that fails ends the context there. Without
@@ -76,6 +85,7 @@ counts per set, source and kind, and the tokens (per source too).
 """
 
 import argparse
+import bisect
 import collections
 import hashlib
 import json
@@ -129,6 +139,20 @@ TEMPLATE = (
     "{%- endfor -%}\n"
     "{%- if add_generation_prompt -%}{{ '<start_of_turn>model\\n' }}{%- endif -%}\n"
 )
+# arm RL's sentence alignment (Gale & Church 1993, "A Program for Aligning Sentences in Bilingual Corpora",
+# Computational Linguistics 19(1)): the priors of the beads (theirs; 1-0/0-1 and 2-1/1-2 split equally over the two
+# directions, so that they sum to 1) and the variance of the length difference per character (6.8); the expected ratio
+# is the source's median ratio of characters (length_bounds), not their 1
+ALIGN_PRIORS = {(1, 1): 0.89, (1, 0): 0.0099 / 2, (0, 1): 0.0099 / 2, (2, 1): 0.089 / 2, (1, 2): 0.089 / 2,
+                (2, 2): 0.011}
+ALIGN_VARIANCE = 6.8
+# a sentence ends at . ! ? or … (closing quotes, brackets, Markdown's _ and * after it), white space, and a capital, a
+# digit or an opening quote, bracket or dash
+SENTENCE_END = re.compile(r"[.!?…]+[\"'’”»)\]_*]*\s+(?=[\"'‘“„«(\[—–\-_*]*\s*[A-Z0-9À-Ý])")
+# a full stop after these (lower case), after an initial or after a bare number ("5." of a note) ends no sentence
+NOT_A_SENTENCE_END = {"mr", "mrs", "ms", "dr", "st", "prof", "jr", "sr", "lt", "col", "gen", "capt", "rev", "vs", "mevr",
+                      "dhr", "drs", "ir", "ing", "bijv", "nr", "ca", "jhr", "mgr"}
+QE_BANDS = (5, 7.5, 10, 15, 20, 23)  # the report of the alignment check per band of MetricX-QE
 META_COLUMNS = ["id", "kind", "source", "length_class", "tag", "prompt", "en", "context", "context_ids", "label",
                 "tokens_prompt", "tokens_target", "qe_en_nl", "chrf"]
 
@@ -193,6 +217,81 @@ def length_fails(pair, bounds):
     if b is None:
         raise SystemExit(f"{pair.get('id')}: no length bound for source {pair['source']}")
     return not b["lo"] <= char_ratio(pair["nl"], pair["en"]) <= b["hi"]
+
+
+def sentences(text):
+    """The sentences of a text: every line, cut at SENTENCE_END unless the piece ends in an abbreviation, an initial or a
+    bare number"""
+    out = []
+    for line in text.split("\n"):
+        line, start, pieces = line.strip(), 0, []
+        for m in SENTENCE_END.finditer(line):
+            pieces.append(line[start:m.end()].strip())
+            start = m.end()
+        pieces.append(line[start:].strip())
+        merged = []
+        for piece in (p for p in pieces if p):
+            if merged and _no_sentence_end(merged[-1]):
+                merged[-1] += " " + piece
+            else:
+                merged.append(piece)
+        out += merged
+    return out
+
+
+def _no_sentence_end(piece):
+    words = piece.rstrip(".").split()
+    last = words[-1] if words else ""
+    return (piece.endswith(".") and (last.lower() in NOT_A_SENTENCE_END or (len(last) == 1 and last.isupper())
+                                     or piece.rstrip(".").isdigit()))
+
+
+def bead_cost(n_en, n_nl, ratio):
+    """-log P(the length difference) of a bead of n_en English and n_nl Dutch characters (Gale & Church's delta, with
+    the mean of n_en and n_nl / ratio under the root)"""
+    mean = (n_en + n_nl / ratio) / 2
+    z = abs(n_nl - n_en * ratio) / math.sqrt(ALIGN_VARIANCE * mean)
+    return -math.log(max(math.erfc(z / math.sqrt(2)), 1e-300))  # 2 (1 - Phi(z))
+
+
+def sentence_alignment(en, nl, ratio):
+    """[(sentences of en, sentences of nl, cost)] in order: the alignment of least cost (-log prior - log P(length))
+    with the beads of ALIGN_PRIORS, by dynamic programming"""
+    if not en or not nl:
+        raise ValueError("an alignment needs sentences on both sides")
+    len_en, len_nl = [len(s) for s in en], [len(s) for s in nl]
+    best = {(0, 0): (0.0, None)}
+    for i in range(len(en) + 1):
+        for j in range(len(nl) + 1):
+            for (di, dj), prior in ALIGN_PRIORS.items():
+                if (i, j) == (0, 0) or i < di or j < dj or (i - di, j - dj) not in best:
+                    continue
+                cost = -math.log(prior) + bead_cost(sum(len_en[i - di:i]), sum(len_nl[j - dj:j]), ratio)
+                total = best[(i - di, j - dj)][0] + cost
+                if (i, j) not in best or total < best[(i, j)][0]:
+                    best[(i, j)] = (total, (di, dj, cost))
+    beads, i, j = [], len(en), len(nl)
+    while (i, j) != (0, 0):
+        di, dj, cost = best[(i, j)][1]
+        beads.append((di, dj, cost))
+        i, j = i - di, j - dj
+    return beads[::-1]
+
+
+def align_edges(en, nl, ratio):
+    """(start, end): the mean cost of the first two beads and of the last two of the pair's sentence alignment. A shifted
+    passage (the Dutch begins with a sentence the English lacks, or the English ends with one the Dutch lacks) pairs
+    sentences of unlike length there"""
+    costs = [c for _, _, c in sentence_alignment(sentences(en), sentences(nl), ratio)]
+    return sum(costs[:2]) / len(costs[:2]), sum(costs[-2:]) / len(costs[-2:])
+
+
+def qe_band(qe):
+    """'<=5', '5-7.5', ..., '>23': the band of QE_BANDS a MetricX-QE score falls in"""
+    for k, hi in enumerate(QE_BANDS):
+        if qe <= hi:
+            return f"<={hi}" if k == 0 else f"{QE_BANDS[k - 1]}-{hi}"
+    return f">{QE_BANDS[-1]}"
 
 
 def query_fails(pair, passage, blocked, qe_max=QE_MAX, bounds=None):
@@ -417,8 +516,12 @@ def candidates_real(args, blocked, report, path=None, qe_max=None, key="real"):
         raise SystemExit(f"{path} has no qe_en_nl (real_pairs.py join-qe), and --real-without-qe is not set")
     hard_ok = [r for r in rows if not r["fails"]]
     bounds = length_bounds(hard_ok, args.len_factor) if getattr(args, "len_factor", None) else None
-    qe_max = real_qe_max(args) if qe_max is None else qe_max
+    qe_max = real_qe_max(args) if key == "real" else qe_max
+    align_max = getattr(args, "real_align_max", None) if key == "real" else None
+    if align_max is not None and bounds is None:
+        raise SystemExit("--real-align-max aligns at the source's median ratio: it needs --len-factor")
     first, alone, out = collections.Counter(), collections.Counter(), []
+    align = {"max": align_max, "edges": [], "by_qe": collections.defaultdict(lambda: [0, 0])}
     for r in rows:
         for side in ("nl", "en"):
             if "<unused" in r[side]:
@@ -428,10 +531,18 @@ def candidates_real(args, blocked, report, path=None, qe_max=None, key="real"):
             if not without_qe:
                 if r["qe_en_nl"] is None:
                     raise SystemExit(f"real {r['id']}: passed the hard checks without a MetricX-QE")
-                if r["qe_en_nl"] > qe_max:
+                if qe_max is not None and r["qe_en_nl"] > qe_max:
                     fails.append("qe")
             if length_fails(r, bounds):
                 fails.append("length")
+            if align_max is not None:
+                edge = max(align_edges(r["en"], r["nl"], bounds[r["source"]]["median"]))
+                align["edges"].append(edge)
+                band = align["by_qe"][qe_band(r["qe_en_nl"])] if r["qe_en_nl"] is not None else [0, 0]
+                band[0] += 1
+                if edge > align_max:
+                    fails.append("align")
+                    band[1] += 1
             if (sp.ngrams(r["nl"]) | sp.ngrams(r["en"])) & blocked:
                 fails.append("eval_13gram")
         for f in fails:
@@ -444,16 +555,28 @@ def candidates_real(args, blocked, report, path=None, qe_max=None, key="real"):
                       "query_cost": {"first_failed": dict(sorted(first.items())), "alone": dict(sorted(alone.items()))},
                       "eligible": dict(collections.Counter(r["source"] for r in out)), "without_qe": without_qe,
                       "qe_max": None if without_qe else qe_max,
+                      "qe_unbounded": not without_qe and qe_max is None,
                       "length_bounds": bounds,
                       "qe_hard_ok": None if without_qe else {
                           s: {"n": len(v), **{f"p{q}": round(quantile(v, q / 100), 3) for q in (50, 90, 95, 99)},
                               "over": {str(c): sum(x > c for x in v) for c in (3, 4, 5, 7.5, 10)}}
                           for s, v in sorted(_by_source(hard_ok, "qe_en_nl").items())}}
+    if align_max is not None:
+        edges = sorted(align["edges"])
+        report[key]["align"] = {
+            "max": align_max, "ratio": {s: b["median"] for s, b in bounds.items()}, "checked": len(edges),
+            "failed": sum(e > align_max for e in edges),
+            "quantiles": {f"p{q}": round(quantile(edges, q / 100), 3) for q in (50, 90, 95, 97, 98, 99)},
+            "by_qe": {b: {"pairs": n, "failed": k} for b, (n, k) in sorted(
+                align["by_qe"].items(), key=lambda kv: float(kv[0].lstrip("<=>").split("-")[0]))}}
     return out
 
 
 def real_qe_max(args):
-    """The real pairs' bound on MetricX-QE: --real-qe-max, else the back-translations' --qe-max"""
+    """The real pairs' bound on MetricX-QE: --real-qe-max, else the back-translations' --qe-max; None (no bound) with
+    --real-qe-unbounded"""
+    if getattr(args, "real_qe_unbounded", False):
+        return None
     own = getattr(args, "real_qe_max", None)
     return args.qe_max if own is None else own
 
@@ -469,6 +592,70 @@ def bt_per_real_draw(bt_rows, n_real, per_real, seed):
     kept = [r for r in bt_rows if r["pid"] in keep]
     return kept, {"per_real": per_real, "real": n_real, "drawn": want, "of": len(bt_rows),
                   "drawn_by_source": dict(sorted(collections.Counter(r["source"] for r in kept).items()))}
+
+
+def match_target(set_dir):
+    """[(source, ratio)]: the ratio of Dutch to English words (word_ratio) of every real example of a set's train split
+    (--bt-match-set; arm RL: R2's, Europarl-direct and Global Voices)"""
+    import pyarrow.parquet as pq
+
+    d = Path(set_dir)
+    metas = pq.read_table(d / "train-meta.parquet", columns=["kind", "source", "en"]).to_pylist()
+    msgs = pq.read_table(d / "train.parquet").column("messages").to_pylist()
+    if len(metas) != len(msgs):
+        raise SystemExit(f"{d}: {len(msgs)} examples, {len(metas)} meta rows")
+    out = [(m["source"], word_ratio(x[1]["content"], m["en"])) for m, x in zip(metas, msgs) if m["kind"] == "real"]
+    if not out:
+        raise SystemExit(f"{d}: no real examples to match")
+    return out
+
+
+def bt_match_draw(bt_rows, target, want, bins, seed):
+    """(the back-translation rows kept, in their order, info): a sample whose log(word_ratio) follows the target's
+    (arm RL), by histogram matching. The bins are cut at the target's quantiles k / bins (the outer two open; equal cuts
+    merge); bin b gets n x its share of the target (largest remainder), drawn uniformly without replacement with the
+    seed. n is want when every bin holds its part, else the largest n for which they all do (and the info says so)."""
+    if any(r <= 0 for _, r in target):
+        raise SystemExit("a target ratio of 0")
+    logs = sorted(math.log(r) for _, r in target)
+    cuts = sorted({quantile(logs, k / bins) for k in range(1, bins)})
+    pool = collections.defaultdict(list)
+    for r in bt_rows:
+        ratio = word_ratio(r["nl"], r["en"])
+        if ratio <= 0:
+            raise SystemExit(f"{r['pid']}: a back-translation without Dutch words")
+        pool[bisect.bisect_right(cuts, math.log(ratio))].append(r)
+    share = collections.Counter(bisect.bisect_right(cuts, x) for x in logs)
+    empty = sorted(b for b in share if not pool[b])
+    if empty:
+        raise SystemExit(f"--bt-match-set: no back-translation in bin(s) {empty} of the target")
+    most = min(want, min(math.floor(len(pool[b]) * len(logs) / share[b]) for b in share))
+    n = most
+    while any(k > len(pool[b]) for b, k in allocate(n, dict(share)).items()):
+        n -= 1
+    parts = allocate(n, dict(share))
+    keep = set()
+    for b in sorted(parts):
+        keep |= set(random.Random(f"{seed}/bt-match/{b}").sample(sorted(r["pid"] for r in pool[b]), parts[b]))
+    kept = [r for r in bt_rows if r["pid"] in keep]
+    edges = [None] + [round(math.exp(c), 4) for c in cuts] + [None]
+
+    def ratios(values):
+        values = sorted(values)
+        return {"n": len(values), **{f"p{q}": round(quantile(values, q / 100), 4) for q in (5, 10, 25, 50, 75, 90, 95)}}
+
+    info = {"method": "histogram matching on log(words nl / words en)", "bins": len(cuts) + 1, "bins_asked": bins,
+            "cuts": edges[1:-1], "want": want, "most": most, "drawn": n, "limited": n < want,
+            "per_bin": [{"lo": edges[b], "hi": edges[b + 1], "target": share[b],
+                         "target_share": round(share[b] / len(logs), 4), "pool": len(pool[b]), "drawn": parts.get(b, 0)}
+                        for b in range(len(cuts) + 1)],
+            "ratio": {"target": ratios(r for _, r in target),
+                      "pool": ratios(word_ratio(r["nl"], r["en"]) for r in bt_rows),
+                      "drawn": ratios(word_ratio(r["nl"], r["en"]) for r in kept)},
+            "target_by_source": dict(sorted(collections.Counter(s for s, _ in target).items())),
+            "pool_by_source": dict(sorted(collections.Counter(r["source"] for r in bt_rows).items())),
+            "drawn_by_source": dict(sorted(collections.Counter(r["source"] for r in kept).items()))}
+    return kept, info
 
 
 def _by_source(rows, key):
@@ -570,6 +757,12 @@ def build(args, tokenizer=None):
         query |= {"len_factor": len_factor}
     if getattr(args, "real_qe_max", None) is not None:
         query |= {"real_qe_en_nl_max": args.real_qe_max}
+    if getattr(args, "real_qe_unbounded", False):
+        query |= {"real_qe_en_nl_max": None}
+    if getattr(args, "real_align_max", None) is not None:
+        query |= {"real_align_max": args.real_align_max}
+    if getattr(args, "bt_match_set", None):
+        query |= {"bt_match": {"bins": args.bt_match_bins, "per_real": args.bt_per_real}}
     if getattr(args, "real2", None):
         query |= {"real2_qe_en_nl_max": args.qe_max}
     real_path = getattr(args, "real", None)
@@ -698,8 +891,17 @@ def build(args, tokenizer=None):
         if args.bt != "all" or not getattr(args, "real_all", False) or \
                 any(extra != "real" for _, extra in sets.values()):
             raise SystemExit("--bt-per-real draws from --bt all against --real-all's real pairs, in sets with +real only")
-        bt_rows, report["bt"]["per_real_draw"] = bt_per_real_draw(bt_rows, len(real), args.bt_per_real, args.seed)
-        report["bt"]["per_real_draw"]["context"] = sum(r["pid"] in ctx_set for r in bt_rows)
+        if getattr(args, "bt_match_set", None):
+            print(f"PROGRESS matching the back-translations to {args.bt_match_set}", flush=True)
+            bt_rows, report["bt"]["match_draw"] = bt_match_draw(bt_rows, match_target(args.bt_match_set),
+                                                                round(args.bt_per_real * len(real)), args.bt_match_bins,
+                                                                args.seed)
+            report["bt"]["match_draw"]["context"] = sum(r["pid"] in ctx_set for r in bt_rows)
+            report["inputs"]["bt_match_set"] = {"path": str(args.bt_match_set), **{
+                f: sha256(Path(args.bt_match_set) / f) for f in ("train.parquet", "train-meta.parquet")}}
+        else:
+            bt_rows, report["bt"]["per_real_draw"] = bt_per_real_draw(bt_rows, len(real), args.bt_per_real, args.seed)
+            report["bt"]["per_real_draw"]["context"] = sum(r["pid"] in ctx_set for r in bt_rows)
 
     def real_example(r):
         user = user_turn(REAL_PROMPT, r["en"])
@@ -848,6 +1050,32 @@ def report_md(report):
                   f"{json.dumps(r.get('draw'))}."]
         if r.get("qe_max") is not None:
             lines += ["", f"MetricX-24-QE-grens van de echte paren: {r['qe_max']}."]
+        if r.get("qe_unbounded"):
+            lines += ["", "Geen MetricX-24-QE-grens op de echte paren (`--real-qe-unbounded`); hun QE staat in de meta."]
+        if r.get("align"):
+            a = r["align"]
+            lines += ["", f"Uitlijncontrole (`--real-align-max {a['max']}`): zinsuitlijning naar lengte (Gale en Church "
+                      f"1993) met de mediane tekenverhouding van de bron ({json.dumps(a['ratio'])}); een paar valt af als "
+                      f"het gemiddelde van de kosten van de eerste twee of de laatste twee paren zinnen hoger is dan "
+                      f"{a['max']}. Gecontroleerd {_n(a['checked'])}, afgevallen {_n(a['failed'])}; kosten aan de rand "
+                      f"{json.dumps(a['quantiles'])}.", "", "| MetricX-QE | paren | afgevallen | aandeel |",
+                      "|---|---:|---:|---:|"]
+            lines += [f"| {b} | {_n(v['pairs'])} | {_n(v['failed'])} | {v['failed'] / v['pairs']:.1%} |"
+                      for b, v in a["by_qe"].items()]
+        if "match_draw" in report["bt"]:
+            d = report["bt"]["match_draw"]
+            lines += ["", f"BT hersampled (`--bt-match-set`, `--bt-per-real`): {d['method']}, {d['bins']} bakken op de "
+                      f"kwantielen van het doel; gewenst {_n(d['want'])}, hoogstens {_n(d['most'])}, getrokken "
+                      f"{_n(d['drawn'])}{' (minder dan gewenst: de dunste bak begrenst)' if d['limited'] else ''} van "
+                      f"de BT-voorbeelden die in aanmerking komen ({_n(d['context'])} met context); per bron "
+                      f"{json.dumps(d['drawn_by_source'])} (in aanmerking {json.dumps(d['pool_by_source'])}).", "",
+                      "| bak (woorden NL / EN) | doel | aandeel doel | in aanmerking | getrokken |",
+                      "|---|---:|---:|---:|---:|"]
+            lines += [f"| {b['lo'] or '…'} – {b['hi'] or '…'} | {_n(b['target'])} | {b['target_share']:.3f} | "
+                      f"{_n(b['pool'])} | {_n(b['drawn'])} |" for b in d["per_bin"]]
+            lines += ["", "| verdeling | n | p5 | p10 | p25 | p50 | p75 | p90 | p95 |", "|---|---:|" + "---:|" * 7]
+            lines += [f"| {k} | {_n(v['n'])} | " + " | ".join(f"{v[f'p{q}']:.3f}" for q in (5, 10, 25, 50, 75, 90, 95))
+                      + " |" for k, v in d["ratio"].items()]
         if "per_real_draw" in report["bt"]:
             d = report["bt"]["per_real_draw"]
             lines += ["", f"BT getrokken (`--bt-per-real {d['per_real']}`): {_n(d['drawn'])} van {_n(d['of'])} "
@@ -991,6 +1219,13 @@ def main(argv=None):
     b.add_argument("--real-without-qe", action="store_true", help="a dry run: no MetricX-QE bound on the real pairs")
     b.add_argument("--real-qe-max", type=float, default=None,
                    help="the real pairs' own bound on MetricX-24-QE en->nl (arm RB2: 7.5); --qe-max by default")
+    b.add_argument("--real-qe-unbounded", action="store_true",
+                   help="no bound on the real pairs' MetricX-QE (arm RL: the books); their QE is still required")
+    b.add_argument("--real-align-max", type=float, default=None,
+                   help="fail a real pair whose sentence alignment costs more than this at its start or end (arm RL)")
+    b.add_argument("--bt-match-set", default=None,
+                   help="a set's directory: the --bt-per-real draw follows the word ratio of its real examples (arm RL)")
+    b.add_argument("--bt-match-bins", type=int, default=10, help="the bins of --bt-match-set (at the target's quantiles)")
     b.add_argument("--bt-per-real", type=float, default=None,
                    help="with --bt all and --real-all: draw this many back-translation examples per real pair (arm RB2: 4)")
     b.add_argument("--real2", default=None,
@@ -1016,6 +1251,15 @@ def main(argv=None):
         parser.error("--bt-per-real is a positive number, with --bt all and --real-all")
     if args.command == "build" and args.real_without_qe and args.real_qe_max is not None:
         parser.error("--real-without-qe has no QE bound on the real pairs: no --real-qe-max with it")
+    if args.command == "build" and args.real_qe_unbounded and (args.real_without_qe or args.real_qe_max is not None
+                                                               or not args.real):
+        parser.error("--real-qe-unbounded goes with --real, without --real-without-qe or --real-qe-max")
+    if args.command == "build" and args.real_align_max is not None and (args.real_align_max <= 0 or not args.real
+                                                                        or not args.len_factor):
+        parser.error("--real-align-max is a positive number, with --real and --len-factor")
+    if args.command == "build" and (args.bt_match_set or args.bt_match_bins != 10) and (
+            not args.bt_match_set or args.bt_per_real is None or args.bt_match_bins < 2):
+        parser.error("--bt-match-set goes with --bt-per-real (and --bt-match-bins of 2 or more)")
     if args.command == "build" and (args.real2 or args.real2_from or args.real2_per_real is not None) and (
             not (args.real2 and args.real2_from and args.real2_per_real and args.real2_per_real > 0)
             or not args.real or not args.real_all or args.real_without_qe):

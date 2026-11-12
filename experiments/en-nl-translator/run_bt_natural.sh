@@ -152,13 +152,14 @@ all)
   if [ ! -s "$SHM/venv-fork/done.txt" ] || [ ! -s "$TOK/tokenizer.json" ]; then
     HF_HUB_OFFLINE=0 bash "$C/setup_generic.sh" venv
   fi
-  ( SHM=$SHM bash "$C/setup_comet.sh" && HF_HUB_OFFLINE=0 "$PY" -c "import sys; sys.path.insert(0, '$C'); import metricx_qe as m; print(m.download('xxl', '$SHM/metricx'))" ) \
+  ( HF_HUB_OFFLINE=0 SHM=$SHM bash "$C/setup_comet.sh" && HF_HUB_OFFLINE=0 "$PY" -c "import sys; sys.path.insert(0, '$C'); import metricx_qe as m; print(m.download('xxl', '$SHM/metricx'))" ) \
     > ~/logs/bt_setup_bg.log 2>&1 & setup_bg=$!
-  if gsutil -q stat "$B/judge/gemma-4-31b-it-maxtext/done.txt"; then
-    convert_bg=
-  else
+  # The conversion's pid in a file: a run started again while it goes on waits for it instead of starting a second
+  if ! gsutil -q stat "$B/judge/gemma-4-31b-it-maxtext/done.txt" \
+      && ! { [ -f ~/logs/bt_convert.pid ] && kill -0 "$(cat ~/logs/bt_convert.pid)" 2> /dev/null; }; then
     mkdir -p /dev/shm/judge/code && gsutil -q cp "$B/judge/scripts/setup.sh" /dev/shm/judge/code/setup.sh
-    HF_HUB_OFFLINE=0 bash /dev/shm/judge/code/setup.sh convert > ~/logs/bt_convert.log 2>&1 & convert_bg=$!
+    HF_HUB_OFFLINE=0 setsid bash /dev/shm/judge/code/setup.sh convert >> ~/logs/bt_convert.log 2>&1 < /dev/null &
+    echo $! > ~/logs/bt_convert.pid
   fi
   echo "== data $(date -u +%T)"
   if gsutil -q stat "$O/data/done.txt"; then
@@ -180,9 +181,11 @@ all)
   echo "== MetricX-QE of the human references $(date -u +%T)"
   if ! gsutil -q stat "$O/report/refqe.md"; then job 1 bt_refqe refqe; fi
   gsutil -q cp "$O/report/refqe.md" -
-  if [ -n "$convert_bg" ]; then
+  if ! gsutil -q stat "$B/judge/gemma-4-31b-it-maxtext/done.txt"; then
     echo "== waiting for the conversion of Gemma 4 $(date -u +%T)"
-    wait $convert_bg || { echo "conversion failed: ~/logs/bt_convert.log"; exit 1; }
+    while kill -0 "$(cat ~/logs/bt_convert.pid)" 2> /dev/null; do sleep 30; done
+    gsutil -q stat "$B/judge/gemma-4-31b-it-maxtext/done.txt" || { echo "conversion failed: ~/logs/bt_convert.log"; exit 1; }
+    echo "== converted $(date -u +%T)"
   fi
   echo "== probe $(date -u +%T)"
   if ! gsutil -q stat "$O/probe/show.txt"; then

@@ -1103,3 +1103,32 @@ RL-instellingen: lora_rank=64 lora_alpha=32 learning_rate=1e-5
   start de training alleen als RL met evaluatie naar schatting vóór 13 nov 16:30 CET klaar is (150 min gerekend vanaf de
   start van de training); anders slaat hij RL over met een logregel. Verwacht: de vervolgketen klaar ~00:15 op 13 nov
   (met RBR) of ~21:20 (zonder), RL ~2 uur later.
+
+**Aanvulling 12 nov 2026 ~15:35 CET op het amendement RL: 5 bakken in plaats van 10** [besluit van de hoofdsessie
+namens Yeb (afwezig), op advies van een Fable-adviseur, 12 nov ~16:00 volgens de hoofdsessie (de klok van co1 gaf bij
+het vastleggen 15:35); vastgelegd vóór de nieuwe bouw van de set en vóór de eerste trainingsstap van RL; de set met 10
+bakken (`$S/data/rl/`) is niet getraind en blijft staan; de keten die op die set wachtte is gestopt]. Aanleiding: met
+10 bakken liet het hersamplen maar 7.267 BT-voorbeelden toe in plaats van 4 × 12.521 = 50.084, zodat BT : boeken 37 : 63
+werd in voorbeelden (32 : 68 in tokens). RL verschilde daardoor van RB3 ook in het aandeel boeken. Met 5 bakken (de
+kwintielen van het doel) pasten er in de proef van het amendement 12.763 (mediaan 1,057), ongeveer evenveel als er
+boekparen zijn: BT : boeken ≈ 50 : 50, zoals bij RB3. RL verschilt dan van RB3 (BT : boeken 50 : 50, BT uniform
+getrokken, boeken met MetricX-QE ≤ 7,5) alleen in de lengteverdeling van de BT en in het filter op de boeken (geen
+QE-grens, wel de uitlijncontrole).
+
+- **Wat verandert**: in punt 3 van het amendement RL ("Methode") **5 bakken**, begrensd door de kwintielen van het doel,
+  in plaats van 10 op de decielen. De rest van de methode blijft: log(woorden NL / woorden EN), het doel (de echte
+  voorbeelden van de trainingsset van R2), de verdeling over de bakken naar hun aandeel in het doel (grootste rest),
+  zonder teruglegging, de seeds `en-nl-sft/0/bt-match/<b>`, een bak van het doel zonder BT-voorbeelden is een fout.
+  "Aantal" blijft: 4 × het aantal boekparen als elke bak dat toelaat, anders de grootste n waarvoor elke bak zijn deel
+  bevat; verwacht ~12.760 [schatting uit de proef, die 12.520 boekparen nam].
+- **Wat gelijk blijft**: de boeken (punt 1 en 2: zonder QE-grens, de uitlijncontrole met grens 4,39), geen Europarl,
+  Global Voices, FLAN-replay of instructiezin; de training (rank 64, alpha 32, LR 1e-5, één epoch, 16 chips; de regel
+  met de RL-instellingen hierboven verandert niet), de evaluatie, de beslisregel en de tijdgrens (13 nov 16:30 CET).
+- **Code en plaats**: `b258cc4` (`run_arms.sh rlbuild` met `--bt-match-bins 5`, met tests); de set in
+  **`$S/data/rl-b5/`**, een nieuwe plaats, zodat de eerste bouw in `$S/data/rl/` niet wordt overschreven. Het aantal
+  bakken is een parameter (`RL_MATCH_BINS` in `run_arms.sh`, standaard 5; `sft_build.py --bt-match-bins`), zodat de
+  versie met 10 bakken later kan worden gebouwd voor een arm "RL met QE-filter" [besluit van de hoofdsessie]; die arm
+  is hiermee niet vastgelegd.
+- De keten (`mbert-ops/scripts/translator_sft_rl_run.sh`) start opnieuw met een nieuwe tag, op de set in
+  `$S/data/rl-b5/`, en weigert te starten zonder deze aanvulling en zonder `b258cc4`. De arm heet verder RL (paden
+  `$S/rl/`, `$S/blind/RL/`).

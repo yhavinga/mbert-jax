@@ -1326,3 +1326,12 @@ evalueerde; code `97c44b6` (bundel `253f2e4`), tag `re11121728`. Rapport `$S/dat
   en blijft K = 10 de variant voor een late start, zoals de voorwaarde bedoelt [eigen gevolgtrekking]. Met `RE_K` gekozen
   geldt alleen de grens van 16:30, zonder terugval. Verwacht: de keten van RL is ~02:20 klaar (met RBR) of ~23:25 (zonder);
   dan start de training van RE ~02:35 of ~23:40, met K = 20.
+
+**Aanvulling 12 nov 2026 ~19:30 CET op het amendement RE: K = 10 na de uitslag van R2** [de hoofdsessie namens Yeb
+(afwezig), op advies van een Fable-adviseur; vastgelegd vóór de eerste trainingsstap van RE]: R2 (BT 80% + 20% Europarl/GV,
+rank 64) haalt regel (b) met +9,2 pp net niet, waar RB2 (dezelfde BT + 20% Nederlands-originele boeken) +15,5 pp haalde;
+regel (a) en de uitvoerlengte werden beter (+0,89 / +0,43 / +0,50; uitvoer/referentie 1,000 / 1,000 / 0,982). Daarmee
+ging voorwaarde 1 van het advies voor RE af ("daalt (b) door het echte Engels, dan K = 10"). De keten traint daarom
+**K = 10** (`$S/data/re-k10/RE`, 29.394 romanparen, echt Engels 23,1% van de tokens), geforceerd met `RE_K=10`; voor K = 10
+geldt alleen de grens van 16:30. De set, de instellingen en de evaluatie blijven verder gelijk. Valt (b) bij K = 10 niet
+verder en verbeteren (a) en lengte, dan is K = 20 een mogelijke volgende arm.

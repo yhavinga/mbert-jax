@@ -1274,3 +1274,55 @@ RE-instellingen: lora_rank=64 lora_alpha=32 learning_rate=1e-5
   de uitvoer tegenover de menselijke referentie op de vier sets. RE helpt als (a), (b) en (c) alle drie gelden.
 - **Licentie en privacy**: de romans zijn gepubliceerde boeken en vertalingen onder auteursrecht, uit een privé
   dataset; de sets, de adapter en alle afgeleiden blijven privé (bucket); niets wordt gepubliceerd zonder Yeb.
+
+**Aanvulling 12 nov 2026 op het amendement RE: de sets zoals gebouwd en gecontroleerd** [subagent RE; vastgelegd vóór de
+eerste trainingsstap van RE (de klok van co1 gaf bij het vastleggen ~19:03); de sets zijn gebouwd met de code en de
+regels van het amendement, niets daarvan is veranderd]. Gebouwd 12 nov ~18:30 CET op mbert-mix (K = 20 op w1, K = 10 op
+w3) en gecontroleerd op w2 (K = 20) en w3 (K = 10), alleen CPU (`nice -n 19`, `ionice -c3`), terwijl de nachtketen R2
+evalueerde; code `97c44b6` (bundel `253f2e4`), tag `re11121728`. Rapport `$S/data/re-k20/report.md` en
+`$S/data/re-k10/report.md` (samen in `mbert-ops/translator-sft/data-re-report.md`).
+
+- **De romans** [gemeten]: 1.628.217 rijen van `en_orig` → `passes` niet waar 81.310 → `dup_nl` 1.006 → Markdown 220.315
+  → schoonmaak aan één kant 53.495 → andere editie van hetzelfde Engelse boek 23.967 → **1.248.124 rijen in 2.953
+  Engelse boeken** (van de 2.967; edities per boek: 2.880 één, 70 twee, 2 drie, 1 vijf; rijen per boek p10 131, p50 396,
+  p90 726). Los van de volgorde, van de rijen met `passes`: Markdown 220.511, schoonmaak aan één kant 64.671, `dup_nl`
+  1.006.
+- **Trekking**: K = 20 **58.646** paren (32 boeken hebben er minder dan 20, samen 226), K = 10 **29.394** (24 boeken
+  minder dan 10, samen 104); geen enkel bekeken paar deelde een 13-gram met een evaluatieset of blinde passage of was
+  te lang. De romans van K = 10 zijn precies de eerste tien van elk boek in K = 20 (`books.parquet` van beide sets);
+  hoogstens 20 per Engels boek, één editie per boek. Ze staan verspreid door de set: per tiende 5.784–5.914 (K = 20),
+  de langste reeks romans achter elkaar 8.
+- **De set van R2 erin ongewijzigd**: de 260.908 voorbeelden van R2 staan in beide sets in hun eigen volgorde en byte
+  voor byte gelijk (sha256 over alle voorbeelden `2aa6dba1c118c2b0d0f8ab5183264a2688d6677ee4e8e6d01cdb16a6cc658f9d` in R2
+  en in RE; de meta gelijk); `eval.parquet`, `eval-meta.parquet` en `template.jinja` zijn kopieën (sha256 `494a0f3f…`,
+  `c9938080…`, `cfb8ff6c…`). `check-base` (los, per voorbeeld): 260.908 van de 260.908 voorbeelden van R2 in dezelfde volgorde (`same_in_order`), dezelfde digest, de eval-bestanden en de template gelijk, in beide sets (58.646 en 29.394 erbij).
+- **Per set** (train):
+
+  | | R2 | RE, K = 20 | RE, K = 10 |
+  |---|---:|---:|---:|
+  | voorbeelden | 260.908 | 319.554 | 290.302 |
+  | waarvan romans | 0 | 58.646 (18,4%) | 29.394 (10,1%) |
+  | tokens | 112.640.547 | 145.435.215 | 129.086.399 |
+  | romantokens | 0 | 32.794.668 (22,5%) | 16.445.852 (12,7%) |
+  | echt Engels (Europarl, Global Voices, romans) in tokens | 13.409.351 (11,9%) | 46.204.019 (31,8%) | 29.855.203 (23,1%) |
+  | doeltokens | 47.578.407 | 63.419.176 | 55.521.465 |
+  | max tokens per voorbeeld | 2.048 | 2.048 | 2.048 |
+
+  Romans: 270 doeltokens per voorbeeld (Europarl 116, Global Voices 80, BT 201); woorden NL / EN p5 / p10 / p25 / p50 /
+  p75 / p90 / p95 = 0,926 / 0,961 / 1,014 / 1,069 / 1,127 / 1,187 / 1,227 (Europarl en Global Voices van R2: 0,889 /
+  0,927 / 1,000 / 1,062 / 1,141 / 1,222 / 1,278; BT 0,833 / 0,867 / 0,917 / 0,967 / 1,017 / 1,065 / 1,097). Mediaan van
+  de hele set 1,000 (K = 20) en 0,988 (K = 10), R2 0,980.
+- **Gecontroleerd** met `sft_build.py check` (MaxText's eigen SFT-stappen op elk voorbeeld): K = 20 `EXIT 0`, train 319.554 (bt 196.186, bt_context 12.540, real 110.828), 145.435.215 tokens, max 2.048; K = 10 `EXIT 0`, train 290.302 (bt 196.186, bt_context 12.540, real 81.576), 129.086.399 tokens, max 2.048; eval in beide 4.167, max 2.006 (`$S/data/re-k20/check.txt`, `$S/data/re-k10/check.txt`).
+- **De doelteksten voor de classifier** (`classify-targets.parquet`, 2.000 per groep) zijn in beide sets gelijk (md5
+  `XMB8swbE2DLMsgbSp5BRVg==`).
+- **Verwachte epoch en tijd** [schatting]: tokens per stap als R2 (112,64 M in 3.653 stappen): K = 20 **~4.717 stappen**,
+  K = 10 **~4.186**. Van de start van de training tot het rapport, gemeten bij R2 (rank 64, 12 nov: 49 min tot het
+  geteld was, 7,18 s per stap, 28 min laden, compileren en opslaan) en RB2 (evaluatie 54 min), naar het aantal
+  voorbeelden en tokens van RE: K = 20 ~713 min, K = 10 ~644 min; de keten rekent met ~2% marge **725** en **655** min.
+- **Gevolg voor de tijdregel**: K = 20 is alleen vóór 16:30 klaar als de training uiterlijk ~04:25 start (16:30 − 725
+  min), dus vóór de grens van 05:00; K = 10 uiterlijk ~05:35. **Keuze** [subagent RE, de voorwaarden van Fable laten dit
+  open]: geeft de tijdregel K = 20 maar zou K = 20 naar schatting na 16:30 klaar zijn en K = 10 niet, dan traint de
+  keten **K = 10**; past ook K = 10 niet, dan wordt RE overgeslagen. Zo valt RE tussen ~04:25 en 05:00 niet helemaal weg,
+  en blijft K = 10 de variant voor een late start, zoals de voorwaarde bedoelt [eigen gevolgtrekking]. Met `RE_K` gekozen
+  geldt alleen de grens van 16:30, zonder terugval. Verwacht: de keten van RL is ~02:20 klaar (met RBR) of ~23:25 (zonder);
+  dan start de training van RE ~02:35 of ~23:40, met K = 20.

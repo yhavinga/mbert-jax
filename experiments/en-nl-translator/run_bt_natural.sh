@@ -222,6 +222,10 @@ all)
   if [ $ca != 0 ] || [ $cb != 0 ] || [ $cc != 0 ]; then echo "stops before the report"; exit 1; fi
   bash "$0" report
   ;;
+half0|half1)
+  # One half's work on its own (e.g. after it failed while the other half went on): skips what is in the bucket
+  job "${step#half}" "bt_$step" "$step"
+  ;;
 report)
   mkdir -p "$D/logs" "$D/report"
   gsutil -m -q cp "$O/logs/bt_half*.log" "$D/logs/"
@@ -265,5 +269,5 @@ EOF
   echo "== report done $(date -u +%T)"
   ;;
 *)
-  echo "usage: run_bt_natural.sh all|report"; exit 1 ;;
+  echo "usage: run_bt_natural.sh all|half0|half1|report"; exit 1 ;;
 esac

@@ -296,3 +296,10 @@ def test_sample_writes_the_segments_the_probe_and_the_fullset(tmp_path):
     assert all(129 <= p["tokens"] <= 256 for p in probe)
     assert set(json.loads((out / "fullset.json").read_text())) == set(bn.SOURCES) | {"handelingen_context"}
     assert (out / "classes.txt").read_text().split() == ["tiny", "medium"]
+
+
+def test_merge_without_shards_measures_translategemmas_english_only(tmp_path):
+    make_pilot(tmp_path)
+    bn.main(["merge", "--sample", str(tmp_path / "sample.parquet"), "--out", str(tmp_path / "tg.parquet")])
+    rows = bn.read_rows(tmp_path / "tg.parquet")
+    assert len(rows) == 15 and "en_tg" in rows[0] and "en_natural" not in rows[0]

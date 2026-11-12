@@ -879,7 +879,8 @@ def main(argv=None):
     p.add_argument("--target", default="en")
     p = sub.add_parser("merge")
     p.add_argument("--sample", required=True)
-    p.add_argument("--shards", nargs="+", required=True, help="SETUP=DIR of translate.py's shards")
+    p.add_argument("--shards", nargs="*", default=[],
+                   help="SETUP=DIR of translate.py's shards (none: TranslateGemma's English only)")
     p.add_argument("--out", required=True)
     p = sub.add_parser("report")
     p.add_argument("--compare", required=True)

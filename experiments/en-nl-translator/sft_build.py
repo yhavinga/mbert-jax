@@ -6,7 +6,8 @@ run, the FLAN-nl replay, and the user turn of translate.user_text.
     python sft_build.py build --run RUN --long LONG --replay REPLAY.parquet --flan-eval EVAL-ROWS.parquet \\
         --evalsets EVALSETS.parquet --tokenizer TOK --bt auto|all|N [--qe-max 7.5] [--replay-tag none|conventional] \\
         [--len-factor F] [--block-jsonl blind100.jsonl] [--real REAL.parquet [--real-share 0.2 | --real-all] \\
-        [--real-without-qe] [--real-qe-max Q] [--bt-per-real K]] \\
+        [--real-without-qe] [--real-qe-max Q] [--bt-per-real K] \\
+        [--real2 REAL2.parquet --real2-from SET/train-meta.parquet --real2-per-real K2]] \\
         --sets B=none N-token=token+replay R2=none+real ... --out OUT
     python sft_build.py check --data OUT/<set> --tokenizer TOK   (SFT venv: MaxText's own SFT steps on every example)
 
@@ -44,6 +45,11 @@ they make. --real-qe-max gives the real pairs a MetricX-QE bound of their own (a
 books at 7.5, the back-translations at --qe-max 5). --bt-per-real K (arm RB2: 4, back-translations : books 80 : 20), with
 --bt all and --real-all, then draws K back-translation examples per real pair from every eligible one, uniformly with the
 seed: a passage drawn with its context stays a context example, so the context share is that of --bt all in expectation.
+--real2 (arm RBR, amendment of 12 Nov ~13:10: the books, and R2's Global Voices and Europarl pairs) adds a second table
+of real pairs to a --real-all build: the query of --real at the back-translations' --qe-max (R2's bound) and the length
+bound around each of its own sources' medians, as R2's build had them; of those, only the real examples of
+--real2-from (R2's train-meta.parquet), each of which must pass that query here; round(--real2-per-real x the --real
+pairs) of them drawn uniformly with the seed, so their sources keep R2's shares in expectation.
 
 Context examples (design §9): a training passage the selection marked as a context example keeps its turns before it,
 nearest first, as long as each turn is eligible by the same query; the first that fails ends the context there. Without
@@ -396,20 +402,22 @@ def candidates_replay(args, blocked, report, flan_grams=frozenset()):
     return out
 
 
-def candidates_real(args, blocked, report):
-    """The real pairs of --real with what the query says of them (first and alone per source, as for the
-    back-translations); returns the eligible ones (tokens are counted in build)."""
+def candidates_real(args, blocked, report, path=None, qe_max=None, key="real"):
+    """The real pairs of --real (or of path, with its own QE bound, reported under key: --real2) with what the query
+    says of them (first and alone per source, as for the back-translations); returns the eligible ones (tokens are
+    counted in build)."""
     import pyarrow.parquet as pq
 
-    rows = pq.read_table(args.real).to_pylist()
+    path = path or args.real
+    rows = pq.read_table(path).to_pylist()
     if len({r["id"] for r in rows}) != len(rows):
-        raise SystemExit(f"{args.real}: real pairs with the same id")
-    without_qe = getattr(args, "real_without_qe", False)
+        raise SystemExit(f"{path}: real pairs with the same id")
+    without_qe = getattr(args, "real_without_qe", False) and key == "real"
     if not without_qe and "qe_en_nl" not in rows[0]:
-        raise SystemExit(f"{args.real} has no qe_en_nl (real_pairs.py join-qe), and --real-without-qe is not set")
+        raise SystemExit(f"{path} has no qe_en_nl (real_pairs.py join-qe), and --real-without-qe is not set")
     hard_ok = [r for r in rows if not r["fails"]]
     bounds = length_bounds(hard_ok, args.len_factor) if getattr(args, "len_factor", None) else None
-    qe_max = real_qe_max(args)
+    qe_max = real_qe_max(args) if qe_max is None else qe_max
     first, alone, out = collections.Counter(), collections.Counter(), []
     for r in rows:
         for side in ("nl", "en"):
@@ -432,7 +440,7 @@ def candidates_real(args, blocked, report):
             first[f"{r['source']}/{fails[0]}"] += 1
         else:
             out.append(r)
-    report["real"] = {"pairs": dict(collections.Counter(r["source"] for r in rows)),
+    report[key] = {"pairs": dict(collections.Counter(r["source"] for r in rows)),
                       "query_cost": {"first_failed": dict(sorted(first.items())), "alone": dict(sorted(alone.items()))},
                       "eligible": dict(collections.Counter(r["source"] for r in out)), "without_qe": without_qe,
                       "qe_max": None if without_qe else qe_max,
@@ -487,6 +495,38 @@ def real_draw(eligible, cap, seed):
     return chosen, info
 
 
+def real2_from_ids(meta_path):
+    """The ids of the real examples (kind real) of a set's train-meta.parquet: --real2-from"""
+    import pyarrow.parquet as pq
+
+    ids = [m["id"] for m in pq.read_table(meta_path, columns=["id", "kind"]).to_pylist() if m["kind"] == "real"]
+    if not ids or len(set(ids)) != len(ids):
+        raise SystemExit(f"{meta_path}: {len(ids)} real examples, {len(set(ids))} ids (none, or one twice)")
+    return ids
+
+
+def real2_draw(fitting, from_ids, n_real, per_real, seed):
+    """(chosen pairs of --real2 in id order, info): round(per_real x n_real) of the pairs whose id is in from_ids, drawn
+    uniformly with the seed. Every id of from_ids must be among fitting (the pairs that pass the query and fit here):
+    they passed the same query in that set's build, so a missing one means the bounds differ (SystemExit)."""
+    by_id = {r["id"]: r for r in fitting}
+    missing = sorted(set(from_ids) - set(by_id))
+    if missing:
+        raise SystemExit(f"--real2-from: {len(missing)} of its {len(from_ids)} real pairs do not pass the query here "
+                         f"(first: {missing[:3]})")
+    want = round(per_real * n_real)
+    if want > len(from_ids):
+        raise SystemExit(f"--real2-per-real {per_real}: {want} pairs wanted for {n_real} real pairs, "
+                         f"{len(from_ids)} in --real2-from")
+    keep = set(random.Random(f"{seed}/real2").sample(sorted(from_ids), want))
+    chosen = sorted((by_id[i] for i in keep), key=lambda r: r["id"])
+    info = {"per_real": per_real, "real": n_real, "drawn": want, "of": len(from_ids),
+            "eligible": dict(sorted(collections.Counter(r["source"] for r in fitting).items())),
+            "from": dict(sorted(collections.Counter(by_id[i]["source"] for i in from_ids).items())),
+            "chosen": dict(sorted(collections.Counter(r["source"] for r in chosen).items()))}
+    return chosen, info
+
+
 def quantile(values, q):
     if not values:
         return None
@@ -530,6 +570,8 @@ def build(args, tokenizer=None):
         query |= {"len_factor": len_factor}
     if getattr(args, "real_qe_max", None) is not None:
         query |= {"real_qe_en_nl_max": args.real_qe_max}
+    if getattr(args, "real2", None):
+        query |= {"real2_qe_en_nl_max": args.qe_max}
     real_path = getattr(args, "real", None)
     if any(extra == "real" for _, extra in sets.values()) != bool(real_path):
         raise SystemExit("--real goes with a set NAME=TAG+real, and such a set needs --real")
@@ -543,7 +585,7 @@ def build(args, tokenizer=None):
                   ("passages_long", Path(args.long) / "passages.parquet"),
                   ("context_turns", Path(args.run) / "context-turns.parquet"), ("replay", Path(args.replay)),
                   ("flan_eval", Path(args.flan_eval)), ("evalsets", Path(args.evalsets)))}}
-    for key in ("real", "block_jsonl"):
+    for key in ("real", "real2", "block_jsonl"):
         if getattr(args, key, None):
             report["inputs"][key] = {"path": str(getattr(args, key)), "sha256": sha256(getattr(args, key))}
     evalsets = pq.read_table(args.evalsets, columns=["source", "reference"]).to_pylist()
@@ -614,10 +656,10 @@ def build(args, tokenizer=None):
         replay = random.Random(f"{args.seed}/replay").sample(fitting, n_replay)
         report["replay"]["drawn"] = n_replay
 
-    real = []
-    if real_path:
-        pool = candidates_real(args, blocked, report)
-        print(f"PROGRESS {len(pool)} eligible real pairs, counting tokens", flush=True)
+    def fit_real(pool, key):
+        """the pairs of pool that fit MAX_TOKENS in TranslateGemma's own prompt, with their token counts; the others
+        counted as too_long in report[key]"""
+        print(f"PROGRESS {len(pool)} eligible real pairs ({key}), counting tokens", flush=True)
         prompts = counter.prompt_lengths([user_turn(REAL_PROMPT, r["en"]) for r in pool])
         targets = counter.target_lengths([r["nl"].strip() for r in pool])
         fitting = []
@@ -625,8 +667,13 @@ def build(args, tokenizer=None):
             if n_prompt + n_target <= MAX_TOKENS:
                 fitting.append(r | {"tokens_prompt": n_prompt, "tokens_target": n_target})
             else:
-                report["real"]["query_cost"]["first_failed"][f"{r['source']}/too_long"] = \
-                    report["real"]["query_cost"]["first_failed"].get(f"{r['source']}/too_long", 0) + 1
+                report[key]["query_cost"]["first_failed"][f"{r['source']}/too_long"] = \
+                    report[key]["query_cost"]["first_failed"].get(f"{r['source']}/too_long", 0) + 1
+        return fitting
+
+    real = []
+    if real_path:
+        fitting = fit_real(candidates_real(args, blocked, report), "real")
         if getattr(args, "real_all", False):
             real = sorted(fitting, key=lambda r: r["id"])
             by_source = dict(collections.Counter(r["source"] for r in real))
@@ -637,6 +684,16 @@ def build(args, tokenizer=None):
             real, draw = real_draw(fitting, cap, args.seed)
         report["real"]["share"] = share
         report["real"]["draw"] = draw
+    real2 = []
+    if getattr(args, "real2", None):
+        if not real_path or not getattr(args, "real_all", False):
+            raise SystemExit("--real2 adds to --real-all's real pairs")
+        pool2 = candidates_real(args, blocked, report, path=args.real2, qe_max=args.qe_max, key="real2")
+        real2, report["real2"]["draw"] = real2_draw(fit_real(pool2, "real2"), real2_from_ids(args.real2_from),
+                                                    len(real), args.real2_per_real, args.seed)
+        report["inputs"]["real2_from"] = {"path": str(args.real2_from), "sha256": sha256(args.real2_from)}
+        if {r["id"] for r in real} & {r["id"] for r in real2}:
+            raise SystemExit("--real and --real2 share an id")
     if getattr(args, "bt_per_real", None):
         if args.bt != "all" or not getattr(args, "real_all", False) or \
                 any(extra != "real" for _, extra in sets.values()):
@@ -684,7 +741,7 @@ def build(args, tokenizer=None):
         if with_replay:
             examples += [replay_example(r) for r in replay]
         if extra == "real":
-            examples += [real_example(r) for r in real]
+            examples += [real_example(r) for r in real + real2]
         random.Random(f"{args.seed}/shuffle").shuffle(examples)
         eval_examples = bt_examples(evals, tag, [bool(r["context"]) for r in evals])
         for split, part in (("train", examples), ("eval", eval_examples)):
@@ -801,6 +858,24 @@ def report_md(report):
             lines += [f"| {k} | {_n(v['n'])} | {v['median']} | {v['lo']} | {v['hi']} |" for k, v in r["length_bounds"].items()]
         if r["qe_hard_ok"]:
             lines += ["", f"MetricX-24-QE van de paren die door de harde controles komen: {json.dumps(r['qe_hard_ok'])}."]
+    if "real2" in report:
+        r = report["real2"]
+        d = r["draw"]
+        lines += ["", "## Tweede bron van echte paren (`--real2`)", "",
+                  f"De query van `--real` met de QE-grens van de BT-paren ({r['qe_max']}) en de lengtegrens rond de "
+                  "mediaan van elke eigen bron; daarvan alleen de echte voorbeelden van `--real2-from`, die hier allemaal "
+                  "door de query moeten komen.", "",
+                  "| bron/grens | eerste | alleen |", "|---|---:|---:|"]
+        cost = r["query_cost"]
+        for key in sorted(set(cost["first_failed"]) | set(cost["alone"])):
+            lines.append(f"| {key} | {_n(cost['first_failed'].get(key, 0))} | {_n(cost['alone'].get(key, 0))} |")
+        lines += ["", f"Paren: {json.dumps(r['pairs'])}; in aanmerking: {json.dumps(d['eligible'])}; in `--real2-from`: "
+                  f"{json.dumps(d['from'])}; getrokken (`--real2-per-real {d['per_real']}`, {d['per_real']} × "
+                  f"{_n(d['real'])} paren van `--real`, uniform): {_n(d['drawn'])} van {_n(d['of'])}, per bron "
+                  f"{json.dumps(d['chosen'])}."]
+        if r["length_bounds"]:
+            lines += ["", "| bron | n | mediaan | ondergrens | bovengrens |", "|---|---:|---:|---:|---:|"]
+            lines += [f"| {k} | {_n(v['n'])} | {v['median']} | {v['lo']} | {v['hi']} |" for k, v in r["length_bounds"].items()]
     lines += ["", "## Sets", "", f"Tag van de replay (`--replay-tag`): {report['replay_tag']} "
               f"(`{report['tag_prompts'][report['replay_tag']]}`).", "",
               "| set | tag | replay | split | voorbeelden | bt | bt_context | replay | lang | "
@@ -918,6 +993,12 @@ def main(argv=None):
                    help="the real pairs' own bound on MetricX-24-QE en->nl (arm RB2: 7.5); --qe-max by default")
     b.add_argument("--bt-per-real", type=float, default=None,
                    help="with --bt all and --real-all: draw this many back-translation examples per real pair (arm RB2: 4)")
+    b.add_argument("--real2", default=None,
+                   help="with --real-all: a second table of real pairs (with qe_en_nl), at --qe-max (arm RBR: R2's)")
+    b.add_argument("--real2-from", default=None,
+                   help="a set's train-meta.parquet: --real2 takes only its real examples (arm RBR: R2's)")
+    b.add_argument("--real2-per-real", type=float, default=None,
+                   help="draw this many --real2 pairs per --real pair, uniformly (arm RBR: 1)")
     b.add_argument("--sets", nargs="+", required=True,
                    help="NAME=TAG[+replay|+real], TAG none, token, instruction or conventional")
     b.add_argument("--seed", default=SEED)
@@ -935,6 +1016,11 @@ def main(argv=None):
         parser.error("--bt-per-real is a positive number, with --bt all and --real-all")
     if args.command == "build" and args.real_without_qe and args.real_qe_max is not None:
         parser.error("--real-without-qe has no QE bound on the real pairs: no --real-qe-max with it")
+    if args.command == "build" and (args.real2 or args.real2_from or args.real2_per_real is not None) and (
+            not (args.real2 and args.real2_from and args.real2_per_real and args.real2_per_real > 0)
+            or not args.real or not args.real_all or args.real_without_qe):
+        parser.error("--real2, --real2-from and a positive --real2-per-real go together, with --real and --real-all, "
+                     "not with --real-without-qe")
     {"build": build, "check": check}[args.command](args)
 
 

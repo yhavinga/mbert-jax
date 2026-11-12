@@ -567,3 +567,110 @@ def test_bt_per_real_needs_enough_back_translations_and_every_real_pair(tmp_path
     args.block_jsonl, args.real_without_qe, args.real_qe_max, args.bt_per_real = None, False, 7.5, 4.0
     with pytest.raises(SystemExit, match="sets with \\+real only"):
         sb.build(args, tokenizer=CharTokenizer())
+
+
+def books_table(path, n=12):
+    """n book pairs: books:0 not a Dutch original, books:1 at QE 8 (out at 7.5), the rest in"""
+    rows = []
+    for i in range(n):
+        en, nl = f"The English of book passage {i} here.", f"Het Nederlands van boekpassage {i} hier."
+        fails = ["not_dutch_original"] if i == 0 else []
+        qe = None if fails else (8.0 if i == 1 else 6.0 if i == 2 else 1.0)
+        rows.append({"id": f"books:{i}", "source": "books", "en": en, "nl": nl, "fails": fails, "qe_en_nl": qe})
+    write(path, rows)
+
+
+def test_a_build_of_arm_rbr_adds_r2s_real_pairs_to_the_books(tmp_path):
+    """Arm RBR: the books as RB2 (their own QE bound 7.5, all of them), R2's real pairs as a second source (R2's query at
+    the back-translations' QE bound 5; only the real examples of R2's set, drawn uniformly, 1 per book pair) and 3
+    back-translations per book pair: 60 : 20 : 20"""
+    import json
+
+    args = tables(tmp_path)
+    real_pairs_table(tmp_path / "r2-real.parquet")
+    args.bt, args.sets, args.qe_max = "all", ["R2=none+real"], 5.0
+    args.len_factor, args.real, args.real_share = 1.25, str(tmp_path / "r2-real.parquet"), 0.2
+    args.block_jsonl, args.real_without_qe, args.out = None, False, str(tmp_path / "out-r2")
+    sb.build(args, tokenizer=CharTokenizer())
+    r2_meta = tmp_path / "out-r2" / "R2" / "train-meta.parquet"
+    r2_real = sorted(m["id"] for m in pq.read_table(r2_meta).to_pylist() if m["kind"] == "real")
+    assert len(r2_real) == 17  # 68 x 0.25: 4 Global Voices, 13 Europarl
+
+    books_table(tmp_path / "books.parquet")
+    args = tables(tmp_path)
+    args.bt, args.sets, args.qe_max, args.out = "all", ["RBR=none+real"], 5.0, str(tmp_path / "out-rbr")
+    args.len_factor, args.real, args.real_share, args.real_all = 1.25, str(tmp_path / "books.parquet"), 0.2, True
+    args.block_jsonl, args.real_without_qe, args.real_qe_max, args.bt_per_real = None, False, 7.5, 3.0
+    args.real2, args.real2_from, args.real2_per_real = str(tmp_path / "r2-real.parquet"), str(r2_meta), 1.0
+    sb.build(args, tokenizer=CharTokenizer())
+    out = Path(args.out)
+    meta = pq.read_table(out / "RBR" / "train-meta.parquet").to_pylist()
+    msgs = pq.read_table(out / "RBR" / "train.parquet").column("messages").to_pylist()
+    books = [m for m in meta if m["kind"] == "real" and m["source"] == "books"]
+    r2 = [m for m in meta if m["kind"] == "real" and m["source"] != "books"]
+    bt = [m for m in meta if m["kind"] in ("bt", "bt_context")]
+    # 10 of 12 books (not a Dutch original, QE 8 out; QE 6 in at 7.5); 10 of R2's 17; 30 = 3 x 10 back-translations
+    assert len(books) == 10 and {"books:2"} <= {m["id"] for m in books}
+    assert len(r2) == 10 and {m["id"] for m in r2} <= set(r2_real) and {m["source"] for m in r2} <= {"globalvoices", "europarl"}
+    assert len(bt) == 30 and len(meta) == 50
+    for m, row in zip(meta, msgs):
+        if m["kind"] == "real":
+            assert m["prompt"] == "chat-v1" and row[0]["content"] == sb.user_turn("chat-v1", m["en"])
+    report = json.loads((out / "report.json").read_text())
+    d = report["real2"]["draw"]
+    assert (d["per_real"], d["real"], d["drawn"], d["of"]) == (1.0, 10, 10, 17)
+    assert d["from"] == {"europarl": 13, "globalvoices": 4} and sum(d["chosen"].values()) == 10
+    # R2's bound on its own pairs (QE 9 out at 5), the books' own bound
+    assert report["real2"]["qe_max"] == 5.0 and report["real"]["qe_max"] == 7.5
+    assert report["query"]["real2_qe_en_nl_max"] == 5.0
+    assert report["real2"]["query_cost"]["first_failed"] == {"europarl/hard:short": 1, "europarl/length": 1,
+                                                             "europarl/eval_13gram": 1, "europarl/qe": 1}
+    assert report["bt"]["per_real_draw"]["drawn"] == 30 and report["sets"]["RBR"]["train"]["real_share"] == 0.4
+    assert report["inputs"]["real2_from"]["path"] == str(r2_meta)
+    assert "## Tweede bron van echte paren" in (out / "report.md").read_text()
+    # the same seed, the same draw
+    first = sorted(m["id"] for m in meta)
+    sb.build(args, tokenizer=CharTokenizer())
+    assert sorted(m["id"] for m in pq.read_table(out / "RBR" / "train-meta.parquet").to_pylist()) == first
+
+
+def test_rbr_refuses_r2_pairs_that_fail_its_query_and_too_few_of_them(tmp_path):
+    args = tables(tmp_path)
+    real_pairs_table(tmp_path / "r2-real.parquet")
+    books_table(tmp_path / "books.parquet")
+    args.bt, args.sets, args.qe_max = "all", ["RBR=none+real"], 5.0
+    args.len_factor, args.real, args.real_share, args.real_all = 1.25, str(tmp_path / "books.parquet"), 0.2, True
+    args.block_jsonl, args.real_without_qe, args.real_qe_max, args.bt_per_real = None, False, 7.5, 3.0
+    args.real2, args.real2_per_real = str(tmp_path / "r2-real.parquet"), 1.0
+    # europarl:9 has QE 9: in a set built with another bound, not here
+    write(tmp_path / "meta-bad.parquet", [{"id": i, "kind": "real"} for i in ("globalvoices:0", "europarl:9")])
+    args.real2_from = str(tmp_path / "meta-bad.parquet")
+    with pytest.raises(SystemExit, match="1 of its 2 real pairs do not pass the query here"):
+        sb.build(args, tokenizer=CharTokenizer())
+    # 10 wanted (1 per book pair), 3 in the set
+    write(tmp_path / "meta-few.parquet", [{"id": f"globalvoices:{i}", "kind": "real"} for i in range(3)]
+          + [{"id": "handelingen:d1:t5:0", "kind": "bt"}])
+    args.real2_from = str(tmp_path / "meta-few.parquet")
+    with pytest.raises(SystemExit, match="10 pairs wanted for 10 real pairs, 3 in --real2-from"):
+        sb.build(args, tokenizer=CharTokenizer())
+    # the same id in both sources: books:3 also in the second table, and drawn (all 16 of its set: 1.6 per book pair)
+    rows = pq.read_table(tmp_path / "r2-real.parquet").to_pylist()
+    write(tmp_path / "r2-books.parquet", rows + [{"id": "books:3", "source": "europarl", "en": "The English of book "
+                                                  "passage 3 here.", "nl": "Het Nederlands van boekpassage 3 hier.",
+                                                  "fails": [], "qe_en_nl": 1.0}])
+    write(tmp_path / "meta-ok.parquet", [{"id": i, "kind": "real"} for i in
+                                         ["books:3"] + [f"europarl:{i}" for i in range(10, 25)]])
+    args.real2, args.real2_from, args.real2_per_real = str(tmp_path / "r2-books.parquet"), str(tmp_path / "meta-ok.parquet"), 1.6
+    with pytest.raises(SystemExit, match="share an id"):
+        sb.build(args, tokenizer=CharTokenizer())
+    # the command line: --real2 with --real2-from and a positive --real2-per-real, --real and --real-all
+    base = ["build", "--run", "r", "--long", "l", "--replay", "x", "--flan-eval", "f", "--evalsets", "e",
+            "--tokenizer", "t", "--sets", "RBR=none+real", "--real", "x", "--bt", "all", "--out", "o"]
+    for extra in (["--real-all", "--real2", "y", "--real2-per-real", "1"],
+                  ["--real-all", "--real2", "y", "--real2-from", "m"],
+                  ["--real-all", "--real2", "y", "--real2-from", "m", "--real2-per-real", "0"],
+                  ["--real2", "y", "--real2-from", "m", "--real2-per-real", "1"],
+                  ["--real-all", "--real-without-qe", "--real2", "y", "--real2-from", "m", "--real2-per-real", "1"],
+                  ["--real-all", "--real2-from", "m", "--real2-per-real", "1"]):
+        with pytest.raises(SystemExit):
+            sb.main(base + extra)

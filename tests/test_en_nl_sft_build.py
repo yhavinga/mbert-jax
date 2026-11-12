@@ -851,3 +851,57 @@ def test_rl_options_go_together(tmp_path):
                               real_without_qe=False, qe_max=5.0)
     with pytest.raises(SystemExit, match="needs --len-factor"):
         sb.candidates_real(args, set(), {})
+
+
+def test_five_bins_cut_at_the_quintiles_and_hold_more_than_ten_when_the_top_decile_is_thin():
+    """Arm RL (addendum of 12 Nov ~16:00): the bins are cut at the target's quantiles k / bins, and a pool that is thin
+    above the target's top decile (as the back-translations are above R2's 1.222) holds more with 5 bins than with 10"""
+    target = [("europarl", (100 + k) / 100) for k in range(100)]  # ratios 1.00 ... 1.99
+    pool = ratio_rows([(f"r{k}-{i}", 100 + k, 100) for k in range(90) for i in range(10)]
+                      + [(f"top{k}", 100 + k, 100) for k in range(90, 100)])
+    kept, info = sb.bt_match_draw(pool, target, 2000, 10, "s")
+    assert (info["bins"], len(info["cuts"]), info["drawn"], info["limited"]) == (10, 9, 100, True)
+    assert [b["target"] for b in info["per_bin"]] == [10] * 10 and info["per_bin"][-1]["pool"] == 10
+    assert 1.89 < info["cuts"][-1] < 1.90
+    kept, info = sb.bt_match_draw(pool, target, 2000, 5, "s")
+    assert (info["bins"], info["bins_asked"], len(info["cuts"]), info["drawn"], len(kept)) == (5, 5, 4, 550, 550)
+    assert [b["target"] for b in info["per_bin"]] == [20] * 5 and [b["pool"] for b in info["per_bin"]] == [200] * 4 + [110]
+    assert [b["drawn"] for b in info["per_bin"]] == [110] * 5
+    assert 1.19 < info["cuts"][0] < 1.20 and 1.79 < info["cuts"][-1] < 1.80
+
+
+def run_arms_job_body(tmp_path, stage, tag, **env):
+    """the job body that run_arms.sh STAGE writes to ~/job_body_<job>.sh, with gsutil (stat: only R2's set exists),
+    setsid (starts nothing) and mkdir under /dev/shm faked, HOME in tmp_path"""
+    import os
+    import subprocess
+
+    fake = tmp_path / "bin"
+    fake.mkdir(exist_ok=True)
+    for name, text in {
+        "gsutil": 'args=(); for a in "$@"; do case $a in -q|-m) ;; *) args+=("$a") ;; esac; done\n'
+                  'case ${args[0]} in stat) case ${args[1]} in *R2/train-meta.parquet) exit 0 ;; *) exit 1 ;; esac ;; esac\n',
+        "setsid": "exit 0\n",
+        "mkdir": 'args=(); for a in "$@"; do case $a in /dev/shm/*) ;; *) args+=("$a") ;; esac; done\n'
+                 'exec /bin/mkdir "${args[@]}"\n'}.items():
+        (fake / name).write_text("#!/bin/bash\n" + text)
+        (fake / name).chmod(0o755)
+    script = ROOT / "experiments" / "en-nl-translator" / "run_arms.sh"
+    out = subprocess.run(["bash", str(script), stage], capture_output=True, text=True, timeout=60,
+                         env={"HOME": str(tmp_path), "PATH": f"{fake}:{os.environ['PATH']}", "TAG": tag, **env})
+    assert out.returncode == 0, out.stdout + out.stderr
+    job = {"rlbuild": "rl_build", "rlcheck": "rl_check"}[stage]
+    return (tmp_path / f"job_body_{job}_{tag}.sh").read_text()
+
+
+def test_arm_rl_draws_with_five_bins_to_a_place_of_its_own_and_ten_stay_an_option(tmp_path):
+    """run_arms.sh rlbuild / rlcheck (addendum of 12 Nov ~16:00): 5 bins, the set in $S/data/rl-b5 (the first build,
+    with 10, stays in $S/data/rl); RL_MATCH_BINS=10 builds the deciles' version in a place of its own"""
+    s = "gs://t5-dutch-english-usc2/mbert/translator/sft/data"
+    body = run_arms_job_body(tmp_path, "rlbuild", "t5")
+    assert "--bt-per-real 4 --bt-match-set $R/r2-set --bt-match-bins 5 --sets RL=none+real" in body
+    assert f"rsync -r /dev/shm/translator/rl/build-t5 {s}/rl-b5\n" in body
+    body = run_arms_job_body(tmp_path, "rlbuild", "t10", RL_MATCH_BINS="10")
+    assert "--bt-match-bins 10 --sets RL=none+real" in body and f"rsync -r /dev/shm/translator/rl/build-t10 {s}/rl-b10\n" in body
+    body = run_arms_job_body(tmp_path, "rlcheck", "c5")
+    assert f"rsync -r {s}/rl-b5/RL /dev/shm/translator/rl/check-c5\n" in body and f"cp /dev/shm/translator/rl/check-c5/check.txt {s}/rl-b5/check.txt" in body

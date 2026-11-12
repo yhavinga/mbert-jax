@@ -67,12 +67,12 @@
 #                                                their QE) --real2-from R2's train-meta.parquet --real2-per-real 1, set
 #                                                RBR, to $S/data/rbr/              (jobs rbr_build_$TAG, rbr_check_$TAG)
 # Arm RL (protocol §9, amendment of 12 Nov ~15:45; translator_sft_rl_run.sh) runs the same stages with ARMS_ROOT=$S/rl
-# SETS=$S/data/rl RUN_PREFIX=arm27b_rl ARMS=RL. RB's books without a QE bound but with the alignment check
+# SETS=$S/data/rl-b5 RUN_PREFIX=arm27b_rl ARMS=RL. RB's books without a QE bound but with the alignment check
 # (--real-align-max), the back-translations drawn to the word ratio of R2's real examples ($S/data/r2/R2), 4 per book
-# pair or as many as the bins hold:
+# pair or as many as the bins hold (5 bins: the addendum of 12 Nov ~16:00; the first build's 10 with RL_MATCH_BINS=10):
 #   bash run_arms.sh rlbuild / rlcheck           as rb2build / rb2check, --real-qe-unbounded --real-align-max
-#                                                --bt-per-real 4 --bt-match-set (R2's set) --bt-match-bins 10, set RL,
-#                                                to $S/data/rl/                      (jobs rl_build_$TAG, rl_check_$TAG)
+#                                                --bt-per-real 4 --bt-match-set (R2's set) --bt-match-bins 5, set RL,
+#                                                to $S/data/rl-b5/                   (jobs rl_build_$TAG, rl_check_$TAG)
 set -euo pipefail
 STAGE=${1:?a stage: setup, data, train, adapter, scale, translate, score, summary, texts, classifier, classify, pll, blind, report, report-scaled, r2data, r2qe, r2build, r2check, rbdata, rbqe, rbbuild, rbcheck, rbedges, rb2build, rb2check, rb3build, rb3check, rbrbuild, rbrcheck, rlbuild, rlcheck}
 S=gs://t5-dutch-english-usc2/mbert/translator/sft
@@ -95,7 +95,9 @@ R2_REAL=$S/data/r2-real              # RBR's second real source: R2's candidates
 R2_SET=$S/data/r2
 RL_ALIGN_MAX=4.39                    # protocol §9, amendment of 12 Nov ~15:45: p98 of the books' edge cost at QE <= 7.5
 RL_BT_PER_REAL=4                     # 4 back-translations per book pair, or as many as the bins of the match hold
-RL_MATCH_BINS=10                     # the bins at the deciles of R2's real examples' word ratio
+# the bins of the match at the quantiles of R2's real examples' word ratio: 5 (the quintiles; protocol §9, addendum
+# of 12 Nov ~16:00: 10 held 7,267 back-translations, 37 : 63 to the books); 10 (the deciles) stays an option
+RL_MATCH_BINS=${RL_MATCH_BINS:-5}
 case $STAGE in
   rb2*) REAL=$S/data/rb-real; XSET=RB2; XOUT=$S/data/rb2; XJOB=rb2
         XREAL="--real-all --real-qe-max $RB2_BOOKS_QE_MAX --bt-per-real $RB2_BT_PER_REAL" ;;
@@ -105,7 +107,7 @@ case $STAGE in
   rbr*) REAL=$S/data/rb-real; XSET=RBR; XOUT=$S/data/rbr; XJOB=rbr
         XREAL="--real-all --real-qe-max $RB2_BOOKS_QE_MAX --bt-per-real $RBR_BT_PER_REAL --real2 \$R/r2-real-qe.parquet --real2-from \$R/r2-train-meta.parquet --real2-per-real $RBR_R2_PER_REAL" ;;
   rb*) REAL=$S/data/rb-real; XSET=RB; XOUT=$S/data/rb; XJOB=rb; XREAL=--real-all ;;
-  rl*) REAL=$S/data/rb-real; XSET=RL; XOUT=$S/data/rl; XJOB=rl
+  rl*) REAL=$S/data/rb-real; XSET=RL; XOUT=$S/data/rl-b$RL_MATCH_BINS; XJOB=rl  # $S/data/rl: the first build (10)
        XREAL="--real-all --real-qe-unbounded --real-align-max $RL_ALIGN_MAX --bt-per-real $RL_BT_PER_REAL --bt-match-set \$R/r2-set --bt-match-bins $RL_MATCH_BINS" ;;
   *) REAL=$S/data/r2-real; XSET=R2; XOUT=$S/data/r2; XJOB=r2; XREAL= ;;
 esac

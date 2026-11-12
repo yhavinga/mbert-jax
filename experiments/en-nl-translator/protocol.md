@@ -840,3 +840,82 @@ grenzen, training verder, evaluatie en beslisregel zoals het amendement R2. De r
 R2 is daarom aangepast: de waarden volgen uit de geheugentest; de keten vult ze in, weigert te starten als die regel
 niet letterlijk gelijk is aan de zijne, en controleert na de training rank en alpha in `adapter.json` van
 `$S/r2/R2/`.
+
+**Amendement 12 nov 2026 ~13:10 CET: armen RB3 en RBR, meer boeken en de echte paren van R2 erbij** [besluit van de
+hoofdsessie namens Yeb, 12 nov ~13:10, genomen terwijl Yeb afwezig was en zonder vragen aan hem; vastgelegd vóór de
+bouw van de sets en vóór de eerste trainingsstap van RB3 en RBR; RB2 en R2 blijven zoals ze zijn]. Aanleiding: RB2
+haalt (a) niet (MetricX-24-QE +1,131 / +0,555 / +0,684 op WMT24++ (960) / FLORES / NTREX, `$S/rb2/report/report.md`)
+en (b) wel (+15,5 pp). Tot nu toe hielp een groter aandeel boeken het meest (RB met 4% boeken +1,62 / +0,75 / +1,03,
+RB2 met 20% +1,13 / +0,55 / +0,68), maar de uitvoer heeft per Engels bronwoord nog steeds mediaan ~1,00 Nederlands
+woord, tegen 1,05–1,10 bij de menselijke referenties. Twee nieuwe armen, in deze volgorde, na de nachtketen van 11/12
+nov (RB2 en R2) en op dezelfde VM (mbert-mix): **RB3** en daarna, alleen onder de voorwaarde hieronder, **RBR**.
+
+- **Arm RB3: BT : boeken = 50 : 50** (`$S/data/rb3/RB3/`; `sft_build.py build --bt all --qe-max 5 --len-factor 1.3333
+  --block-jsonl blind100.jsonl --real real-qe.parquet --real-all --real-qe-max 7.5 --bt-per-real 1 --sets RB3=none+real`;
+  keten `run_arms.sh rb3build`, `rb3check`):
+  1. **Boeken**: dezelfde boekparen als RB2 (punt 1 van het amendement RB2: de kandidaten en QE-scores van RB in
+     `$S/data/rb-real/`, MetricX-24-QE en→nl ≤ 7,5, de lengtegrens, geen 13-gram met een evaluatieset of blinde
+     passage, ≤ 2.048 tokens; verwacht dezelfde 11.923).
+  2. **BT-paren**: **1 per boekpaar**, uniform getrokken met de vaste seed `en-nl-sft/0/bt-per-real` uit de
+     BT-voorbeelden die bij RB2 in aanmerking kwamen (de 208.726: §2.1 met QE ≤ 5, de lengtegrens, contextvoorbeelden
+     volgens §2.2 zoals bij `--bt all`; een passage die met haar context getrokken wordt, blijft een contextvoorbeeld).
+     `random.sample` met een andere omvang geeft een andere trekking: het BT-deel van RB3 is geen deelverzameling van
+     dat van RB2 [gevolg van `--bt-per-real 1`, geen aparte keuze].
+  3. Geen Europarl, Global Voices, FLAN-replay of instructiezin.
+- **Arm RBR: BT 60% + boeken 20% + Europarl/Global Voices 20%** (`$S/data/rbr/RBR/`; dezelfde build met
+  `--bt-per-real 3 --real2 r2-real-qe.parquet --real2-from r2-train-meta.parquet --real2-per-real 1 --sets
+  RBR=none+real`; keten `run_arms.sh rbrbuild`, `rbrcheck`; nieuwe code: `sft_build.py --real2`, `--real2-from`,
+  `--real2-per-real`, met tests):
+  1. **Boeken** als RB2 en RB3 (11.923 verwacht).
+  2. **De echte paren van R2**: de echte voorbeelden van de set R2 zoals die getraind is (`$S/data/r2/R2/train-meta.parquet`,
+     soort `real`: 11.412 Global Voices, 40.770 Europarl-direct 2004–2011; `$S/data/r2/report.md`). In de build van
+     RBR gaan de kandidaten van R2 (`$S/data/r2-real/candidates/real.parquet` met hun QE uit `$S/data/r2-real/qe/`)
+     opnieuw door de query van R2 (harde controles, MetricX-24-QE ≤ 5, de lengtegrens factor 4/3 rond de mediaan van
+     elke bron, geen 13-gram met een evaluatieset of blinde passage, ≤ 2.048 tokens); elk van de 52.182 moet daar
+     doorheen komen, anders stopt de build (dan verschillen de grenzen van die van R2). Daaruit **zoveel dat ze 20% van
+     de voorbeelden zijn: 1 per boekpaar**, **uniform** getrokken met de seed `en-nl-sft/0/real2` [keuze: uniform uit
+     de echte paren van R2, zodat Global Voices en Europarl in verwachting hun aandeel in R2 houden (21,9% en 78,1%);
+     niet de regel van R2 "eerst alle Global Voices, Europarl vult aan", want die zou bij ~11.900 paren ~96% Global
+     Voices geven, een menging die R2 niet getest heeft, terwijl de voorwaarde hieronder op de uitslag van R2 steunt].
+  3. **BT-paren**: **3 per boekpaar**, getrokken zoals bij RB2 en RB3, zodat BT : boeken : R2-echt = 60 : 20 : 20 in
+     voorbeelden (in tokens niet: boekpassages zijn lang, de echte paren van R2 kort; het rapport van de set geeft de
+     tokens per bron).
+  4. Geen FLAN-replay of instructiezin.
+- **Voorwaarde voor RBR** [besluit hoofdsessie]: RBR traint alleen als R2 op regel (a), **gemiddeld over de drie sets**
+  (WMT24++ (960), FLORES-200, NTREX-128), **minstens zo goed** is als RB2: het gemiddelde van de drie verschillen
+  MetricX-24-QE(R2) − QE(basis) ≤ dat van RB2 (lager is beter; gelijk telt als "minstens zo goed"). De verschillen
+  komen onafgerond uit `report.json` van beide rapporten (`$S/r2/report/report.json` en `$S/rb2/report/report.json`,
+  veld `rule_a.<arm>.sets.<set>.delta`); voor RB2 is het gemiddelde (1,1315 + 0,5547 + 0,6843) / 3 = 0,7902 [berekend
+  uit `report.json`]. De keten leest dat na RB3 en schrijft de vergelijking in zijn log; anders slaat hij RBR over met
+  een logregel `RBR overgeslagen: …`. De set RBR wordt wel vooraf gebouwd en gecontroleerd (CPU), zodat de keten bij
+  een geldige voorwaarde meteen kan trainen.
+
+RBR-voorwaarde: gemiddelde regel (a) R2 <= gemiddelde regel (a) RB2 (wmt24pp, flores, ntrex; report.json, onafgerond)
+
+- **Training** van beide armen zoals RB2 en R2: LoRA op attentie en MLP, **rank 64, alpha 32**, LR 1e-5 cosine naar 0
+  met 10% warmup, **één epoch** (`step_limit`), sequenties van 2.048, 1 per chip, **16 chips** [besluit hoofdsessie;
+  rank 64 is de rank die de geheugentest van RB2 koos: piek 27,16 GiB per chip, rank 128 `oom`]. Geen nieuwe
+  geheugentest: een stap heeft dezelfde vorm als in de test van RB2 (gepakte sequenties van 2.048, 1 per chip) en
+  dezelfde rank.
+  Uitvoer `$S/rb3/runs/arm27b_rb3_RB3/` en `$S/rbr/runs/arm27b_rbr_RBR/`, adapters `$S/rb3/RB3/` en `$S/rbr/RBR/`. De
+  keten (`mbert-ops/scripts/translator_sft_followup_run.sh`) weigert te starten als de regels hieronder niet letterlijk
+  gelijk zijn aan de zijne, en controleert na elke training rank en alpha in `adapter.json`.
+
+RB3-instellingen: lora_rank=64 lora_alpha=32 learning_rate=1e-5
+RBR-instellingen: lora_rank=64 lora_alpha=32 learning_rate=1e-5
+
+- **Evaluatie en beslisregel gelijk aan die van B, N, RB, RB2 en R2** (§4, §5; de amendementen R2 en RB), tegen
+  hetzelfde uitgangspunt (`$E/baseline-tg27b/scores.parquet`), per arm: de vier sets met dezelfde code (MetricX-24 met
+  referentie en QE, COMET-22; niet af, lus, Engels over, leeg); de extra sets van soort `x` (FLAN 1.000, blind 100,
+  in-domein 4.519 van `$S/arms/data/x/`, het basismodel uit `$S/arms/eval/base-x/`); de classifier van 10 nov
+  (`$S/arms/naturalness/classifier/`, 0,9575; niet opnieuw getraind) op de WMT24++ (960) en de 1.000 FLAN-rijen,
+  basismodel en arm in één classify-run; PLL en MTLD; het blinde pakket `$S/blind/RB3/` en `$S/blind/RBR/` (A/B met
+  seed `en-nl-sft/blind/ab/<arm>/<blind_id>`, sleutel alleen in de bucket); het rapport `$S/rb3/report/report.md` en
+  `$S/rbr/report/report.md` met regel (a), (b), de stand van (c) en, gerapporteerd zonder mee te beslissen, de lengte
+  van de uitvoer tegenover de menselijke referentie op de vier sets. (a) MetricX-24-QE(arm) − QE(basis) ≤ 0,20 op
+  WMT24++ (960), FLORES-200 en NTREX-128 (grenzen 1,747 / 1,022 / 1,282); (b) aandeel "origineel" ≥ basis + 0,10; (c)
+  de blinde beoordeling, alleen als (a) en (b) gelden. Een arm helpt als (a), (b) en (c) alle drie gelden.
+- **Tijd** [keuze, voor de evaluatie van T2 op 13 nov ~17:00 op dezelfde VM]: de keten laat mbert-mix vóór 13 nov
+  ~17:00 vrij. Hij start de training van een arm alleen als die arm met evaluatie naar schatting vóór 13 nov 16:30 CET
+  klaar is (RB3 ~2,5 uur, RBR ~3,5 uur gerekend vanaf de start van de training); anders slaat hij de arm over met een
+  logregel. Verwacht: de nachtketen klaar ~19:15 op 12 nov, RB3 klaar ~21:30, RBR ~00:30.

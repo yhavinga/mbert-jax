@@ -1036,6 +1036,49 @@ RB2, tegen 1,0625 in de echte voorbeelden van de trainingsset van R2 (Europarl-d
        BT-voorbeelden aan beide uiteinden (onderste deciel onder 0,927 woord per woord). In vijf gelezen BT-voorbeelden
        uit de bovenste bak was het Engels beknopt maar volledig, op één ingekorte bijzin na.
   4. Geen Europarl, Global Voices, FLAN-replay of instructiezin.
+- **De set** [gemeten 12 nov ~15:20, `$S/data/rl/report.md` (kopie `mbert-ops/translator-sft/data-rl-report.md`), code
+  `9fb6879`; vóór de eerste trainingsstap; gebouwd op w3 en gecontroleerd op w2 van mbert-mix, alleen CPU (`nice -n 19`,
+  `ionice -c3`), terwijl R2 op de TPU trainde]:
+  - **Boeken**: 15.004 rijen → niet in het Nederlands geschreven 2.025 → harde controles 96 (Engels over 80, lengte > 1,5
+    15, kort 1) → 12.883 → lengtegrens 45 → **uitlijning 317** (343 als de 26 meetellen die ook de lengtegrens niet
+    halen) → 13-gram 0, te lang 0 → **12.521 boekparen**, zonder QE-grens (QE van de 12.883: p50 4,00, p90 6,96, p99
+    12,40). Tegengehouden door de uitlijning per QE-band: ≤ 5 158 / 8.850, 5–7,5 80 / 3.092, 7,5–10 41 / 641, 10–15
+    39 / 242, 15–20 15 / 38, 20–23 6 / 14, 23–25 4 / 6 (bij 5–7,5 één paar minder dan in de meting hierboven, die
+    p98 = 4,388 als grens nam in plaats van 4,39).
+  - **BT**: gewenst 4 × 12.521 = 50.084, **hoogstens en getrokken 7.267** (0,58 per boekpaar), uit de 208.726; 621 met
+    context (8,5%). Verdeling woorden NL / EN vóór (de 208.726) en na (de 7.267) de trekking, p10 / p50 / p90:
+
+    | deel | n vóór | vóór | n na | na |
+    |---|---:|---|---:|---|
+    | doel: echte voorbeelden R2 | | | 52.182 | 0,927 / 1,062 / 1,222 (Europarl 0,932 / 1,065 / 1,221, Global Voices 0,909 / 1,050 / 1,222) |
+    | BT samen | 208.726 | 0,867 / 0,967 / 1,065 | 7.267 | 0,927 / 1,062 / 1,222 |
+    | Handelingen | 79.734 | 0,900 / 0,988 / 1,081 | 3.396 | 0,955 / 1,073 / 1,226 |
+    | FineWeb-2 | 54.475 | 0,869 / 0,966 / 1,062 | 1.866 | 0,926 / 1,065 / 1,222 |
+    | raad | 42.144 | 0,837 / 0,938 / 1,036 | 1.062 | 0,875 / 1,018 / 1,200 |
+    | dpc | 16.478 | 0,829 / 0,931 / 1,027 | 376 | 0,863 / 1,000 / 1,149 |
+    | rechtspraak | 15.895 | 0,875 / 0,970 / 1,067 | 567 | 0,933 / 1,065 / 1,227 |
+    | boeken (niet getrokken) | | | 12.521 | 0,907 / 0,988 / 1,082 |
+
+  - Samen **19.788 trainvoorbeelden** (boeken 63,3%), 9.899.934 tokens (boeken 6.687.192, 67,5%), 4.428.244 doeltokens
+    (boeken 3.154.121, 71,2%); eval 4.167 BT-passages.
+
+    | bron | voorbeelden | tokens | doeltokens | doeltokens per voorbeeld |
+    |---|---:|---:|---:|---:|
+    | boeken | 12.521 | 6.687.192 | 3.154.121 | 252 |
+    | Handelingen | 3.396 | 1.744.997 | 604.350 | 178 |
+    | FineWeb-2 | 1.866 | 693.237 | 310.572 | 166 |
+    | raad | 1.062 | 393.810 | 180.424 | 170 |
+    | rechtspraak | 567 | 237.434 | 113.349 | 200 |
+    | dpc | 376 | 143.264 | 65.428 | 174 |
+
+    De getrokken BT-voorbeelden zijn korter dan bij RB2 (175 doeltokens per voorbeeld, RB2 201) [gemeten]; vermoedelijk
+    omdat kortere passages meer spreiden in hun verhouding en zo vaker in de buitenste bakken vallen [eigen
+    gevolgtrekking].
+  - Mediane verhouding woorden NL / EN (tekens): hele set 1,007 (1,042), BT 1,062 (1,063), boeken 0,988 (1,032); RB2
+    0,972 (1,010).
+  - Gecontroleerd met `sft_build.py check` (MaxText's eigen SFT-stappen op elk voorbeeld): EXIT 0, train 19.788 (bt
+    6.646, bt_context 621, real 12.521), 9.899.934 tokens, max 2.034; eval 4.167, max 2.006 (`$S/data/rl/check.txt`).
+  - Verwachte epoch [schatting, tokens per stap als bij RB2: 29,09 M tokens in 950 stappen]: ~325 stappen.
 - **Training** zoals RB2, RB3 en RBR: LoRA op attentie en MLP, **rank 64, alpha 32**, LR 1e-5 cosine naar 0 met 10%
   warmup, **één epoch** (`step_limit`), sequenties van 2.048, 1 per chip, **16 chips** [besluit Yeb]. Uitvoer
   `$S/rl/runs/arm27b_rl_RL/`, adapter `$S/rl/RL/`. De keten (`mbert-ops/scripts/translator_sft_rl_run.sh`) weigert te

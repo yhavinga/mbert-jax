@@ -105,12 +105,16 @@ def test_the_new_prompts_fit_the_smallest_headroom_of_the_classes():
 
 def test_chatter_finds_an_introduction_or_a_note_and_not_plain_text():
     assert bn.chatter("Here is the translation:\n\nThe House agrees.")
-    assert bn.chatter("Sure! The House agrees.")
+    assert not bn.chatter("Sure! The House agrees.")
     assert bn.chatter("The House agrees.\n\nNote: 'Kamer' is the House of Representatives.")
     assert bn.chatter("**Translation:** The House agrees.")
     assert not bn.chatter("The House agrees. There is a note on the table.")
     assert not bn.chatter("Of the motions, two are accepted.")
     assert not bn.chatter("")
+    # a faithful "Natuurlijk, ..." and a note that the source has as well
+    assert not bn.chatter("Of course, gay and lesbian people go out where they like.")
+    assert bn.chatter("Certainly! Here is the translation:\n\nThe House agrees.")
+    assert not bn.chatter("Activity.\nNote: the advice follows in May.", "Activiteit.\nNoot: het advies volgt in mei.")
 
 
 def test_measure_applies_r2s_bound_of_the_source():

@@ -86,10 +86,11 @@ PROMPTS = ("natural-v1", "bare-v1")
 MODEL = "gemma4-31b"
 PROBE_CLASS = "medium"
 COLUMNS = ["id", "nl", "en", "qe_en_nl", "length_class", "hard_fails", "ended", "tokens_nl", "tokens_en"]
-# An introduction before the translation or a note after it, which an instruction model may add
-CHATTER = re.compile(r"^\s*(?:\*\*)?(?:here(?:'s| is)\b|sure\b|certainly\b|of course\b|(?:english |dutch )?translation\s*:|"
-                     r"hier is\b|vertaling\s*:)|\n\s*(?:\*\*)?(?:note|translator'?s note|opmerking|noot)\s*:",
-                     re.IGNORECASE)
+# An introduction before the translation, or a note after it that the source has no counterpart of. "Of course," or
+# "Certainly," alone opens many a faithful translation ("Natuurlijk, ..."), so an introduction must name the translation
+INTRO = re.compile(r"^\s*(?:\*\*)?(?:(?:sure|certainly|of course)[,!.]?\s+)?(?:here(?:'s| is)\b[^\n]{0,60}\btranslation|"
+                   r"(?:english |dutch )?translation\s*:|hier is\b[^\n]{0,60}\bvertaling|vertaling\s*:)", re.IGNORECASE)
+NOTE = re.compile(r"\n\s*(?:\*\*)?(?:note|translator'?s note|opmerking|noot|n\.b\.)\s*:", re.IGNORECASE)
 
 
 def stable(key):
@@ -117,8 +118,11 @@ def quantile(values, q):
     return values[min(len(values) - 1, int(q * (len(values) - 1) + 0.5))]
 
 
-def chatter(text):
-    return bool(text) and bool(CHATTER.search(text))
+def chatter(text, source=""):
+    """An introduction to the translation, or a note the source does not have"""
+    if not text:
+        return False
+    return bool(INTRO.search(text)) or (bool(NOTE.search(text)) and not NOTE.search(source or ""))
 
 
 def write_parquet(rows, path):
@@ -373,7 +377,7 @@ def measure(nl, en, source, ended):
     row = {"ended": ended, **{k: m[k] for k in ("decode_loop", "dutch_left", "len_ratio", "numbers_missing",
                                                  "structure", "sentences_nl", "sentences_en")}}
     row["hard_fails"] = pm.hard_fails(row)
-    row["chatter"] = chatter(en)
+    row["chatter"] = chatter(en, nl)
     row["word_ratio"] = round(word_ratio(nl, en), 4)
     row["char_ratio"] = round(char_ratio(nl, en), 4)
     b = R2_BOUNDS[source]
@@ -456,6 +460,7 @@ def setup_stats(rows, s):
         out[f"qe_over_{q}"] = share(rows, lambda r: r[qe_en_nl] is not None and r[qe_en_nl] > q)
         out[f"filter_{q}"] = share(rows, lambda r: bool(r[f"hard_fails_{s}"]) or r[f"r2_length_out_{s}"]
                                    or r[qe_en_nl] is None or r[qe_en_nl] > q)
+    out["structure_categories"] = dict(collections.Counter(c for r in rows for c in (r[f"structure_{s}"] or [])))
     checks = collections.Counter(f for r in rows for f in r[f"hard_fails_{s}"])
     out["checks"] = {k: checks.get(k, 0) for k in ("not_ended", "decode_loop", "dutch_left", "len_ratio", "structure",
                                                      "newline_doubled")}
@@ -573,6 +578,8 @@ def table(stats, setups, labels):
     row("getal uit het Nederlands ontbreekt", lambda x: pct(x["numbers_missing"]))
     for k in ("not_ended", "decode_loop", "dutch_left", "structure", "newline_doubled", "len_ratio", "chatter"):
         row(f"`{k}`", lambda x, k=k: nl_num(x["checks"][k], 0))
+    row("`structure`: categorieën", lambda x: ", ".join(f"{k} {v}" for k, v in sorted(
+        x["structure_categories"].items(), key=lambda kv: -kv[1])) or "–")
     return lines
 
 

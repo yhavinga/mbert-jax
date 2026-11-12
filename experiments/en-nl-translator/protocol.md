@@ -1180,3 +1180,97 @@ QE-grens, wel de uitlijncontrole).
   - Gecontroleerd met `sft_build.py check`: EXIT 0, train 25.284 (bt 11.742, bt_context 1.021, real 12.521),
     12.411.900 tokens, max 2.047; eval 4.167, max 2.006 (`$S/data/rl-b5/check.txt`).
   - Verwachte epoch [schatting, tokens per stap als bij RB2: 29,09 M tokens in 950 stappen]: ~405 stappen.
+
+**Amendement 12 nov 2026 ~18:20 CET: arm RE, de set van R2 plus Engelse romans als derde echt-Engelse bron**
+[besluit Yeb 12 nov ~18:15: "ja eens doe die arm ook", op het voorstel in `mbert-ops/translator-sft/books-b1-inventory.md`
+§8 punt 2; de opzet (optie A, K = 20, de tijdregel en de classifier-stap vóór de training) door de hoofdsessie namens
+Yeb (afwezig), op advies van een Fable-adviseur, 12 nov ~18:20; de uitwerking (de filters, de keuze van de editie, de
+trekking en de volgorde) door de subagent RE; vastgelegd vóór de bouw van de set en vóór de eerste trainingsstap van RE
+(de klok van co1 gaf bij het vastleggen ~18:30); R2, RB2, RB3, RBR en RL blijven zoals ze zijn]. Aanleiding: het echte
+deel van R2 (Europarl-direct 2004–2011 en Global Voices, 52.182 voorbeelden, 11,9% van de tokens) is parlementaire en
+journalistieke tekst. Het `-b1-`-deel van `yhavinga/nedd_x_dataset` heeft 1.546.907 paren uit 2.967 Engelse romans
+met hun gepubliceerde Nederlandse vertaling die door de controles van de inventaris komen; hun woordverhouding NL / EN
+(mediaan 1,072, p5–p95 0,937–1,224) ligt dicht bij die van de echte voorbeelden van R2 (1,062; 0,889–1,278) en ver van
+de BT (0,967) [gemeten, inventaris §5.2]. Ze brengen literaire registers en dialoog [eigen gevolgtrekking, inventaris
+§8]. Eén nieuwe arm, **RE**: R2's set ongewijzigd plus een begrensde trekking uit die romans. Alleen de romans
+toevoegen houdt de vergelijking met R2 zuiver [advies Fable, optie A].
+
+- **Trainingsdata** (`$S/data/re-k20/RE/` en `$S/data/re-k10/RE/`; `sft_build.py extend --base R2 --books
+  b1-selected.parquet --per-book K --evalsets evalsets.parquet --block-jsonl blind100.jsonl --name RE`; keten
+  `run_arms.sh rebuild`, `recheck`; code op branch `en-nl-sft-re`, met tests):
+  1. **De set van R2 ongewijzigd** (`$S/data/r2/R2/`): alle 260.908 trainvoorbeelden byte voor byte en in hun eigen
+     volgorde, met hun meta; de eval-split (4.167) en `template.jinja` gekopieerd. `extend` controleert dat na het
+     schrijven (de voorbeelden die geen roman zijn, zijn die van R2 in dezelfde volgorde; sha256 over alle voorbeelden,
+     de bestanden van de eval-split en de template); `check-base` doet het in de controlestap opnieuw, los daarvan
+     (sha256 per voorbeeld en over alle voorbeelden).
+  2. **De romans** uit `$S/data/books-b1/b1-selected.parquet` (de inventaris van 12 nov: `yhavinga/nedd_x_dataset` @
+     `708f34de8ec1ff4172f22b30e5890a5ee01d2ca7`, de rijen met `-b1-` in het id, tekst na `clean_line` van de loader),
+     een rij als:
+     - de groep `en_orig` is (Engels origineel, bepaald per auteur; inventaris §3);
+     - `passes` waar is: de controles van de inventaris, dus de harde controles van `real_pairs.real_fails`, de
+       lengtegrens van R2 (factor 4/3 rond de mediane tekenverhouding van de groep), de uitlijncontrole van RL (4,39 bij
+       die mediaan), geen herhaald id en geen herhaald Engels;
+     - de Nederlandse tekst niet eerder voorkomt (`dup_nl`) [keuze: twee Engelse passages met dezelfde Nederlandse tekst
+       wijzen op een uitlijnfout; 1.006 rijen van de 1.546.907, gemeten];
+     - er aan geen van beide kanten een Markdown-spoor in staat, met de maat van de inventaris (§5.4): de reguliere
+       expressie `(^|\s)_[^_\s][^_]*_($|[\s.,;:!?])|\*\*`;
+     - de schoonmaak van de loader niet maar aan één kant iets veranderde: `en_raw` en `nl_raw` beide leeg of beide
+       gevuld [letterlijk volgens de opdracht; ook een verschil in alleen zachte afbreekstreepjes of witruimte telt;
+       gemeten: dat kost ~313 paren en 8 boeken meer dan een maat die alleen zichtbare veranderingen telt];
+     - **geen MetricX-QE-grens** [richting Yeb: de data zo goed dat filteren niet nodig is].
+     Van een Engels boek met meer Nederlandse edities telt **één editie**: die met de meeste rijen die door de controles
+     hierboven komen; bij gelijkspel het laagste Nederlandse id [keuze binnen de opdracht].
+  3. **Trekking, hoogstens K per Engels boek**: de rijen van de gekozen editie in een volgorde getrokken met de seed
+     `en-nl-sft/0/re-books/<Engels id>`; daarvan de eerste K die geen 13-gram delen met een evaluatieset (bron en
+     referentie van WMT24++, FLORES-200, NTREX-128 en Europarl-direct) of een blinde passage (`blind100.jsonl`) en in
+     2.048 tokens passen, zoals bij de echte paren van R2. Rijen na de K-de worden niet bekeken, dus de trekking met
+     K = 10 is het begin van die met K = 20. **K = 20** (`$S/data/re-k20/`) en **K = 10** (`$S/data/re-k10/`) worden
+     allebei gebouwd en gecontroleerd. Verwacht [gemeten 12 nov ~18:20 op w1 van mbert-mix, met de rijcontroles
+     hierboven zonder `dup_nl`, 13-gram en tokengrens]: 2.953 Engelse boeken met rijen, K = 20 **~58.650** paren, K = 10
+     **~29.390** (de inventaris: 59.324 en 29.664 zonder de Markdown- en schoonmaakcontrole).
+  4. **Prompt en vorm**: TranslateGemma's eigen prompt (`chat-v1`), zonder context of tag, soort `real`, bron
+     `books_en`, zoals de echte paren van R2.
+  5. **Volgorde** [keuze, het meest conservatieve dat R2 ongewijzigd laat]: MaxText leest de trainingsdata in de volgorde
+     van het bestand (`enable_data_shuffling=false`). De voorbeelden van R2 houden hun eigen volgorde; de
+     romanvoorbeelden, eerst onderling geschud (`en-nl-sft/0/re-books-order`), komen op plaatsen die uniform over de hele
+     set getrokken zijn (`en-nl-sft/0/re-merge`). Ze staan dus verspreid, niet achter elkaar.
+  6. Geen FLAN-replay, instructiezin of nieuwe contextvoorbeelden; de BT en de echte paren van R2 zoals ze zijn.
+- **Verwacht** [schatting, tokens per voorbeeld als de boeken van RL (534) en tokens per stap als R2 (112,64 M tokens in
+  3.653 stappen)]: K = 20 ~31 M tokens erbij, ~144 M samen, echt Engels ~30% van de tokens (R2 11,9%), ~4.650 stappen;
+  K = 10 ~16 M erbij, ~128 M, ~4.160 stappen. De set zoals gebouwd en gecontroleerd volgt in een aanvulling vóór de
+  eerste trainingsstap.
+- **Training** zoals R2, RB2, RB3, RBR en RL: LoRA op attentie en MLP, **rank 64, alpha 32**, LR 1e-5 cosine naar 0 met
+  10% warmup, **één epoch** (`step_limit`), sequenties van 2.048, 1 per chip, **16 chips**. Uitvoer
+  `$S/re/runs/arm27b_re_RE/`, adapter `$S/re/RE/`. De keten (`mbert-ops/scripts/translator_sft_re_run.sh`) weigert te
+  starten als de regel hieronder niet letterlijk gelijk is aan de zijne, en controleert na de training rank en alpha in
+  `adapter.json`.
+
+RE-instellingen: lora_rank=64 lora_alpha=32 learning_rate=1e-5
+
+- **Vóór de training: de classifier op de doelteksten** [voorwaarde Fable; een interpretatie van regel (b), geen poort].
+  De classifier van 10 nov (`$S/arms/naturalness/classifier/`, nauwkeurigheid 0,9575; niet opnieuw getraind) op de
+  Nederlandse doelteksten van drie groepen: 2.000 romandoelen (uit de trekking met K = 10, dus in beide sets), 2.000
+  doelen van Europarl-direct en Global Voices en 2.000 BT-doelen uit de set van R2, elk getrokken met de seed
+  `en-nl-sft/0/re-classify/<groep>` (`classify-targets.parquet` naast de set). Het aandeel "origineel" (kans ≥ 0,5) per
+  groep en per bron komt in het log en in het rapport. Risico [Fable]: de romandoelen zijn vertaald Nederlands; regel (b)
+  kan voor RE daardoor dalen, en dan weegt (c) zwaarder. In dezelfde stap dezelfde classifier op de vertalingen van
+  Gemma 4 31B als en→nl-vertaler (`$S/gemma4-en-nl/texts.parquet`: WMT24++ 960 en FLAN 1.000) naast die van het
+  basismodel (`$S/arms/naturalness/texts.parquet`, dezelfde id's), in één run; het verschil in het samengenomen aandeel
+  "origineel" zoals regel (b) het rekent, in het log (regel (b) voor Gemma 4 ontbrak nog). Beide beslissen niets over RE.
+  Uitvoer `$S/re/classify/` (`run_arms.sh reclassify`).
+- **Tijd** [voorwaarde Fable]: de keten start pas na `EXIT 0` van de keten van RL (`translator_sft_rl_run.sh`; een andere
+  `EXIT` is `FAILED`) en neemt dan `final_eval_mix.lock`. De training start uiterlijk **13 nov 05:00 CET met K = 20**;
+  start ze tussen 05:00 en 07:00, dan **met K = 10**; later wordt RE **niet getraind** (logregel "RE overgeslagen: …",
+  daarna `DONE`). Daarnaast moeten training en evaluatie naar schatting vóór **13 nov 16:30 CET** klaar zijn (zoals bij
+  RL; mbert-mix is daarna voor de evaluatie van T2); anders ook overgeslagen. De schatting (minuten van de start van de
+  training tot het rapport) volgt met de aanvulling.
+- **Evaluatie en beslisregel gelijk aan die van B, N, RB, RB2, R2, RB3, RBR en RL** (§4, §5; de amendementen R2 en RB),
+  tegen hetzelfde uitgangspunt (`$E/baseline-tg27b/scores.parquet`): de vier sets met dezelfde code (MetricX-24 met
+  referentie en QE, COMET-22; niet af, lus, Engels over, leeg); de extra sets van soort `x` (FLAN 1.000, blind 100,
+  in-domein 4.519 van `$S/arms/data/x/`, het basismodel uit `$S/arms/eval/base-x/`); de classifier van 10 nov op de
+  WMT24++ (960) en de 1.000 FLAN-rijen, basismodel en RE in één classify-run; PLL en MTLD; het blinde pakket
+  `$S/blind/RE/` (A/B met seed `en-nl-sft/blind/ab/RE/<blind_id>`, sleutel alleen in de bucket); het rapport
+  `$S/re/report/report.md` met regel (a), (b), de stand van (c) en, gerapporteerd zonder mee te beslissen, de lengte van
+  de uitvoer tegenover de menselijke referentie op de vier sets. RE helpt als (a), (b) en (c) alle drie gelden.
+- **Licentie en privacy**: de romans zijn gepubliceerde boeken en vertalingen onder auteursrecht, uit een privé
+  dataset; de sets, de adapter en alle afgeleiden blijven privé (bucket); niets wordt gepubliceerd zonder Yeb.

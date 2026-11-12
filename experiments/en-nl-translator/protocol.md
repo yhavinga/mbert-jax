@@ -892,6 +892,26 @@ nov (RB2 en R2) en op dezelfde VM (mbert-mix): **RB3** en daarna, alleen onder d
 
 RBR-voorwaarde: gemiddelde regel (a) R2 <= gemiddelde regel (a) RB2 (wmt24pp, flores, ntrex; report.json, onafgerond)
 
+- **De sets** [gemeten 12 nov ~13:40, `$S/data/rb3/report.md` en `$S/data/rbr/report.md`, code `8d8946d`; vóór de
+  eerste trainingsstap; gebouwd op w3 en gecontroleerd op w2 van mbert-mix, alleen CPU, terwijl R2 trainde]:
+  - **Boeken** (beide sets, gelijk aan RB2): 15.004 rijen → niet in het Nederlands geschreven 2.025 → harde controles
+    96 → 12.883 → MetricX-QE > 7,5: 941 → lengtegrens 19 → 13-gram 0, te lang 0 → **11.923**.
+  - **RB3**: BT **11.923** = 1 × 11.923, getrokken uit de 208.726 van RB2 (733 met context, 6,1%). Samen **23.846
+    trainvoorbeelden** (boeken 50,0%), 12.024.479 tokens (boeken 6.359.249, 52,9%), 5.393.084 doeltokens (boeken
+    2.998.433, 55,6%); eval 4.167 BT-passages. Mediane verhouding woorden NL / EN (tekens): hele set 0,978 (1,020), BT
+    0,967 (1,004), boeken 0,988 (1,034). Gecontroleerd met `sft_build.py check` (MaxText's eigen SFT-stappen op elk
+    voorbeeld): EXIT 0, train 23.846 (bt 11.190, bt_context 733, real 11.923), 12.024.479 tokens, max 2.038; eval
+    4.167, max 2.006 (`$S/data/rb3/check.txt`).
+  - **RBR**: van de kandidaten van R2 komen er 96.284 door de query (Global Voices 11.412, Europarl 84.872, gelijk aan de
+    build van R2), en **alle 52.182 echte voorbeelden van R2 halen hem opnieuw**; daaruit **11.923** uniform: Europarl
+    9.329 (78,2%), Global Voices 2.594 (21,8%) (in R2 78,1% / 21,9%). BT **35.769** = 3 × 11.923 (2.186 met context,
+    6,1%). Samen **59.615 trainvoorbeelden**: BT 60,0%, boeken 20,0%, R2-echt 20,0%; 26.435.452 tokens (BT 17.019.275,
+    64,4%; boeken 6.359.249, 24,1%; R2-echt 3.056.928, 11,6%), 11.463.319 doeltokens (62,6 / 26,2 / 11,2%); eval 4.167.
+    Mediane verhouding woorden NL / EN (tekens): hele set 0,985 (1,028), BT 0,967 (1,004), boeken 0,988 (1,033), R2-echt
+    1,062 (1,138) (in R2 1,062 (1,139)). Gecontroleerd met `sft_build.py check`: EXIT 0, train 59.615 (bt 33.583, bt_context
+    2.186, real 23.846), 26.435.452 tokens, max 2.038; eval 4.167, max 2.006 (`$S/data/rbr/check.txt`).
+  - Verwachte epoch [schatting, tokens per stap als bij RB2: 29,09 M tokens in 950 stappen]: RB3 ~390, RBR ~860
+    stappen.
 - **Training** van beide armen zoals RB2 en R2: LoRA op attentie en MLP, **rank 64, alpha 32**, LR 1e-5 cosine naar 0
   met 10% warmup, **één epoch** (`step_limit`), sequenties van 2.048, 1 per chip, **16 chips** [besluit hoofdsessie;
   rank 64 is de rank die de geheugentest van RB2 koos: piek 27,16 GiB per chip, rank 128 `oom`]. Geen nieuwe

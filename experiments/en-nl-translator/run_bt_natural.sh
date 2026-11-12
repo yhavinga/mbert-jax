@@ -1,10 +1,11 @@
 #!/bin/bash
-# On a spot v6e-8 in europe-west4 (Gemma 4 31B's MaxText checkpoint is in that region's bucket): the pilot of
-# bt_natural.py, and Gemma 4 as an en->nl translator on the translator's evaluation sets.
-#   bash run_bt_natural.sh all   setup, data and the probe (a handful of passages per prompt, shown in
-#                                ~/logs/bt_probe_show.txt and $O/probe/show.txt); then, only once $O/probe/approved is
-#                                in the bucket (put there after reading the probe), translate, score and report; between
-#                                them MetricX-QE of the four sets' human references (refqe, the calibration of rule (a))
+# On a spot v6e-8 in europe-west4 or us-east1: the pilot of bt_natural.py, and Gemma 4 as an en->nl translator on the
+# translator's evaluation sets. Gemma 4 31B's MaxText checkpoint is in europe-west4's bucket; in a region without one,
+# en-nl-judge's setup.sh convert makes it (from Hugging Face, beside the other setup).
+#   bash run_bt_natural.sh all   setup, data, MetricX-QE of the four sets' human references (refqe, the calibration of
+#                                rule (a)), the probe (a handful of passages per prompt, shown in ~/logs/bt_probe_show.txt
+#                                and $O/probe/show.txt); then, only once $O/probe/approved is in the bucket (put there
+#                                after reading the probe), translate, score and report
 # The v6e-8 runs as two TPUs of 4 chips (Gemma 4 31B allows at most 4-way tensor parallelism):
 #   half 0: nl->en natural-v1 (the 5,000 passages), then MetricX of TranslateGemma's and natural-v1's English
 #   half 1: en->nl natural-v1 on the four sets and FLAN and their MetricX, then nl->en bare-v1 and its MetricX;
@@ -22,7 +23,8 @@ CPY=$SHM/comet-venv/bin/python
 ZONE=$(curl -fs -H Metadata-Flavor:Google http://metadata.google.internal/computeMetadata/v1/instance/zone | awk -F/ '{print $NF}')
 case ${ZONE%-*} in
   europe-west4) BUCKET=gs://t5-dutch-english ;;
-  *) echo "zone '$ZONE': Gemma 4 31B's checkpoint is only in europe-west4's bucket"; exit 1 ;;
+  us-east1) BUCKET=gs://t5-dutch-english-use1 ;;
+  *) echo "no bucket for zone '$ZONE'"; exit 1 ;;
 esac
 B=$BUCKET/mbert/translator
 O=$B/bt-natural
@@ -152,6 +154,12 @@ all)
   fi
   ( SHM=$SHM bash "$C/setup_comet.sh" && HF_HUB_OFFLINE=0 "$PY" -c "import sys; sys.path.insert(0, '$C'); import metricx_qe as m; print(m.download('xxl', '$SHM/metricx'))" ) \
     > ~/logs/bt_setup_bg.log 2>&1 & setup_bg=$!
+  if gsutil -q stat "$B/judge/gemma-4-31b-it-maxtext/done.txt"; then
+    convert_bg=
+  else
+    mkdir -p /dev/shm/judge/code && gsutil -q cp "$B/judge/scripts/setup.sh" /dev/shm/judge/code/setup.sh
+    HF_HUB_OFFLINE=0 bash /dev/shm/judge/code/setup.sh convert > ~/logs/bt_convert.log 2>&1 & convert_bg=$!
+  fi
   echo "== data $(date -u +%T)"
   if gsutil -q stat "$O/data/done.txt"; then
     gsutil -m -q rsync -r "$O/data" "$D"
@@ -168,6 +176,14 @@ all)
   [ -d "$D/eval-input" ] || { mkdir -p "$D/eval-input" && gsutil -m -q rsync -r "$O/eval-input" "$D/eval-input"; }
   # head on the file, not after cat: with pipefail cat's SIGPIPE would end the script
   head -c 3000 "$D/sample.json"; echo
+  wait $setup_bg || { echo "background setup failed: ~/logs/bt_setup_bg.log"; exit 1; }
+  echo "== MetricX-QE of the human references $(date -u +%T)"
+  if ! gsutil -q stat "$O/report/refqe.md"; then job 1 bt_refqe refqe; fi
+  gsutil -q cp "$O/report/refqe.md" -
+  if [ -n "$convert_bg" ]; then
+    echo "== waiting for the conversion of Gemma 4 $(date -u +%T)"
+    wait $convert_bg || { echo "conversion failed: ~/logs/bt_convert.log"; exit 1; }
+  fi
   echo "== probe $(date -u +%T)"
   if ! gsutil -q stat "$O/probe/show.txt"; then
     job 0 bt_probe_0 probe0 & a=$!
@@ -184,10 +200,6 @@ all)
     } > ~/logs/bt_probe_show.txt
     gsutil -q cp ~/logs/bt_probe_show.txt "$O/probe/show.txt"
   fi
-  wait $setup_bg || { echo "background setup failed: ~/logs/bt_setup_bg.log"; exit 1; }
-  echo "== MetricX-QE of the human references $(date -u +%T)"
-  if ! gsutil -q stat "$O/report/refqe.md"; then job 1 bt_refqe refqe; fi
-  gsutil -q cp "$O/report/refqe.md" - 
   if ! gsutil -q stat "$O/probe/approved"; then
     echo "WAITING: read $O/probe/show.txt, then put $O/probe/approved and start again"
     exit 0

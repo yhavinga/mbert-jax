@@ -870,9 +870,9 @@ def test_five_bins_cut_at_the_quintiles_and_hold_more_than_ten_when_the_top_deci
     assert 1.19 < info["cuts"][0] < 1.20 and 1.79 < info["cuts"][-1] < 1.80
 
 
-def run_arms_job_body(tmp_path, stage, tag, **env):
+def run_arms_job_body(tmp_path, stage, tag, job=None, **env):
     """the job body that run_arms.sh STAGE writes to ~/job_body_<job>.sh, with gsutil (stat: only R2's set exists),
-    setsid (starts nothing) and mkdir under /dev/shm faked, HOME in tmp_path"""
+    setsid (starts nothing) and mkdir under /dev/shm faked, HOME in tmp_path; job: the job's name before _<tag>"""
     import os
     import subprocess
 
@@ -890,7 +890,7 @@ def run_arms_job_body(tmp_path, stage, tag, **env):
     out = subprocess.run(["bash", str(script), stage], capture_output=True, text=True, timeout=60,
                          env={"HOME": str(tmp_path), "PATH": f"{fake}:{os.environ['PATH']}", "TAG": tag, **env})
     assert out.returncode == 0, out.stdout + out.stderr
-    job = {"rlbuild": "rl_build", "rlcheck": "rl_check"}[stage]
+    job = job or {"rlbuild": "rl_build", "rlcheck": "rl_check"}[stage]
     return (tmp_path / f"job_body_{job}_{tag}.sh").read_text()
 
 
@@ -905,3 +905,146 @@ def test_arm_rl_draws_with_five_bins_to_a_place_of_its_own_and_ten_stay_an_optio
     assert "--bt-match-bins 10 --sets RL=none+real" in body and f"rsync -r /dev/shm/translator/rl/build-t10 {s}/rl-b10\n" in body
     body = run_arms_job_body(tmp_path, "rlcheck", "c5")
     assert f"rsync -r {s}/rl-b5/RL /dev/shm/translator/rl/check-c5\n" in body and f"cp /dev/shm/translator/rl/check-c5/check.txt {s}/rl-b5/check.txt" in body
+
+
+BLOCKED = "the quick brown fox jumps over the lazy dog near the river bank today again"
+
+
+def b1_row(rid, book, group="en_orig", passes=True, dup_id=False, dup_nl=False, en=None, nl=None, en_raw=None,
+           nl_raw=None):
+    """A row of b1-selected.parquet (the -b1- inventory); book is '<Dutch id>-<English id>'"""
+    nl_id, en_id = (int(x) for x in book.split("-"))
+    return {"id": f"{book}-b1-{rid}", "book": book, "nl_book_id": nl_id, "en_book_id": en_id, "group": group,
+            "author": f"Author {en_id}", "en": en or f"English passage {rid} of book {en_id}, told in a few words.",
+            "nl": nl or f"Nederlandse passage {rid} van boek {en_id}, verteld in een paar woorden.", "en_raw": en_raw,
+            "nl_raw": nl_raw, "passes": passes, "dup_id": dup_id, "dup_nl": dup_nl}
+
+
+def re_tables(tmp_path):
+    """A base set (R2-like: back-translations of tables()) and a b1-selected.parquet of five English books:
+    100 with editions 10 (5 rows) and 11 (3 rows); 200 with editions 21 and 20 (2 rows each: a tie); 300 with a row
+    for every check; 400 where two rows share a 13-gram with the evaluation set and one is too long; and a Dutch
+    original's row"""
+    args = tables(tmp_path)
+    args.bt, args.sets = "all", ["R2=none"]
+    sb.build(args, tokenizer=CharTokenizer())
+    rows = [b1_row(i, "10-100") for i in range(5)] + [b1_row(i, "11-100") for i in range(5, 8)]
+    rows += [b1_row(i, "21-200") for i in range(2)] + [b1_row(i, "20-200") for i in range(2, 4)]
+    rows += [b1_row(0, "30-300"), b1_row(1, "30-300"),
+             b1_row(2, "30-300", en="An _italic_ word in the English passage here."),
+             b1_row(3, "30-300", nl="Een **vet** woord in de Nederlandse passage hier."),
+             b1_row(4, "30-300", en_raw="> English passage 4 of book 300, told in a few words."),
+             b1_row(5, "30-300", en_raw="- English passage 5 of book 300, told in a few words.",
+                    nl_raw="- Nederlandse passage 5 van boek 300, verteld in een paar woorden."),
+             b1_row(6, "30-300", dup_nl=True), b1_row(7, "30-300", passes=False), b1_row(8, "30-300", dup_id=True)]
+    rows += [b1_row(0, "40-400", en=f"Here {BLOCKED} once more."), b1_row(1, "40-400", nl=f"Hier {BLOCKED} weer."),
+             b1_row(2, "40-400", en="long " * 450), b1_row(3, "40-400")]
+    rows += [b1_row(0, "50-500", group="nl_orig_nlbooks")]
+    write(tmp_path / "b1-selected.parquet", rows)
+    return argparse.Namespace(base=str(Path(args.out) / "R2"), books=str(tmp_path / "b1-selected.parquet"),
+                              per_book=3, evalsets=args.evalsets, block_jsonl=None, tokenizer="char", name="RE",
+                              seed="t", out=str(tmp_path / "re-k3"))
+
+
+def test_merge_order_keeps_both_orders_and_draws_the_places():
+    order = sb.merge_order(6, 4, "s")
+    assert sorted(order) == list(range(10)) and order == sb.merge_order(6, 4, "s")
+    assert [i for i in order if i < 6] == list(range(6)) and [i for i in order if i >= 6] == list(range(6, 10))
+    assert {tuple(sb.merge_order(6, 4, f"s{k}")) for k in range(20)} != {tuple(order)}
+
+
+def test_the_b1_rows_and_the_edition_of_each_english_book(tmp_path):
+    """arm RE: en_orig, passes, no repeated id or Dutch text, no Markdown trace, not cleaned on one side only; per
+    English book the edition with the most such rows, a tie to the lowest Dutch id"""
+    args = re_tables(tmp_path)
+    rows, groups = sb.read_b1(args.books)
+    assert groups == {"en_orig": 25, "nl_orig_nlbooks": 1} and len(rows) == 25
+    chosen, info = sb.b1_editions(rows)
+    assert sorted(r["book"] for r in chosen[100]) == ["10-100"] * 5
+    assert sorted(r["book"] for r in chosen[200]) == ["20-200"] * 2
+    assert sorted(r["id"] for r in chosen[300]) == ["30-300-b1-0", "30-300-b1-1", "30-300-b1-5"]
+    assert info["first_failed"] == {"cleaned_one_side": 1, "dup_id": 1, "dup_nl": 1, "markdown": 2, "other_edition": 5,
+                                    "passes": 1}
+    assert info["alone_after_passes"] == {"cleaned_one_side": 1, "dup_nl": 1, "markdown": 2}
+    assert (info["english_books"], info["english_books_with_rows"], info["rows_kept"]) == (4, 4, 14)
+
+
+def test_a_build_of_arm_re_keeps_r2s_set_and_adds_at_most_k_book_pairs_per_book(tmp_path):
+    import json
+
+    args = re_tables(tmp_path)
+    sb.extend(args, tokenizer=CharTokenizer())
+    base, d = Path(args.base), Path(args.out) / "RE"
+    meta = pq.read_table(d / "train-meta.parquet").to_pylist()
+    msgs = pq.read_table(d / "train.parquet").column("messages").to_pylist()
+    base_msgs = pq.read_table(base / "train.parquet").column("messages").to_pylist()
+    # the base set's examples: the same, in the same order; the eval split and the template copied
+    assert [m for m, x in zip(msgs, meta) if x["source"] != sb.B1_SOURCE] == base_msgs
+    assert pq.read_table(d / "train-meta.parquet").schema == pq.read_table(base / "train-meta.parquet").schema
+    for f in ("eval.parquet", "eval-meta.parquet", "template.jinja"):
+        assert (d / f).read_bytes() == (base / f).read_bytes()
+    books = [x for x in meta if x["source"] == sb.B1_SOURCE]
+    ids = sorted(x["id"] for x in books)
+    # 3 of book 100's edition 10, both of 200's edition 20, the 3 of 300 that pass, 400's one row that fits and shares
+    # no 13-gram
+    per = {b: sum(i.startswith(f"b1:{b}-") for i in ids) for b in ("10-100", "11-100", "20-200", "21-200", "30-300",
+                                                                   "40-400", "50-500")}
+    assert per == {"10-100": 3, "11-100": 0, "20-200": 2, "21-200": 0, "30-300": 3, "40-400": 1, "50-500": 0}
+    assert "b1:40-400-b1-3" in ids and "b1:30-300-b1-5" in ids
+    for x, m in zip(meta, msgs):
+        if x["source"] == sb.B1_SOURCE:
+            assert (x["kind"], x["prompt"], x["tag"], x["context"], x["qe_en_nl"]) == ("real", sb.REAL_PROMPT, "none", [],
+                                                                                       None)
+            assert m[0]["content"] == sb.user_turn(sb.REAL_PROMPT, x["en"]) and m[1]["content"].startswith("Nederlandse")
+            assert x["tokens_prompt"] + x["tokens_target"] <= sb.MAX_TOKENS
+    report = json.loads((Path(args.out) / "report.json").read_text())
+    assert report["draw"] == {"per_book": 3, "books": 4, "drawn": 9, "looked_at": 12, "eval_13gram": 2,
+                              "too_long": 1, "books_short": 2, "short_rows": 3}
+    assert report["identity"]["base_digest"] == report["identity"]["digest_in_new_set"]
+    assert report["sets"]["RE"]["train"]["sources"][sb.B1_SOURCE] == 9 and (Path(args.out) / "report.md").exists()
+    targets = pq.read_table(Path(args.out) / "classify-targets.parquet").to_pylist()
+    assert {t["model"] for t in targets} == {"bt", "books_en"} and sum(t["model"] == "books_en" for t in targets) == 9
+    assert pq.read_table(Path(args.out) / "books.parquet").num_rows == 9
+    # a smaller K draws the first part of the larger one's; the same seed, the same set
+    small = argparse.Namespace(**{**vars(args), "per_book": 2, "out": str(tmp_path / "re-k2")})
+    sb.extend(small, tokenizer=CharTokenizer())
+    small_ids = {x["id"] for x in pq.read_table(tmp_path / "re-k2" / "RE" / "train-meta.parquet").to_pylist()
+                 if x["source"] == sb.B1_SOURCE}
+    assert len(small_ids) == 7 and small_ids < set(ids)
+    again = argparse.Namespace(**{**vars(args), "out": str(tmp_path / "re-k3b")})
+    sb.extend(again, tokenizer=CharTokenizer())
+    assert (tmp_path / "re-k3b" / "RE" / "train.parquet").read_bytes() == (d / "train.parquet").read_bytes()
+    with pytest.raises(SystemExit, match="exists"):
+        sb.extend(args, tokenizer=CharTokenizer())
+
+
+def test_check_base_finds_r2s_examples_in_re_and_refuses_a_changed_one(tmp_path, capsys):
+    args = re_tables(tmp_path)
+    sb.extend(args, tokenizer=CharTokenizer())
+    d = Path(args.out) / "RE"
+    sb.main(["check-base", "--base", args.base, "--data", str(d)])
+    out = capsys.readouterr().out
+    assert '"same_in_order": true' in out and '"added": 9' in out
+    t = pq.read_table(d / "train.parquet").to_pylist()
+    meta = pq.read_table(d / "train-meta.parquet").to_pylist()
+    k = next(i for i, x in enumerate(meta) if x["source"] != sb.B1_SOURCE)
+    t[k]["messages"][1]["content"] += " "
+    pq.write_table(pa.Table.from_pylist(t), d / "train.parquet")
+    with pytest.raises(SystemExit, match="not .*'s examples"):
+        sb.main(["check-base", "--base", args.base, "--data", str(d)])
+
+
+def test_arm_re_builds_k20_and_k10_in_places_of_their_own(tmp_path):
+    """run_arms.sh rebuild / recheck (protocol §9, amendment RE): RE_K=20 by default, $S/data/re-k<K>"""
+    s = "gs://t5-dutch-english-usc2/mbert/translator/sft/data"
+    body = run_arms_job_body(tmp_path, "rebuild", "t", job="re_build_k20")
+    assert "--per-book 20 --evalsets /dev/shm/translator/re/in-k20/evalsets.parquet --block-jsonl" in body
+    assert f"cp {s}/books-b1/b1-selected.parquet /dev/shm/translator/re/in-k20/" in body
+    assert f"cp {s}/r2/R2/train.parquet {s}/r2/R2/train-meta.parquet" in body
+    assert f"rsync -r /dev/shm/translator/re/build-k20-t {s}/re-k20\n" in body
+    body = run_arms_job_body(tmp_path, "rebuild", "t", job="re_build_k10", RE_K="10")
+    assert "--per-book 10 " in body and f"rsync -r /dev/shm/translator/re/build-k10-t {s}/re-k10\n" in body
+    body = run_arms_job_body(tmp_path, "recheck", "c", job="re_check_k10", RE_K="10")
+    assert f"rsync -r {s}/re-k10/RE /dev/shm/translator/re/check-k10-c/RE\n" in body
+    assert "sft_build.py check-base --base /dev/shm/translator/re/check-k10-c/r2" in body
+    assert f"cp /dev/shm/translator/re/check-k10-c/check.txt {s}/re-k10/check.txt" in body

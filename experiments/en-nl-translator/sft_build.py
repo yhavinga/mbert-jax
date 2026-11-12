@@ -11,6 +11,8 @@ run, the FLAN-nl replay, and the user turn of translate.user_text.
         [--real2 REAL2.parquet --real2-from SET/train-meta.parquet --real2-per-real K2]] \\
         --sets B=none N-token=token+replay R2=none+real ... --out OUT
     python sft_build.py check --data OUT/<set> --tokenizer TOK   (SFT venv: MaxText's own SFT steps on every example)
+    python sft_build.py extend --base SET/<set> --books b1-selected.parquet --per-book K --evalsets EVALSETS.parquet \\
+        --tokenizer TOK [--block-jsonl blind100.jsonl] --name RE --out OUT   (arm RE: a set plus English novels)
 
 RUN holds the main run's pairs.parquet (mainset/run/pairs/), passages.parquet and context-turns.parquet
 (mainset/run/select/); LONG the long run's pairs.parquet and passages.parquet.
@@ -76,6 +78,18 @@ the prompt of --replay-tag: untagged chat-v1 (none), or with the tag turned roun
 untagged, the replay with the sentence of chat-v1-tag-conventional, the mode of a close, conventional translation;
 at use nothing is added); it is drawn from the replay pairs that are none of FLAN's evaluation rows' segments and share no
 13-gram with an evaluation set.
+
+Arm RE (amendment of 12 Nov ~18:20): extend takes a built set (R2's) unchanged and adds English novels with their
+human Dutch translation, the -b1- rows of yhavinga/nedd_x_dataset as the inventory of 12 Nov left them
+(b1-selected.parquet, mbert-ops/translator-sft/books-b1-inventory.md; its checks are real_pairs.real_fails, the length
+bound of --len-factor 1.3333 around the group's own median and --real-align-max 4.39, as RL applies them): rows of an
+English original (group en_orig) that pass those checks (passes), no repeated id or Dutch text, no Markdown trace on
+either side, not changed by the loader's cleaning on one side only (en_raw, nl_raw); one Dutch edition per English book
+(the one with the most such rows, a tie to the lowest Dutch id); no MetricX-QE bound. Per English book its rows in an
+order drawn with the seed, and of them the first K that share no 13-gram with an evaluation set or --block-jsonl and
+fit MAX_TOKENS, in TranslateGemma's own prompt (as R2's real pairs): so a smaller K's draw is the first part of a larger
+one's. The set's examples keep their order and bytes; the books go in at positions drawn with the seed. The eval split
+and the template are the set's, copied.
 
 build writes per set OUT/<set>/: train.parquet and eval.parquet (one column `messages`, user then assistant, for
 MaxText's SFT pipeline; train shuffled), train-meta.parquet and eval-meta.parquet (row by row: id, kind bt/bt_context/
@@ -153,6 +167,15 @@ SENTENCE_END = re.compile(r"[.!?…]+[\"'’”»)\]_*]*\s+(?=[\"'‘“„«(\[
 NOT_A_SENTENCE_END = {"mr", "mrs", "ms", "dr", "st", "prof", "jr", "sr", "lt", "col", "gen", "capt", "rev", "vs", "mevr",
                       "dhr", "drs", "ir", "ing", "bijv", "nr", "ca", "jhr", "mgr"}
 QE_BANDS = (5, 7.5, 10, 15, 20, 23)  # the report of the alignment check per band of MetricX-QE
+# arm RE: the English novels' source name in the meta, and the inventory's measure of a Markdown trace (its §5.4)
+B1_SOURCE = "books_en"
+B1_MARKDOWN = re.compile(r"(^|\s)_[^_\s][^_]*_($|[\s.,;:!?])|\*\*")
+B1_COLUMNS = ["id", "book", "nl_book_id", "en_book_id", "group", "author", "en", "nl", "en_raw", "nl_raw", "passes",
+              "dup_id", "dup_nl"]
+# the classifier's look at the targets before RE's training: this many Dutch targets per group, the books among the
+# first RE_CLASSIFY_RANK of their book (the draw of K=10, which every larger K's contains)
+RE_CLASSIFY_N = 2000
+RE_CLASSIFY_RANK = 10
 META_COLUMNS = ["id", "kind", "source", "length_class", "tag", "prompt", "en", "context", "context_ids", "label",
                 "tokens_prompt", "tokens_target", "qe_en_nl", "chrf"]
 
@@ -714,6 +737,151 @@ def real2_draw(fitting, from_ids, n_real, per_real, seed):
     return chosen, info
 
 
+def read_b1(path):
+    """(the rows of group en_orig, with B1_COLUMNS; {group: rows} of the whole file): b1-selected.parquet of the
+    -b1- inventory"""
+    import pyarrow.compute as pc
+    import pyarrow.parquet as pq
+
+    t = pq.read_table(path, columns=B1_COLUMNS)
+    groups = {g["values"]: g["counts"] for g in pc.value_counts(t["group"]).to_pylist()}
+    return t.filter(pc.equal(t["group"], "en_orig")).to_pylist(), groups
+
+
+def b1_fails(r):
+    """The first of arm RE's row checks a -b1- row fails, or None. passes is the inventory's: real_fails, its length
+    bound and its alignment check, no repeated id or English"""
+    if r["group"] != "en_orig":
+        return "group"
+    if r["dup_id"]:
+        return "dup_id"
+    if not r["passes"]:
+        return "passes"
+    if r["dup_nl"]:
+        return "dup_nl"
+    if B1_MARKDOWN.search(r["en"]) or B1_MARKDOWN.search(r["nl"]):
+        return "markdown"
+    # the loader's clean_line changed the text on one side only: a leading mark taken off there and not here
+    if (r["en_raw"] is None) != (r["nl_raw"] is None):
+        return "cleaned_one_side"
+    return None
+
+
+def b1_editions(rows):
+    """({English book id: the rows of its chosen Dutch edition}, info): the rows without b1_fails; of an English book
+    with several Dutch editions the one with the most such rows, a tie to the lowest Dutch id"""
+    first, alone = collections.Counter(), collections.Counter()
+    by = collections.defaultdict(lambda: collections.defaultdict(list))
+    english = set()
+    for r in rows:
+        english.add(r["en_book_id"])
+        f = b1_fails(r)
+        if f is None:
+            by[r["en_book_id"]][r["book"]].append(r)
+        else:
+            first[f] += 1
+        if r["group"] == "en_orig" and not r["dup_id"] and r["passes"]:
+            alone["dup_nl"] += bool(r["dup_nl"])
+            alone["markdown"] += bool(B1_MARKDOWN.search(r["en"]) or B1_MARKDOWN.search(r["nl"]))
+            alone["cleaned_one_side"] += (r["en_raw"] is None) != (r["nl_raw"] is None)
+    chosen, editions = {}, collections.Counter()
+    for en, eds in by.items():
+        book = min(eds, key=lambda b: (-len(eds[b]), int(eds[b][0]["nl_book_id"])))
+        chosen[en] = eds[book]
+        editions[len(eds)] += 1
+        first["other_edition"] += sum(len(v) for b, v in eds.items() if b != book)
+    counts = sorted(len(v) for v in chosen.values())
+    info = {"rows": len(rows), "first_failed": dict(sorted(first.items())),
+            "alone_after_passes": dict(sorted(alone.items())), "english_books": len(english),
+            "english_books_with_rows": len(chosen), "editions": dict(sorted(editions.items())),
+            "rows_kept": sum(counts),
+            "rows_per_book": {f"p{q}": quantile(counts, q / 100) for q in (0, 10, 50, 90, 100)} if counts else None}
+    return chosen, info
+
+
+def b1_draw(by_book, k, blocked, counter, seed):
+    """(rows drawn, each with its rank in its book and its token counts; info): per English book its rows in an order
+    drawn with the seed, and of them the first k that share no 13-gram with blocked and fit MAX_TOKENS in TranslateGemma's
+    own prompt. Rows after the k-th are not looked at, so the draw of a smaller k is the first part of a larger one's"""
+    out, stats, short = [], collections.Counter(), {}
+    for en in sorted(by_book, key=str):
+        rows = sorted(by_book[en], key=lambda r: r["id"])
+        random.Random(f"{seed}/re-books/{en}").shuffle(rows)
+        kept, i = [], 0
+        while len(kept) < k and i < len(rows):
+            part = rows[i:i + k + 8]
+            i += len(part)
+            prompts = counter.prompt_lengths([user_turn(REAL_PROMPT, r["en"]) for r in part])
+            targets = counter.target_lengths([r["nl"].strip() for r in part])
+            for r, n_prompt, n_target in zip(part, prompts, targets):
+                if len(kept) == k:
+                    break
+                stats["looked_at"] += 1
+                if (sp.ngrams(r["nl"]) | sp.ngrams(r["en"])) & blocked:
+                    stats["eval_13gram"] += 1
+                elif n_prompt + n_target > MAX_TOKENS:
+                    stats["too_long"] += 1
+                else:
+                    kept.append(r | {"rank": len(kept), "tokens_prompt": n_prompt, "tokens_target": n_target})
+        if len(kept) < k:
+            short[str(en)] = len(kept)
+        out += kept
+    info = {"per_book": k, "books": len(by_book), "drawn": len(out), **dict(sorted(stats.items())),
+            "books_short": len(short), "short_rows": sum(short.values())}
+    return out, info
+
+
+def merge_order(n_base, n_add, seed):
+    """[index]: the n_base rows of a set in their own order, the rows n_base ... n_base + n_add - 1 in theirs, at
+    positions drawn with the seed uniformly over the n_base + n_add places"""
+    at = set(random.Random(f"{seed}/re-merge").sample(range(n_base + n_add), n_add))
+    base, add = iter(range(n_base)), iter(range(n_base, n_base + n_add))
+    return [next(add) if i in at else next(base) for i in range(n_base + n_add)]
+
+
+def rows_digest(messages):
+    """sha256 over the examples in order (each as JSON with sorted keys)"""
+    h = hashlib.sha256()
+    for m in messages:
+        h.update(json.dumps(m, ensure_ascii=False, sort_keys=True).encode("utf-8") + b"\n")
+    return h.hexdigest()
+
+
+def re_group(meta):
+    """bt, europarl_gv (R2's real pairs) or books_en"""
+    if meta["source"] == B1_SOURCE:
+        return "books_en"
+    return "europarl_gv" if meta["kind"] == "real" else "bt"
+
+
+def ratio_quantiles(rows):
+    """{all | group | source/<s>: {n, p5 ... p95}} of the ratio of Dutch to English words, rows (messages, meta)"""
+    by = collections.defaultdict(list)
+    for msgs, m in rows:
+        ratio = word_ratio(msgs["messages"][1]["content"], m["en"])
+        for key in ("all", re_group(m), f"source/{m['source']}"):
+            by[key].append(ratio)
+    return {k: {"n": len(v), **{f"p{q}": round(quantile(sorted(v), q / 100), 4) for q in (5, 10, 25, 50, 75, 90, 95)}}
+            for k, v in sorted(by.items())}
+
+
+def classify_targets(rows, ranks, seed):
+    """The Dutch targets of the classifier's look before RE's training: RE_CLASSIFY_N per group (bt, europarl_gv,
+    books_en among the first RE_CLASSIFY_RANK of their book), drawn by id with the seed; rows (messages, meta), ranks
+    {id: rank} of the books. As texts.parquet of naturalness.py classify: model = group, set = source"""
+    by = collections.defaultdict(list)
+    for msgs, m in rows:
+        group = re_group(m)
+        if group != "books_en" or ranks[m["id"]] < RE_CLASSIFY_RANK:
+            by[group].append((m["id"], m["source"], msgs["messages"][1]["content"]))
+    out = []
+    for group in sorted(by):
+        pool = sorted(by[group])
+        for i, source, text in random.Random(f"{seed}/re-classify/{group}").sample(pool, min(RE_CLASSIFY_N, len(pool))):
+            out.append({"model": group, "set": source, "id": i, "text": text})
+    return out
+
+
 def quantile(values, q):
     if not values:
         return None
@@ -1195,6 +1363,202 @@ def check(args):
     print("CHECK " + json.dumps({"data": str(data), **stats}))
 
 
+def extend(args, tokenizer=None):
+    """Arm RE: the set of --base unchanged plus --per-book English-novel pairs per English book (module docstring);
+    OUT/<name>/ as build writes a set, OUT/books.parquet (the books drawn, with their rank), OUT/classify-targets.parquet
+    (classify_targets), OUT/report.json and report.md"""
+    import shutil
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    base, out = Path(args.base), Path(args.out)
+    d = out / args.name
+    if d.exists():
+        raise SystemExit(f"{d} exists")
+    if tokenizer is None:
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
+    counter = TokenCounter(tokenizer)
+    train = pq.read_table(base / "train.parquet")
+    meta = pq.read_table(base / "train-meta.parquet")
+    if train.num_rows != meta.num_rows:
+        raise SystemExit(f"{base}: {train.num_rows} examples, {meta.num_rows} meta rows")
+    base_ids = set(meta.column("id").to_pylist())
+    if len(base_ids) != meta.num_rows:
+        raise SystemExit(f"{base}: an id twice in train-meta.parquet")
+    evalsets = pq.read_table(args.evalsets, columns=["source", "reference"]).to_pylist()
+    blocked = blocked_ngrams(evalsets)
+    n_blocked = len(blocked)
+    if args.block_jsonl:
+        for line in Path(args.block_jsonl).read_text(encoding="utf-8").split("\n"):
+            if line.strip():
+                blocked |= sp.ngrams(json.loads(line)["source"] or "")
+    print(f"PROGRESS {len(blocked)} blocked 13-grams; reading {args.books}", flush=True)
+    rows, groups = read_b1(args.books)
+    by_book, editions = b1_editions(rows)
+    del rows
+    print(f"PROGRESS {editions['rows_kept']} rows in {len(by_book)} English books; drawing {args.per_book} per book",
+          flush=True)
+    chosen, draw = b1_draw(by_book, args.per_book, blocked, counter, args.seed)
+    chosen.sort(key=lambda r: r["id"])
+    random.Random(f"{args.seed}/re-books-order").shuffle(chosen)
+    book_msgs, book_metas = [], []
+    for r in chosen:
+        en, nl = r["en"].strip(), r["nl"].strip()
+        book_msgs.append([{"role": "user", "content": user_turn(REAL_PROMPT, en)}, {"role": "assistant", "content": nl}])
+        book_metas.append({"id": f"b1:{r['id']}", "kind": "real", "source": B1_SOURCE, "length_class": None,
+                           "tag": "none", "prompt": REAL_PROMPT, "en": en, "context": [], "context_ids": [],
+                           "label": None, "tokens_prompt": r["tokens_prompt"], "tokens_target": r["tokens_target"],
+                           "qe_en_nl": None, "chrf": None})
+    if book_metas and set(book_metas[0]) != set(meta.schema.names):
+        raise SystemExit(f"{base}: train-meta columns {meta.schema.names}, the books' {sorted(book_metas[0])}")
+    if {m["id"] for m in book_metas} & base_ids:
+        raise SystemExit("a book id is in the base set")
+    order = pa.array(merge_order(train.num_rows, len(book_msgs), args.seed), type=pa.int64())
+    new_train = pa.concat_tables([train, pa.table({"messages": book_msgs}, schema=train.schema)]).take(order)
+    new_meta = pa.concat_tables([meta, pa.Table.from_pylist(book_metas, schema=meta.schema)]).take(order)
+    d.mkdir(parents=True)
+    pq.write_table(new_train, d / "train.parquet")
+    pq.write_table(new_meta, d / "train-meta.parquet")
+    for f in ("eval.parquet", "eval-meta.parquet", "template.jinja"):
+        shutil.copyfile(base / f, d / f)
+    # the base set's examples, read back: the same rows in the same order, byte for byte
+    got = pq.read_table(d / "train.parquet")
+    got_meta = pq.read_table(d / "train-meta.parquet")
+    keep = pa.array([s != B1_SOURCE for s in got_meta.column("source").to_pylist()])
+    base_msgs = train.column("messages").to_pylist()
+    got_base_msgs = got.filter(keep).column("messages").to_pylist()
+    if got_base_msgs != base_msgs or not got_meta.filter(keep).equals(meta):
+        raise SystemExit(f"{d}: the base set's examples are not those of {base} in its order")
+    identity = {"base_examples": len(base_msgs), "base_digest": rows_digest(base_msgs),
+                "digest_in_new_set": rows_digest(got_base_msgs), "base_meta_equal": True,
+                "base_order_kept": True, "files_copied": {f: sha256(base / f) for f in
+                                                          ("eval.parquet", "eval-meta.parquet", "template.jinja")}}
+    if identity["base_digest"] != identity["digest_in_new_set"] or any(
+            sha256(d / f) != h for f, h in identity["files_copied"].items()):
+        raise SystemExit(f"{d}: a digest differs from the base set's")
+    pairs = [({"messages": m}, x) for m, x in zip(got.column("messages").to_pylist(), got_meta.to_pylist())]
+    evals = [({"messages": m}, x) for m, x in zip(pq.read_table(d / "eval.parquet").column("messages").to_pylist(),
+                                                  pq.read_table(d / "eval-meta.parquet").to_pylist())]
+    stats = set_stats(pairs, evals)
+    ranks = {f"b1:{r['id']}": r["rank"] for r in chosen}
+    targets = classify_targets(pairs, ranks, args.seed)
+    pq.write_table(pa.Table.from_pylist(targets), out / "classify-targets.parquet")
+    pq.write_table(pa.Table.from_pylist([
+        {"id": f"b1:{r['id']}", "book": r["book"], "en_book_id": r["en_book_id"], "nl_book_id": r["nl_book_id"],
+         "author": r["author"], "rank": r["rank"], "tokens_prompt": r["tokens_prompt"],
+         "tokens_target": r["tokens_target"]} for r in sorted(chosen, key=lambda r: r["id"])]), out / "books.parquet")
+    query = {"books": "group en_orig, passes, not dup_id, not dup_nl, no Markdown trace, not cleaned on one side only; "
+                      "one Dutch edition per English book (most rows, a tie to the lowest Dutch id); no MetricX-QE "
+                      "bound", "per_book": args.per_book, "eval_13gram": "none shared", "max_tokens": MAX_TOKENS,
+             "prompt": REAL_PROMPT}
+    inputs = {"books": {"path": str(args.books), "sha256": sha256(args.books)},
+              "evalsets": {"path": str(args.evalsets), "sha256": sha256(args.evalsets)},
+              "base": {"path": str(base), **{f: sha256(base / f) for f in ("train.parquet", "train-meta.parquet")}}}
+    if args.block_jsonl:
+        inputs["block_jsonl"] = {"path": str(args.block_jsonl), "sha256": sha256(args.block_jsonl)}
+    manifest = {"set": args.name, "tag": "none", "replay": False, "real": True, "base": str(base),
+                "prompts": sorted({m["prompt"] for _, m in pairs}), "query": query, "seed": args.seed, **stats,
+                "files": {f.name: sha256(f) for f in sorted(d.iterdir()) if f.suffix in (".parquet", ".jinja")}}
+    (d / "manifest.json").write_text(json.dumps(manifest, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
+    report = {"query": query, "seed": args.seed, "inputs": inputs, "blocked_13grams": n_blocked,
+              "blocked_13grams_with_block_jsonl": len(blocked), "groups_in_file": groups, "editions": editions,
+              "draw": draw, "identity": identity, "sets": {args.name: stats}, "ratios": ratio_quantiles(pairs),
+              "classify_targets": dict(collections.Counter(t["model"] for t in targets))}
+    (out / "report.json").write_text(json.dumps(report, indent=1, ensure_ascii=False, default=str) + "\n",
+                                     encoding="utf-8")
+    (out / "report.md").write_text(extend_report_md(report, args.name), encoding="utf-8")
+    print(f"SET {args.name} {json.dumps(stats['train'])}", flush=True)
+    print(f"IDENTITY {json.dumps(identity)}", flush=True)
+
+
+def check_base(args):
+    """The examples of --data that are not --source's are --base's, in its order and byte for byte (sha256 per example
+    and over all), and --data's eval files and template are --base's bytes (arm RE: R2's set in RE)"""
+    import pyarrow.parquet as pq
+
+    base, data = Path(args.base), Path(args.data)
+    sources = pq.read_table(data / "train-meta.parquet", columns=["source"]).column("source").to_pylist()
+    msgs = pq.read_table(data / "train.parquet").column("messages").to_pylist()
+    if len(sources) != len(msgs):
+        raise SystemExit(f"{data}: {len(msgs)} examples, {len(sources)} meta rows")
+    mine = [m for m, s in zip(msgs, sources) if s != args.source]
+    theirs = pq.read_table(base / "train.parquet").column("messages").to_pylist()
+    digest = {k: [hashlib.sha256(json.dumps(m, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+                  for m in v] for k, v in (("base", theirs), ("data", mine))}
+    files = {f: (sha256(base / f), sha256(data / f)) for f in ("eval.parquet", "eval-meta.parquet", "template.jinja")}
+    out = {"base_examples": len(theirs), "examples_not_" + args.source: len(mine), "added": len(msgs) - len(mine),
+           "same_in_order": digest["base"] == digest["data"],
+           "same_as_multiset": collections.Counter(digest["base"]) == collections.Counter(digest["data"]),
+           "digest_base": rows_digest(theirs), "digest_data": rows_digest(mine),
+           "files_equal": {f: a == b for f, (a, b) in files.items()}}
+    print("CHECK_BASE " + json.dumps(out), flush=True)
+    if not out["same_in_order"] or not all(out["files_equal"].values()):
+        raise SystemExit(f"{data}: not {base}'s examples and files")
+
+
+def extend_report_md(report, name):
+    s = report["sets"][name]
+    t = s["train"]
+    e, dr, idn = report["editions"], report["draw"], report["identity"]
+    lines = ["# Trainingsdata van arm RE (sft_build.py extend)", "",
+             f"De set `{report['inputs']['base']['path']}` ongewijzigd, plus hoogstens {dr['per_book']} paren per Engels "
+             f"boek uit `{report['inputs']['books']['path']}` (sha256 `{report['inputs']['books']['sha256']}`), in "
+             f"TranslateGemma's eigen prompt (`{report['query']['prompt']}`), op plaatsen getrokken met seed "
+             f"`{report['seed']}`. Geblokkeerde 13-grammen: {_n(report['blocked_13grams'])} van de evaluatiesets, "
+             f"{_n(report['blocked_13grams_with_block_jsonl'])} met de blinde passages.", "",
+             "## De boeken", "", f"Groepen in het bestand: {json.dumps(report['groups_in_file'])}.", "",
+             "Rijen van `en_orig` die afvallen (de eerste controle die faalt; `passes` is die van de inventaris: harde "
+             "controles, lengtegrens, uitlijning, geen herhaald id of Engels):", "",
+             "| controle | rijen |", "|---|---:|"]
+    lines += [f"| {k} | {_n(v)} |" for k, v in e["first_failed"].items()]
+    lines += ["", f"Van de rijen met `passes`, los van de volgorde: {json.dumps(e['alone_after_passes'])}.", "",
+              f"Engelse boeken {_n(e['english_books'])}, met rijen over {_n(e['english_books_with_rows'])} "
+              f"(edities per boek: {json.dumps(e['editions'])}); rijen over in de gekozen edities "
+              f"{_n(e['rows_kept'])}; per boek {json.dumps(e['rows_per_book'])}.", "",
+              f"Trekking: {dr['per_book']} per boek, getrokken {_n(dr['drawn'])} uit {_n(dr['books'])} boeken; bekeken "
+              f"{_n(dr.get('looked_at', 0))}, 13-gram {_n(dr.get('eval_13gram', 0))}, te lang "
+              f"{_n(dr.get('too_long', 0))}; boeken met minder dan {dr['per_book']}: {_n(dr['books_short'])} "
+              f"({_n(dr['short_rows'])} paren).", "",
+              "## De voorbeelden van de basisset", "",
+              f"{_n(idn['base_examples'])} voorbeelden, in dezelfde volgorde en byte voor byte gelijk (sha256 over de "
+              f"voorbeelden: basis `{idn['base_digest']}`, in de nieuwe set `{idn['digest_in_new_set']}`; de meta ook "
+              f"gelijk). Gekopieerd: " + ", ".join(f"`{f}` (`{h[:16]}…`)" for f, h in idn["files_copied"].items()) + ".",
+              "", "## Set", "",
+              "| split | voorbeelden | bt | bt_context | real | tokens | verliestokens | max |",
+              "|---|---:|---:|---:|---:|---:|---:|---:|"]
+    for split in ("train", "eval"):
+        p = s[split]
+        k = p["kinds"]
+        lines.append(f"| {split} | {_n(p['examples'])} | {_n(k.get('bt', 0))} | {_n(k.get('bt_context', 0))} | "
+                     f"{_n(k.get('real', 0))} | {_n(p['tokens'])} | {_n(p['loss_tokens'])} | {_n(p['max_tokens'])} |")
+    groups = collections.defaultdict(lambda: [0, 0, 0])
+    for source, n in t["sources"].items():
+        g = "books_en" if source == B1_SOURCE else "europarl_gv" if source in ("europarl", "globalvoices") else "bt"
+        groups[g][0] += n
+        groups[g][1] += t["tokens_by_source"][source]
+        groups[g][2] += t["loss_tokens_by_source"][source]
+    lines += ["", "## Per groep en per bron (train; tokens: prompt + doel, doeltokens: het Nederlands + `<end_of_turn>\\n`)",
+              "", "| groep / bron | voorbeelden | aandeel | tokens | aandeel | doeltokens | aandeel | doeltokens per voorbeeld |",
+              "|---|---:|---:|---:|---:|---:|---:|---:|"]
+    for g, (n, tok, loss) in sorted(groups.items()):
+        lines.append(f"| **{g}** | {_n(n)} | {n / t['examples']:.1%} | {_n(tok)} | {tok / t['tokens']:.1%} | "
+                     f"{_n(loss)} | {loss / t['loss_tokens']:.1%} | {loss / n:.0f} |")
+    for source, n in t["sources"].items():
+        tok, loss = t["tokens_by_source"][source], t["loss_tokens_by_source"][source]
+        lines.append(f"| {source} | {_n(n)} | {n / t['examples']:.1%} | {_n(tok)} | {tok / t['tokens']:.1%} | "
+                     f"{_n(loss)} | {loss / t['loss_tokens']:.1%} | {loss / n:.0f} |")
+    lines += ["", "## Woorden NL / woorden EN per voorbeeld (train)", "",
+              "| deel | n | p5 | p10 | p25 | p50 | p75 | p90 | p95 |", "|---|---:|" + "---:|" * 7]
+    lines += [f"| {k} | {_n(v['n'])} | " + " | ".join(f"{v[f'p{q}']:.3f}" for q in (5, 10, 25, 50, 75, 90, 95)) + " |"
+              for k, v in report["ratios"].items()]
+    lines += ["", f"Doelteksten voor de classifier vóór de training (`classify-targets.parquet`, boeken uit de eerste "
+              f"{RE_CLASSIFY_RANK} per boek): {json.dumps(report['classify_targets'])}.", ""]
+    return "\n".join(lines)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Training data of the fine-tune's arms")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1241,7 +1605,23 @@ def main(argv=None):
     c = sub.add_parser("check")
     c.add_argument("--data", required=True)
     c.add_argument("--tokenizer", required=True)
+    x = sub.add_parser("extend")
+    x.add_argument("--base", required=True, help="a built set's directory (R2's: .../r2/R2), taken unchanged")
+    x.add_argument("--books", required=True, help="b1-selected.parquet of the -b1- inventory")
+    x.add_argument("--per-book", type=int, required=True, help="at most this many pairs per English book")
+    x.add_argument("--evalsets", required=True)
+    x.add_argument("--block-jsonl", default=None, help="JSONL with a source per line (blind100.jsonl): 13-grams blocked")
+    x.add_argument("--tokenizer", required=True)
+    x.add_argument("--name", required=True, help="the new set's name (RE)")
+    x.add_argument("--seed", default=SEED)
+    x.add_argument("--out", required=True)
+    y = sub.add_parser("check-base")
+    y.add_argument("--base", required=True, help="the base set's directory (R2's)")
+    y.add_argument("--data", required=True, help="the extended set's directory (RE)")
+    y.add_argument("--source", default=B1_SOURCE, help="the source of the added examples")
     args = parser.parse_args(argv)
+    if args.command == "extend" and args.per_book < 1:
+        parser.error("--per-book is a positive number")
     if args.command == "build" and args.bt not in ("auto", "all") and not re.fullmatch(r"[1-9]\d*", args.bt):
         parser.error("--bt is 'auto', 'all' or a positive number")
     if args.command == "build" and args.real_all and args.real_share != REAL_SHARE:
@@ -1265,7 +1645,7 @@ def main(argv=None):
             or not args.real or not args.real_all or args.real_without_qe):
         parser.error("--real2, --real2-from and a positive --real2-per-real go together, with --real and --real-all, "
                      "not with --real-without-qe")
-    {"build": build, "check": check}[args.command](args)
+    {"build": build, "check": check, "extend": extend, "check-base": check_base}[args.command](args)
 
 
 if __name__ == "__main__":

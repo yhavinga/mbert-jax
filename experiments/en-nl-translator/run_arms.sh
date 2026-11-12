@@ -73,8 +73,18 @@
 #   bash run_arms.sh rlbuild / rlcheck           as rb2build / rb2check, --real-qe-unbounded --real-align-max
 #                                                --bt-per-real 4 --bt-match-set (R2's set) --bt-match-bins 5, set RL,
 #                                                to $S/data/rl-b5/                   (jobs rl_build_$TAG, rl_check_$TAG)
+# Arm RE (protocol §9, amendment of 12 Nov ~18:20; translator_sft_re_run.sh) runs the same stages with ARMS_ROOT=$S/re
+# SETS=$S/data/re-k<K> RUN_PREFIX=arm27b_re ARMS=RE. R2's set ($S/data/r2/R2) unchanged, plus at most K pairs per English
+# book of English novels with their human Dutch translation (the -b1- rows of nedd_x_dataset, $B1; K=20 or 10, RE_K):
+#   RE_K=20 bash run_arms.sh rebuild             a worker (CPU, nice, ionice): sft_build.py extend, to $S/data/re-k20/
+#                                                                                              (job re_build_k20_$TAG)
+#   RE_K=20 bash run_arms.sh recheck             a worker (CPU): sft_build.py check, and check-base (R2's examples in RE
+#                                                by their sha256, the eval files)               (job re_check_k20_$TAG)
+#   RE_K=20 bash run_arms.sh reclassify          a worker (its TPU): naturalness.py classify on the set's Dutch targets
+#                                                (classify-targets.parquet) and on Gemma 4's en->nl translations with the
+#                                                base model's ($G4), to $A/classify/                (job re_classify_$TAG)
 set -euo pipefail
-STAGE=${1:?a stage: setup, data, train, adapter, scale, translate, score, summary, texts, classifier, classify, pll, blind, report, report-scaled, r2data, r2qe, r2build, r2check, rbdata, rbqe, rbbuild, rbcheck, rbedges, rb2build, rb2check, rb3build, rb3check, rbrbuild, rbrcheck, rlbuild, rlcheck}
+STAGE=${1:?a stage: setup, data, train, adapter, scale, translate, score, summary, texts, classifier, classify, pll, blind, report, report-scaled, r2data, r2qe, r2build, r2check, rbdata, rbqe, rbbuild, rbcheck, rbedges, rb2build, rb2check, rb3build, rb3check, rbrbuild, rbrcheck, rlbuild, rlcheck, rebuild, recheck, reclassify}
 S=gs://t5-dutch-english-usc2/mbert/translator/sft
 A=${ARMS_ROOT:-$S/arms}
 BASE_A=$S/arms                       # the base model on kind x, the extra sets, the classifier (the arms' chain)
@@ -98,6 +108,9 @@ RL_BT_PER_REAL=4                     # 4 back-translations per book pair, or as 
 # the bins of the match at the quantiles of R2's real examples' word ratio: 5 (the quintiles; protocol §9, addendum
 # of 12 Nov ~16:00: 10 held 7,267 back-translations, 37 : 63 to the books); 10 (the deciles) stays an option
 RL_MATCH_BINS=${RL_MATCH_BINS:-5}
+B1=$S/data/books-b1/b1-selected.parquet  # arm RE's books: the -b1- inventory of 12 Nov (books-b1-inventory.md)
+RE_K=${RE_K:-20}                     # arm RE: at most this many pairs per English book (protocol: 20, or 10 after 05:00)
+G4=$S/gemma4-en-nl                   # Gemma 4 31B as en->nl translator: its translations of WMT24++ (960) and FLAN (1,000)
 case $STAGE in
   rb2*) REAL=$S/data/rb-real; XSET=RB2; XOUT=$S/data/rb2; XJOB=rb2
         XREAL="--real-all --real-qe-max $RB2_BOOKS_QE_MAX --bt-per-real $RB2_BT_PER_REAL" ;;
@@ -172,8 +185,8 @@ data_dir() {  # data_dir DATA: the E of run_baseline.sh (its data in $E/data/)
 
 check_model_data() {
   case "$MODEL/$DATA" in
-    base/x|B/four|B/x|N/four|N/x|Ninstr/instr|N50/four|N50/x|N25/four|N25/x|N75/four|N75/x|R2/four|R2/x|RB/four|RB/x|RB2/four|RB2/x|RB3/four|RB3/x|RBR/four|RBR/x|RL/four|RL/x) ;;
-    *) echo "MODEL/DATA $MODEL/$DATA is not one of the chains': base/x, B/four, B/x, N/four, N/x, Ninstr/instr, N50/four, N50/x, N25/four, N25/x, N75/four, N75/x, R2/four, R2/x, RB/four, RB/x, RB2/four, RB2/x, RB3/four, RB3/x, RBR/four, RBR/x, RL/four, RL/x"; exit 1 ;;
+    base/x|B/four|B/x|N/four|N/x|Ninstr/instr|N50/four|N50/x|N25/four|N25/x|N75/four|N75/x|R2/four|R2/x|RB/four|RB/x|RB2/four|RB2/x|RB3/four|RB3/x|RBR/four|RBR/x|RL/four|RL/x|RE/four|RE/x) ;;
+    *) echo "MODEL/DATA $MODEL/$DATA is not one of the chains': base/x, B/four, B/x, N/four, N/x, Ninstr/instr, N50/four, N50/x, N25/four, N25/x, N75/four, N75/x, R2/four, R2/x, RB/four, RB/x, RB2/four, RB2/x, RB3/four, RB3/x, RBR/four, RBR/x, RL/four, RL/x, RE/four, RE/x"; exit 1 ;;
   esac
 }
 
@@ -265,7 +278,7 @@ translate)
   tpu_free
   case $MODEL in
     base) ADAPTER=; PROMPT= ;;
-    B|N|N50|N25|N75|R2|RB|RB2|RB3|RBR|RL) ADAPTER=$A/$MODEL; PROMPT= ;;
+    B|N|N50|N25|N75|R2|RB|RB2|RB3|RBR|RL|RE) ADAPTER=$A/$MODEL; PROMPT= ;;
     Ninstr) ADAPTER=$A/N; PROMPT=chat-v1-tag-conventional ;;
   esac
   if [ -n "$ADAPTER" ]; then
@@ -335,6 +348,7 @@ summary)
     RB2) label="TranslateGemma 27B + LoRA RB2 (rb2: BT : boeken 80 : 20, BT QE ≤ 5 en lengtegrens, boeken QE ≤ 7,5; rank uit de geheugentest; protocol en-nl-sft §9)" ;;
     RB3) label="TranslateGemma 27B + LoRA RB3 (rb3: BT : boeken 50 : 50, BT QE ≤ 5 en lengtegrens, boeken QE ≤ 7,5; rank 64; protocol en-nl-sft §9)" ;;
     RL) label="TranslateGemma 27B + LoRA RL (rl: BT hersampled naar de woordverhouding van de echte paren van R2, QE ≤ 5 en lengtegrens; boeken zonder QE-grens, met uitlijncontrole; rank 64; protocol en-nl-sft §9)" ;;
+    RE) label="TranslateGemma 27B + LoRA RE (${SETS##*/}: de set van R2 ongewijzigd plus Engelse romans met hun menselijke Nederlandse vertaling, hoogstens ${SETS##*-k} per Engels boek, zonder QE-grens; rank 64; protocol en-nl-sft §9)" ;;
     RBR) label="TranslateGemma 27B + LoRA RBR (rbr: BT : boeken : Europarl/Global Voices van R2 60 : 20 : 20, BT en R2 QE ≤ 5 en lengtegrens, boeken QE ≤ 7,5; rank 64; protocol en-nl-sft §9)" ;;
     *) label="TranslateGemma 27B + LoRA $MODEL (arms-v2, QE ≤ 7,5; protocol en-nl-sft)" ;;
   esac
@@ -352,7 +366,7 @@ texts)
 gsutil -q cp $E/baseline-tg27b/translations.parquet $T/base-four.parquet
 gsutil -m -q cp '$(model_dir base x)/pairs/pairs-w*.parquet' $T/base-x/"
             wmt="$wmt 'base=$T/base-four.parquet'"; flan="$flan 'base=$T/base-x/pairs-w*.parquet'" ;;
-      B|N|N50|N25|N75|R2|RB|RB2|RB3|RBR|RL) fetch="$fetch
+      B|N|N50|N25|N75|R2|RB|RB2|RB3|RBR|RL|RE) fetch="$fetch
 mkdir -p $T/$m-x
 gsutil -q cp $(model_dir "$m" four)/translations.parquet $T/$m-four.parquet
 gsutil -m -q cp '$(model_dir "$m" x)/pairs/pairs-w*.parquet' $T/$m-x/"
@@ -704,6 +718,98 @@ JAX_PLATFORMS=cpu TOKENIZERS_PARALLELISM=false HF_HUB_OFFLINE=1 nice -n 19 ionic
 gsutil -q cp $D/check.txt $OUTSET/check.txt
 EOF
   detach "${XJOB}_check_$TAG" bash ~/job_body_${XJOB}_check_$TAG.sh
+  ;;
+rebuild)
+  # arm RE's set: CPU and the bucket only (nice, ionice), the TPU may run someone else's job meanwhile
+  OUTSET=$S/data/re-k$RE_K
+  ! gsutil -q stat "$OUTSET/report.json" || { echo "$OUTSET has a report.json: a new set takes a new place"; exit 1; }
+  gsutil -q stat "$R2_SET/R2/train-meta.parquet" || { echo "no $R2_SET/R2/train-meta.parquet (R2's set)"; exit 1; }
+  IN=$SHM/re/in-k$RE_K
+  R=$SHM/re/base-k$RE_K-$TAG
+  O=$SHM/re/build-k$RE_K-$TAG
+  cat > ~/job_body_re_build_k${RE_K}_$TAG.sh <<EOF
+set -euo pipefail
+export OMP_NUM_THREADS=8 TOKENIZERS_PARALLELISM=true
+mkdir -p $IN $R
+[ -s $IN/b1-selected.parquet ] || gsutil -q cp $B1 $IN/
+[ -s $IN/evalsets.parquet ] || gsutil -q cp $E/data/evalsets.parquet $IN/
+gsutil -q cp $BLIND $R/
+gsutil -m -q cp $R2_SET/R2/train.parquet $R2_SET/R2/train-meta.parquet $R2_SET/R2/eval.parquet $R2_SET/R2/eval-meta.parquet $R2_SET/R2/template.jinja $R/
+[ ! -e $O ] || { echo "$O exists"; exit 1; }
+nice -n 19 ionice -c3 $PY -I -u $CODE/sft_build.py extend --base $R --books $IN/b1-selected.parquet --per-book $RE_K --evalsets $IN/evalsets.parquet --block-jsonl $R/blind100.jsonl --tokenizer /dev/shm/flan_nl/tokenizer-27b --name RE --out $O
+gsutil -m -q rsync -r $O $OUTSET
+echo "BUILT: $OUTSET"
+EOF
+  detach "re_build_k${RE_K}_$TAG" bash ~/job_body_re_build_k${RE_K}_$TAG.sh
+  ;;
+recheck)
+  OUTSET=$S/data/re-k$RE_K
+  D=$SHM/re/check-k$RE_K-$TAG
+  cat > ~/job_body_re_check_k${RE_K}_$TAG.sh <<EOF
+set -euo pipefail
+mkdir -p $D/RE $D/r2
+gsutil -m -q rsync -r $OUTSET/RE $D/RE
+gsutil -m -q cp $R2_SET/R2/train.parquet $R2_SET/R2/eval.parquet $R2_SET/R2/eval-meta.parquet $R2_SET/R2/template.jinja $D/r2/
+JAX_PLATFORMS=cpu TOKENIZERS_PARALLELISM=false HF_HUB_OFFLINE=1 nice -n 19 ionice -c3 $SFT_PY -u $CODE/sft_build.py check --data $D/RE --tokenizer /dev/shm/flan_nl/tokenizer-27b | tee $D/check.txt
+nice -n 19 ionice -c3 $PY -I -u $CODE/sft_build.py check-base --base $D/r2 --data $D/RE | tee -a $D/check.txt
+gsutil -q cp $D/check.txt $OUTSET/check.txt
+EOF
+  detach "re_check_k${RE_K}_$TAG" bash ~/job_body_re_check_k${RE_K}_$TAG.sh
+  ;;
+reclassify)
+  # the classifier of 10 Nov (protocol §4.2.1, not trained again) on RE's Dutch targets before the training, and on
+  # Gemma 4's translations beside the base model's (rule (b) for Gemma 4: the same pooled share as the arms')
+  tpu_free
+  dumb_ready
+  X=$W_DIR/reclassify-$TAG
+  cat > ~/job_body_re_classify_$TAG.sh <<EOF
+set -euo pipefail
+$ONE_HOST
+export JAX_COMPILATION_CACHE_DIR=$W_DIR/jax_cache_s PYTHONPATH=src
+cd $DUMB
+mkdir -p $X/model
+gsutil -m -q cp $BASE_A/naturalness/classifier/params.pkl $BASE_A/naturalness/classifier/config.json $BASE_A/naturalness/classifier/results.json $X/model/
+gsutil -q cp $S/data/re-k$RE_K/classify-targets.parquet $X/targets.parquet
+gsutil -q cp $G4/texts.parquet $X/g4-texts.parquet
+gsutil -q cp $BASE_A/naturalness/texts.parquet $X/arms-texts.parquet
+$PY -I - $X/g4-texts.parquet $X/arms-texts.parquet $X/g4-base-texts.parquet <<'PY'
+import collections, sys
+import pyarrow as pa, pyarrow.parquet as pq
+g4 = pq.read_table(sys.argv[1]).to_pylist()
+base = [r for r in pq.read_table(sys.argv[2]).to_pylist() if r["model"] == "base"]
+keys = lambda rows: sorted((r["set"], r["id"]) for r in rows)
+if {r["model"] for r in g4} != {"G4"} or keys(g4) != keys(base):
+    raise SystemExit("Gemma 4's texts are not the base model's sets and ids")
+pq.write_table(pa.Table.from_pylist(g4 + base), sys.argv[3])
+print("TEXTS " + str(dict(collections.Counter(r["model"] + "/" + r["set"] for r in g4 + base))), flush=True)
+PY
+$DPY -u $CODE/naturalness.py classify --dumb-code $DUMB --model $X/model --texts $X/targets.parquet --out $X/targets-predictions.parquet
+$DPY -u $CODE/naturalness.py classify --dumb-code $DUMB --model $X/model --texts $X/g4-base-texts.parquet --out $X/g4-predictions.parquet
+$PY -I - $X $CODE <<'PY'
+import collections, json, sys
+from pathlib import Path
+import pyarrow.parquet as pq
+x = Path(sys.argv[1])
+sys.path.insert(0, sys.argv[2])
+import armeval
+accuracy = json.loads((x / "model" / "results.json").read_text())["test_accuracy"]
+targets = collections.defaultdict(lambda: collections.defaultdict(list))
+for r in pq.read_table(x / "targets-predictions.parquet").to_pylist():
+    for key in ("all", "set/" + r["set"]):
+        targets[r["model"]][key].append(r["p_original"] >= 0.5)
+targets = {m: {k: {"share": round(sum(v) / len(v), 4), "n": len(v)} for k, v in sorted(d.items())} for m, d in sorted(targets.items())}
+shares = armeval.classifier_shares(pq.read_table(x / "g4-predictions.parquet").to_pylist())
+delta = shares["G4"]["pooled"] - shares["base"]["pooled"]
+gemma4 = {"shares": shares, "delta": delta, "rule_b": armeval.RULE_B, "holds": delta >= armeval.RULE_B - armeval.TOLERANCE}
+out = {"classifier_accuracy": accuracy, "targets": targets, "gemma4": gemma4}
+(x / "summary.json").write_text(json.dumps(out, indent=1) + "\n")
+print("RE_CLASSIFY targets " + json.dumps({m: d["all"] for m, d in targets.items()}), flush=True)
+print("RE_CLASSIFY gemma4 " + json.dumps({"G4": round(shares["G4"]["pooled"], 4), "base": round(shares["base"]["pooled"], 4), "delta": round(delta, 4), "holds": gemma4["holds"], "accuracy": accuracy}), flush=True)
+PY
+gsutil -m -q cp $X/targets-predictions.parquet $X/g4-base-texts.parquet $X/g4-predictions.parquet $X/summary.json $A/classify/
+echo "RECLASSIFIED: $A/classify/summary.json"
+EOF
+  detach "re_classify_$TAG" bash ~/job_body_re_classify_$TAG.sh
   ;;
 *)
   echo "unknown stage $STAGE"

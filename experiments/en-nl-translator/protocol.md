@@ -939,3 +939,124 @@ RBR-instellingen: lora_rank=64 lora_alpha=32 learning_rate=1e-5
   ~17:00 vrij. Hij start de training van een arm alleen als die arm met evaluatie naar schatting vóór 13 nov 16:30 CET
   klaar is (RB3 ~2,5 uur, RBR ~3,5 uur gerekend vanaf de start van de training); anders slaat hij de arm over met een
   logregel. Verwacht: de nachtketen klaar ~19:15 op 12 nov, RB3 klaar ~21:30, RBR ~00:30.
+
+**Amendement 12 nov 2026 ~15:20 CET: arm RL, BT-paren hersampled naar de lengteverhouding van menselijke vertalingen,
+en boeken zonder QE-grens** [besluit Yeb 12 nov ~14:45; de uitwerking (methode en bakken van de trekking, de
+uitlijncontrole en haar grens) door de subagent RL; vastgelegd vóór de bouw van de set en vóór de eerste trainingsstap
+van RL; RB2, R2, RB3 en RBR blijven zoals ze zijn]. Aanleiding: de BT-paren hebben synthetisch Engels dat omslachtiger is
+dan het Nederlandse origineel: mediaan 0,967 Nederlandse woorden per Engels woord in de 208.726 BT-voorbeelden van RB en
+RB2, tegen 1,0625 in de echte voorbeelden van de trainingsset van R2 (Europarl-direct 1,065, Global Voices 1,050)
+[gemeten 12 nov]. Elke arm leert daardoor comprimeren. RB2 is de beste arm tot nu toe (MetricX-24-QE +1,131 / +0,555 /
++0,684 op WMT24++ (960) / FLORES / NTREX), maar zijn uitvoer heeft nog steeds ~1,00 woord per bronwoord. Eén nieuwe arm,
+**RL**, op mbert-mix na de vervolgketen van 12/13 nov (RB3, RBR).
+
+- **Trainingsdata** (`$S/data/rl/RL/`; `sft_build.py build --bt all --qe-max 5 --len-factor 1.3333 --block-jsonl
+  blind100.jsonl --real real-qe.parquet --real-all --real-qe-unbounded --real-align-max 4.39 --bt-per-real 4
+  --bt-match-set r2-set --bt-match-bins 10 --sets RL=none+real`; keten `run_arms.sh rlbuild`, `rlcheck`; nieuwe code
+  `1db9957`, met tests):
+  1. **Boeken zonder QE-grens** [besluit Yeb: "move towards no QE filter on the books"]: alle boekparen van RB (kandidaten
+     en QE in `$S/data/rb-real/`, zonder de vijf auteurs die niet in het Nederlands schreven), met de harde controles,
+     de lengtegrens van R2 (factor 4/3 rond de mediane tekenverhouding van de boeken, 1,0326: 0,7745–1,3768), geen 13-gram
+     met een evaluatieset of blinde passage, ≤ 2.048 tokens en TranslateGemma's eigen prompt; **geen MetricX-24-QE-grens**
+     (de QE wordt gelezen en gerapporteerd, niet gebruikt), en in plaats daarvan **de uitlijncontrole** van punt 2.
+  2. **Uitlijncontrole** [keuze, binnen het besluit "vang de uitlijnfouten op met een structurele controle"]. De
+     uitlijnfouten bij QE 23–25 zijn verschoven passages: het Nederlands begint met een of twee zinnen die in het Engels
+     ontbreken, en vaak eindigt het Engels met een zin die in het Nederlands ontbreekt; de lengteverhouding van het geheel
+     blijft gewoon [gelezen: de zes paren met QE 23–25].
+     - **Zinnen**: per regel geknipt na `.`, `!`, `?` of `…` (met afsluitende aanhalingstekens, haakjes, `_` of `*`),
+       gevolgd door witruimte en een hoofdletter, een cijfer of een openend teken; niet na een afkorting (Mr, Mrs, Ms, Dr,
+       St, Prof, Jr, Sr, Lt, Col, Gen, Capt, Rev, vs, mevr, dhr, drs, ir, ing, bijv, nr, ca, jhr, mgr), een initiaal of
+       een los getal (het nummer van een noot).
+     - **Uitlijning naar lengte in tekens** volgens Gale en Church (1993, "A Program for Aligning Sentences in Bilingual
+       Corpora", *Computational Linguistics* 19(1)): paren van 1-1, 1-0, 0-1, 2-1, 1-2 en 2-2 zinnen met hun
+       a-priorikansen 0,89 / 0,0099 (1-0 en 0-1 samen, gelijk verdeeld) / 0,089 (2-1 en 1-2 samen, gelijk verdeeld) /
+       0,011 en de variantie 6,8 per teken; de verwachte verhouding is de mediane tekenverhouding van de bron (boeken
+       1,0326) in plaats van hun 1. Kosten van een paar zinnen = −log a-priorikans − log P(lengteverschil); de
+       goedkoopste uitlijning door dynamisch programmeren (`sft_build.py`: `sentences`, `sentence_alignment`,
+       `align_edges`).
+     - **Maat**: het gemiddelde van de kosten van de eerste twee paren zinnen (begin) en van de laatste twee (eind).
+       **Een boekpaar valt af als begin of eind boven 4,39 ligt.**
+     - **Grens uit de verdeling** [keuze]: 4,39 is p98 (4,388) van die maat over de 11.942 boekparen met QE ≤ 7,5 die
+       door de harde controles komen (de boeken van RB2 vóór de lengtegrens): de controle neemt 2% van die paren weg.
+       Gekozen na het lezen van paren rond p95–p98 (met een eerdere versie van de zinsknipper, nog zonder de
+       afkortingen): daarboven vooral verschoven passages, eronder steeds meer correcte vertalingen die de vertaler
+       anders in zinnen knipte.
+     - **Getoetst** [gemeten 12 nov ~15:00 op w3 van mbert-mix, met de code van `1db9957`; tegengehouden / paren per
+       QE-band, van de 12.883 boekparen die door de harde controles komen]:
+
+       | MetricX-QE | ≤ 5 | 5–7,5 | 7,5–10 | 10–15 | 15–20 | 20–23 | 23–25 |
+       |---|---:|---:|---:|---:|---:|---:|---:|
+       | tegengehouden | 158 / 8.850 (1,8%) | 81 / 3.092 (2,6%) | 41 / 641 (6,4%) | 39 / 242 (16%) | 15 / 38 (39%) | 6 / 14 | **4 / 6** |
+
+       Van de zes met QE 23–25 houdt de controle de vier verschoven passages tegen (Mulisch `books:74768-137379-b1-950`,
+       Hermans `books:59396-137374-b1-217`, Koch `books:42430-137372-b1-223` en `…-533`); ze laat er twee door: Van Iperen
+       `books:74080-137392-b1-427` (begin en eind kloppen; in het Engels staat een zin twee keer) en Wieringa
+       `books:46782-137377-b1-212` (het Nederlands mist aan het begin "She had smiled and said" en heeft een losse regel
+       "cover: eve lesage back in the limelight."). Van tien willekeurig gelezen tegengehouden paren met QE 5–7,5 (seed
+       `en-nl-sft/rl/align-read`) zijn er vijf verschoven of aan een rand anders (het Nederlands begint of eindigt met een
+       zin die in het Engels ontbreekt, of omgekeerd; één daarvan een notenlijst met andere nummers), drie correct maar
+       anders in zinnen geknipt (een samengevoegde zin, een beletselteken gevolgd door een hoofdletter, dialoog met
+       gedachtestreepjes) en twee onduidelijk. De controle kost op de "meestal correcte" paren met QE 5–7,5 dus 2,6%,
+       waarvan ongeveer de helft zelf uitlijnfouten zijn.
+     - **Het aantal zinnen** (een van Yebs voorbeelden) gebruikt de controle niet: het verschil scheidt niet (≥ 2 zinnen
+       verschil bij QE ≤ 5 15,6%, bij 5–7,5 16,2%, bij 23–25 1 van de 6) [gemeten, met de eerdere zinsknipper]; de
+       uitlijning vangt samengevoegde en gesplitste zinnen op met 2-1 en 1-2. De lengtegrens van R2 blijft (punt 1).
+       **Opnieuw uitlijnen** op zinsniveau niet [keuze]: de uitlijning naar lengte ziet een verschoven rand, maar is in
+       literaire tekst (dialoog, samengevoegde zinnen) niet betrouwbaar genoeg om zinnen weg te knippen.
+     - Verwacht [schatting uit de meting]: 12.883 → lengtegrens 45 → uitlijning ~340 → **~12.520 boekparen** (RB2:
+       11.923).
+  3. **BT-paren hersampled naar de lengteverhouding van menselijke vertalingen** [besluit Yeb]: uit de BT-voorbeelden die
+     bij RB2 in aanmerking kwamen (de 208.726: §2.1 met QE ≤ 5, de lengtegrens van R2 en de contextvoorbeelden volgens
+     §2.2 zoals bij `--bt all`; een passage die met haar context getrokken wordt, blijft een contextvoorbeeld) een
+     steekproef waarvan de verdeling van het aantal Nederlandse woorden per Engels woord (split op witruimte, zoals in de
+     rapporten van de sets) die van de **echte voorbeelden van de trainingsset van R2** volgt
+     (`$S/data/r2/R2/train.parquet` en `train-meta.parquet`, soort `real`: 52.182, Europarl-direct 2004–2011 40.770 en
+     Global Voices 11.412; mediaan 1,0625), **niet** die van de evaluatiesets.
+     - **Methode** [keuze binnen het besluit]: histogram matching op log(woorden NL / woorden EN), met **10 bakken**
+       begrensd door de decielen van het doel (de buitenste twee open; gelijke grenzen vallen samen); bak b krijgt n × zijn
+       aandeel in het doel (grootste rest), **zonder teruglegging** uniform getrokken met de vaste seed
+       `en-nl-sft/0/bt-match/<b>` (`sft_build.py`: `match_target`, `bt_match_draw`). Een bak van het doel zonder
+       BT-voorbeelden is een fout.
+     - **Aantal** [besluit Yeb]: n = 4 × het aantal boekparen als elke bak dat toelaat; anders de grootste n waarvoor
+       elke bak zijn deel bevat.
+     - **Wat de verdeling toelaat** [gemeten: een proef met deze code op de 208.726 BT-voorbeelden van RB, met 4 × 12.520
+       = 50.080 gewenst]: **hoogstens 7.267** (0,58 per boekpaar). De bovenste deciel van het doel (meer dan 1,222 woord
+       per woord) heeft onder de BT-voorbeelden maar 728 voorbeelden (0,35%), en die begrenzen n. Ter vergelijking: met
+       20 bakken 4.486, met 5 bakken 12.763 (dan ligt de mediaan van de trekking op 1,057). Dus **zoveel als past: ~7.270
+       BT-voorbeelden**, BT : boeken ≈ **37 : 63** in voorbeelden, in plaats van 80 : 20 bij RB2 [gevolg van de regel
+       "anders zoveel als past"; hierbij gemeld].
+     - De getrokken verdeling in die proef (woorden NL / EN, p5 / p10 / p25 / p50 / p75 / p90 / p95): **0,886 / 0,927 /
+       1,000 / 1,0625 / 1,138 / 1,222 / 1,250**; doel 0,889 / 0,927 / 1,000 / 1,0625 / 1,141 / 1,222 / 1,278; alle
+       BT-voorbeelden 0,833 / 0,867 / 0,917 / 0,967 / 1,017 / 1,065 / 1,097. Bronnen in de trekking: Handelingen 46,7%,
+       FineWeb-2 25,7%, raad 14,6%, rechtspraak 7,8%, dpc 5,2% (bij RB2 38,5 / 25,9 / 20,1 / 7,7 / 7,8%): bronnen met
+       een hogere verhouding wegen zwaarder [gevolg; niet per bron gestratificeerd, want per bron gematcht past er
+       hoogstens ~1.900]. Contextvoorbeelden 621 (8,5%).
+     - Voorbehoud [eigen gevolgtrekking]: de echte voorbeelden van R2 zijn korter (mediaan 57 Engelse woorden, de
+       BT-voorbeelden 107), dus hun verhouding spreidt meer; het doel volgen in alle decielen neemt daardoor ook
+       BT-voorbeelden aan beide uiteinden (onderste deciel onder 0,927 woord per woord). In vijf gelezen BT-voorbeelden
+       uit de bovenste bak was het Engels beknopt maar volledig, op één ingekorte bijzin na.
+  4. Geen Europarl, Global Voices, FLAN-replay of instructiezin.
+- **Training** zoals RB2, RB3 en RBR: LoRA op attentie en MLP, **rank 64, alpha 32**, LR 1e-5 cosine naar 0 met 10%
+  warmup, **één epoch** (`step_limit`), sequenties van 2.048, 1 per chip, **16 chips** [besluit Yeb]. Uitvoer
+  `$S/rl/runs/arm27b_rl_RL/`, adapter `$S/rl/RL/`. De keten (`mbert-ops/scripts/translator_sft_rl_run.sh`) weigert te
+  starten als de regel hieronder niet letterlijk gelijk is aan de zijne, en controleert na de training rank en alpha in
+  `adapter.json`. Verwachte epoch [schatting, tokens per stap als bij RB2]: ~10 M tokens, ~330 stappen.
+
+RL-instellingen: lora_rank=64 lora_alpha=32 learning_rate=1e-5
+
+- **Evaluatie en beslisregel gelijk aan die van B, N, RB, RB2, R2, RB3 en RBR** (§4, §5; de amendementen R2 en RB),
+  tegen hetzelfde uitgangspunt (`$E/baseline-tg27b/scores.parquet`): de vier sets met dezelfde code (MetricX-24 met
+  referentie en QE, COMET-22; niet af, lus, Engels over, leeg); de extra sets van soort `x` (FLAN 1.000, blind 100,
+  in-domein 4.519 van `$S/arms/data/x/`, het basismodel uit `$S/arms/eval/base-x/`); de classifier van 10 nov
+  (`$S/arms/naturalness/classifier/`, 0,9575; niet opnieuw getraind) op de WMT24++ (960) en de 1.000 FLAN-rijen,
+  basismodel en RL in één classify-run; PLL en MTLD; het blinde pakket `$S/blind/RL/` (A/B met seed
+  `en-nl-sft/blind/ab/RL/<blind_id>`, sleutel alleen in de bucket); het rapport `$S/rl/report/report.md` met regel (a),
+  (b), de stand van (c) en, gerapporteerd zonder mee te beslissen, **de lengte van de uitvoer tegenover de menselijke
+  referentie** op de vier sets. (a) MetricX-24-QE(RL) − QE(basis) ≤ 0,20 op WMT24++ (960), FLORES-200 en NTREX-128
+  (grenzen 1,747 / 1,022 / 1,282); (b) aandeel "origineel" ≥ basis + 0,10; (c) de blinde beoordeling, alleen als (a) en
+  (b) gelden. RL helpt als (a), (b) en (c) alle drie gelden.
+- **Tijd** [keuze, voor de evaluatie van T2 op 13 nov ~17:00 op dezelfde VM]: de keten start pas na `EXIT 0` van de
+  vervolgketen (`translator_sft_followup_run.sh`; een andere `EXIT` is `FAILED`), neemt dan `final_eval_mix.lock`, en
+  start de training alleen als RL met evaluatie naar schatting vóór 13 nov 16:30 CET klaar is (150 min gerekend vanaf de
+  start van de training); anders slaat hij RL over met een logregel. Verwacht: de vervolgketen klaar ~00:15 op 13 nov
+  (met RBR) of ~21:20 (zonder), RL ~2 uur later.

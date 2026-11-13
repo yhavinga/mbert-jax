@@ -4,6 +4,8 @@
 #   bash setup_generic.sh            venv-fork, tokenizers, data
 #   bash setup_generic.sh release    also venv-025: MaxText 0.2.5 from PyPI, for translate_checks.py decode only
 #   bash setup_generic.sh venv       venv-fork and tokenizers only, without the pilot's data (bt_natural.py)
+# FORK_COMMIT=<sha> installs another commit of the fork into venv-fork-<first 9 of sha> instead (fork_fix_check.py);
+# without it, venv-fork at the commit below, as before.
 # venv-fork: MaxText from the fork yhavinga/maxtext, branch fix-nnx-decode-cache-abstract-init (upstream main d1c0d0afe
 # of 9 Nov with fix 1: the NNX decode cache made from shapes inside the init jit; upstream main has since 8 Oct the
 # sliding-window decode mask measured in true positions, commit 2bbe8006c), installed from git at a fixed commit with
@@ -15,7 +17,8 @@
 # 27B. Needs ~/.cache/huggingface/token (put there through stdin; never printed).
 set -euo pipefail
 SHM=/dev/shm/translate-generic
-FORK_COMMIT=2249474b93b971d8248520e3a09b94b4ce626ce4
+DEFAULT_FORK_COMMIT=2249474b93b971d8248520e3a09b94b4ce626ce4
+FORK_COMMIT=${FORK_COMMIT:-$DEFAULT_FORK_COMMIT}
 GEMMA4=google/gemma-4-31B-it
 GEMMA4_REV=842da3794eaa0b77d5f08bae87a17459d91ff475
 TG27=google/translategemma-27b-it
@@ -30,6 +33,7 @@ ZONE=$(curl -fs -H Metadata-Flavor:Google http://metadata.google.internal/comput
 case ${ZONE%-*} in
   us-east1) BUCKET=gs://t5-dutch-english-use1 ;;
   europe-west4) BUCKET=gs://t5-dutch-english ;;
+  us-central2) BUCKET=gs://t5-dutch-english-usc2 ;;  # mbert-corpus (run_bt_length_v4.sh: venv only)
   *) echo "no bucket for zone '$ZONE'"; exit 1 ;;
 esac
 mkdir -p "$SHM/data" ~/logs
@@ -52,6 +56,7 @@ if [ "${1:-}" = release ]; then
 fi
 
 V=$SHM/venv-fork
+[ "$FORK_COMMIT" = "$DEFAULT_FORK_COMMIT" ] || V=$SHM/venv-fork-${FORK_COMMIT:0:9}
 if [ ! -s "$V/done.txt" ]; then
   [ -x "$V/bin/python" ] || uv venv -q --python 3.12 "$V"
   SRC=$SHM/maxtext-src

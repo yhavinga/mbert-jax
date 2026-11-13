@@ -285,6 +285,20 @@ def patch_maxtext():
     return applied
 
 
+ENGINE_KEYS = {"model_name", "load_parameters_path", "ici_tensor_parallelism", "per_device_batch_size",
+               "max_prefill_predict_length", "max_target_length", "decode_sampling_strategy", "tokenizer_path"}
+
+
+def engine_overrides(model):
+    """The model's maxtext_overrides (a model MaxText has no config for, as MaxText config keys over the config of
+    maxtext_model); never one of the keys make_engine sets itself, which would hide what runs."""
+    overrides = dict(model.get("maxtext_overrides") or {})
+    clash = sorted(ENGINE_KEYS & set(overrides))
+    if clash:
+        raise ValueError(f"maxtext_overrides may not set {', '.join(clash)}: make_engine sets them")
+    return overrides
+
+
 def make_engine(args, shapes, chips=4):
     """MaxText's MaxEngine with the converted checkpoint: (engine, params)."""
     from maxtext.configs import pyconfig
@@ -303,7 +317,7 @@ def make_engine(args, shapes, chips=4):
         ici_fsdp_parallelism=1, ici_tensor_parallelism=chips, per_device_batch_size=shapes["slots"] / chips,
         max_prefill_predict_length=max_prefill, max_target_length=max_prefill + shapes["max_decode"],
         decode_sampling_strategy="greedy", return_log_prob=False, tokenizer_type="huggingface",
-        tokenizer_path=args.tokenizer)
+        tokenizer_path=args.tokenizer, **engine_overrides(MODELS[args.model]))
     engine = maxengine.MaxEngine(config)
     return engine, engine.load_params()
 

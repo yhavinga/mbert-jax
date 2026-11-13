@@ -289,23 +289,34 @@ def sample(args):
 
 def evalsegments(args):
     """The segments of the en->nl evaluation: four/ (the four sets as evalsets.py wrote them) and flan/ (the 1,000 FLAN
-    rows of armeval.py's kind x), each with evalsets.parquet, segments-w0.parquet (Gemma 4 token counts) and
-    classes.txt; and probe-en.parquet (one segment of class small per set)"""
+    rows of armeval.py's kind x), each with evalsets.parquet, segments-w0.parquet (token counts of --model's tokenizer,
+    every prompt checked against its chat turn) and classes.txt; and probe-en.parquet (one segment of class small per
+    set). With --blind also blind/: the 100 passages of the blind assessment (set blind of the same x), as
+    run_g4_blind.sh made them for the 31B."""
     import shutil
 
     import translate as tr
     from transformers import AutoTokenizer
 
+    model = getattr(args, "model", MODEL)
     count = Counter(args.tokenizer)
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
-    classes = tr.MODELS[MODEL]["length_classes"]
+    classes = tr.MODELS[model]["length_classes"]
     out = Path(args.out)
     four = read_rows(args.four)
-    flan = [r for r in read_rows(args.x) if r["set"] == "flan"]
+    x = read_rows(args.x)
+    flan = [r for r in x if r["set"] == "flan"]
     if len(flan) != 1000:
         raise SystemExit(f"{args.x}: {len(flan)} FLAN rows, expected 1,000")
+    parts = [("four", four), ("flan", flan)]
+    if getattr(args, "blind", False):
+        blind = [r for r in x if r["set"] == "blind"]
+        if len(blind) != 100 or len({r["id"] for r in blind}) != 100:
+            raise SystemExit(f"{args.x}: {len(blind)} rows of set blind ({len({r['id'] for r in blind})} ids), "
+                             f"expected 100")
+        parts.append(("blind", blind))
     probe = []
-    for name, rows in (("four", four), ("flan", flan)):
+    for name, rows in parts:
         d = out / name
         d.mkdir(parents=True, exist_ok=True)
         write_parquet(rows, d / "evalsets.parquet")
@@ -314,14 +325,14 @@ def evalsegments(args):
             shutil.copy(manifest, d / "manifest.json")
         segments = [{"id": r["id"], "text": r["source"], "tokens": n}
                     for r, n in zip(rows, count.many(r["source"] for r in rows))]
-        overhead = check_prompts(segments, tokenizer, "en", "nl", prompts=("natural-v1",))
+        overhead = check_prompts(segments, tokenizer, "en", "nl", prompts=("natural-v1",), model=model)
         write_parquet(segments, d / "segments-w0.parquet")
         present = collections.Counter(class_of(s["tokens"], classes) for s in segments)
         (d / "classes.txt").write_text(" ".join(c for c in classes if present.get(c)) + "\n")
         print(f"EVALSEGMENTS {json.dumps({'part': name, 'rows': len(rows), 'classes': dict(present), 'overhead': overhead})}",
               flush=True)
         by_id = {r["id"]: r for r in rows}
-        for set_name in sorted({r["set"] for r in rows}):
+        for set_name in sorted({r["set"] for r in rows} - {"blind"}):
             pick = next((s for s in segments if by_id[s["id"]]["set"] == set_name
                          and class_of(s["tokens"], classes) == "small"), None)
             if pick:
@@ -761,9 +772,11 @@ def evalcompare(args):
     result["flan"] = {"n": len(flan), "qe_mean": avg(flan_qe[r["id"]] for r in flan),
                       "qe_median": med(flan_qe[r["id"]] for r in flan), **armeval.counts(flan)}
     result["throughput"] = throughput(args.logs)
+    label = getattr(args, "label", None) or "Gemma 4 31B-it"
+    result["label"] = label
     Path(args.out).with_suffix(".json").write_text(json.dumps(result, indent=1, ensure_ascii=False, default=str))
-    L = ["# Gemma 4 31B-it als en→nl-vertaler (natural-v1) op de evaluatiesets van de vertaler", "",
-         f"Gemaakt {result['created']} door `bt_natural.py evalcompare` (branch `bt-natural`). Greedy; MetricX-24 hybrid "
+    L = [f"# {label} als en→nl-vertaler (natural-v1) op de evaluatiesets van de vertaler", "",
+         f"Gemaakt {result['created']} door `bt_natural.py evalcompare`. Greedy; MetricX-24 hybrid "
          "XXL (JAX-port), COMET-22 op de CPU; TranslateGemma 27B = het uitgangspunt van 10 nov (`baseline-tg27b`). "
          "Per cel gemiddelde / mediaan.", "",
          "| set | n | MetricX-QE Gemma 4 | TG | verschil | MetricX-ref Gemma 4 | TG | COMET-22 Gemma 4 | TG | "
@@ -817,7 +830,7 @@ def evalcompare(args):
         L += [f"### {k}. {group} — {r['set']} `{r['id']}`", "",
               f"MetricX-QE: TG {nl_num(b['metricx_qe'])} · Gemma 4 {nl_num(r['metricx_qe'])} · MetricX-ref: TG "
               f"{nl_num(b['metricx_ref'])} · Gemma 4 {nl_num(r['metricx_ref'])}", "",
-              "| bron (Engels) | TranslateGemma 27B | Gemma 4 31B natural-v1 | referentie |", "|---|---|---|---|",
+              f"| bron (Engels) | TranslateGemma 27B | {label} natural-v1 | referentie |", "|---|---|---|---|",
               f"| {cell(r['source'])} | {cell(b['hypothesis'])} | {cell(r['hypothesis'])} | {cell(r['reference'])} |", ""]
     Path(args.out).write_text("\n".join(L) + "\n")
     print(f"EVALCOMPARE {args.out}", flush=True)
@@ -902,11 +915,14 @@ def main(argv=None):
     p.add_argument("--four", required=True, help="evalsets.parquet of the four sets (evalsets.py fetch)")
     p.add_argument("--x", required=True, help="evalsets.parquet of armeval.py data --kind x (its set flan)")
     p.add_argument("--tokenizer", required=True)
+    p.add_argument("--model", default=MODEL, help="The model of translate_models.yml whose classes and chat turn count")
+    p.add_argument("--blind", action="store_true", help="Also blind/: the 100 passages of x's set blind")
     p.add_argument("--out", required=True)
     p = sub.add_parser("evalcompare")
     for name in ("--data", "--pairs", "--metricx", "--comet", "--flan-pairs", "--flan-metricx", "--base",
                  "--logs", "--out"):
         p.add_argument(name, required=True)
+    p.add_argument("--label", default=None, help="The model's name in the report (default: Gemma 4 31B-it)")
     p = sub.add_parser("refqe")
     p.add_argument("--evalsets", required=True, help="evalsets.parquet of the four sets")
     p.add_argument("--qe", required=True, help="metricx_qe.py score with --pair source:reference")

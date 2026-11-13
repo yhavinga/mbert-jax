@@ -263,3 +263,77 @@ models:
     length_classes: *translategemma_classes
     # xxlong (merge with en-nl-translator, never run for Gemma 4): 20 x 2048 slot-tokens, as many as xlong's 28 x 1472
     slots: {tiny: 192, small: 80, medium: 52, long: 36, xlong: 28, xxlong: 20}
+
+  # The smaller Gemma 4 instruction models (Yeb, 13 Nov: "the same trial for the smaller Gemma 4 models"), with the
+  # 31B's prompt, classes and stop tokens; run_g4_sizes.sh, converted per region by g4_sizes.py convert from the pinned
+  # revision. Tensor parallelism cannot exceed a layer's KV heads (MaxText refuses it), so one process takes as many
+  # chips as the fewest KV heads allow and the weights need: E2B (1 KV head), E4B (2) and 12B (1 global KV head) one
+  # v6e chip of 32 GB, 26B-A4B (2 global KV heads, 50 GB of weights) two. KV of a token in bf16, every layer counted
+  # with the full length (an upper bound: E2B/E4B share the KV of their last layers); weights of the text model only.
+  # Slots: about half of what is left of a chip, as margin for a first, unattended run.
+  # E2B: 4.6 G parameters (2.3 G of them per-layer embeddings), 9.2 GB; KV 28 x 1 x 256 x 4 + 7 x 1 x 512 x 4 = 43 KB.
+  gemma4-e2b:
+    maxtext_model: gemma4-e2b
+    hf_repo: google/gemma-4-E2B-it
+    hf_revision: 4adf15748de9e1a0097b6274cee9c15836c41c37
+    checkpoints:
+      europe-west4: gs://t5-dutch-english/mbert/translator/gemma4-sizes/ckpt/gemma-4-e2b-it-maxtext/0/items
+      us-east1: gs://t5-dutch-english-use1/mbert/translator/gemma4-sizes/ckpt/gemma-4-e2b-it-maxtext/0/items
+    chips: 1
+    eos_ids: [1, 106, 50]
+    prompt: chat-v1
+    # E2B's and E4B's own chat template closes no empty thought channel with thinking off (the 31B's does)
+    turn: {prefix: "<bos><|turn>user\n", suffix: "<turn|>\n<|turn>model\n", check: true}
+    length_classes: *translategemma_classes
+    slots: {tiny: 512, small: 256, medium: 160, long: 112, xlong: 88, xxlong: 64}
+
+  # E4B: 7.4 G parameters (2.8 G per-layer embeddings), 14.8 GB; KV 35 x 2 x 256 x 4 + 7 x 2 x 512 x 4 = 100 KB.
+  gemma4-e4b:
+    maxtext_model: gemma4-e4b
+    hf_repo: google/gemma-4-E4B-it
+    hf_revision: 4ecc2ba63bcac23ba4a767fc87025b1450f84c9c
+    checkpoints:
+      europe-west4: gs://t5-dutch-english/mbert/translator/gemma4-sizes/ckpt/gemma-4-e4b-it-maxtext/0/items
+      us-east1: gs://t5-dutch-english-use1/mbert/translator/gemma4-sizes/ckpt/gemma-4-e4b-it-maxtext/0/items
+    chips: 1
+    eos_ids: [1, 106, 50]
+    prompt: chat-v1
+    turn: {prefix: "<bos><|turn>user\n", suffix: "<turn|>\n<|turn>model\n", check: true}
+    length_classes: *translategemma_classes
+    slots: {tiny: 256, small: 112, medium: 72, long: 52, xlong: 40, xxlong: 28}
+
+  # 12B (Gemma4UnifiedForConditionalGeneration, no MaxText config of its own on the fork or upstream main of 13 Nov):
+  # its text model has exactly the 31B's tensors and decoder layer (transformers' gemma4_unified reuses Gemma 4's
+  # attention and MLP; no per-layer embeddings, no MoE), so MaxText's gemma4-31b with the 12B's sizes. 11.5 G
+  # parameters, 23 GB; KV 40 x 8 x 256 x 4 + 8 x 1 x 512 x 4 = 344 KB.
+  gemma4-12b:
+    maxtext_model: gemma4-31b
+    maxtext_overrides: {override_model_config: true, base_num_decoder_layers: 48, base_emb_dim: 3840,
+                        base_num_query_heads: 16, base_num_kv_heads: 8, base_mlp_dim: 15360, global_num_kv_heads: 1}
+    hf_repo: google/gemma-4-12B-it
+    hf_revision: 43c9d014b231474fa7212dbb48a762566c2b255d
+    checkpoints:
+      europe-west4: gs://t5-dutch-english/mbert/translator/gemma4-sizes/ckpt/gemma-4-12b-it-maxtext/0/items
+      us-east1: gs://t5-dutch-english-use1/mbert/translator/gemma4-sizes/ckpt/gemma-4-12b-it-maxtext/0/items
+    chips: 1
+    eos_ids: [1, 106, 50]
+    prompt: chat-v1
+    turn: {prefix: "<bos><|turn>user\n", suffix: "<turn|>\n<|turn>model\n<|channel>thought\n<channel|>", check: true}
+    length_classes: *translategemma_classes
+    slots: {tiny: 64, small: 28, medium: 16, long: 12, xlong: 10, xxlong: 7}
+
+  # 26B-A4B (MoE, 128 experts, 8 a token): 25.2 G parameters, 25.2 GB a chip on two; KV 25 x 8 x 256 x 4 + 5 x 2 x 512
+  # x 4 = 225 KB, 112 KB a chip.
+  gemma4-26b:
+    maxtext_model: gemma4-26b
+    hf_repo: google/gemma-4-26B-A4B-it
+    hf_revision: 4d7ae4984b7db7de8f8457170b3f1a419ee76d52
+    checkpoints:
+      europe-west4: gs://t5-dutch-english/mbert/translator/gemma4-sizes/ckpt/gemma-4-26b-it-maxtext/0/items
+      us-east1: gs://t5-dutch-english-use1/mbert/translator/gemma4-sizes/ckpt/gemma-4-26b-it-maxtext/0/items
+    chips: 2
+    eos_ids: [1, 106, 50]
+    prompt: chat-v1
+    turn: {prefix: "<bos><|turn>user\n", suffix: "<turn|>\n<|turn>model\n<|channel>thought\n<channel|>", check: true}
+    length_classes: *translategemma_classes
+    slots: {tiny: 128, small: 56, medium: 36, long: 26, xlong: 20, xxlong: 14}

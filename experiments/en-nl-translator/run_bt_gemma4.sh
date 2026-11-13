@@ -123,23 +123,25 @@ all)
       gsutil -q cp "$O/scripts/probe-ids.json" "$D/probe-ids.json"
       [ -s "$D/probe/units.json" ] || "$PY" -u "$C/bt_gemma4.py" probeplan --data "$D/hf" --pilot "$D/probe-ids.json" \
         --tokenizer "$TOK" --out "$D/probe"
-      ( HF_HUB_OFFLINE=0 "$PY" -c "import sys; sys.path.insert(0, '$C'); import metricx_qe as m; print(m.download('xxl', '$SHM/metricx'))" ) \
-        > ~/logs/bt4_metricx_dl.log 2>&1 &
       job 0 bt4_probe_0 work_loop "$D/probe" "$O/probe" "" & a=$!
       job 1 bt4_probe_1 work_loop "$D/probe" "$O/probe" "" & b=$!
       wait $a && ca=0 || ca=$?
       wait $b && cb=0 || cb=$?
       if [ $ca != 0 ] || [ $cb != 0 ]; then echo "probe failed: half 0 $ca, half 1 $cb"; exit 1; fi
+    fi
+    # The selection and MetricX once, on the VM that creates the lock first (a generation precondition, atomic)
+    if ! gsutil -q stat "$O/probe/report/qe.parquet" \
+        && hostname | gsutil -q -h "x-goog-if-generation-match:0" cp - "$O/probe/select.lock" 2> /dev/null; then
+      log "selection on this VM"
+      ( HF_HUB_OFFLINE=0 "$PY" -c "import sys; sys.path.insert(0, '$C'); import metricx_qe as m; print(m.download('xxl', '$SHM/metricx'))" ) \
+        > ~/logs/bt4_metricx_dl.log 2>&1 &
+      dl=$!
       mkdir -p "$D/probe/shards" "$D/probe/report"
       gsutil -m -q rsync -r "$O/probe/shards" "$D/probe/shards"
       "$PY" -u "$C/bt_gemma4.py" select --plan "$D/probe" --shards "$D/probe/shards" --out "$D/probe/report"
       gsutil -m -q cp "$D/probe/report/*" "$O/probe/report/"
-      log "selection in $O/probe/report/selection.md"
-    fi
-    if ! gsutil -q stat "$O/probe/report/qe.parquet"; then
-      log "MetricX-QE of the probe"
-      [ -s "$D/probe/report/compare.parquet" ] || { mkdir -p "$D/probe/shards" "$D/probe/report"; gsutil -m -q rsync -r "$O/probe/shards" "$D/probe/shards"; gsutil -m -q rsync -r "$O/probe/report" "$D/probe/report"; }
-      wait || true
+      log "selection in $O/probe/report/selection.md; MetricX-QE of the probe"
+      wait $dl || true
       HF_HUB_OFFLINE=0 "$PY" -c "import sys; sys.path.insert(0, '$C'); import metricx_qe as m; print(m.download('xxl', '$SHM/metricx'))" \
         >> ~/logs/bt4_metricx_dl.log 2>&1 || echo "MetricX download failed: ~/logs/bt4_metricx_dl.log"
       if job 0 bt4_probe_qe probe_qe; then

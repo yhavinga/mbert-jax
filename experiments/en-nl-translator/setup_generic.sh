@@ -30,6 +30,7 @@ ZONE=$(curl -fs -H Metadata-Flavor:Google http://metadata.google.internal/comput
 case ${ZONE%-*} in
   us-east1) BUCKET=gs://t5-dutch-english-use1 ;;
   europe-west4) BUCKET=gs://t5-dutch-english ;;
+  us-central2) BUCKET=gs://t5-dutch-english-usc2 ;;  # mbert-corpus (run_bt_length_v4.sh: venv only)
   *) echo "no bucket for zone '$ZONE'"; exit 1 ;;
 esac
 mkdir -p "$SHM/data" ~/logs

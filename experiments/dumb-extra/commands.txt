@@ -1,0 +1,79 @@
+# The evaluations of experiments/dumb-extra (protocol.md) on a v4-32 in us-central2-b, the region of the bucket: per
+# worker a single-host TPU of its own 4 chips. Nothing here creates a TPU: use a VM that exists and is idle (dumbx.sh
+# and blimp.sh refuse while a trainer, an eval or a fine-tune runs on it). A new VM only through training/tpu.py up.
+# Code: branch dumb-extra of github.com/yhavinga/mbert-jax at COMMIT. Scripts: $B (copies of experiments/dumb-extra/).
+COMMIT=ae114789bf2eae153e4e3bea579299a617dcd417
+B=gs://t5-dutch-english-usc2/mbert/dumb-extra/scripts
+M=gs://t5-dutch-english-usc2/mbert
+VM=mbert-mix   # or mbert-corpus: whichever v4-32 is idle when this runs
+ZONE=us-central2-b
+
+# 0. Scripts and specs in the bucket. Done on 2026-11-08 for COMMIT; again only after a change (from the mbert-jax checkout):
+gsutil -m cp experiments/dumb-extra/dumbx.sh experiments/dumb-extra/blimp.sh experiments/dumb-extra/spec_653k.txt experiments/dumb-extra/spec_smoke.txt $B/
+
+# 1. Each worker needs the venv of the earlier DUMB rounds (vm.lock; no package is installed) and a few GB of disk
+# (0.92 GB per converted model, at most 3 per worker in spec_653k.txt). Check:
+gcloud compute tpus tpu-vm ssh $VM --zone $ZONE --worker=all --quiet --command='hostname; ls -l ~/mbert-dumb/.venv/bin/python; df -h ~ | tail -1' < /dev/null
+# Without ~/mbert-dumb/.venv: PY=<another venv of vm.lock, e.g. ~/mbert-corpus/.venv/bin/python> before bash in 2-4.
+
+# 2. Smoke test on worker 0: every task once (seed 42, 1 epoch, 256 train and 64 dev/test rows), then BLiMP-NL on 200
+# pairs of two models, the mix-heads one included. Expected ~30 minutes, mostly conversion and first compiles.
+gcloud compute tpus tpu-vm ssh $VM --zone $ZONE --worker=0 --quiet --command="gsutil -q cp $B/dumbx.sh $B/blimp.sh ~/ && SEEDS=42 EXTRA='--epochs 1 --max-train-examples 256 --max-eval-examples 64' COMMIT=$COMMIT bash ~/dumbx.sh $B/spec_smoke.txt" < /dev/null
+# Done when gs://t5-dutch-english-usc2/mbert/dumb-extra/logs/dumbx_w0.exit exists (EXIT 0); results:
+gsutil ls "$M/dumb-extra/smoke/*/*.json"   # 4 files; each log in smoke/<task>/logs/ ends in EXIT 0
+gcloud compute tpus tpu-vm ssh $VM --zone $ZONE --worker=0 --quiet --command="OUT=$M/dumb-extra/smoke/blimp-nl EXTRA='--max-pairs 200' COMMIT=$COMMIT bash ~/blimp.sh 653000=$M/culturax-nl-230m-chunk1024/ckpt_keep/653000 mixheads-653000=$M/culturax-nl-230m-chunk1024-mixheads/ckpt_keep/653000" < /dev/null
+gsutil ls "$M/dumb-extra/smoke/blimp-nl/*.json"   # 2 files; smoke/blimp-nl/logs/blimp_w0.exit says EXIT 0
+# Then remove the smoke outputs (the converted model on worker 0 stays and is used in 3):
+gsutil -m rm -r $M/dumb-extra/smoke $M/dumb-extra/logs/dumbx_w0.log $M/dumb-extra/logs/dumbx_w0.exit
+
+# 3. The fine-tunes of the six 653,000-step models, 24 lines x 3 seeds = 72 jobs, on all 4 workers (spec_653k.txt):
+gcloud compute tpus tpu-vm ssh $VM --zone $ZONE --worker=all --quiet --command="gsutil -q cp $B/dumbx.sh ~/ && COMMIT=$COMMIT bash ~/dumbx.sh $B/spec_653k.txt" < /dev/null
+# Progress: gsutil ls "$M/dumb-extra/*/*--seed*.json" | wc -l   (72 when done); per job $M/dumb-extra/<task>/logs/<job>.log;
+# per worker ~/logs/dumbx_w<N>.log, at the end $M/dumb-extra/logs/dumbx_w<N>.{log,exit}. After a preemption or a failed
+# job: the same command again; jobs with a result are skipped, converted models are kept.
+# Spec lines, WORKER NAME CKPT TASK LR OUT (spec_653k.txt has all 24), e.g.:
+#   0 653000 gs://t5-dutch-english-usc2/mbert/culturax-nl-230m-chunk1024/ckpt_keep/653000 squadnl 5e-5 gs://t5-dutch-english-usc2/mbert/dumb-extra/squadnl
+#   0 mix-653000 gs://t5-dutch-english-usc2/mbert/culturax-nl-230m-chunk1024-mix/ckpt_keep/653000 squadnl 5e-5 gs://t5-dutch-english-usc2/mbert/dumb-extra/squadnl
+#   1 mixheads-653000 gs://t5-dutch-english-usc2/mbert/culturax-nl-230m-chunk1024-mixheads/ckpt_keep/653000 conll2002 5e-5 gs://t5-dutch-english-usc2/mbert/dumb-extra/conll2002
+#   2 fw2-653000 gs://t5-dutch-english-usc2/mbert/fineweb2-nl-230m-chunk1024/ckpt_keep/653000 pos-lassysmall 5e-5 gs://t5-dutch-english-usc2/mbert/dumb-extra/pos-lassysmall
+#   3 fw2mix-653000 gs://t5-dutch-english-usc2/mbert/fineweb2-nl-230m-chunk1024-mix/ckpt_keep/653000 pos-alpino 5e-5 gs://t5-dutch-english-usc2/mbert/dumb-extra/pos-alpino
+#   3 mc4-653000 gs://t5-dutch-english-usc2/mbert/mc4-nl-230m-chunk1024/ckpt_keep/653000 pos-alpino 5e-5 gs://t5-dutch-english-usc2/mbert/dumb-extra/pos-alpino
+
+# 4. BLiMP-NL of the 15 models, after 3 (the TPU guard refuses next to a fine-tune), one list per worker:
+gcloud compute tpus tpu-vm ssh $VM --zone $ZONE --worker=0 --quiet --command="gsutil -q cp $B/blimp.sh ~/ && COMMIT=$COMMIT bash ~/blimp.sh 653000=$M/culturax-nl-230m-chunk1024/ckpt_keep/653000 mix-653000=$M/culturax-nl-230m-chunk1024-mix/ckpt_keep/653000 mixheads-653000=$M/culturax-nl-230m-chunk1024-mixheads/ckpt_keep/653000 mc4-653000=$M/mc4-nl-230m-chunk1024/ckpt_keep/653000" < /dev/null
+gcloud compute tpus tpu-vm ssh $VM --zone $ZONE --worker=1 --quiet --command="gsutil -q cp $B/blimp.sh ~/ && COMMIT=$COMMIT bash ~/blimp.sh fw2-653000=$M/fineweb2-nl-230m-chunk1024/ckpt_keep/653000 fw2mix-653000=$M/fineweb2-nl-230m-chunk1024-mix/ckpt_keep/653000 anneal-u15-uniform10=$M/anneal/anneal-u15-uniform10/ckpt/20000 anneal-u15-uniform5=$M/anneal/anneal-u15-uniform5/ckpt/20000" < /dev/null
+gcloud compute tpus tpu-vm ssh $VM --zone $ZONE --worker=2 --quiet --command="gsutil -q cp $B/blimp.sh ~/ && COMMIT=$COMMIT bash ~/blimp.sh anneal-u15-uniform15-65300=$M/anneal/anneal-u15-uniform15-65300/ckpt/65300 anneal-u15-uniform10-65300=$M/anneal/anneal-u15-uniform10-65300/ckpt/65300 anneal-u15-uniform5-65300=$M/anneal/anneal-u15-uniform5-65300/ckpt/65300 p2048-u15-C1024=$M/phase2048/p2048-u15-C1024/ckpt/20000" < /dev/null
+gcloud compute tpus tpu-vm ssh $VM --zone $ZONE --worker=3 --quiet --command="gsutil -q cp $B/blimp.sh ~/ && COMMIT=$COMMIT bash ~/blimp.sh flan-F=$M/flan-decay/flan-F/ckpt/20000 300000=$M/culturax-nl-230m-chunk1024/ckpt_keep/300000 fw2-300000=$M/fineweb2-nl-230m-chunk1024/ckpt_keep/300000" < /dev/null
+# Progress: gsutil ls "$M/blimp-nl/*.json" | wc -l   (15 when done); logs $M/blimp-nl/logs/<name>.log and blimp_w<N>.{log,exit}.
+# All 15 on one worker works too (one blimp.sh with all NAME=STEP_DIR), ~1.5-2 hours.
+
+# 5. Summary: mean [min-max] over seeds next to DBRD/SICK-NL of the same models (masking/dumb, at lr 2e-5 there), the
+# protocol's comparison, and BLiMP-NL (on the Mac, from the mbert-jax checkout):
+mkdir -p /tmp/dx/dumb && gsutil -m cp -r $M/dumb-extra/squadnl $M/dumb-extra/conll2002 $M/dumb-extra/pos-lassysmall $M/dumb-extra/pos-alpino $M/blimp-nl /tmp/dx/ && gsutil -m cp "$M/masking/dumb/*653000--*.json" /tmp/dx/dumb/
+python experiments/dumb-extra/summarize.py --results /tmp/dx/squadnl /tmp/dx/conll2002 /tmp/dx/pos-lassysmall /tmp/dx/pos-alpino /tmp/dx/dumb --reference 653000 --compare mix-653000 mixheads-653000 mc4-653000 fw2-653000 fw2mix-653000 --blimp /tmp/dx/blimp-nl --output /tmp/dx/summary.json && gsutil cp /tmp/dx/summary.json $M/dumb-extra/summary.json
+
+# 6. Afterwards, on every worker: the converted models and run directories (the compile cache may stay)
+gcloud compute tpus tpu-vm ssh $VM --zone $ZONE --worker=all --quiet --command='rm -rf ~/dumbx/ckpt* ~/dumbx/runs' < /dev/null
+
+######## Expected compile cost and run times (estimates, not measured on this code)
+# Basis: DBRD on 4 v4 chips at 3.74 steps/s with 96 rows of up to 512 tokens, ~184k tokens/s forward and backward in
+# float32 (masking/dumb/logs/653000--dbrd--seed42.log, epochs 2-3); SICK-NL's first epoch there took 12 min 37 s for
+# 18 steps, ~42 s of compile per new batch length. Without padding to a multiple every batch length compiled again,
+# hence the ~47 minutes of the first DBRD/SICK-NL fine-tune per task and LR on a worker.
+# Here every batch is padded to a multiple of 128, so a task compiles at most 4 train and 4 eval shapes: 128 and 256 for
+# nearly all token-task batches (512 only for the few batches with a cut CoNLL-2002 sentence), 384 for nearly every
+# squadnl train batch (79% of its windows are shorter, but a batch of 32 almost always holds a full one). Expected: ~5
+# minutes of compile on the first job of each task on a worker. The program depends on the task, the LR and the
+# number of updates, not on the model or the seed, so later jobs of that task on that worker hit the compile cache
+# (JAX_COMPILATION_CACHE_DIR=~/dumbx/jaxcache). A smoke test (other updates) does not fill it for the real runs.
+# Per seed, at an update of 32 (8 x 4 chips) and ~0.03 s of overhead per step assumed:
+#   squadnl         90,653 train windows, 2,832 steps per epoch of 32 x 384: ~14 min of training, ~1 min of evaluation
+#                   (9,808 dev windows per epoch, 1,251 test), ~1-2 min of loading: ~17 min (51 min per spec line)
+#   conll2002       15,812 rows, 494 steps per epoch of 32 x 128: ~1.5 min of training: ~3 min with loading (9 per line)
+#   pos-lassysmall  13,817 rows, 431 steps per epoch: ~3 min;  pos-alpino  12,289 rows, 384 steps per epoch: ~3 min
+# Per model and worker once: conversion (--params-only, 0.92 GB in the same region) and verify_ckpt.py, ~3-5 min.
+# spec_653k.txt: workers 0 and 1 ~120 minutes of jobs, 2 and 3 ~114, plus 2-3 conversions and the first compiles:
+# ~2.5 hours for all 72 jobs.
+# BLiMP-NL per model: 219,150 masked copies (3.5M tokens) in ~6,850 rows of 512, ~108 batches of 64 rows, forward
+# only, float32: ~1-2 min of forward, ~2-3 min of compile, ~1-2 min to read the params and pack: ~5-7 min; the 4 lists
+# of step 4 ~30 minutes.

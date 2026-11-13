@@ -1,0 +1,6 @@
+# Smoke test of dumbx.sh on one worker (commands.txt, step 2): every task once, with SEEDS=42 and a small EXTRA.
+# Outputs under gs://t5-dutch-english-usc2/mbert/dumb-extra/smoke/, deleted afterwards.
+0 653000 gs://t5-dutch-english-usc2/mbert/culturax-nl-230m-chunk1024/ckpt_keep/653000 squadnl 5e-5 gs://t5-dutch-english-usc2/mbert/dumb-extra/smoke/squadnl
+0 653000 gs://t5-dutch-english-usc2/mbert/culturax-nl-230m-chunk1024/ckpt_keep/653000 conll2002 5e-5 gs://t5-dutch-english-usc2/mbert/dumb-extra/smoke/conll2002
+0 653000 gs://t5-dutch-english-usc2/mbert/culturax-nl-230m-chunk1024/ckpt_keep/653000 pos-lassysmall 5e-5 gs://t5-dutch-english-usc2/mbert/dumb-extra/smoke/pos-lassysmall
+0 653000 gs://t5-dutch-english-usc2/mbert/culturax-nl-230m-chunk1024/ckpt_keep/653000 pos-alpino 5e-5 gs://t5-dutch-english-usc2/mbert/dumb-extra/smoke/pos-alpino

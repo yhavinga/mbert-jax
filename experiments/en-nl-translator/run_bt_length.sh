@@ -5,6 +5,7 @@
 #   bash run_bt_length.sh all    setup, the stretches (from Hugging Face, one process per source), the segments, then
 #                                on both halves (4 chips each) stukken and heel up to d8k, collect, MetricX, report A
 #                                (bins up to 8192) and the English for part B
+#                                and, when bin 8192 passes the decision rule (AUTO_D16K=1, the default), the step d16k
 #   bash run_bt_length.sh d16k   the bin 16384 whole on both halves, then collect, MetricX and the report of all bins
 #   bash run_bt_length.sh report collect, MetricX of what is not scored, the report (what is in the bucket)
 # Everything done is in the bucket ($O) and every step skips it there: a preempted spot VM loses at most a shard.
@@ -203,6 +204,17 @@ all)
   echo "== translate: stukken, heel up to d8k $(date -u +%T)"
   both a d512 d1k d2k d4k d8k
   score_and_report a
+  # The bin 16384 only when 8192 goes well: when bin 8192 passes the decision rule (the report's verdict); AUTO_D16K=0
+  # leaves it to a separate call of the step d16k
+  if [ "${AUTO_D16K:-1}" = 1 ]; then
+    if "$PY" -c "import json, sys; v = json.load(open(sys.argv[1]))['verdict'].get('8192', {}); sys.exit(0 if v.get('pass') else 1)" \
+        "$D/report/bt-length-a.json"; then
+      echo "== bin 8192 passes the rule: heel d16k $(date -u +%T)"
+      bash "$0" d16k
+    else
+      echo "== bin 8192 does not pass the rule: no d16k"
+    fi
+  fi
   ;;
 d16k)
   [ -s "$D/data/docs.parquet" ] && [ -s "$D/seg/segments.json" ] || { echo "run 'all' first"; exit 1; }

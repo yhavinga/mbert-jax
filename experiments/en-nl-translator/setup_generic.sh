@@ -3,6 +3,7 @@
 # /dev/shm/translate-generic. Each step is skipped when its result is there.
 #   bash setup_generic.sh            venv-fork, tokenizers, data
 #   bash setup_generic.sh release    also venv-025: MaxText 0.2.5 from PyPI, for translate_checks.py decode only
+#   bash setup_generic.sh venv       venv-fork and tokenizers only, without the pilot's data (bt_natural.py)
 # venv-fork: MaxText from the fork yhavinga/maxtext, branch fix-nnx-decode-cache-abstract-init (upstream main d1c0d0afe
 # of 9 Nov with fix 1: the NNX decode cache made from shapes inside the init jit; upstream main has since 8 Oct the
 # sliding-window decode mask measured in true positions, commit 2bbe8006c), installed from git at a fixed commit with
@@ -76,6 +77,10 @@ snapshot() {  # repo revision dir [patterns...]
 }
 snapshot "$GEMMA4" "$GEMMA4_REV" "$SHM/tokenizer-gemma4" 'tokenizer*' chat_template.jinja config.json generation_config.json
 snapshot "$TG27" "$TG27_REV" "$SHM/tokenizer-tg27b" 'tokenizer*' special_tokens_map.json added_tokens.json chat_template.jinja config.json generation_config.json
+if [ "${1:-}" = venv ]; then
+  echo "$(hostname): venv-fork and tokenizers ready in $SHM"
+  exit 0
+fi
 
 D=$SHM/data
 [ -s "$D/pairs.parquet" ] || gsutil -q cp "$PILOT" "$D/pairs.parquet"

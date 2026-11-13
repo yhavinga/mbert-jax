@@ -285,12 +285,38 @@ def patch_maxtext():
     return applied
 
 
+ENGINE_KEYS = {"model_name", "load_parameters_path", "ici_tensor_parallelism", "ici_data_parallelism",
+               "per_device_batch_size", "max_prefill_predict_length", "max_target_length", "decode_sampling_strategy",
+               "tokenizer_path"}
+
+
+def mesh_of(model, chips):
+    """(tensor, data) parallelism over the process's chips: tensor parallel over all of them unless the model's tensor
+    is smaller (a layer's KV heads bound it, and a v6e process takes 1, 4 or 8 chips: two give START_SESSION failed,
+    13 Nov), and the rest of the chips data parallel (weights replicated, the decode slots split)."""
+    tensor = model.get("tensor", chips)
+    if tensor < 1 or chips % tensor:
+        raise ValueError(f"tensor {tensor} does not divide the process's {chips} chips")
+    return tensor, chips // tensor
+
+
+def engine_overrides(model):
+    """The model's maxtext_overrides (a model MaxText has no config for, as MaxText config keys over the config of
+    maxtext_model); never one of the keys make_engine sets itself, which would hide what runs."""
+    overrides = dict(model.get("maxtext_overrides") or {})
+    clash = sorted(ENGINE_KEYS & set(overrides))
+    if clash:
+        raise ValueError(f"maxtext_overrides may not set {', '.join(clash)}: make_engine sets them")
+    return overrides
+
+
 def make_engine(args, shapes, chips=4):
     """MaxText's MaxEngine with the converted checkpoint: (engine, params)."""
     from maxtext.configs import pyconfig
     from maxtext.inference.maxengine import maxengine
 
     max_prefill = shapes["prefill_lengths"][-1]
+    tensor, data = mesh_of(MODELS[args.model], chips)
     config = pyconfig.initialize(
         [""], model_name=MODELS[args.model]["maxtext_model"], load_parameters_path=args.ckpt, run_name="flan_nl",
         log_config=False,
@@ -300,10 +326,11 @@ def make_engine(args, shapes, chips=4):
         jax_cache_dir=f"{args.work_dir}/jax_cache",
         enable_checkpointing=False, async_checkpointing=False, skip_jax_distributed_system=True, scan_layers=False,
         use_multimodal=False, attention="dot_product", dtype="bfloat16", weight_dtype="bfloat16",
-        ici_fsdp_parallelism=1, ici_tensor_parallelism=chips, per_device_batch_size=shapes["slots"] / chips,
+        ici_fsdp_parallelism=1, ici_tensor_parallelism=tensor, ici_data_parallelism=data,
+        per_device_batch_size=shapes["slots"] / chips,
         max_prefill_predict_length=max_prefill, max_target_length=max_prefill + shapes["max_decode"],
         decode_sampling_strategy="greedy", return_log_prob=False, tokenizer_type="huggingface",
-        tokenizer_path=args.tokenizer)
+        tokenizer_path=args.tokenizer, **engine_overrides(MODELS[args.model]))
     engine = maxengine.MaxEngine(config)
     return engine, engine.load_params()
 

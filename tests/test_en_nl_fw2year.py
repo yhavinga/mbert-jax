@@ -66,6 +66,20 @@ def test_row_groups_touching_a_year_by_their_crawl_range():
     assert fy.groups_touching(groups, 2018) == []
 
 
+def test_row_groups_are_read_in_batches_until_enough_documents():
+    calls = []
+
+    def read(part):
+        calls.append(part)
+        return [f"doc{g}" for g in part if g % 2], {"docs_read": len(part)}
+
+    docs, counts, done = fy.read_in_batches([5, 3, 9, 1, 8, 2, 7], 3, read, lambda d: len(d) >= 4)
+    assert calls == [[3, 5, 9], [1, 2, 8]]  # sorted within a batch, the batches in the given order
+    assert docs == ["doc3", "doc5", "doc9", "doc1"] and counts == {"docs_read": 6} and done == [3, 5, 9, 1, 2, 8]
+    docs, counts, done = fy.read_in_batches([5, 3], 3, read, lambda d: len(d) >= 100)
+    assert done == [3, 5] and counts == {"docs_read": 2}  # none left: what there is
+
+
 def test_the_classifiers_passages_are_left_out_by_pid_or_text():
     bt = [{"id": "fineweb:x:d:1", "nl": "Een tekst."}, {"id": "fineweb:y:d:2", "nl": " Tweede tekst. "},
           {"id": "fineweb:z:d:3", "nl": "Derde."}]
@@ -141,7 +155,8 @@ def test_report_states_the_fixed_rule_and_the_first_declining_year(tmp_path, cap
         "rule": {"text": fy.RULE_NL, "fixed_at": fy.RULE_FIXED_AT},
         "bt": {"repo": "r", "revision": "0123456789abcdef", "rows": 59408, "kept": 59000,
                "left_out_classifier": {"by_pid": 400, "by_text": 401, "either": 408}},
-        "fineweb": {"repo": "f", "revision": "fedcba9876543210", "min_per_year": 1000, "row_groups_per_year": 30,
+        "fineweb": {"repo": "f", "revision": "fedcba9876543210", "min_per_year": 1000, "row_groups_batch": 30,
+                    "max_docs_per_year": 6000,
                     "seed": "fw2year"}}))
     (tmp_path / "results.json").write_text(json.dumps({"test_accuracy": 0.9575}))
     (tmp_path / "sources.json").write_text(json.dumps({"targets": {"bt": {

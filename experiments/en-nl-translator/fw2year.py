@@ -16,9 +16,10 @@ data: the dataset's train and validation splits at a fixed revision (BT_REPO); a
 data (its 2,000 eval passages, by pid or text) are left out. A crawl year with fewer than MIN_PER_YEAR passages gets a
 supplement up to MIN_PER_YEAR: passages of HuggingFaceFW/fineweb-2 nld_Latn of that year (the revision and the 45 files
 select_passages.py read), cut and filtered as select_passages.py cuts FineWeb-2 (Builder, the page's address,
-paragraph_breaks), from documents outside the dataset, drawn with a fixed seed: SUPPLEMENT_ROW_GROUPS row groups at
-random among those whose crawls (the row group's min/max of `dump`; each file is ordered by crawl) touch the year, at
-most SUPPLEMENT_MAX_DOCS of that year's documents, one passage per document, LONG_SHARE of them long. Written: texts.parquet
+paragraph_breaks), from documents outside the dataset, drawn with a fixed seed: the row groups whose crawls (the row
+group's min/max of `dump`; the files are ordered by crawl in runs) touch the year, in a seeded random order, read
+SUPPLEMENT_ROW_GROUPS at a time until SUPPLEMENT_MAX_DOCS documents of that year are in (a thin year needs more row
+groups: 2015 has few), then SUPPLEMENT_MAX_DOCS of them at random, one passage per document, LONG_SHARE of them long. Written: texts.parquet
 (model = group "bt" or "extra", set = crawl, id, text; what naturalness.py classify reads), meta.parquet (id, group,
 dump, year, half, length_class, tokens, url) and data.json (counts per year and group, what was left out, what was read).
 report: the share "original" (P(original) >= 0.5) per crawl year and group with its 95% Wilson interval and n, per crawl
@@ -124,6 +125,21 @@ def supplement_needs(counts, min_per_year=MIN_PER_YEAR):
 def groups_touching(groups, year):
     """The row groups [(file, group, min dump, max dump)] whose crawls touch the year"""
     return [g for g in groups if crawl_year(g[2]) <= year <= crawl_year(g[3])]
+
+
+def read_in_batches(groups, batch, read, enough):
+    """Reads the groups batch by batch in their order (read(batch) -> (docs, counts)) until enough(docs) or none are
+    left: (docs, counts, the groups read)"""
+    docs, counts, done = [], collections.Counter(), []
+    for k in range(0, len(groups), batch):
+        part = sorted(groups[k:k + batch])
+        found, c = read(part)
+        docs += found
+        counts.update(c)
+        done += part
+        if enough(docs):
+            break
+    return docs, dict(counts), done
 
 
 def classifier_exclusions(bt_rows, classifier_rows):
@@ -269,9 +285,12 @@ def data(args):
                                                     initargs=(args.tokenizer, args.wordlist, args.idioms)) as pool:
             for year, need in needs.items():
                 touching = groups_touching(groups, year)
-                rng = random.Random(f"{SEED}/{year}/groups")
-                chosen_groups = sorted(rng.sample(touching, min(args.row_groups, len(touching))))
-                docs, c = read_year_docs(fs, chosen_groups, year, bt_docs)
+                order = list(touching)
+                random.Random(f"{SEED}/{year}/groups").shuffle(order)
+                docs, c, chosen_groups = read_in_batches(
+                    order, args.row_groups, lambda part: read_year_docs(fs, part, year, bt_docs),
+                    lambda found: len(found) >= args.max_docs)
+                c["docs_kept"] = len(docs)
                 docs.sort(key=lambda d: d["id"])
                 if len(docs) > args.max_docs:
                     docs = random.Random(f"{SEED}/{year}/docs").sample(docs, args.max_docs)
@@ -311,7 +330,7 @@ def data(args):
         "bt": {"repo": BT_REPO[0], "revision": BT_REPO[1], "rows": len(bt), "kept": len(kept),
                "left_out_classifier": how},
         "fineweb": {"repo": sp.FINEWEB[0], "revision": sp.FINEWEB[1], "min_per_year": args.min_per_year,
-                    "row_groups_per_year": args.row_groups, "max_docs_per_year": args.max_docs, "seed": SEED,
+                    "row_groups_batch": args.row_groups, "max_docs_per_year": args.max_docs, "seed": SEED,
                     "needs": {str(y): n for y, n in needs.items()}, "read": {str(y): v for y, v in read.items()}},
         "per_year": dict(per_year), "texts": len(rows), "commit": args.commit,
         "resources": {"wordlist": WORDLIST_SHA256, "idioms": IDIOMS_SHA256},
@@ -428,9 +447,11 @@ def report(args):
           f"classifier zitten (op pid {bt_info['left_out_classifier']['by_pid']}, op tekst "
           f"{bt_info['left_out_classifier']['by_text']}).",
           f"- Aanvulling: jaren met minder dan {fw['min_per_year']} BT-passages, aangevuld tot ~{fw['min_per_year']} "
-          f"uit `{fw['repo']}` nld_Latn @ `{fw['revision'][:12]}`: {fw['row_groups_per_year']} willekeurige row "
-          f"groups per jaar (seed `{fw['seed']}`), geknipt en gefilterd als `select_passages.py`, één passage per "
-          f"document, 25% lang; documenten van de dataset uitgesloten. Wat gelezen werd: `data.json`.",
+          f"uit `{fw['repo']}` nld_Latn @ `{fw['revision'][:12]}`: row groups die het jaar raken in willekeurige "
+          f"volgorde (seed `{fw['seed']}`), per {fw['row_groups_batch']} gelezen tot er {fw['max_docs_per_year']} "
+          f"documenten van dat jaar waren, daaruit {fw['max_docs_per_year']} willekeurig; geknipt en gefilterd als "
+          f"`select_passages.py`, één passage per document, 25% lang; documenten van de dataset uitgesloten. Wat "
+          f"gelezen werd: `data.json`.",
           f"- Classifier: S @ 653k, fijngetuned op 10 nov (nauwkeurigheid {accuracy:.4f}) op origineel Nederlands "
           f"tegenover de terugvertaling (nl->en->nl) van TranslateGemma 27B, op passages van dezelfde vijf bronnen. "
           f"Hij leerde vertaalstijl van TranslateGemma herkennen; of hij tekst van andere vertaalsystemen of door een "

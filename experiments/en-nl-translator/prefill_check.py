@@ -282,6 +282,17 @@ def read_scores(paths, column="qe_src_cand"):
     return scores
 
 
+def similarity(pairs):
+    """Of (translation, known translation) pairs: how many are equal, and difflib's ratio on their words (no
+    autojunk: on long texts it would drop the common words), median and how many below 0.5"""
+    import difflib
+
+    ratios = sorted(difflib.SequenceMatcher(None, (a or "").split(), (b or "").split(), autojunk=False).ratio()
+                    for a, b in pairs)
+    return {"n": len(pairs), "identical": sum((a or "").strip() == (b or "").strip() for a, b in pairs),
+            "median": ratios[len(ratios) // 2] if ratios else None, "below_half": sum(r < 0.5 for r in ratios)}
+
+
 def stats(rows, qe, cond):
     """bt_length.bin_stats of rows of one condition (a test, or heel/stukken of the trial), whatever their bins; qe
     keyed by (doc, condition), only the rows' documents count"""
@@ -366,7 +377,9 @@ def report(args):
              "same_prompts": sum(m["tokens_in"] == heel[m["id"]]["tokens_in"] for m in rows if m["id"] in heel),
              "both_done": sum(m["done"] and heel[m["id"]]["done"] for m in rows if m["id"] in heel),
              "only_ref_done": sum(heel[m["id"]]["done"] and not m["done"] for m in rows if m["id"] in heel),
-             "only_test_done": sum(m["done"] and not heel[m["id"]]["done"] for m in rows if m["id"] in heel)}
+             "only_test_done": sum(m["done"] and not heel[m["id"]]["done"] for m in rows if m["id"] in heel),
+             "similarity": similarity([(m["translation"], heel[m["id"]]["translation"]) for m in rows
+                                       if m["id"] in heel])}
         if t["reuse"]:
             for g, flag in (("first", True), ("later", False)):
                 rs = [m for m in fit_rows if m["first_inserted"] == flag]
@@ -412,11 +425,16 @@ def report_md(r):
             f"{num(s['qe_mean'])} | {num(s['tokens_out_median'], 0)} | {kn(h['done'], h['docs'])} / "
             f"{num(h['qe_mean'])} | {kn(p['done'], p['docs'])} / {num(p['qe_mean'])} | "
             f"**{e['verdict']}** ({e['done_fit']}/{e['fits']}) | {t['expect']} |")
-    lines += ["", "Per document tegen de bekende uitslag in de klasse van de lengteproef (heel):", "",
-              "| test | prompts gelijk (tokens_in) | beide af | alleen bekend af | alleen nu af |", "|---|---:|---:|---:|---:|"]
+    lines += ["", "Per document tegen de bekende uitslag in de klasse van de lengteproef (heel). Gelijkenis (achteraf "
+              "toegevoegd, na het zien van T1; niet vooraf vastgelegd): difflib-ratio op woorden van de vertaling nu "
+              "en de bekende vertaling van hetzelfde document; 1 is gelijk.", "",
+              "| test | prompts gelijk (tokens_in) | beide af | alleen bekend af | alleen nu af | gelijke tekst | "
+              "gelijkenis med. | gelijkenis < 0,5 |", "|---|---:|---:|---:|---:|---:|---:|---:|"]
     for test, e in r["tests"].items():
+        sim = e["similarity"]
         lines.append(f"| {test} | {e['same_prompts']}/{e['measured']} | {e['both_done']} | {e['only_ref_done']} | "
-                     f"{e['only_test_done']} |")
+                     f"{e['only_test_done']} | {sim['identical']}/{sim['n']} | {num(sim['median'], 3)} | "
+                     f"{sim['below_half']} |")
     reuse = [(test, e) for test, e in r["tests"].items() if TESTS[test]["reuse"]]
     if reuse:
         lines += ["", "Slot-hergebruik: documenten die in een leeg slot begonnen (eerste `slots` van hun worker) tegen "

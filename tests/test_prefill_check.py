@@ -95,6 +95,14 @@ def test_insertion_ranks_follow_decode_all():
     assert ranks == {"d1": 0, "d4": 1, "d0": 2, "d2": 3, "d5": 4, "d3": 5}
 
 
+def test_similarity_on_words():
+    s = pc.similarity([("een twee drie", "een twee drie"), ("een twee drie vier", "een twee drie"),
+                       ("x x x x x x", "een twee drie"), (None, "een")])
+    assert s["n"] == 4 and s["identical"] == 1 and s["below_half"] == 2
+    assert s["median"] == pytest.approx(6 / 7)
+    assert pc.similarity([]) == {"n": 0, "identical": 0, "median": None, "below_half": 0}
+
+
 def test_verdict_thresholds():
     assert pc.verdict(9, 10) == "goed" and pc.verdict(36, 40) == "goed"
     assert pc.verdict(35, 40) == "gemengd" and pc.verdict(20, 40) == "gemengd"
@@ -194,7 +202,8 @@ def test_collect_and_report_on_made_up_translations(tmp_path, capsys):
             for cond in ("heel", "stukken"):
                 row, us, _ = bl.measure_doc(d, good[d["id"]], True, "nl", "en")
                 rows.append({"id": d["id"], "source": d["source"], "bin": d["bin"], "condition": cond,
-                             "tokens_source": d["tokens"], "tokens_in": d["tokens"] + 90, "tokens_out": 40, **row})
+                             "tokens_source": d["tokens"], "tokens_in": d["tokens"] + 90, "tokens_out": 40,
+                             "translation": good[d["id"]], **row})
                 unit_rows += [{"id": f"{d['id']}|{cond}|u{u['unit']:04d}", "doc": d["id"], "condition": cond,
                                "n_source": u["n_source"]} for u in us]
         bl.write_parquet(rows, ref / "measured.parquet")
@@ -219,6 +228,7 @@ def test_collect_and_report_on_made_up_translations(tmp_path, capsys):
     assert e["group_first"]["verdict"] == "goed" and e["group_later"]["verdict"] == "fout"
     assert e["group_later"]["n"] == 4 and e["only_ref_done"] == 4 and e["same_prompts"] == 12
     assert e["ref_heel"]["qe_mean"] == pytest.approx(1.5) and e["test"]["qe_mean"] == pytest.approx(2.0)
+    assert e["similarity"] == {"n": 12, "identical": 8, "median": 1.0, "below_half": 4}
     md = (tmp_path / "report" / "prefill-check.md").read_text()
     assert "| T6 |" in md and "eerst ingevoegd" in md and "2249474b9" in md and "25,10" in md
 

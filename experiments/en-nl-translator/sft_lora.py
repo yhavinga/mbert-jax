@@ -10,6 +10,8 @@ so the cosine schedule ends with the epoch; a multi-host job takes the smallest 
 (step_limit), and holds a given number of steps to that limit too. Then MaxText's setup_trainer_state and train_model,
 unchanged, with two wrapped hooks that keep, per step, the loss, the time it ended and the batch's token counts.
 
+Before the first step every process prints LORA_MODULES: the LoRA parameters per module type and the modules that the
+LoRA regex matches but that got none (qwix adds LoRA only where it intercepts a matmul of a module's own weight).
 Writes to DIR (process 0): summary.json (configuration, times, throughput, memory per chip, loss per step), adapter.npz
 (the LoRA parameters in float32, keys as decoder/layers_0/self_attention/query/kernel_lora_a), adapter.json (rank,
 alpha, module regex, model, checkpoint, original dtype); MaxText's output (metrics file, tensorboard, Tunix's checkpoint
@@ -19,6 +21,7 @@ of the LoRA parameters) under DIR/maxtext.
 import argparse
 import json
 import math
+import re
 import statistics
 import sys
 import time
@@ -31,6 +34,61 @@ def split_argv(argv):
         return argv, []
     k = argv.index("--")
     return argv[:k], argv[k + 1:]
+
+
+def path_key(path):
+    """A pytree path as "/"-joined names, as adapter_arrays makes the adapter's keys."""
+    return "/".join(str(getattr(p, "key", getattr(p, "name", getattr(p, "idx", p)))) for p in path)
+
+
+LORA_SUFFIXES = ("_lora_a", "_lora_b")
+LAYER_INDEX = re.compile(r"(?<=layers_)[0-9]+")
+
+
+def module_type(module_path):
+    """A module's path with its layer index as *: decoder/layers_3/self_attention/query -> decoder/layers_*/..."""
+    return LAYER_INDEX.sub("*", module_path)
+
+
+def lora_module_type(key):
+    """The module type of a LoRA parameter (adapter key, e.g. decoder/layers_3/self_attention/query/kernel_lora_a ->
+    decoder/layers_*/self_attention/query). qwix names a LoRA pair after the weight it adapts; a weight other than a
+    kernel (a MoE block's own expert weights wi_0, wi_1, wo) stays in the type."""
+    module, _, name = key.rpartition("/")
+    for suffix in LORA_SUFFIXES:
+        if name.endswith(suffix):
+            weight = name[: -len(suffix)]
+            return module_type(module) if weight == "kernel" else f"{module_type(module)}/{weight}"
+    raise ValueError(f"{key} is not a LoRA parameter (it ends in neither of {LORA_SUFFIXES})")
+
+
+def from_decoder(path):
+    """A module path from its first "decoder" component on, as the LoRA regex sees it (a wrapper's prefix dropped)."""
+    parts = path.split("/")
+    return "/".join(parts[parts.index("decoder"):]) if "decoder" in parts else path
+
+
+def lora_report(regex, sizes, module_paths):
+    """What LoRA reached: per module type the modules with LoRA and their parameters (sizes: {adapter key: number of
+    values}), and per module type the modules whose path the regex fullmatches (as qwix matches it) that have none."""
+    by_type, modules = {}, {}
+    for key, size in sizes.items():
+        kind = lora_module_type(key)
+        entry = by_type.setdefault(kind, {"modules": 0, "params": 0})
+        entry["params"] += int(size)
+        modules.setdefault(kind, set()).add(key.rpartition("/")[0])
+    for kind, paths in modules.items():
+        by_type[kind]["modules"] = len(paths)
+    with_lora = {from_decoder(key.rpartition("/")[0]) for key in sizes}
+    pattern = re.compile(regex)
+    without = {}
+    for path in module_paths:
+        path = from_decoder(path)
+        if pattern.fullmatch(path) and path not in with_lora:
+            kind = module_type(path)
+            without[kind] = without.get(kind, 0) + 1
+    return {"regex": regex, "params": int(sum(sizes.values())), "by_type": dict(sorted(by_type.items())),
+            "matched_without_lora": dict(sorted(without.items()))}
 
 
 def adapter_arrays(lora_pure):
@@ -205,6 +263,14 @@ def main(argv=None):
     t_setup = time.time()
     trainer, mesh = train_sft.setup_trainer_state(config)
     setup_s = time.time() - t_setup
+    # Shapes only (no transfer): what the LoRA regex reached, before the first step, so a run that fails in compilation
+    # still shows it
+    lora_sizes = {path_key(path): math.prod(leaf.shape) for path, leaf in jax.tree_util.tree_flatten_with_path(
+        nnx.to_pure_dict(nnx.state(trainer.model, nnx.LoRAParam)))[0]}
+    module_paths = ["/".join(str(p) for p in path) for path, value in nnx.iter_graph(trainer.model)
+                    if path and isinstance(value, nnx.Module)]
+    lora_seen = lora_report(lora_utils._get_lora_module_path(config), lora_sizes, module_paths)  # noqa: SLF001
+    print(f"LORA_MODULES {json.dumps(lora_seen)}", flush=True)
 
     hooks = trainer.training_hooks
     records, batch_counts = [], []
@@ -253,7 +319,13 @@ def main(argv=None):
         "devices": jax.device_count(), "processes": jax.process_count(), "device_kind": jax.devices()[0].device_kind,
         "lora": {"rank": lora.lora_rank, "alpha": lora.lora_alpha,
                  "module_path": lora_utils._get_lora_module_path(config),  # noqa: SLF001 - the regex qwix used
-                 "params": int(sum(v.size for v in flat.values())), "dtype": sorted(dtypes)},
+                 "params": int(sum(v.size for v in flat.values())), "dtype": sorted(dtypes),
+                 "by_module": lora_seen["by_type"], "matched_without_lora": lora_seen["matched_without_lora"]},
+        # the MoE's settings (a dense model: num_experts 1); getattr with a default, so that a key another MaxText
+        # lacks costs no finished run its summary
+        "moe": {k: getattr(config, k, None) for k in (
+            "num_experts", "num_experts_per_tok", "sparse_matmul", "megablox", "capacity_factor",
+            "ici_expert_parallelism", "load_balance_loss_weight")},
         "config": {k: getattr(config, k) for k in (
             "per_device_batch_size", "global_batch_size_to_train_on", "gradient_accumulation_steps",
             "max_target_length", "packing", "learning_rate", "learning_rate_final_fraction", "warmup_steps_fraction",

@@ -2,7 +2,9 @@
 # On a worker of mbert-corpus: sft_lora.py (MaxText train_sft with LoRA) detached from ssh, either as a TPU of the
 # worker's own 4 chips (default) or, with MULTIHOST=1 started on all four workers at once, as one job over the 16 chips.
 #   NAME=sft12b_N MODEL=12b [STEPS=auto] DATA=/dev/shm/translator/smoke-lora/data/train-N.parquet [ROOT=gs://...]
-#     [TEMPLATE=<chat template>] bash run_sft.sh [key=value ...]
+#     [TEMPLATE=<chat template>] [LORA_MODULES=<regex>] bash run_sft.sh [key=value ...]
+# MODEL: 12b or 27b (TranslateGemma), or gemma4-26b / gemma4-31b (Gemma 4 26B-A4B-it and 31B-it, converted by
+# run_g4lora.sh convert; their tokenizers from run_g4lora.sh setup).
 # The key=value arguments are MaxText overrides after this script's own (later ones win). Log: ~/logs/$NAME.log, a fresh
 # file per start that ends in "EXIT <code>"; the log and, from worker 0, the run's summary and adapter go to
 # $ROOT/runs/$NAME/.
@@ -19,12 +21,19 @@ MODEL=${MODEL:?12b or 27b}
 DATA=${DATA:?the training parquet}
 MULTIHOST=${MULTIHOST:-0}
 STEPS=${STEPS:-auto}  # auto: one epoch, counted by sft_lora.py (multi-host: up to its step_limit, below every process's count)
+MAXTEXT_MODEL=gemma3-$MODEL
+TOK=/dev/shm/flan_nl/tokenizer-$MODEL
 case $MODEL in
   12b) CKPT=gs://t5-dutch-english-usc2/mbert/translator/smoke-lora/translategemma-12b-maxtext ;;
   27b) CKPT=gs://t5-dutch-english-usc2/mbert/flan-nl/translategemma-27b-maxtext ;;
-  *) echo "MODEL is 12b or 27b, not $MODEL"; exit 1 ;;
+  gemma4-26b) CKPT=gs://t5-dutch-english-usc2/mbert/translator/gemma4-ckpt/gemma-4-26b-a4b-it ;;
+  gemma4-31b) CKPT=gs://t5-dutch-english-usc2/mbert/translator/gemma4-ckpt/gemma-4-31b-it ;;
+  *) echo "MODEL is 12b, 27b, gemma4-26b or gemma4-31b, not $MODEL"; exit 1 ;;
 esac
-TOK=/dev/shm/flan_nl/tokenizer-$MODEL
+if [[ $MODEL == gemma4-* ]]; then
+  MAXTEXT_MODEL=$MODEL
+  TOK=/dev/shm/translator/g4lora/tok-$MODEL
+fi
 # sft_data.py's template (the smoke test) or sft_build.py's (template.jinja: the user turn as built, in Gemma 3's turn)
 TEMPLATE=${TEMPLATE:-$SHM/data/translategemma_en_nl.jinja}
 OUT=$SHM/runs/$NAME
@@ -47,8 +56,10 @@ mkdir -p ~/logs "$OUT"
 # lora_module_path: MaxText's gemma3 regex (configs/post_train/lora_module_path.yml) names decoder/(scanned_blocks|
 # layers_remainder|layers)/, which no unscanned layer (decoder/layers_<i>) matches, and _get_lora_module_path's rewrite
 # of "layers/" does not reach it inside that group; qwix then finds no module (9 Nov). Same modules, unscanned names.
-LORA_MODULES='decoder/layers_[0-9]+/.*(self_attention/(query|key|value|out)|mlp/(wi_0|wi_1|wo))'
-ARGS=(run_name=$NAME model_name=gemma3-$MODEL load_parameters_path=$CKPT/0/items tokenizer_type=huggingface
+# LORA_MODULES from the environment: another regex (qwix fullmatches it against a module's path), e.g. the Gemma 4 test's
+# variants (run_g4lora.sh).
+LORA_MODULES=${LORA_MODULES:-'decoder/layers_[0-9]+/.*(self_attention/(query|key|value|out)|mlp/(wi_0|wi_1|wo))'}
+ARGS=(run_name=$NAME model_name=$MAXTEXT_MODEL load_parameters_path=$CKPT/0/items tokenizer_type=huggingface
   tokenizer_path=$TOK hf_path=parquet hf_train_files=$DATA train_split=train chat_template_path=$TEMPLATE
   enable_data_shuffling=false max_target_length=1024 packing=true scan_layers=false
   lora.enable_lora=true lora.lora_rank=16 lora.lora_alpha=16.0 "lora.lora_module_path=$LORA_MODULES"

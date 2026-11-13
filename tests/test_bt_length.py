@@ -323,9 +323,8 @@ def test_docs_reads_row_groups_and_writes_stretches_per_bin(tmp_path, monkeypatc
     import json
     import types
 
-    from tokenizers import Tokenizer, models, pre_tokenizers
-
     import select_passages as sp
+    from tokenizers import Tokenizer, models, pre_tokenizers
 
     tok = Tokenizer(models.WordLevel({"[UNK]": 0}, unk_token="[UNK]"))
     tok.pre_tokenizer = pre_tokenizers.WhitespaceSplit()

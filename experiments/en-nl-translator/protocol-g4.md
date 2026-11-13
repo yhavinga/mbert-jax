@@ -1,0 +1,287 @@
+# Protocol: arm G4-1, de eerste vertalerarm op Gemma 4 31B-it
+
+Status: **vastgelegd 14 nov 2026** (tijdstip: de commit van dit bestand op branch `en-nl-g4arm` van
+`github.com/yhavinga/mbert-jax`), vóór de bouw van de trainingsset, vóór de eerste trainingsstap en vóór elke uitslag
+van G4-1. Geschreven door een subagent voor de hoofdsessie en Yeb. Wat na het vastleggen verandert, staat als gedateerd
+amendement in §9. Het protocol van de armen op TranslateGemma (`protocol.md`, hierna "TG-protocol") blijft gelden waar
+dit document ernaar verwijst; waar dit document iets anders zegt, geldt dit document voor G4-1.
+
+Labels: **[besluit]** = besluit van Yeb (met datum); **[keuze]** = keuze van dit protocol (technisch, door de subagent);
+**[gemeten]** = gemeten, met bron; **[schatting]**; **[gevolgtrekking]** = eigen gevolgtrekking, niet gemeten.
+
+`R=gs://t5-dutch-english-usc2/mbert/translator`, `S=$R/sft`, `E=$R/eval`, `G=$S/g4arm` (alles in us-central2).
+
+## 1. Vraag, arm en uitgangspunt
+
+**Vraag.** Maakt een LoRA-fine-tune van Gemma 4 31B-it op terugvertalingen van Gemma 4 en op de Nederlandse boeken een
+betere en→nl-vertaler dan Gemma 4 31B-it zelf, zonder fine-tune, met de prompt `natural-v1`?
+
+- **Besluit van Yeb (14 nov ~00:40)**: de eerste arm op Gemma 4 bouwen, **zonder FLAN-replay** zolang FLAN-nl niet
+  hersteld is. De gepubliceerde FLAN-nl is met TranslateGemma op MaxText 0.2.5 vertaald, met de fout in het
+  sliding-window-masker (LEARNINGS, "Lange teksten falen door twee fouten in ons MaxText-decodeerpad"). FLAN-replay komt
+  pas in de mix als er een Gemma 4-vertaling van de replay-voorbeelden is; **TranslateGemma-FLAN-nl wordt nooit
+  gebruikt** (§2.5).
+- **Arm G4-1** = Gemma 4 31B-it (`google/gemma-4-31B-it` @ `842da3794eaa0b77d5f08bae87a17459d91ff475`, Apache 2.0) +
+  LoRA **rank 32, alpha 16**, op attention (`query`, `key`, `value`, `out`) en MLP (`wi_0`, `wi_1`, `wo`) van alle 60
+  lagen; de 10 globale lagen hebben geen `value` (410 modules, 244.858.880 LoRA-parameters) [gemeten 13 nov, run
+  `g4l_v3b`, `$S/g4lora/runs/g4l_v3b/summary.json`]. Waarom rank 32: het advies van de geheugentest van 13 nov volgens de
+  daar vooraf vastgelegde regel (rank 64: piek 29,6 GiB per chip, boven de grens 29,5; rank 32: 24,6 GiB, 8,2 s per stap;
+  `mbert-ops/translator-sft/gemma4-moe-lora-test.md`). Alpha 16 geeft dezelfde schaal alpha / rank = 0,5 als rank 64 /
+  alpha 32 van RB2, RB3, RBR, RL en RE.
+- **Uitgangspunt G4-0** = hetzelfde Gemma 4 31B-it zonder fine-tune, prompt `natural-v1`, **opnieuw vertaald in
+  dezelfde keten als G4-1** (zelfde VM-type v4, code, MaxText-fork, lengteklassen, slots, greedy) [keuze]. Reden: het
+  verschil tussen arm en uitgangspunt moet van de adapter komen, niet van een ander decodeerpad: greedy uitvoer hangt af
+  van de batch-samenstelling en de klasse-indeling (bij de blinde set van de 31B waren 32 van 35 WMT-passages gelijk aan
+  de eerdere vertaling; `gemma4-sizes.md` §7). De eerdere uitkomsten van Gemma 4 31B op een v6e-8 (QE 2,230 / 1,160 /
+  1,554 op WMT24++ (960) / FLORES / NTREX, "origineel" 30,46%, blind 56 / 22 / 22 tegen TG) worden naast G4-0
+  gerapporteerd als controle; ze beslissen niet.
+- **Tweede referentie: TranslateGemma 27B (TG)** zonder fine-tune, de bestaande uitkomsten van het TG-protocol
+  (`$E/baseline-tg27b/`, de basisvertalingen van FLAN en de blinde set in `$S/arms/eval/base-x/`). Gerapporteerd, beslist
+  niet (§5).
+
+## 2. Trainingsdata
+
+Code: `experiments/en-nl-translator/g4arm.py build` en `check`; tests `tests/test_en_nl_g4arm.py`. De set komt in
+`$G/data/G4-1/` (`train.parquet` met kolom `messages`, `train-meta.parquet`, `template.jinja`, `manifest.json`), het
+verslag in `$G/data/report.md` en `report.json` (kopie `mbert-ops/translator-sft/data-g4-1-report.md`). Vaste seed-prefix
+`en-nl-g4arm/0`.
+
+### 2.1 Terugvertalingen van Gemma 4 (BT)
+
+- **Bron** [besluit 13 nov: alleen de Gemma 4-BT telt]: de vijf publieke datasets `yhavinga/<bron>-nl-en-gemma4`, split
+  `train` (de split `validation` blijft de evaluatiekant, per document gesplitst), op deze revisies (14 nov 00:17 CET,
+  met de kolommen van de rondgang):
+
+  | dataset | revisie | bron in de rapporten |
+  |---|---|---|
+  | `yhavinga/handelingen-tweede-kamer-nl-en-gemma4` | `3a129f586544d57eb7d6135b3c7b154153f22ee8` | handelingen |
+  | `yhavinga/openraadsinformatie-nl-en-gemma4` | `6fb33363cf38a329beb15a1ed72e986ad220ccf5` | raad |
+  | `yhavinga/rijksoverheid-websites-nl-en-gemma4` | `0683859b68e6ee594b60e800d4d0110ff4c86276` | dpc |
+  | `yhavinga/rechtspraak-nl-en-gemma4` | `0eaca05493c9293f377ec3bf6b2e2c0d02963b82` | rechtspraak |
+  | `yhavinga/fineweb-2-nl-en-gemma4` | `f7538a912cb3b24c810e2032d8dca108e216b2e0` | fineweb |
+
+  Een squash op Hugging Face kan een revisie later laten verdwijnen; daarom gaat een kopie van de gelezen bestanden naar
+  `$G/input/bt/` met hun sha256 in `manifest.json` [keuze]. Alleen de configuratie `default` (`data/`); de
+  contextbeurten van de Handelingen (`context_turns`) niet (§2.6).
+- **Pool** (een rij komt in aanmerking als alles geldt) [keuze, zoals RL waar het kan]:
+  1. `hard_fails` leeg (de harde controles van de dataset: niet af, lus, Nederlands over, lengteverhouding > 1,5,
+     opmaak, verdubbelde regelafbreking, inleiding of noot);
+  2. de lengtegrens van R2: de tekenverhouding Nederlands / Engels ligt binnen een factor 4/3 van de mediaan van de
+     bron (mediaan / 1,3333 tot mediaan × 1,3333; medianen over de train-rijen van die bron die door punt 1 komen)
+     (TG-protocol §9, amendement R2, punt 1 (ii); `sft_build.length_bounds`);
+  3. geen 13-gram van woorden gedeeld met een evaluatieset (WMT24++, FLORES-200, NTREX-128, Europarl-direct: bron en
+     referentie, `$E/data/evalsets.parquet`) of met de bronnen van de 100 blinde passages
+     (`$S/blind/fixed-2026-11-10/blind100.jsonl`), aan de Nederlandse en de Engelse kant;
+  4. het hele voorbeeld (prompt in het chat-template + Nederlands + `<turn|>\n`) telt hoogstens **2.048** tokens van
+     Gemma 4;
+  5. **FineWeb-2-crawljaar: een parameter, standaard geen grens** (`--fineweb-max-crawl`, inclusief; een jaar `2023`
+     of een crawl `CC-MAIN-2023-23`; leest de kolom `dump`). De meting van 13 nov
+     (`mbert-ops/translator-sft/fineweb2-year-check.md`) vond de eerste daling in crawljaar 2024 en een knik bij
+     CC-MAIN-2023-40; welke grens geldt, heeft Yeb nog niet gekozen. G4-1 traint **zonder grens**; een grens maakt een
+     andere arm (amendement).
+- **Geen QE-grens**: er is geen MetricX-score van het Gemma 4-Engels, en Yebs richting (12 nov) is data zo goed dat
+  filteren niet nodig is. De chrF van de rondgang (kolom `chrf`) is **geen grens**; het verslag geeft haar verdeling in
+  de pool en in de trekking [keuze].
+- **Hersampling naar de menselijke lengteverhouding** (de methode van RL, TG-protocol §9, amendement RL punt 3 met de
+  aanvulling "5 bakken"; `sft_build.match_target` en `bt_match_draw`, ongewijzigd): histogram matching op
+  log(woorden NL / woorden EN) naar de **echte voorbeelden van de trainingsset van R2** (`$S/data/r2/R2`, soort `real`:
+  52.182, Europarl-direct en Global Voices, mediaan 1,0625), **5 bakken** begrensd door de kwintielen van het doel
+  (0,9737 / 1,0351 / 1,0909 / 1,1613), elke bak gevuld naar zijn aandeel in het doel (grootste rest), zonder
+  teruglegging, uniform met seed `en-nl-g4arm/0/bt-match/<b>`. Een bak van het doel zonder BT-voorbeelden is een fout.
+  Volgens een schatting van de hoofdsessie houdt de hersampling hoogstens ~60.145 paren; G4-1 trekt er veel minder
+  (§2.4), dus geen bak begrenst het aantal [schatting, de build meet het].
+
+### 2.2 Nederlandse boeken
+
+De **12.521 boekparen van RL** (`$S/data/rl-b5/RL`, soort `real`: `yhavinga/nedd_x_dataset_nlbooks_b1` zonder de vijf
+auteurs die niet in het Nederlands schreven, de harde controles, de lengtegrens, de uitlijncontrole met grens 4,39, geen
+QE-grens, geen 13-gram met een evaluatieset of blinde passage; TG-protocol §9, amendement RL punten 1–2): het Engels uit
+`train-meta.parquet`, het Nederlands uit `train.parquet`, ongewijzigd, met de prompt van §2.6. Opnieuw geteld met Gemma 4
+(punt 4 van §2.1); het verslag noemt wat daarbij wegvalt [keuze: dezelfde boekparen als RL, zodat het verschil met RL
+niet in de boeken zit].
+
+### 2.3 Wat er niet in zit
+
+Geen contextvoorbeelden (§2.6), geen Europarl of Global Voices (RBR en R2: echt Engels uit Europarl/GV voegde niets toe
+boven de boeken en drukte regel (b)), geen romans van RE, geen FLAN-replay (§2.5), geen instructiezin.
+
+### 2.4 Verhouding BT : boeken = 1 : 1 [keuze, onderbouwing]
+
+n_BT = het aantal boekparen (`--bt-per-book 1`), dus ~50 : 50 in voorbeelden, zoals RB3 (11.923 + 11.923) en RL
+(12.763 + 12.521). Onderbouwing, uit de uitslagen van de TG-armen (LEARNINGS):
+- RB3 (50 : 50) lag op regel (a) dichter bij TG dan RB2 (80 : 20) en RBR (60 : 20 : 20) en haalde (b) (+12,2 pp);
+  meer BT (B, RB, RB2, R2) trok de uitvoer verder van het uitgangspunt en comprimeerde haar.
+- RL (50 : 50, BT hersampled naar de menselijke lengte, boeken zonder QE-grens) was even goed als RB3 op (a1) en (a2) en
+  het hoogst op (b) (+13,4 pp), met uitvoer even lang als de referentie op alle drie de sets.
+- G4-1 verschilt daardoor van RL alleen in: het basismodel (Gemma 4 31B-it in plaats van TranslateGemma 27B), de bron
+  van het synthetische Engels (Gemma 4 in plaats van TranslateGemma), de prompt en het template (§2.6), de rank (32 / 16
+  in plaats van 64 / 32, zelfde schaal) en het ontbreken van contextvoorbeelden (RL: 1.021, 8%).
+
+### 2.5 FLAN-replay: een parameter, nu 0
+
+- `--replay-share` (aandeel van de voorbeelden; replay = round((BT + boeken) × aandeel / (1 − aandeel))), **standaard
+  0**. G4-1 heeft geen replay [besluit 14 nov ~00:40].
+- Met een aandeel > 0 eist de build `--replay` (een parquet met kolommen `id`, `en`, `nl`, eventueel `task` en `model`)
+  en `--replay-model`; hij **weigert** een bron die TranslateGemma-FLAN-nl is: een pad of naam met `yhavinga/flan-nl`,
+  `mbert/flan-nl/` (behalve de map van de Gemma 4-pilot `mbert/flan-nl/g4-pilot`) of `mainset/replay`, een
+  `--replay-model` zonder `gemma-4`, of een kolom `model` met een waarde zonder `gemma-4` [keuze].
+- Getrokken uit de replay-rijen die geen segment van de FLAN-evaluatierijen zijn (`$R/mainset/flan-eval/eval-rows.parquet`,
+  kolom `segments`, sets `classifier` en `yeb`), geen 13-gram delen met een evaluatieset of blinde passage, en binnen
+  2.048 tokens passen; uniform met seed `en-nl-g4arm/0/replay`. Prompt: `natural-v1` **zonder** instructiezin, zoals de
+  rest [keuze: de replay moet de standaardmodus leren een opdracht te vertalen in plaats van uit te voeren, de faalwijze
+  van de TG-armen op FLAN; de instructiezin van arm N was een modusschakelaar naar TG's letterlijke stijl].
+- Een arm met replay is een **nieuwe arm (G4-2)** met een eigen amendement vóór zijn training; de beslisregel en de
+  evaluatie van dit protocol gelden dan ongewijzigd, met G4-0 als uitgangspunt.
+
+### 2.6 Prompt, template, verlies
+
+- User-beurt: `natural-v1` uit `experiments/flan-nl/translate_models.yml`, letterlijk, met het Engels als `{text}`
+  (`translate.user_text`): dezelfde prompt als het uitgangspunt van de blinde beoordeling en als G4-0. `natural-v1` heeft
+  geen contextvorm; daarom geen contextvoorbeelden [keuze; een arm met context is een latere arm].
+- Template: het chat-template van Gemma 4 met één user-beurt en **thinking uit** (het lege denkkanaal gesloten:
+  `<bos><|turn>user\n…<turn|>\n<|turn>model\n<|channel>thought\n<channel|>`), het Nederlands erachter, afgesloten met
+  `<turn|>\n` (`g4lora.TEMPLATE`). `check` legt elk voorbeeld langs MaxTexts eigen SFT-stappen en het eigen chat-template
+  van het model (zoals `g4lora.py data` op 13 nov).
+- Verlies alleen op het Nederlands en `<turn|>\n` (`sft_train_on_completion_only`).
+- De volgorde van de voorbeelden: geschud met seed `en-nl-g4arm/0/shuffle` (MaxText schudt niet).
+
+## 3. Training
+
+- Stack van de geheugentest van 13 nov: MaxText 0.2.5 `train_sft` met Tunix en qwix-LoRA (`run_sft.sh`, `sft_lora.py`,
+  SFT-venv van `setup_sft.sh`), checkpoint `$R/gemma4-ckpt/gemma-4-31b-it` (ongescand, bf16 op schijf, gewichten in fp32
+  tijdens de training), als één multi-host-job over de 16 chips van een v4-32 (`MULTIHOST=1`, FSDP).
+- LoRA rank 32, alpha 16, de modules van §1 (de regex van `run_sft.sh`), embeddings bevroren, dropout 0.
+- Optimalisatie als RL: AdamW (β2 0,999, weight decay 0,01), LR 1e-5, cosine naar 0 met 10% warmup, clipping 1,0,
+  **één epoch** (`step_limit` van `sft_lora.py`), `num_vocab_tiling=8`.
+- **Sequenties van 2.048 tokens**, packing, 1 per chip (16 × 2.048 = 32.768 tokenplaatsen per stap) [keuze].
+  Onderbouwing: elk voorbeeld past (punt 4 van §2.1); de tokens per stap zijn die van RL en de andere armen, dus dezelfde
+  effectieve batch; gemeten 24,6 GiB per chip en 8,2 s per stap (13 nov). Bij 4.096 (25,0 GiB, 10,6 s per stap) zou een
+  epoch ~35% sneller zijn, maar met de helft van de stappen en een dubbele batch: een tweede verschil met RL. 4.096 is
+  bedoeld voor een latere set met langere voorbeelden.
+- **Eén epoch** [keuze]: zoals alle TG-armen; de boeken komen uit 31 boeken, en een tweede epoch op dezelfde 12.521
+  boekparen leert eerder die boeken dan Nederlands. Verwacht [schatting]: ~12,8 M tokens (RL 12,4 M TG-tokens × 1,03) →
+  ~430 stappen × 8,2 s ≈ 1,0 uur, plus ~15 min tellen, laden en compileren; de build meet de tokens.
+- Uitvoer: `$G/runs/g4arm_G4-1/` (`adapter.npz`, `adapter.json`, `summary.json`, `metrics.txt`, logs per worker,
+  `maxtext/`: de checkpoint van Tunix met de LoRA-parameters, alleen aan het eind), daarna `$G/G4-1/` (`adapter.npz`,
+  `adapter.json`, `summary.json`). Na de training controleert de keten rank, alpha en schaal in `adapter.json`.
+- **Smoke-test vooraf** (§6): 8 stappen op dezelfde set, dezelfde instellingen, run `g4arm_G4-1_s8`.
+
+## 4. Evaluatie
+
+### 4.1 Vertalen
+
+- `translate.py` in de venv van de MaxText-fork @ `2249474` (`setup_generic.sh venv`, `/dev/shm/translate-generic/venv-fork`),
+  model `gemma4-31b` van `translate_models.yml`, `--prompt natural-v1`, checkpoint `$R/judge/gemma-4-31b-it-maxtext`
+  (dezelfde omzetting als die van de training: `_METADATA` byte-gelijk, `HANDOVER-g4lora.md` §1), greedy, elke worker
+  een TPU van zijn eigen 4 chips.
+- **Lengteklassen tiny tot en met xlong** (prefill ≤ 640, decodeerlimiet ≤ 832 ≤ 1.024 tokens). Daarmee raakt geen van
+  de twee fouten van het decodeerpad de evaluatie: fout 2 (de gedeelde `cache_ar_index` van de fork @ `2249474`) speelt
+  alleen bij een decodeerlimiet boven het venster van 1.024, fout 1 (het masker in cache-slots) alleen in MaxText 0.2.5.
+  Klasse xxlong (limiet 1.152) wordt niet gebruikt: een segment boven 512 Gemma 4-tokens is een fout van de
+  datastap [keuze]. De evaluatie van Gemma 4 op 12/13 nov had ook alleen tiny–xlong [gemeten:
+  `gs://t5-dutch-english/mbert/translator/bt-natural/data/eval/{four,flan}/classes.txt`].
+- **De adapter samengevoegd in de gewichten bij het laden** (`translate.py --lora`: per module A·B·schaal in float32
+  opgeteld bij de kernel en terug naar bf16), niet LoRA tijdens het decoderen [keuze]. Redenen:
+  1. hetzelfde pad als alle TG-armen, dus vergelijkbaar met hun uitkomsten;
+  2. de samenvoeging is getest tegen qwix' eigen LoRA-forward op MaxText's `DenseGeneral`
+     (`tests/test_en_nl_lora_merge.py`), het laagtype van de attention en MLP van Gemma 4;
+  3. de decode-engine van de fork kent geen LoRA; qwix in `prefill`/`insert`/`generate` van `maxengine` inbouwen is
+     nieuwe, ongeteste code in precies het pad waar op 13 nov twee fouten zaten;
+  4. samengevoegd vertaalt even snel als het basismodel.
+  Prijs: de update wordt in bf16 afgerond (bij N bleef 45% van de kernelelementen ongewijzigd); het geëvalueerde model is
+  een afgeronde versie van de getrainde LoRA, zoals bij alle TG-armen. `translate.py` meldt per run het aantal modules
+  (verwacht 410), de relatieve norm van de update en het aandeel gewijzigde elementen (regel `LORA`); het verslag neemt
+  die over.
+- G4-0 vertaalt dezelfde segmenten in dezelfde keten, zonder `--lora`.
+
+### 4.2 Sets
+
+| set | n | rol |
+|---|---:|---|
+| WMT24++ en→nl_NL | 960 zonder `is_bad_source` (alle 998 gerapporteerd) | (a1), (b) |
+| FLORES-200 devtest | 1.012 | (a1) |
+| NTREX-128 | 1.997 | (a1) |
+| Europarl-direct | 640 | gerapporteerd |
+| FLAN (set `classifier` van `$R/mainset/flan-eval/eval-rows.parquet`) | 1.000 | (b); QE gerapporteerd |
+| blind (`blind100.jsonl`: 35 WMT24++, 30 idioom, 35 FLAN) | 100 | (a2), (c) |
+
+Bron, referentie en ids als in het TG-protocol (`$E/data/evalsets.parquet` en de soort `x` van `$S/arms/data/x/data/`);
+de segmenten opnieuw geteld met de tokenizer van Gemma 4 voor de lengteklassen. **Niet**: het in-domeindeel (TG-protocol
+§4.2.2; met het Engels van Gemma 4 zou het een andere set zijn dan bij de TG-armen, en het beslist niet), PLL, MTLD
+[keuze].
+
+### 4.3 Maten
+
+- MetricX-24 hybrid XXL (`metricx_qe.py`, JAX-port, bf16 op de TPU): QE (**beslist (a1)**) en met referentie;
+  COMET-22 met referentie (CPU); niet af, lus, Engels over, leeg; de lengte van de uitvoer tegenover de referentie
+  (`armeval.length_ratios`).
+- **Classifier "origineel of vertaald"** van 10 nov (S @ 653k, `$S/arms/naturalness/classifier/`, nauwkeurigheid
+  0,9575; niet opnieuw getraind; TG-protocol §4.2.1) op de vertalingen van WMT24++ (960) en de 1.000 FLAN-rijen. In
+  één classify-run: G4-1, G4-0 en, als controle, de bestaande teksten van TG en van Gemma 4 op de v6e
+  (`$S/re/classify/g4-base-texts.parquet`, modellen `base` 19,13% en `G4` 30,46% op 13 nov).
+- **Blinde beoordeling** (TG-protocol §4.2.4: dezelfde 100 passages, dezelfde rubriek, letterlijk): A/B **G4-1 tegen
+  G4-0**, volgorde per passage met seed `en-nl-sft/blind/ab/G4-1/<blind_id>` (`armeval.base_is_a`), pakket in
+  `$S/blind/G4-1/` (`judge-input.jsonl`; de sleutel `key.jsonl` alleen in de bucket). Eén verse Claude-subagent met
+  alleen de rubriek en de passages, geen tweede ronde; twijfelgevallen blijven gemarkeerd en Yeb kan ze vervangen
+  [besluit 13 nov ~07:50: geen Fable]. Daarnaast een pakket **G4-1 tegen TG** (`$S/blind/G4-1-tg/`, seed
+  `en-nl-sft/blind/ab/G4-1-tg/<blind_id>`), alleen gerapporteerd; of het beoordeeld wordt, beslist de hoofdsessie.
+
+## 5. Beslisregel (exact)
+
+G4-1 **helpt** als (a1), (a2), (b) en (c) alle vier gelden; anders **helpt G4-1 niet**. Het uitgangspunt van (a2), (b)
+en (c) is **G4-0, Gemma 4 31B-it zonder fine-tune**, niet TranslateGemma: de arm moet Gemma 4 zelf verbeteren. TG
+verslaan is niet genoeg, want G4-0 verslaat TG al (13 nov: (b) +11,3 pp, blind 56 / 22 / 22, fouten 17 tegen 41).
+
+- **(a1) niet slechter dan een mens op MetricX-24-QE** (ongewijzigd uit het TG-protocol §9, amendement 13 nov): voor elk
+  van WMT24++ (de 960 zonder `is_bad_source`), FLORES-200 en NTREX-128 geldt gemiddelde QE(G4-1) ≤ gemiddelde QE van de
+  menselijke referentie als kandidaat: **2,3917784375 / 1,4938481225 / 1,8419510766** (onafgerond;
+  `gs://t5-dutch-english-use1/mbert/translator/bt-natural/report/refqe.json`, `ref_mean`).
+- **(a2) niet meer betekenisfouten dan G4-0**: in de blinde beoordeling G4-1 tegen G4-0 (§4.3) is het aantal passages
+  met "fout = ja" bij G4-1 ≤ dat bij G4-0, over dezelfde 100 passages.
+- **(b) natuurlijker volgens de classifier dan G4-0**: aandeel "origineel"(G4-1) − aandeel "origineel"(G4-0) ≥ **0,10**,
+  op de samengenomen uitvoer van WMT24++ (960) en de 1.000 FLAN-rijen, G4-1 en G4-0 uit dezelfde classify-run.
+  Bij G4-0 ≈ 30,5% betekent dat ≈ 40,5% voor G4-1, ~21 pp boven TG [gevolgtrekking uit de v6e-meting].
+- **(c) beter dan G4-0 in de blinde beoordeling**: G4-1 wint in minstens 60% van de niet-gelijke oordelen: k / n ≥ 0,60,
+  met n het aantal passages met "A beter" of "B beter" en k het aantal waarin G4-1 beter is.
+- De blinde beoordeling gebeurt alleen als (a1) en (b) gelden (TG-protocol §4.2.4: "een arm die daarop faalt, helpt
+  volgens de regel toch niet"); het pakket wordt altijd gemaakt.
+- **Gerapporteerd, beslist niet**: MetricX-QE, MetricX-ref en COMET-22 tegen G4-0 en tegen TG (verschillen per set), (b)
+  tegen TG, de lengte van de uitvoer, niet af / lus / Engels over / leeg, Europarl-direct, FLAN-QE, de v6e-uitkomsten van
+  Gemma 4 naast G4-0, de LoRA-samenvoeging (§4.1), en de blinde beoordeling tegen TG als die gedaan wordt.
+- Vergelijkingen op onafgeronde gemiddelden; een verschil gelijk aan de grens op afronding na (1e-9) telt als op de
+  grens (`armeval.TOLERANCE`).
+
+## 6. Smoke-test op de TPU (vóór de volle training)
+
+Op de eerste vrije v4-32 (mbert-mix na `EXIT` van `logs/fork_fix_check_run.log`, of mbert-corpus na `EXIT` van
+`logs/flan_g4_pilot_run.log`), met de locks en controles van die VM. Een technische controle, geen uitslag van G4-1:
+
+1. **8 trainingsstappen** op de set van §2 met de instellingen van §3 (`STEPS=8`, run `g4arm_G4-1_s8`), en de
+   checkpoint van stap 8. Geslaagd als: alle 4 workers `EXIT 0`, 8 eindige verliezen, piek ≤ 29,5 GiB per chip,
+   `adapter.npz`, `adapter.json` (rank 32, alpha 16, schaal 0,5) en `maxtext/g4arm_G4-1_s8/checkpoints/8/commit_success.txt`
+   in `$G/runs/g4arm_G4-1_s8/`.
+2. **Decoderen van 50 segmenten**: de eerste 50 WMT24++-segmenten (uit de 960) van klasse `small` in volgorde van id,
+   op w0, met de adapter van stap 8 (`--lora`) en zonder (G4-0), elk met de code en klassen van §4.1. Geslaagd als: de
+   regel `LORA` noemt 410 modules en een relatieve norm > 0; van beide runs zijn ≥ 48 van de 50 vertalingen af, geen lus,
+   niet leeg.
+3. **MetricX-24 (QE en met referentie) op die 50**, op w0. Geslaagd als alle scores eindig zijn en |gemiddelde QE(G4-1,
+   stap 8) − gemiddelde QE(G4-0)| ≤ 0,5 (na 8 stappen in de warmup hoort de adapter de vertaling nauwelijks te veranderen;
+   een fout in de samenvoeging gaf onzin).
+
+Verslag `$G/smoke/<tag>/smoke.md` en `.json` (kopie `mbert-ops/translator-sft/g4arm-smoke.md`).
+
+## 7. Volgorde van de volle run
+
+Training (§3) → adapter → vertalen G4-1 en G4-0 (§4.1) → MetricX en COMET → teksten → classify → blinde pakketten →
+verslag `$G/report/report.md` met (a1), (b) en de stand van (a2) en (c) (kopie `mbert-ops/translator-sft/g4-1-report.md`).
+De blinde beoordeling zelf doet de hoofdsessie (een verse subagent), daarna (a2) en (c) met `g4arm.py tally`.
+
+## 8. Bronnen
+
+TG-protocol (`protocol.md`, §2–§5 en §9); hammond `mbert/LEARNINGS.md`, de vertaler-items vanaf "27B-armen B en N";
+`mbert-ops/translator-sft/gemma4-moe-lora-test.md` (geheugentest), `rl-report.md`, `rb3-report.md`, `gemma4-sizes.md`,
+`prefill-check.md`, `fineweb2-year-check.md`; `mbert-ops/HANDOVER-g4lora.md`.
+
+## 9. Amendementen na het vastleggen
+
+Geen.

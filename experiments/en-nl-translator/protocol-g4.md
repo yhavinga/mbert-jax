@@ -170,7 +170,7 @@ n_BT = het aantal boekparen (`--bt-per-book 1`), dus ~50 : 50 in voorbeelden, zo
 
 ### 4.1 Vertalen
 
-- `translate.py` in de venv van de MaxText-fork @ `2249474` (`setup_generic.sh venv`, `/dev/shm/translate-generic/venv-fork`; **@ `f4d8615` volgens het amendement van 14 nov ~00:55, §9**),
+- `translate.py` in de venv van de MaxText-fork @ `2249474` (`setup_generic.sh venv`, `/dev/shm/translate-generic/venv-fork`; **@ `f4d8615` volgens het amendement van 14 nov ~00:49, §9**),
   model `gemma4-31b` van `translate_models.yml`, `--prompt natural-v1`, checkpoint `$R/judge/gemma-4-31b-it-maxtext`
   (dezelfde omzetting als die van de training: `_METADATA` byte-gelijk, `HANDOVER-g4lora.md` §1), greedy, elke worker
   een TPU van zijn eigen 4 chips.
@@ -284,7 +284,7 @@ TG-protocol (`protocol.md`, §2–§5 en §9); hammond `mbert/LEARNINGS.md`, de 
 
 ## 9. Amendementen na het vastleggen
 
-**Amendement 14 nov 2026 ~00:55 CET: vertalen op de fork met de fix van de gedeelde cache-index** [instructie van de
+**Amendement 14 nov 2026 ~00:49 CET: vertalen op de fork met de fix van de gedeelde cache-index** [instructie van de
 hoofdsessie 00:50; vastgelegd vóór de bouw van de set, de eerste trainingsstap en elke uitslag]. Aanleiding: de
 fork-fix-controle van 14 nov (`mbert-ops/translator-sft/fork-fix-check.md`, `EXIT 0` om 00:43): branch
 `fix-decode-cache-shared-index` @ `f4d8615f478b6c18de9df8f2dff1f57f775a2521` (op `2249474`) laat Gemma 4 ook met

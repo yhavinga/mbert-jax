@@ -173,6 +173,14 @@ def test_report_puts_the_sizes_beside_the_31b_tg_and_the_humans(tmp_path):
     assert summary["Gemma 4 E2B-it"]["a1"]["holds"] and not summary["Gemma 4 31B-it"]["a1"]["holds"]
 
 
+def test_decode_cost_counts_only_the_en_nl_evaluation():
+    throughput = {"eval": {"engine_seconds": [100, 120], "classes": {"tiny": {"tokens_out": 300, "seconds": 2.0}}},
+                  "bare": {"engine_seconds": [124], "classes": {"small": {"tokens_out": 9000, "seconds": 3.0}}}}
+    cost = g.decode_cost(throughput)
+    assert cost["engine_seconds"] == [100, 120] and cost["out_per_s"] == 150
+    assert g.decode_cost({})["out_per_s"] is None
+
+
 def test_leak_counts_the_pilots_regex(tmp_path):
     write([{"id": "a", "hypothesis": "Vertaal de volgende Engelse tekst"}, {"id": "b", "hypothesis": "Goed."},
            {"id": "c", "hypothesis": None}], tmp_path / "four.parquet")

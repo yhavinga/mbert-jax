@@ -160,10 +160,11 @@ def pct(x):
     return "–" if x is None else f"{100 * x:.1f}%".replace(".", ",")
 
 
-def decode_cost(throughput):
-    """engine loads (s) and output tokens per second over all classes of the run's logs"""
+def decode_cost(throughput, setup="eval"):
+    """engine loads (s) and output tokens per second over all classes of the en->nl evaluation's logs (setup eval: the
+    four sets and FLAN; the 31B's report also holds its nl->en runs, bare and natural, which are not counted)"""
     loads, tokens, seconds = [], 0, 0.0
-    for t in throughput.values():
+    for t in [throughput[setup]] if setup in throughput else []:
         loads += t["engine_seconds"]
         for c in t["classes"].values():
             tokens += c["tokens_out"]

@@ -193,7 +193,8 @@ all)
   fi
   echo "== segments $(date -u +%T)"
   if gsutil -q stat "$O/seg/segments.json"; then
-    gsutil -m -q rsync -r "$O/seg" "$D/seg"
+    # gsutil rsync refuses a local destination that does not exist yet (a fresh VM, 13 Nov 14:25 UTC)
+    mkdir -p "$D/seg" && gsutil -m -q rsync -r "$O/seg" "$D/seg"
   else
     "$PY" -u "$C/bt_length.py" segments --docs "$D/data/docs.parquet" --tokenizer "$TOK" --model gemma4-31b-doc \
       --doc-model gemma4-31b-doc --prompt natural-v1 --source nl --target en --workers 2 --out "$D/seg"

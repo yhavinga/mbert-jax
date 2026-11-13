@@ -199,11 +199,35 @@ prompts:
   # takes 89 in Gemma 4's turn, bare-v1 27.
   natural-v1:
     kind: instruct
-    plain: |-
+    plain: &natural_v1_plain |-
       Translate the following {source} text into natural, idiomatic {target}, as a native speaker would write it, not word for word. Translate everything: leave nothing out and add nothing; keep every name, number, detail and nuance, and the tone. Be as concise as the original. Keep the paragraphs, line breaks and formatting. Output only the translation, without explanation or commentary.
 
 
       {text}
+  # The length trial's condition ctx (13 Nov, Yeb: in pieces, with the piece before as context; bt_length_ctx.py):
+  # without context natural-v1 word for word (the anchor), so that the first piece of a document gets exactly the
+  # prompt of the condition stukken. With context, natural-v1's words, then the end of the English translation already
+  # made of the piece before (the context element's translation; its source is not shown), marked off, and the Dutch
+  # piece to translate last. English only: Gemma 4's prompts stay within a prefill of 1,152 tokens (the class that
+  # decoded well in part A), and the Dutch of the piece before would halve the room for its English.
+  natural-v1-ctx:
+    kind: instruct
+    plain: *natural_v1_plain
+    context: |-
+      Translate the following {source} text into natural, idiomatic {target}, as a native speaker would write it, not word for word. Translate everything: leave nothing out and add nothing; keep every name, number, detail and nuance, and the tone. Be as concise as the original. Keep the paragraphs, line breaks and formatting. Output only the translation, without explanation or commentary.
+
+      The text is the next part of a longer document. For context only, here is the {target} translation of the part just before it (or its last paragraphs). Keep names, terms and references consistent with it, but do not translate it again and do not repeat it.
+
+      <previous_translation>
+      {turns}
+      </previous_translation>
+
+      The {source} text to translate:
+
+
+      {text}
+    turn: |-
+      {translation}
   bare-v1:
     kind: instruct
     plain: |-
@@ -289,6 +313,29 @@ models:
       d8k: {max_source: 8192, prefill_lengths: [8320], max_decode: 10240}
       d16k: {max_source: 16384, prefill_lengths: [16512], max_decode: 20480}
     slots: {d512: 32, d1k: 16, d2k: 8, d4k: 4, d8k: 2, d16k: 1}
+
+  # The length trial's condition ctx (bt_length_ctx.py): every piece of a stretch (whole paragraphs, at most 512
+  # tokens) with prompt natural-v1-ctx, the end of the English of the piece before as context. The prefill stays within
+  # 1,152 tokens, the longest prefill of part A that decoded well (d1k; d2k's 2,176 looped, and TranslateGemma looped
+  # at 1,152 in part B: 13 Nov); a piece without context takes 640. The decode limit is the condition stukken's (d512:
+  # 640). Slots: 20 x (1,152 + 640) = 35,840 slot-tokens, fewer than d1k's 16 x 2,432 (28.75 GiB per v4 chip in part
+  # A). xq: the consistency measure's questions (a term and its rendering in a translated piece), short answers.
+  gemma4-31b-ctx:
+    maxtext_model: gemma4-31b
+    hf_repo: google/gemma-4-31B-it
+    checkpoints:
+      europe-west4: gs://t5-dutch-english/mbert/translator/judge/gemma-4-31b-it-maxtext/0/items
+      us-east1: gs://t5-dutch-english-use1/mbert/translator/judge/gemma-4-31b-it-maxtext/0/items
+      us-central2: gs://t5-dutch-english-usc2/mbert/translator/judge/gemma-4-31b-it-maxtext/0/items
+    chips: 4
+    eos_ids: [1, 106, 50]
+    prompt: natural-v1-ctx
+    context_prompt: natural-v1-ctx
+    turn: {prefix: "<bos><|turn>user\n", suffix: "<turn|>\n<|turn>model\n<|channel>thought\n<channel|>", check: true}
+    length_classes:
+      c512: {max_source: 512, prefill_lengths: [640, 1152], max_decode: 640}
+      xq: {max_source: 1024, prefill_lengths: [640, 1152], max_decode: 32}
+    slots: {c512: 20, xq: 24}
 
   # TranslateGemma 27B on a whole stretch (the trial's part B, English to Dutch on a v4 host): the decode limit 1.5 x
   # the source (Dutch takes more tokens than English). Slots: ~80k slot-tokens of 0.13 MB a chip (~10.5 GB beside 13.5

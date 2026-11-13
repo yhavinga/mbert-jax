@@ -8,9 +8,13 @@
 #   bash run_g4_sizes.sh all      everything; each step skips what is in the bucket, so a run started again after a
 #                                 preemption goes on where the last stopped (at most a shard per class is lost)
 #   bash run_g4_sizes.sh chips    the chip check only: one process per chip group, each asserting its device count
-# Chips: a process takes as many chips as its model's KV heads allow (translate_models.yml chips): E2B, E4B and 12B
-# one each (ordinals 0, 1, 2 of the chips sorted by PCI root, as run_bt_natural.sh's halves), 26B two (ordinals 4, 5);
-# MetricX the four chips of ordinals 0-3 once E2B, E4B and 12B are done. The conversion of each model (g4_sizes.py
+#   bash run_g4_sizes.sh size S   one size alone on its chips, after all's setup: conversion, data, translation, check,
+#                                 COMET, MetricX on its own chips, its report and report/sizes.md again
+#   bash run_g4_sizes.sh sizes-report   report/sizes.md from the reports of every size in the bucket
+# Chips (translate_models.yml chips): E2B, E4B and 12B one each (ordinals 0, 1, 2 of the chips sorted by PCI root, as
+# run_bt_natural.sh's halves), their KV heads allowing no tensor parallelism; 26B the four of ordinals 4-7 (tensor 2,
+# data 2: a v6e process cannot take 2 chips, START_SESSION failed on 13 Nov); MetricX the four chips of ordinals 0-3
+# once E2B, E4B and 12B are done. The conversion of each model (g4_sizes.py
 # convert) runs on the CPU from Hugging Face into this region's bucket, beside the setup; check (g4_sizes.py check)
 # compares a few of each model's translations with the Hugging Face model on the CPU and stops that model's report
 # when they disagree.
@@ -20,7 +24,7 @@ set -euo pipefail
 # systemd-logind (RemoveIPC=yes) deletes a user's files in /dev/shm when the user's last session ends (9 Nov)
 sudo -n loginctl enable-linger "$(id -un)"
 SHM=/dev/shm/translate-generic
-C=$SHM/code
+C=${G4S_CODE:-$SHM/code}
 D=$SHM/g4s
 PY=$SHM/venv-fork/bin/python
 CPY=$SHM/comet-venv/bin/python
@@ -42,15 +46,7 @@ export HF_XET_CACHE=$SHM/xet-cache
 mkdir -p ~/logs "$D"
 
 model_of() { echo "gemma4-$1"; }
-# The 26B's two chips and their process bounds: the first pair of chips 4-7 that comes up as one process of 2 devices
-# (pair2, written by step chips); untested on a v6e before this run
-PAIR2=$SHM/g4s-pair2.txt
-chips_of() {
-  case $1 in
-    e2b) echo 0 ;; e4b) echo 1 ;; 12b) echo 2 ;; metricx) echo 0 1 2 3 ;;
-    26b) [ -s "$PAIR2" ] || { echo "no $PAIR2: run step chips first" >&2; exit 2; }; cut -d' ' -f1,2 "$PAIR2" ;;
-  esac
-}
+chips_of() { case $1 in e2b) echo 0 ;; e4b) echo 1 ;; 12b) echo 2 ;; 26b) echo 4 5 6 7 ;; metricx) echo 0 1 2 3 ;; esac; }
 ckpt_of() { echo "$O/ckpt/gemma-4-$1-it-maxtext"; }
 
 groups() {  # the chips' vfio groups, ordered by PCI root and group number (run_bt_natural.sh's half takes 4 of them)
@@ -65,7 +61,6 @@ on_chips() {  # ordinals...: the TPU environment of one process on these chips (
   for k in "$@"; do sel+=("${all[$k]}"); done
   case ${#sel[@]} in
     1) bounds=1,1,1 ;;
-    2) bounds=${G4S_BOUNDS_2:-$(cut -d' ' -f3 "$PAIR2")} ;;
     4) bounds=2,2,1 ;;
     *) echo "no process bounds for ${#sel[@]} chips"; exit 2 ;;
   esac
@@ -237,24 +232,51 @@ report_model() {  # size: evalcompare against TranslateGemma, the texts of the c
   gsutil -m -q cp "$r"/* "$O/report/$size/"
 }
 
+sizes_report() {  # report/sizes.md from every size's evalcompare result in the bucket, beside the 31B, TG and the humans
+  local size evals=() r=$D/sizes
+  mkdir -p "$r"
+  gsutil -q cp "$B/bt-natural/report/eval-gemma4.json" "$B/bt-natural/report/refqe.json" "$r/"
+  for size in e2b e4b 12b 26b; do
+    if gsutil -q stat "$O/report/$size/eval-$size.json"; then
+      gsutil -q cp "$O/report/$size/eval-$size.json" "$O/report/$size/extra-$size.json" "$r/"
+      evals+=("$size=$r/eval-$size.json")
+    fi
+  done
+  "$PY" -u "$C/g4_sizes.py" report --eval "${evals[@]}" --g4 "$r/eval-gemma4.json" --refqe "$r/refqe.json" --out "$r/sizes.md"
+  gsutil -q cp "$r/sizes.md" "$r/sizes.json" "$O/report/"
+}
+
 step=${1:-}
 case $step in
-chips)
-  if [ ! -s "$PAIR2" ]; then
-    for pair in "4 5" "4 6" "4 7"; do
-      for b in 1,2,1 2,1,1; do
-        # shellcheck disable=SC2086
-        if ( export G4S_BOUNDS_2=$b; on_chips $pair; preflight 2 180 ) > ~/logs/g4s_pair2.log 2>&1; then
-          echo "$pair $b" > "$PAIR2"; break 2
-        fi
-        echo "chips $pair bounds $b: no process of 2 devices ($(tail -n 1 ~/logs/g4s_pair2.log | cut -c1-200))"
-      done
-    done
-    # Without a pair the 26B cannot run (two chips at least: 50 GB of weights, 2 global KV heads); the others still can
-    [ -s "$PAIR2" ] || { echo "no pair of chips 4-7 comes up as one process: the 26B is left out"; echo none > "$PAIR2"; }
+sizes-report)
+  sizes_report
+  ;;
+size)
+  # One size alone, after all's setup (the venvs, COMET, MetricX's weights and the inputs are in /dev/shm)
+  size=${2:?usage: run_g4_sizes.sh size e2b|e4b|12b|26b}
+  echo "== $size on chips $(chips_of "$size"), $(hostname) $ZONE $O $(date -u +%T)"
+  [ -s "$SHM/venv-fork/done.txt" ] && [ -s "$SHM/comet/done.txt" -o -d "$SHM/comet" ] && [ -d "$D/in/tg27b" ] \
+    || { echo "run step all first: its setup and inputs are not in $SHM"; exit 1; }
+  tokenizer "$size"
+  convert "$size" 2>&1 | tee ~/logs/g4s_convert_$size.log
+  data "$size"
+  job "$size" "$(chips_of "$size")" "g4s_translate_$size" translate_model "$size" & t=$!
+  check "$size" $t > ~/logs/g4s_check_$size.log 2>&1 & k=$!
+  ( comet "$size:$t" ) > ~/logs/g4s_comet_$size.log 2>&1 & c=$!
+  failed=()
+  wait $t || failed+=("translate")
+  job "metricx $size" "$(chips_of "$size")" "g4s_metricx_$size" metricx "$size:$t" || failed+=("metricx")
+  wait $c || failed+=("comet")
+  wait $k || failed+=("check")
+  if [ ${#failed[@]} = 0 ]; then
+    report_model "$size" > ~/logs/g4s_report_$size.log 2>&1 || failed+=("report")
+    sizes_report
   fi
-  echo "26B on chips $(cat "$PAIR2")"
-  [ "$(cat "$PAIR2")" = none ] && SIZES=(e2b e4b 12b)
+  for f in ~/logs/g4s_*"$size".log; do gsutil -q cp "$f" "$O/logs/$(basename "$f" .log)-$RUN_ID.log" || true; done
+  echo "== $size done $(date -u +%T); failed: ${failed[*]:-none}"
+  [ ${#failed[@]} = 0 ]
+  ;;
+chips)
   pids=()
   # shellcheck disable=SC2046
   for size in "${SIZES[@]}"; do ( on_chips $(chips_of "$size"); preflight "$(chips_of "$size" | wc -w)" ) & pids+=($!); done
@@ -271,7 +293,6 @@ all)
   # Before anything runs in the background: every chip group must come up as a process of its own
   echo "== chips $(date -u +%T)"
   bash "$0" chips
-  if [ "$(cat "$PAIR2")" = none ]; then SIZES=(e2b e4b 12b); echo "LEFT OUT: 26b (no process of 2 chips)"; fi
   ( HF_HUB_OFFLINE=0 SHM=$SHM bash "$C/setup_comet.sh" && HF_HUB_OFFLINE=0 "$PY" -c "import sys; sys.path.insert(0, '$C'); import metricx_qe as m; print(m.download('xxl', '$SHM/metricx'))" ) \
     > ~/logs/g4s_setup_bg.log 2>&1 & setup_bg=$!
   for size in "${SIZES[@]}"; do tokenizer "$size"; done
@@ -319,12 +340,7 @@ all)
       [ -s "$D/$size/report/eval-$size.json" ] && evals+=("$size=$D/$size/report/eval-$size.json")
     fi
   done
-  gsutil -q cp "$B/bt-natural/report/eval-gemma4.json" "$B/bt-natural/report/refqe.json" "$D/"
-  if [ ${#evals[@]} -gt 0 ]; then
-    "$PY" -u "$C/g4_sizes.py" report --eval "${evals[@]}" --g4 "$D/eval-gemma4.json" --refqe "$D/refqe.json" \
-      --out "$D/sizes.md"
-    gsutil -q cp "$D/sizes.md" "$D/sizes.json" "$O/report/"
-  fi
+  [ ${#evals[@]} -gt 0 ] && sizes_report
   for f in ~/logs/g4s_*.log; do gsutil -q cp "$f" "$O/logs/$(basename "$f" .log)-$RUN_ID.log" || true; done
   echo "== done $(date -u +%T); failed: ${failed[*]:-none}"
   [ ${#failed[@]} = 0 ]

@@ -42,8 +42,16 @@ def test_each_size_has_the_31bs_prompt_classes_and_stop_tokens(size):
 
 
 def test_chips_follow_the_fewest_kv_heads():
-    # MaxText refuses tensor parallelism beyond a layer's KV heads: E2B 1, E4B 2, 12B 1 global, 26B 2 global
-    assert {s: tr.MODELS[m]["chips"] for s, m in g.SIZES.items()} == {"e2b": 1, "e4b": 1, "12b": 1, "26b": 2}
+    # MaxText refuses tensor parallelism beyond a layer's KV heads: E2B 1, E4B 2, 12B 1 global, 26B 2 global; a v6e
+    # process takes 1 or 4 chips (2 failed with START_SESSION), so the 26B is tensor 2 x data 2 on 4
+    meshes = {s: (tr.MODELS[m]["chips"], tr.mesh_of(tr.MODELS[m], tr.MODELS[m]["chips"])) for s, m in g.SIZES.items()}
+    assert meshes == {"e2b": (1, (1, 1)), "e4b": (1, (1, 1)), "12b": (1, (1, 1)), "26b": (4, (2, 2))}
+    assert tr.mesh_of(tr.MODELS["gemma4-31b"], 4) == (4, 1)
+
+
+def test_a_tensor_parallelism_that_does_not_divide_the_chips_is_an_error():
+    with pytest.raises(ValueError, match="does not divide"):
+        tr.mesh_of({"tensor": 3}, 4)
 
 
 def test_only_the_small_models_turn_closes_no_thought_channel():

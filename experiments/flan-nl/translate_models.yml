@@ -323,7 +323,9 @@ models:
     slots: {tiny: 64, small: 28, medium: 16, long: 12, xlong: 10, xxlong: 7}
 
   # 26B-A4B (MoE, 128 experts, 8 a token): 25.2 G parameters, 25.2 GB a chip on two; KV 25 x 8 x 256 x 4 + 5 x 2 x 512
-  # x 4 = 225 KB, 112 KB a chip.
+  # x 4 = 225 KB, 112 KB a chip. A v6e process cannot take 2 chips (START_SESSION failed, 13 Nov), so 4 chips with tensor
+  # parallelism 2 (its 2 global KV heads) and data parallelism 2: weights replicated over the two pairs, MaxText's
+  # decode cache (cache_batch unsharded) whole on every pair.
   gemma4-26b:
     maxtext_model: gemma4-26b
     hf_repo: google/gemma-4-26B-A4B-it
@@ -331,7 +333,8 @@ models:
     checkpoints:
       europe-west4: gs://t5-dutch-english/mbert/translator/gemma4-sizes/ckpt/gemma-4-26b-it-maxtext/0/items
       us-east1: gs://t5-dutch-english-use1/mbert/translator/gemma4-sizes/ckpt/gemma-4-26b-it-maxtext/0/items
-    chips: 2
+    chips: 4
+    tensor: 2
     eos_ids: [1, 106, 50]
     prompt: chat-v1
     turn: {prefix: "<bos><|turn>user\n", suffix: "<turn|>\n<|turn>model\n<|channel>thought\n<channel|>", check: true}

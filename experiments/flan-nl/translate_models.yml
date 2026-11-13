@@ -212,6 +212,27 @@ prompts:
 
       {text}
 
+  # The new back-translation of 13 Nov (experiments/en-nl-translator/bt_gemma4.py): natural-v1 added formatting the
+  # source does not have (hard checks 4.9% of the pilot's uniform sample, nearly all `structure`: line and paragraph
+  # breaks, italics, lists), and its English was still somewhat longer than a human translation (median 1.019 Dutch
+  # words per English word, human ~1.06). natural-v1-fmt is natural-v1 with one sentence against added formatting;
+  # natural-v1-fmt-len adds one sentence on length. In Gemma 4's turn they take 114 and 135 tokens beside the source,
+  # more than the 96 (tiny) to 128 of gemma4-31b's classes: they run in gemma4-31b-bt, whose classes leave 160-192.
+  natural-v1-fmt:
+    kind: instruct
+    plain: |-
+      Translate the following {source} text into natural, idiomatic {target}, as a native speaker would write it, not word for word. Translate everything: leave nothing out and add nothing; keep every name, number, detail and nuance, and the tone. Be as concise as the original. Keep the paragraphs, line breaks and formatting. Do not add line breaks, paragraphs, lists, headings, emphasis, Markdown or quotation marks that the source does not have. Output only the translation, without explanation or commentary.
+
+
+      {text}
+  natural-v1-fmt-len:
+    kind: instruct
+    plain: |-
+      Translate the following {source} text into natural, idiomatic {target}, as a native speaker would write it, not word for word. Translate everything: leave nothing out and add nothing; keep every name, number, detail and nuance, and the tone. Be as concise as the original. Make the {target} about as long as a professional human translation would be; do not add words or explanations. Keep the paragraphs, line breaks and formatting. Do not add line breaks, paragraphs, lists, headings, emphasis, Markdown or quotation marks that the source does not have. Output only the translation, without explanation or commentary.
+
+
+      {text}
+
 models:
   gemma3-12b:
     maxtext_model: gemma3-12b
@@ -263,3 +284,29 @@ models:
     length_classes: *translategemma_classes
     # xxlong (merge with en-nl-translator, never run for Gemma 4): 20 x 2048 slot-tokens, as many as xlong's 28 x 1472
     slots: {tiny: 192, small: 80, medium: 52, long: 36, xlong: 28, xxlong: 20}
+
+  # Gemma 4 31B-it for the back-translation of 13 Nov (bt_gemma4.py): gemma4-31b with classes of 64 more prefill tokens,
+  # so that a prompt of up to 160 tokens beside the source fits every class (natural-v1-fmt-len takes 135). The
+  # classes are the pipeline's length setting: a set of longer passages gets classes of its own here (max_source, the
+  # prefill lengths and max_decode, max_target_length being the largest prefill plus max_decode) and bt_gemma4.py plan
+  # --max-source. Slots: about the slot-tokens of gemma4-31b's classes (~45k, ~10 GB a chip of KV); tiny 160 instead
+  # of 192 for its longer prefill.
+  gemma4-31b-bt:
+    maxtext_model: gemma4-31b
+    hf_repo: google/gemma-4-31B-it
+    checkpoints:
+      europe-west4: gs://t5-dutch-english/mbert/translator/judge/gemma-4-31b-it-maxtext/0/items
+      us-east1: gs://t5-dutch-english-use1/mbert/translator/judge/gemma-4-31b-it-maxtext/0/items
+      us-central2: gs://t5-dutch-english-usc2/mbert/translator/judge/gemma-4-31b-it-maxtext/0/items
+    chips: 4
+    eos_ids: [1, 106, 50]
+    prompt: natural-v1-fmt
+    context_prompt: chat-v1
+    turn: {prefix: "<bos><|turn>user\n", suffix: "<turn|>\n<|turn>model\n<|channel>thought\n<channel|>", check: true}
+    length_classes:
+      tiny: {max_source: 32, prefill_lengths: [192], max_decode: 96}
+      small: {max_source: 128, prefill_lengths: [192, 320], max_decode: 256}
+      medium: {max_source: 256, prefill_lengths: [320, 448], max_decode: 448}
+      long: {max_source: 384, prefill_lengths: [448, 576], max_decode: 640}
+      xlong: {max_source: 512, prefill_lengths: [576, 704], max_decode: 832}
+    slots: {tiny: 160, small: 80, medium: 52, long: 36, xlong: 28}

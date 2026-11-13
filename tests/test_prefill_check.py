@@ -221,3 +221,14 @@ def test_collect_and_report_on_made_up_translations(tmp_path, capsys):
     assert e["ref_heel"]["qe_mean"] == pytest.approx(1.5) and e["test"]["qe_mean"] == pytest.approx(2.0)
     md = (tmp_path / "report" / "prefill-check.md").read_text()
     assert "| T6 |" in md and "eerst ingevoegd" in md and "2249474b9" in md and "25,10" in md
+
+
+def test_reuse_cpu_decodes_like_a_forward_pass_until_the_shared_cache_index_wraps(tmp_path):
+    """The fork's decode with slot reuse (MaxText upstream main d1c0d0afe / fork 2249474, CPU, tiny Gemma 4): R2 in a
+    fresh decode state matches a train-mode forward pass at every step; R2 inserted after R1 decoded REUSE_LEAD steps
+    matches until the shared cache index wraps and not after (characterizes H-fork; fails once MaxText fixes it)."""
+    pytest.importorskip("maxtext")
+    fresh, reused = pc.reuse_cpu(type("Args", (), {"work_dir": str(tmp_path)})())
+    assert fresh["first_step_over_tol"] is None
+    wrap = pc.REUSE_DECODE - pc.REUSE_LEAD
+    assert reused["first_step_over_tol"] == wrap + 1 and max(reused["rel"][:wrap + 1]) <= 1e-3

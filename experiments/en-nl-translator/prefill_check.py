@@ -13,6 +13,12 @@ reuse of decode slots changed. On mbert-mix (v4-32), each worker one process of 
         --out DIR
     python prefill_check.py report --plan DIR --measured measured.parquet --units units.parquet --qe qe-*.parquet \\
         --ref-a DIR --ref-b DIR --logs DIR --out prefill-check.md
+    JAX_PLATFORMS=cpu DECOUPLE_GCLOUD=TRUE python prefill_check.py reuse-cpu --work-dir DIR
+
+reuse-cpu (added after the run had started, the CPU side of H-fork): translate_checks.py's tiny Gemma 4 with two
+slots; R1 in slot 0 decodes LEAD steps, then R2 goes into slot 1 and decodes; per step of R2 the relative difference
+of its decode logits from a train-mode forward over the same tokens. A CASE line per lead (0: R2 starts at cache index
+0; REUSE_LEAD: R2 starts at that index and wraps after REUSE_DECODE - REUSE_LEAD steps).
 
 Design and expectation (fixed on 13 Nov before the run, from MaxText's code; W = 1024, the sliding window of the local
 layers of TranslateGemma 27B and Gemma 4 31B):
@@ -449,6 +455,90 @@ def report_md(r):
     return "\n".join(lines) + "\n"
 
 
+# ---------------------------------------------------------------------------------------------------- reuse-cpu
+
+REUSE_WINDOW, REUSE_PREFILL, REUSE_DECODE, REUSE_PROMPT, REUSE_LEAD, REUSE_STEPS = 8, 16, 24, 5, 12, 20
+
+
+def reuse_case(lead, steps, work_dir):
+    """Per decode step of R2 (inserted after R1 decoded `lead` steps): max |decode - forward| / max |forward|"""
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    import translate_checks as tc
+    from flax import nnx
+    from flax.linen import partitioning as nn_partitioning
+    from maxtext.common.common_types import MODEL_MODE_PREFILL, MODEL_MODE_TRAIN
+    from maxtext.configs import pyconfig
+    from maxtext.inference.maxengine import maxengine
+    from maxtext.utils import maxtext_utils, model_creation_utils
+
+    seq = REUSE_PREFILL + REUSE_DECODE
+    cfg = pyconfig.initialize([""], **dict(tc.TINY, per_device_batch_size=2), sliding_window_size=REUSE_WINDOW,
+                              max_prefill_predict_length=REUSE_PREFILL, max_target_length=seq,
+                              base_output_directory=f"{work_dir}/maxtext_output")
+    mesh = jax.sharding.Mesh(maxtext_utils.create_device_mesh(cfg), cfg.mesh_axes)
+    with nn_partitioning.axis_rules(cfg.logical_axis_rules), mesh:
+        model = model_creation_utils.create_model(cfg, mesh, model_mode=MODEL_MODE_PREFILL, rngs=nnx.Rngs(params=0))
+    _, params_state, _ = nnx.split(model, nnx.Param, ...)
+    leaves, treedef = jax.tree.flatten(params_state)
+    keys = jax.random.split(jax.random.PRNGKey(7), len(leaves))
+    params_state = jax.tree.unflatten(treedef, [jax.random.normal(k, x.shape, x.dtype) * 0.2
+                                                for k, x in zip(keys, leaves)])
+    engine = maxengine.MaxEngine(cfg, jax.devices())
+    params = engine.load_params(params=params_state)
+    rng = np.random.default_rng(1)
+
+    def prefill(prompt):
+        padded = jnp.asarray(prompt + [0] * (REUSE_PREFILL - len(prompt)), dtype=jnp.int32)
+        return engine.prefill(params=params, padded_tokens=padded, true_length=len(prompt))
+
+    prefix1, _ = prefill([int(x) for x in rng.integers(3, cfg.vocab_size, REUSE_PROMPT)])
+    state = engine.insert(prefix1, engine.init_decode_state(), slot=0)
+    for _ in range(lead):
+        state, _ = engine.generate(params, state)
+    r2 = [int(x) for x in rng.integers(3, cfg.vocab_size, REUSE_PROMPT)]
+    prefix2, first = prefill(r2)
+    tokens = r2 + [int(first.data[0, 0])]
+    logits = [np.asarray(prefix2["logits"], np.float64).reshape(-1)[-cfg.vocab_size:]]
+    state = engine.insert(prefix2, state, slot=1)
+    for _ in range(steps):
+        state, result = engine.generate(params, state)
+        logits.append(np.asarray(state["logits"][1], np.float64).reshape(-1)[-cfg.vocab_size:])
+        tokens.append(int(result.data[1, 0]))
+    with nn_partitioning.axis_rules(cfg.logical_axis_rules), mesh:
+        train_model = model_creation_utils.create_model(cfg, mesh, model_mode=MODEL_MODE_TRAIN,
+                                                        rngs=nnx.Rngs(params=0))
+    nnx.update(train_model, params_state)
+    batch = cfg.micro_batch_size_to_train_on
+    ids = jnp.tile(jnp.asarray([tokens + [0] * (seq - len(tokens))], dtype=jnp.int32), (batch, 1))
+    positions = jnp.tile(jnp.arange(seq, dtype=jnp.int32)[None], (batch, 1))
+    segments = jnp.tile(jnp.asarray([[1] * len(tokens) + [0] * (seq - len(tokens))], dtype=jnp.int32), (batch, 1))
+    with nn_partitioning.axis_rules(cfg.logical_axis_rules), mesh:
+        ref = train_model(ids, positions, decoder_segment_ids=segments, enable_dropout=False,
+                          model_mode=MODEL_MODE_TRAIN)
+    ref = np.asarray(ref[0] if isinstance(ref, tuple) else ref, np.float64)[0]
+    return [float(np.max(np.abs(d - ref[REUSE_PROMPT - 1 + k])) / np.max(np.abs(ref[REUSE_PROMPT - 1 + k])))
+            for k, d in enumerate(logits)]
+
+
+def reuse_cpu(args):
+    import translate
+    import translate_checks as tc
+
+    print("MAXTEXT " + json.dumps({**translate.maxtext_source(), "patches": translate.patch_maxtext()}), flush=True)
+    cases = []
+    for lead in (0, REUSE_LEAD):
+        rels = reuse_case(lead, REUSE_STEPS, args.work_dir)
+        bad = [k for k, x in enumerate(rels) if x > tc.REL_TOL]
+        cases.append({"window": REUSE_WINDOW, "max_prefill": REUSE_PREFILL, "decode_cache": REUSE_DECODE,
+                      "prompt": REUSE_PROMPT, "lead": lead, "steps": REUSE_STEPS, "wrap_after_step": REUSE_DECODE - lead,
+                      "first_step_over_tol": bad[0] if bad else None, "steps_over_tol": len(bad),
+                      "rel": [float(f"{x:.2g}") for x in rels]})
+        print("CASE " + json.dumps(cases[-1]), flush=True)
+    return cases
+
+
 # ---------------------------------------------------------------------------------------------------- main
 
 def main(argv=None):
@@ -488,8 +578,11 @@ def main(argv=None):
     a.add_argument("--ref-b", required=True, help="the same of part B")
     a.add_argument("--logs", default=None)
     a.add_argument("--out", required=True)
+    a = sub.add_parser("reuse-cpu")
+    a.add_argument("--work-dir", required=True)
     args = p.parse_args(argv)
-    {"plan": plan, "processes": processes, "translate": translate, "collect": collect, "report": report}[args.cmd](args)
+    {"plan": plan, "processes": processes, "translate": translate, "collect": collect, "report": report,
+     "reuse-cpu": reuse_cpu}[args.cmd](args)
 
 
 if __name__ == "__main__":

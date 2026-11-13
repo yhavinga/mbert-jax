@@ -50,20 +50,21 @@ preflight() {
   timeout 600 "$PY" -c "import jax; assert (jax.device_count(), jax.process_count()) == (4, 1), (jax.device_count(), jax.process_count()); print('devices', jax.devices())" || { echo "preflight failed: not 4 chips of one process"; exit 2; }
 }
 
-shard_size() {  # a class's shard: twice its slots for a whole stretch, 256 pieces
-  case $1 in d512) echo 64 ;; d1k) echo 32 ;; d2k) echo 16 ;; d4k) echo 8 ;; d8k) echo 4 ;; d16k) echo 2 ;; *) echo 256 ;; esac
+shard_size() {  # cond class: a shard of 256 pieces, or of twice the class's slots for whole stretches
+  [ "$1" = stukken ] && { echo 256; return; }
+  case $2 in d512) echo 64 ;; d1k) echo 32 ;; d2k) echo 16 ;; d4k) echo 8 ;; d8k) echo 4 ;; d16k) echo 2 ;; *) echo 256 ;; esac
 }
 
-translate_class() {  # k cond class: one class of a half's segments; a run out of memory is marked and not fatal
-  local k=$1 cond=$2 cls=$3 model log out code
-  if [ "$cond" = heel ]; then model=gemma4-31b-doc; else model=gemma4-31b; fi
+translate_class() {  # k cond class: one class of a half's segments; a run out of memory is marked and not fatal.
+  # Both conditions take gemma4-31b-doc: every piece (at most 512 tokens) is in its class d512, one engine load
+  local k=$1 cond=$2 cls=$3 model=gemma4-31b-doc log out code
   out=$O/$cond/w$k/$cls
   log=~/logs/len_${cond}_${cls}_w$k.log
   if gsutil -q stat "$out/oom.txt"; then echo "w$k $cond $cls: out of memory before ($out/oom.txt)"; return 0; fi
   echo "== w$k $cond $cls $(date -u +%T)"
   "$PY" -u "$C/bt_length_translate.py" --segments "$D/seg/$cond/segments-w$k.parquet" --out "$out" --tokenizer "$TOK" \
     --model "$model" --prompt natural-v1 --length-class "$cls" --source-lang nl --target-lang en --ckpt "$CKPT" \
-    --work-dir "$SHM/work-len-$k" --shard-size "$(shard_size "$cls")" > "$log" 2>&1 && code=0 || code=$?
+    --work-dir "$SHM/work-len-$k" --shard-size "$(shard_size "$cond" "$cls")" > "$log" 2>&1 && code=0 || code=$?
   echo "EXIT $code" >> "$log"
   gsutil -q cp "$log" "$O/logs/len_${cond}_${cls}_w$k-$RUN_ID.log" || true
   grep -E '^(SHARD|DONE|MEM|engine)' "$log" | tail -n 4 | cut -c1-300
@@ -143,7 +144,7 @@ fork = Path("/dev/shm/translate-generic/venv-fork/done.txt").read_text().strip()
 Path(sys.argv[1]).write_text(json.dumps({
     "model": "Gemma 4 31B-it (google/gemma-4-31B-it @ 842da37, MaxText 0.2.5-checkpoint van en-nl-judge), prompt "
              "natural-v1, greedy, eigen chat-template met lege denkruimte; heel: translate_models.yml gemma4-31b-doc "
-             "(één klasse per bak, decodeerlimiet 1,25 x de bron); in stukken: gemma4-31b (klassen tiny-xxlong)",
+             "(één klasse per bak, decodeerlimiet 1,25 x de bron); in stukken: dezelfde, alle stukken in klasse d512",
     "MaxText": "fork yhavinga/maxtext, branch fix-nnx-decode-cache-abstract-init @ 2249474b9; pakketten: " + fork,
     "MetricX": "google/metricx-24-hybrid-xxl-v2p6-bfloat16 @ 3d9c6f7, metricx_qe.py (JAX), QE nl->en per uitgelijnde "
                "eenheid (bron: de Nederlandse alinea's, kandidaat: het Engels), invoer afgekapt op 1.536 tokens",
@@ -193,7 +194,7 @@ all)
   if gsutil -q stat "$O/seg/segments.json"; then
     gsutil -m -q rsync -r "$O/seg" "$D/seg"
   else
-    "$PY" -u "$C/bt_length.py" segments --docs "$D/data/docs.parquet" --tokenizer "$TOK" --model gemma4-31b \
+    "$PY" -u "$C/bt_length.py" segments --docs "$D/data/docs.parquet" --tokenizer "$TOK" --model gemma4-31b-doc \
       --doc-model gemma4-31b-doc --prompt natural-v1 --source nl --target en --workers 2 --out "$D/seg"
     gsutil -m -q rsync -r "$D/seg" "$O/seg"
   fi

@@ -455,7 +455,7 @@ def report(args):
           f"documenten van dat jaar waren, daaruit {fw['max_docs_per_year']} willekeurig; geknipt en gefilterd als "
           f"`select_passages.py`, één passage per document, {pct(fw['long_share'])} lang (als de BT-passages); "
           f"documenten van de dataset uitgesloten. Wat gelezen werd: `data.json`.",
-          f"- Classifier: S @ 653k, fijngetuned op 10 nov (nauwkeurigheid {accuracy:.4f}) op origineel Nederlands "
+          f"- Classifier: S @ 653k, fijngetuned op 10 nov (nauwkeurigheid {f'{accuracy:.4f}'.replace('.', ',')}) op origineel Nederlands "
           f"tegenover de terugvertaling (nl->en->nl) van TranslateGemma 27B, op passages van dezelfde vijf bronnen. "
           f"Hij leerde vertaalstijl van TranslateGemma herkennen; of hij tekst van andere vertaalsystemen of door een "
           f"taalmodel geschreven tekst herkent, is niet gemeten.",
@@ -527,7 +527,7 @@ def g4report(args):
     base = shares["base"]
     out = {}
     L = ["## Kleinere Gemma 4-modellen als en->nl-vertaler: regel (b) tegen TranslateGemma", "",
-         f"Dezelfde classifier (nauwkeurigheid {accuracy:.4f}), zoals de stap reclassify van de RE-keten hem voor "
+         f"Dezelfde classifier (nauwkeurigheid {f'{accuracy:.4f}'.replace('.', ',')}), zoals de stap reclassify van de RE-keten hem voor "
          f"Gemma 4 31B toepaste: aandeel \"origineel\" van WMT24++ (960) en FLAN (1.000) samen, min dat van "
          f"TranslateGemma 27B (hier opnieuw gemeten; RE-keten: 19,1%); regel (b): verschil >= "
          f"{armeval.RULE_B:.2f}. Beslist niets.", "",

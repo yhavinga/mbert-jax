@@ -263,3 +263,51 @@ models:
     length_classes: *translategemma_classes
     # xxlong (merge with en-nl-translator, never run for Gemma 4): 20 x 2048 slot-tokens, as many as xlong's 28 x 1472
     slots: {tiny: 192, small: 80, medium: 52, long: 36, xlong: 28, xxlong: 20}
+
+  # The length trial of 13 Nov (experiments/en-nl-translator/bt_length.py): a whole stretch of a document in one prompt.
+  # One class per bin of the trial (a stretch of bin L has more than 0.75 L and at most L source tokens), the prefill
+  # 128 tokens above the source, the decode limit 1.25 x the source for Dutch to English (English takes fewer tokens).
+  # Slots: as gemma4-31b's ~45k slot-tokens (~10 GB a chip), one slot for d16k; the prefill of 16k tokens also needs its
+  # attention scores (8 heads a chip x 16.5k x 16.5k), so d16k may not fit: the trial measures it.
+  gemma4-31b-doc:
+    maxtext_model: gemma4-31b
+    hf_repo: google/gemma-4-31B-it
+    checkpoints:
+      europe-west4: gs://t5-dutch-english/mbert/translator/judge/gemma-4-31b-it-maxtext/0/items
+      us-east1: gs://t5-dutch-english-use1/mbert/translator/judge/gemma-4-31b-it-maxtext/0/items
+      us-central2: gs://t5-dutch-english-usc2/mbert/translator/judge/gemma-4-31b-it-maxtext/0/items
+    chips: 4
+    eos_ids: [1, 106, 50]
+    prompt: chat-v1
+    context_prompt: chat-v1
+    turn: {prefix: "<bos><|turn>user\n", suffix: "<turn|>\n<|turn>model\n<|channel>thought\n<channel|>", check: true}
+    length_classes:
+      d512: {max_source: 512, prefill_lengths: [640], max_decode: 640}
+      d1k: {max_source: 1024, prefill_lengths: [1152], max_decode: 1280}
+      d2k: {max_source: 2048, prefill_lengths: [2176], max_decode: 2560}
+      d4k: {max_source: 4096, prefill_lengths: [4224], max_decode: 5120}
+      d8k: {max_source: 8192, prefill_lengths: [8320], max_decode: 10240}
+      d16k: {max_source: 16384, prefill_lengths: [16512], max_decode: 20480}
+    slots: {d512: 32, d1k: 16, d2k: 8, d4k: 4, d8k: 2, d16k: 1}
+
+  # TranslateGemma 27B on a whole stretch (the trial's part B, English to Dutch on a v4 host): the decode limit 1.5 x
+  # the source (Dutch takes more tokens than English). Slots: ~80k slot-tokens of 0.13 MB a chip (~10.5 GB beside 13.5
+  # GB of weights; small's 115k peaked at 28.9 GiB), one slot for d16k, whose prefill needs its attention scores too.
+  gemma3-27b-doc:
+    maxtext_model: gemma3-27b
+    hf_repo: google/translategemma-27b-it
+    checkpoints:
+      us-central2: gs://t5-dutch-english-usc2/mbert/flan-nl/translategemma-27b-maxtext/0/items
+    chips: 4
+    eos_ids: [1, 106]
+    prompt: translategemma
+    context_prompt: chat-v1
+    turn: {prefix: "<bos><start_of_turn>user\n", suffix: "<end_of_turn>\n<start_of_turn>model\n", check: false}
+    length_classes:
+      d512: {max_source: 512, prefill_lengths: [640], max_decode: 768}
+      d1k: {max_source: 1024, prefill_lengths: [1152], max_decode: 1536}
+      d2k: {max_source: 2048, prefill_lengths: [2176], max_decode: 3072}
+      d4k: {max_source: 4096, prefill_lengths: [4224], max_decode: 6144}
+      d8k: {max_source: 8192, prefill_lengths: [8320], max_decode: 12288}
+      d16k: {max_source: 16384, prefill_lengths: [16512], max_decode: 24576}
+    slots: {d512: 56, d1k: 32, d2k: 16, d4k: 8, d8k: 4, d16k: 1}

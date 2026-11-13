@@ -254,9 +254,19 @@ def test_collect_and_report_on_made_up_translations(tmp_path, capsys):
 def test_reuse_cpu_decodes_like_a_forward_pass_until_the_shared_cache_index_wraps(tmp_path):
     """The fork's decode with slot reuse (MaxText upstream main d1c0d0afe / fork 2249474, CPU, tiny Gemma 4): R2 in a
     fresh decode state matches a train-mode forward pass at every step; R2 inserted after R1 decoded REUSE_LEAD steps
-    matches until the shared cache index wraps and not after (characterizes H-fork; fails once MaxText fixes it)."""
+    matches until the shared cache index wraps and not after (characterizes H-fork). With the fork's fix
+    (fix-decode-cache-shared-index, f4d8615: the newest decode-cache token is the end of the run of valid slots) R2
+    matches past the wrap as well."""
+    import inspect
+
     pytest.importorskip("maxtext")
+    from maxtext.layers.attention_op import AttentionOp
+
+    fixed = "run_end" in inspect.getsource(AttentionOp._decode_cache_positions)
     fresh, reused = pc.reuse_cpu(type("Args", (), {"work_dir": str(tmp_path)})())
     assert fresh["first_step_over_tol"] is None
-    wrap = pc.REUSE_DECODE - pc.REUSE_LEAD
-    assert reused["first_step_over_tol"] == wrap + 1 and max(reused["rel"][:wrap + 1]) <= 1e-3
+    if fixed:
+        assert reused["first_step_over_tol"] is None
+    else:
+        wrap = pc.REUSE_DECODE - pc.REUSE_LEAD
+        assert reused["first_step_over_tol"] == wrap + 1 and max(reused["rel"][:wrap + 1]) <= 1e-3

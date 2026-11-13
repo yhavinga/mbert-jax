@@ -16,17 +16,34 @@
 #   bash run_prefill_check.sh report      w0 (CPU): $O/prefill-check.md and .json
 # Out of memory in a test is logged and marked ($O/out/<test>/w<k>/oom.txt), not fatal. The code is beside this
 # script (a copy of $O/scripts/). Deletes nothing.
+# Another check with the same stages (fork_fix_check.py, 14 Nov) sets, all passed to every stage: CHECK (the script of
+# the tests), FORK_COMMIT (the fork's commit: venv-fork-<first 9> of setup_generic.sh), O and D (its bucket and local
+# directories), PLAN_A and PLAN_B (the tests of part A, Gemma 4, and of part B, TranslateGemma), TESTS_TG and
+# TESTS_FORK, REPORT (the report's name), LOG_PREFIX (the test logs for the report) and BEFORE (an earlier check's
+# bucket directory, given to the report as --before). Unset, each is what the prefill check of 13 Nov used.
 set -euo pipefail
 STAGE=${1:?a stage: check, setup, plan, translate_tg, translate_fork, collect, metricx, report}
 O=${O:-gs://t5-dutch-english-usc2/mbert/translator/prefill-check}
+CHECK=${CHECK:-prefill_check}
+DEFAULT_FORK_COMMIT=2249474b93b971d8248520e3a09b94b4ce626ce4   # setup_generic.sh's
+FORK_COMMIT=${FORK_COMMIT:-$DEFAULT_FORK_COMMIT}
+PLAN_A=${PLAN_A-T3 T6}
+PLAN_B=${PLAN_B-T4a T1 T4b T2b T2 T5}
+TESTS_TG=${TESTS_TG-T4a T1 T4b T2b T2}
+TESTS_FORK=${TESTS_FORK-T5 T3 T6}
+REPORT=${REPORT:-prefill-check}
+LOG_PREFIX=${LOG_PREFIX:-pc_T}
+BEFORE=${BEFORE:-}
 OA=gs://t5-dutch-english-usc2/mbert/translator/bt-length       # part A of the length trial
 OB=gs://t5-dutch-english-usc2/mbert/translator/sft/length      # part B
 SHM=/dev/shm/translator
 TGEN=/dev/shm/translate-generic
-D=$SHM/prefill-check
+D=${D:-$SHM/prefill-check}
 PY=$SHM/venv/bin/python                 # the translator's venv (CPU): pyarrow, transformers, tokenizers; MetricX
 TPY=/dev/shm/flan_nl/venv/bin/python    # FLAN-nl's venv: MaxText 0.2.5 from PyPI (part B)
-FPY=$TGEN/venv-fork/bin/python          # the fork yhavinga/maxtext @ 2249474 (part A)
+FV=$TGEN/venv-fork                      # the fork yhavinga/maxtext @ 2249474 (part A)
+[ "$FORK_COMMIT" = "$DEFAULT_FORK_COMMIT" ] || FV=$TGEN/venv-fork-${FORK_COMMIT:0:9}
+FPY=$FV/bin/python
 TOK_TG=/dev/shm/flan_nl/tokenizer-27b   # part B's tokenizer, for both builds (the same prompts)
 TOK_G4=$TGEN/tokenizer-gemma4
 CKPT_TG=gs://t5-dutch-english-usc2/mbert/flan-nl/translategemma-27b-maxtext/0/items
@@ -61,12 +78,12 @@ RUN_TEST='run_test() {
   local py=$1 test=$2 tok=$3 ckpt=$4 seg out n k log code
   seg=$D/plan/$test/segments-w$W.parquet
   out=$O/out/$test/w$W
-  n=$($py -I $C/prefill_check.py processes --test $test --segments $seg)
+  n=$($py -I $C/$CHECK.py processes --test $test --segments $seg)
   echo "== $test $(date -u +%T): $n process(es)"
   for k in $(seq 1 $n); do
     log=~/logs/pc_${test}_$TAG.log
     [ "$n" -gt 1 ] && log=~/logs/pc_${test}_$TAG-p$k.log
-    $py -u $C/prefill_check.py translate --test $test --segments $seg --out $out --tokenizer $tok --ckpt $ckpt \
+    $py -u $C/$CHECK.py translate --test $test --segments $seg --out $out --tokenizer $tok --ckpt $ckpt \
       --work-dir $SHM/work-pc $([ "$n" -gt 1 ] && echo --max-shards 1) > $log 2>&1 && code=0 || code=$?
     echo "EXIT $code" >> $log
     gsutil -q cp $log $O/logs/$(basename $log .log)-w$W.log || true
@@ -88,7 +105,7 @@ translate_body() {  # translate_body NAME PY TESTS...: the job of one family of 
   shift 2
   {
     echo "set -uo pipefail"
-    echo "C=$C D=$D O=$O W=$W TAG=$TAG SHM=$SHM"
+    echo "C=$C D=$D O=$O W=$W TAG=$TAG SHM=$SHM CHECK=$CHECK"
     echo "$ONE_HOST"
     echo "export JAX_COMPILATION_CACHE_DIR=$SHM/jax_cache_pc"
     echo "mkdir -p $D/plan"
@@ -96,7 +113,7 @@ translate_body() {  # translate_body NAME PY TESTS...: the job of one family of 
     echo "timeout 600 $py -c \"import jax; assert (jax.device_count(), jax.process_count()) == (4, 1), (jax.device_count(), jax.process_count())\" || { echo 'preflight failed: not 4 chips of one process'; exit 2; }"
     echo "$RUN_TEST"
     for test in "$@"; do
-      case $test in T3|T6) echo "run_test $py $test $TOK_G4 $CKPT_G4 || exit 1" ;;
+      case " $PLAN_A " in *" $test "*) echo "run_test $py $test $TOK_G4 $CKPT_G4 || exit 1" ;;
         *) echo "run_test $py $test $TOK_TG $CKPT_TG || exit 1" ;;
       esac
     done
@@ -122,9 +139,9 @@ check)
 setup)
   cat > ~/job_body_pc_setup_$TAG.sh <<EOF
 set -euo pipefail
-HF_HUB_OFFLINE=0 bash $C/setup_generic.sh venv
-[ -s $TGEN/venv-fork/done.txt ] && [ -s $TOK_G4/tokenizer.json ]
-echo "SETUP w$W: \$(cat $TGEN/venv-fork/done.txt | cut -c1-300)"
+FORK_COMMIT=$FORK_COMMIT HF_HUB_OFFLINE=0 bash $C/setup_generic.sh venv
+[ -s $FV/done.txt ] && [ -s $TOK_G4/tokenizer.json ]
+echo "SETUP w$W: \$(cat $FV/done.txt | cut -c1-300)"
 EOF
   detach "pc_setup_$TAG" bash ~/job_body_pc_setup_$TAG.sh
   ;;
@@ -137,12 +154,12 @@ gsutil -m -q cp $OA/data/docs.parquet $D/ref/a/
 gsutil -m -q cp "$OA/seg/heel/segments-w*.parquet" $D/ref/a/seg/
 gsutil -m -q cp $OB/data/docs-en.parquet $D/ref/b/
 gsutil -m -q cp "$OB/seg/heel/segments-w*.parquet" $D/ref/b/seg/
-for t in T4a T1 T4b T2b T2 T5; do
-  $PY -I -u $C/prefill_check.py plan --test \$t --docs $D/ref/b/docs-en.parquet --segments $D/ref/b/seg/segments-w*.parquet \
+for t in $PLAN_B; do
+  $PY -I -u $C/$CHECK.py plan --test \$t --docs $D/ref/b/docs-en.parquet --segments $D/ref/b/seg/segments-w*.parquet \
     --tokenizer $TOK_TG --workers 4 --out $D/plan
 done
-for t in T3 T6; do
-  $PY -I -u $C/prefill_check.py plan --test \$t --docs $D/ref/a/docs.parquet --segments $D/ref/a/seg/segments-w*.parquet \
+for t in $PLAN_A; do
+  $PY -I -u $C/$CHECK.py plan --test \$t --docs $D/ref/a/docs.parquet --segments $D/ref/a/seg/segments-w*.parquet \
     --workers 4 --out $D/plan
 done
 gsutil -m -q rsync -r $D/plan $O/plan
@@ -152,12 +169,12 @@ EOF
   ;;
 translate_tg)
   tpu_free
-  translate_body "pc_translate_tg_$TAG" "$TPY" T4a T1 T4b T2b T2
+  translate_body "pc_translate_tg_$TAG" "$TPY" $TESTS_TG
   ;;
 translate_fork)
   tpu_free
-  [ -x "$FPY" ] && [ -s "$TGEN/venv-fork/done.txt" ] || { echo "w$W: no venv-fork (stage setup)"; exit 1; }
-  translate_body "pc_translate_fork_$TAG" "$FPY" T5 T3 T6
+  [ -x "$FPY" ] && [ -s "$FV/done.txt" ] || { echo "w$W: no $FV (stage setup)"; exit 1; }
+  translate_body "pc_translate_fork_$TAG" "$FPY" $TESTS_FORK
   ;;
 collect)
   [ "$W" = 0 ] || { echo "collect runs on w0 only"; exit 1; }
@@ -166,7 +183,7 @@ set -euo pipefail
 mkdir -p $D/out $D/collect $D/pending $D/plan
 gsutil -m -q rsync -r $O/plan $D/plan
 gsutil -m -q rsync -r $O/out $D/out
-$FPY -I -u $C/prefill_check.py collect --plan $D/plan --translations $D/out --docs-a $D/ref/a/docs.parquet \
+$FPY -I -u $C/$CHECK.py collect --plan $D/plan --translations $D/out --docs-a $D/ref/a/docs.parquet \
   --docs-b $D/ref/b/docs-en.parquet --out $D/collect
 $FPY -I -u $C/bt_length.py pending --units $D/collect/units.parquet --workers 4 --out $D/pending
 gsutil -m -q cp $D/collect/measured.parquet $D/collect/units.parquet $O/collect/
@@ -203,12 +220,18 @@ gsutil -m -q cp $OA/collect/measured.parquet $OA/collect/units.parquet "$OA/scor
 gsutil -m -q cp $OB/collect/measured.parquet $OB/collect/units.parquet "$OB/scores/qe-*.parquet" $D/ref/b/
 gsutil -m -q rsync -r $O/scores $D/scores
 gsutil -m -q cp $O/collect/measured.parquet $O/collect/units.parquet $D/collect/
-gsutil -m -q cp "$O/logs/pc_T*" $D/logs/
-$FPY -I -u $C/prefill_check.py report --plan $D/plan --measured $D/collect/measured.parquet \
+gsutil -m -q cp "$O/logs/$LOG_PREFIX*" $D/logs/
+before=()
+if [ -n "$BEFORE" ]; then
+  mkdir -p $D/before
+  gsutil -m -q cp $BEFORE/collect/measured.parquet $BEFORE/collect/units.parquet "$BEFORE/scores/qe-*.parquet" $D/before/
+  before=(--before $D/before)
+fi
+$FPY -I -u $C/$CHECK.py report --plan $D/plan --measured $D/collect/measured.parquet \
   --units $D/collect/units.parquet --qe $D/scores/qe-*.parquet --ref-a $D/ref/a --ref-b $D/ref/b --logs $D/logs \
-  --out $D/report/prefill-check.md
-gsutil -m -q cp $D/report/prefill-check.md $D/report/prefill-check.json $O/
-echo "REPORT: $O/prefill-check.md"
+  \${before[@]+"\${before[@]}"} --out $D/report/$REPORT.md
+gsutil -m -q cp $D/report/$REPORT.md $D/report/$REPORT.json $O/
+echo "REPORT: $O/$REPORT.md"
 EOF
   detach "pc_report_$TAG" bash ~/job_body_pc_report_$TAG.sh
   ;;

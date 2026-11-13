@@ -1180,3 +1180,20 @@ QE-grens, wel de uitlijncontrole).
   - Gecontroleerd met `sft_build.py check`: EXIT 0, train 25.284 (bt 11.742, bt_context 1.021, real 12.521),
     12.411.900 tokens, max 2.047; eval 4.167, max 2.006 (`$S/data/rl-b5/check.txt`).
   - Verwachte epoch [schatting, tokens per stap als bij RB2: 29,09 M tokens in 950 stappen]: ~405 stappen.
+
+**Amendement 13 nov 2026 ~07:50 CET: regel (a) vervangen door (a1) + (a2)** [besluit Yeb 13 nov ~07:45: "doe 1 + 2";
+vastgelegd **na** het zien van de uitslagen van B, N, N75/N50/N25, RB, RB2, R2, RB3, RBR en RL, de kalibratie op menselijke
+referenties en de verkennende blinde beoordelingen van RB2 en RB3; dat is een regelwijziging achteraf en staat hier zo].
+- **Reden** [gemeten, `gs://t5-dutch-english-use1/mbert/translator/bt-natural/report/refqe.md`]: de menselijke
+  referentievertalingen, gescoord zoals de armen, liggen +0,845 / +0,672 / +0,760 boven TranslateGemma (WMT24++ (960) /
+  FLORES / NTREX); regel (a) (≤ +0,20) is dus onhaalbaar voor elke vertaling die als een mens vertaalt. TranslateGemma is
+  met RL op MetricX-QE getraind.
+- **(a1) niet slechter dan een mens op MetricX-24-QE**: voor elk van WMT24++ (de 960 zonder `is_bad_source`), FLORES-200
+  en NTREX-128 geldt gemiddelde QE(X) ≤ gemiddelde QE(menselijke referentie als kandidaat): 2,392 / 1,494 / 1,842
+  (afgerond weergegeven; de vergelijking op de onafgeronde gemiddelden).
+- **(a2) niet meer betekenisfouten dan TranslateGemma in de blinde beoordeling**: op de 100 passages van §4.2.4, met de
+  rubriek van §4.2.4, telt het aantal passages met een betekenisfout bij X niet hoger dan bij het basismodel. Beoordelaar:
+  een verse Claude-subagent per arm, **zonder tweede ronde** voor twijfelgevallen [besluit Yeb 13 nov ~07:50: geen Fable,
+  te duur]; de twijfelgevallen blijven gemarkeerd en Yeb kan ze vervangen door zijn eigen oordeel. Voor RB2 en RB3 geldt
+  daarom het oordeel van de eerste beoordelaar, niet de herbeoordeling door Fable.
+- (a) = (a1) én (a2). Regels (b) en (c) en §5 verder ongewijzigd.

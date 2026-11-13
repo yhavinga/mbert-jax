@@ -21,7 +21,7 @@
 # The code is beside this script (a copy of $OC/scripts/ at the commit in $OC/scripts/COMMIT). TAG names a chain's jobs.
 set -euo pipefail
 STAGE=${1:?a stage: plan, smoke, translate, collect, metricx, extract, report}
-SHM=/dev/shm/translate-generic
+SHM=${SHM:-/dev/shm/translate-generic}  # another root only for a dry run on CPU
 C=$(cd "$(dirname "$0")" && pwd)
 D=$SHM/bt-length-ctx
 PY=$SHM/venv-fork/bin/python
@@ -57,7 +57,7 @@ PREFLIGHT="timeout 600 $PY -c \"import jax; assert (jax.device_count(), jax.proc
 
 # on_tpu NAME SLOTS LOG COMMAND...: the command with --slots; out of memory: again with half the slots, down to one
 # (the slots of gemma4-31b-ctx are an estimate from part A's d1k on a v4 chip); each attempt its own log
-# (…-s<slots>.log after the first), copied to $OC/logs/
+# (…-s<slots>.log after the first), copied to $OC/logs/; LAST_LOG is the log of the attempt that succeeded
 ON_TPU='on_tpu() {
   local name=$1 slots=$2 log=$3 code try
   shift 3
@@ -68,7 +68,7 @@ ON_TPU='on_tpu() {
     echo "EXIT $code" >> $try
     gsutil -q cp $try '"$OC"'/logs/$(basename $try .log)-w'"$W"'.log || true
     grep -E "^(ROUND|DONE|EXTRACT|MEM|engine)" $try | tail -n 4 | cut -c1-300
-    [ $code = 0 ] && return 0
+    [ $code = 0 ] && { LAST_LOG=$try; return 0; }
     if grep -q -E "RESOURCE_EXHAUSTED|Ran out of memory|[Oo]ut of memory" $try && [ $slots -gt 1 ]; then
       slots=$((slots / 2)); try=${log%.log}-s$slots.log
       echo "$name: out of memory, again with $slots slots"
@@ -110,6 +110,7 @@ $ON_TPU
 log=~/logs/ctx_smoke_tr_$TAG.log
 on_tpu smoke 20 \$log $PY -u $C/bt_length_ctx.py translate --plan $D/plan/plan-w$W.parquet --out $OC/smoke-$TAG/w$W \
   --tokenizer $TOK --ckpt $CKPT --max-docs $SMOKE_DOCS --max-rounds 2 || exit 1
+log=\$LAST_LOG
 n=\$(grep -c '^ROUND ' \$log)
 [ "\$n" = 2 ] || { echo "SMOKE FAILED w$W: \$n ROUND lines, not 2"; exit 1; }
 ctx=\$(grep '^ROUND {"round": 1,' \$log | $PY -c "import json, sys; print(json.loads(sys.stdin.read()[6:])['context_tokens_mean'])")

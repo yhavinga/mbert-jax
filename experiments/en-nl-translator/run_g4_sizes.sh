@@ -42,7 +42,15 @@ export HF_XET_CACHE=$SHM/xet-cache
 mkdir -p ~/logs "$D"
 
 model_of() { echo "gemma4-$1"; }
-chips_of() { case $1 in e2b) echo 0 ;; e4b) echo 1 ;; 12b) echo 2 ;; 26b) echo 4 5 ;; metricx) echo 0 1 2 3 ;; esac; }
+# The 26B's two chips and their process bounds: the first pair of chips 4-7 that comes up as one process of 2 devices
+# (pair2, written by step chips); untested on a v6e before this run
+PAIR2=$SHM/g4s-pair2.txt
+chips_of() {
+  case $1 in
+    e2b) echo 0 ;; e4b) echo 1 ;; 12b) echo 2 ;; metricx) echo 0 1 2 3 ;;
+    26b) [ -s "$PAIR2" ] || { echo "no $PAIR2: run step chips first" >&2; exit 2; }; cut -d' ' -f1,2 "$PAIR2" ;;
+  esac
+}
 ckpt_of() { echo "$O/ckpt/gemma-4-$1-it-maxtext"; }
 
 groups() {  # the chips' vfio groups, ordered by PCI root and group number (run_bt_natural.sh's half takes 4 of them)
@@ -57,7 +65,7 @@ on_chips() {  # ordinals...: the TPU environment of one process on these chips (
   for k in "$@"; do sel+=("${all[$k]}"); done
   case ${#sel[@]} in
     1) bounds=1,1,1 ;;
-    2) bounds=${G4S_BOUNDS_2:-1,2,1} ;;
+    2) bounds=${G4S_BOUNDS_2:-$(cut -d' ' -f3 "$PAIR2")} ;;
     4) bounds=2,2,1 ;;
     *) echo "no process bounds for ${#sel[@]} chips"; exit 2 ;;
   esac
@@ -67,8 +75,8 @@ on_chips() {  # ordinals...: the TPU environment of one process on these chips (
   echo "chips $*: TPU_VISIBLE_CHIPS=$TPU_VISIBLE_CHIPS bounds $bounds port $port"
 }
 
-preflight() {  # n: one process with n chips
-  timeout 600 "$PY" -c "import jax; assert (jax.device_count(), jax.process_count()) == ($1, 1), (jax.device_count(), jax.process_count()); print('devices', jax.devices())" || { echo "preflight failed: not $1 chips of one process"; exit 2; }
+preflight() {  # n [seconds]: one process with n chips
+  timeout "${2:-600}" "$PY" -c "import jax; assert (jax.device_count(), jax.process_count()) == ($1, 1), (jax.device_count(), jax.process_count()); print('devices', jax.devices())" || { echo "preflight failed: not $1 chips of one process"; exit 2; }
 }
 
 job() {  # name ordinals log command...: the command on these chips, its log ending in an EXIT line and in the bucket
@@ -232,6 +240,21 @@ report_model() {  # size: evalcompare against TranslateGemma, the texts of the c
 step=${1:-}
 case $step in
 chips)
+  if [ ! -s "$PAIR2" ]; then
+    for pair in "4 5" "4 6" "4 7"; do
+      for b in 1,2,1 2,1,1; do
+        # shellcheck disable=SC2086
+        if ( export G4S_BOUNDS_2=$b; on_chips $pair; preflight 2 180 ) > ~/logs/g4s_pair2.log 2>&1; then
+          echo "$pair $b" > "$PAIR2"; break 2
+        fi
+        echo "chips $pair bounds $b: no process of 2 devices ($(tail -n 1 ~/logs/g4s_pair2.log | cut -c1-200))"
+      done
+    done
+    # Without a pair the 26B cannot run (two chips at least: 50 GB of weights, 2 global KV heads); the others still can
+    [ -s "$PAIR2" ] || { echo "no pair of chips 4-7 comes up as one process: the 26B is left out"; echo none > "$PAIR2"; }
+  fi
+  echo "26B on chips $(cat "$PAIR2")"
+  [ "$(cat "$PAIR2")" = none ] && SIZES=(e2b e4b 12b)
   pids=()
   # shellcheck disable=SC2046
   for size in "${SIZES[@]}"; do ( on_chips $(chips_of "$size"); preflight "$(chips_of "$size" | wc -w)" ) & pids+=($!); done
@@ -248,6 +271,7 @@ all)
   # Before anything runs in the background: every chip group must come up as a process of its own
   echo "== chips $(date -u +%T)"
   bash "$0" chips
+  if [ "$(cat "$PAIR2")" = none ]; then SIZES=(e2b e4b 12b); echo "LEFT OUT: 26b (no process of 2 chips)"; fi
   ( HF_HUB_OFFLINE=0 SHM=$SHM bash "$C/setup_comet.sh" && HF_HUB_OFFLINE=0 "$PY" -c "import sys; sys.path.insert(0, '$C'); import metricx_qe as m; print(m.download('xxl', '$SHM/metricx'))" ) \
     > ~/logs/g4s_setup_bg.log 2>&1 & setup_bg=$!
   for size in "${SIZES[@]}"; do tokenizer "$size"; done
@@ -270,8 +294,11 @@ all)
     ) & tr[$size]=$!
   done
   wait $setup_bg || { echo "background setup failed: ~/logs/g4s_setup_bg.log"; exit 1; }
+  # Two COMET jobs of half the CPU each: E2B then 12B, E4B then 26B (when it runs)
+  comet_b=("e4b:${tr[e4b]}")
+  [ -n "${tr[26b]:-}" ] && comet_b+=("26b:${tr[26b]}")
   ( comet "e2b:${tr[e2b]}" "12b:${tr[12b]}" ) > ~/logs/g4s_comet_a.log 2>&1 & ca=$!
-  ( comet "e4b:${tr[e4b]}" "26b:${tr[26b]}" ) > ~/logs/g4s_comet_b.log 2>&1 & cb=$!
+  ( comet "${comet_b[@]}" ) > ~/logs/g4s_comet_b.log 2>&1 & cb=$!
   declare -A ck
   for size in "${SIZES[@]}"; do check "$size" "${tr[$size]}" > ~/logs/g4s_check_$size.log 2>&1 & ck[$size]=$!; done
   # MetricX on chips 0-3 once E2B, E4B and 12B are done with them
@@ -279,7 +306,7 @@ all)
   for size in e2b e4b 12b; do wait "${tr[$size]}" || failed+=("translate $size"); done
   ok=(); for size in "${SIZES[@]}"; do [[ " ${failed[*]} " == *" translate $size "* ]] || ok+=("$size:${tr[$size]}"); done
   job metricx "$(chips_of metricx)" g4s_metricx metricx "${ok[@]}" || failed+=("metricx")
-  wait "${tr[26b]}" || failed+=("translate 26b")
+  if [ -n "${tr[26b]:-}" ]; then wait "${tr[26b]}" || failed+=("translate 26b"); fi
   wait $ca || failed+=("comet a")
   wait $cb || failed+=("comet b")
   for size in "${SIZES[@]}"; do wait "${ck[$size]}" || failed+=("check $size"); done

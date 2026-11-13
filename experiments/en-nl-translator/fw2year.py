@@ -19,7 +19,9 @@ select_passages.py read), cut and filtered as select_passages.py cuts FineWeb-2 
 paragraph_breaks), from documents outside the dataset, drawn with a fixed seed: the row groups whose crawls (the row
 group's min/max of `dump`; the files are ordered by crawl in runs) touch the year, in a seeded random order, read
 SUPPLEMENT_ROW_GROUPS at a time until SUPPLEMENT_MAX_DOCS documents of that year are in (a thin year needs more row
-groups: 2015 has few), then SUPPLEMENT_MAX_DOCS of them at random, one passage per document, LONG_SHARE of them long. Written: texts.parquet
+groups: 2015 has few), then SUPPLEMENT_MAX_DOCS of them at random, one passage per document, as many of them long
+(select_passages.py's length class) as of the dataset's passages (14%; the selection's LONG_SHARE of 25% was not kept
+in the published subset). Written: texts.parquet
 (model = group "bt" or "extra", set = crawl, id, text; what naturalness.py classify reads), meta.parquet (id, group,
 dump, year, half, length_class, tokens, url) and data.json (counts per year and group, what was left out, what was read).
 report: the share "original" (P(original) >= 0.5) per crawl year and group with its 95% Wilson interval and n, per crawl
@@ -152,13 +154,13 @@ def classifier_exclusions(bt_rows, classifier_rows):
     return by_pid | by_text, {"by_pid": len(by_pid), "by_text": len(by_text), "either": len(by_pid | by_text)}
 
 
-def draw_supplement(passages, n, year, seed=SEED):
-    """n of the passages that pass every filter, one per document, LONG_SHARE of them long (as select_passages.py's
+def draw_supplement(passages, n, year, long_share=sp.LONG_SHARE, seed=SEED):
+    """n of the passages that pass every filter, one per document, long_share of them long (select_passages.py's
     length classes), drawn with a fixed seed; fails when a class has too few"""
     ok = [p for p in passages if not p["fails"]]
     rng = random.Random(f"{seed}/{year}/draw")
     chooser = sp.Chooser(1)
-    n_long = round(sp.LONG_SHARE * n)
+    n_long = round(long_share * n)
     chosen = []
     for name, k in (("long", n_long), ("short", n - n_long)):
         pool = sorted((p for p in ok if sp.length_class(p) == name), key=lambda p: p["pid"])
@@ -271,9 +273,10 @@ def data(args):
     for r in kept:
         r["year"] = crawl_year(r["dump"])
     counts = collections.Counter(r["year"] for r in kept)
+    long_share = sum(r["length_class"] == "long" for r in kept) / len(kept)
     needs = supplement_needs(counts, args.min_per_year)
     print(f"BT {len(bt)} rows, {len(left_out)} in the classifier's data left out ({how}); per year "
-          f"{json.dumps(dict(sorted(counts.items())))}; supplement {json.dumps(needs)} ({time.time() - started:.0f} s)",
+          f"{json.dumps(dict(sorted(counts.items())))}; supplement {json.dumps(needs)}, long {long_share:.4f} ({time.time() - started:.0f} s)",
           flush=True)
 
     supplement, read = [], {}
@@ -297,7 +300,7 @@ def data(args):
                     c["docs_sampled"] = len(docs)
                 tasks = [("fineweb", docs[k:k + 50]) for k in range(0, len(docs), 50)]
                 passages = [p for _, found, _ in pool.map(sp._work, tasks) for p in found]
-                drawn = draw_supplement(passages, need, year)
+                drawn = draw_supplement(passages, need, year, long_share)
                 dumps = {d["id"]: d for d in docs}
                 for p in drawn:
                     doc = dumps[p["doc_id"]]
@@ -330,7 +333,7 @@ def data(args):
         "bt": {"repo": BT_REPO[0], "revision": BT_REPO[1], "rows": len(bt), "kept": len(kept),
                "left_out_classifier": how},
         "fineweb": {"repo": sp.FINEWEB[0], "revision": sp.FINEWEB[1], "min_per_year": args.min_per_year,
-                    "row_groups_batch": args.row_groups, "max_docs_per_year": args.max_docs, "seed": SEED,
+                    "row_groups_batch": args.row_groups, "long_share": long_share, "max_docs_per_year": args.max_docs, "seed": SEED,
                     "needs": {str(y): n for y, n in needs.items()}, "read": {str(y): v for y, v in read.items()}},
         "per_year": dict(per_year), "texts": len(rows), "commit": args.commit,
         "resources": {"wordlist": WORDLIST_SHA256, "idioms": IDIOMS_SHA256},
@@ -450,8 +453,8 @@ def report(args):
           f"uit `{fw['repo']}` nld_Latn @ `{fw['revision'][:12]}`: row groups die het jaar raken in willekeurige "
           f"volgorde (seed `{fw['seed']}`), per {fw['row_groups_batch']} gelezen tot er {fw['max_docs_per_year']} "
           f"documenten van dat jaar waren, daaruit {fw['max_docs_per_year']} willekeurig; geknipt en gefilterd als "
-          f"`select_passages.py`, één passage per document, 25% lang; documenten van de dataset uitgesloten. Wat "
-          f"gelezen werd: `data.json`.",
+          f"`select_passages.py`, één passage per document, {pct(fw['long_share'])} lang (als de BT-passages); "
+          f"documenten van de dataset uitgesloten. Wat gelezen werd: `data.json`.",
           f"- Classifier: S @ 653k, fijngetuned op 10 nov (nauwkeurigheid {accuracy:.4f}) op origineel Nederlands "
           f"tegenover de terugvertaling (nl->en->nl) van TranslateGemma 27B, op passages van dezelfde vijf bronnen. "
           f"Hij leerde vertaalstijl van TranslateGemma herkennen; of hij tekst van andere vertaalsystemen of door een "

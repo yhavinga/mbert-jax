@@ -107,6 +107,8 @@ def test_the_supplement_draws_one_passage_per_document_a_quarter_long_and_reprod
     assert "bad" not in {p["doc_id"] for p in drawn}
     again = fy.draw_supplement([dict(p, fails=list(p["fails"])) for p in pool], 20, 2015)
     assert [p["pid"] for p in again] == [p["pid"] for p in drawn]
+    as_bt = fy.draw_supplement([dict(p, fails=list(p["fails"])) for p in pool], 20, 2015, long_share=0.1415)
+    assert sum(p["length_class"] == "long" for p in as_bt) == 3  # the dataset's share of long passages
     with pytest.raises(SystemExit, match="only 2 long passages"):
         fy.draw_supplement(passages(30, 1, 100) + passages(2, 1, 500, prefix="L"), 20, 2014)
 
@@ -155,7 +157,7 @@ def test_report_states_the_fixed_rule_and_the_first_declining_year(tmp_path, cap
         "rule": {"text": fy.RULE_NL, "fixed_at": fy.RULE_FIXED_AT},
         "bt": {"repo": "r", "revision": "0123456789abcdef", "rows": 59408, "kept": 59000,
                "left_out_classifier": {"by_pid": 400, "by_text": 401, "either": 408}},
-        "fineweb": {"repo": "f", "revision": "fedcba9876543210", "min_per_year": 1000, "row_groups_batch": 30,
+        "fineweb": {"repo": "f", "revision": "fedcba9876543210", "min_per_year": 1000, "row_groups_batch": 30, "long_share": 0.1415,
                     "max_docs_per_year": 6000,
                     "seed": "fw2year"}}))
     (tmp_path / "results.json").write_text(json.dumps({"test_accuracy": 0.9575}))

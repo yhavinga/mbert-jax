@@ -103,6 +103,21 @@ def test_similarity_on_words():
     assert pc.similarity([]) == {"n": 0, "identical": 0, "median": None, "below_half": 0}
 
 
+def test_wrap_schedule_replays_decode_all():
+    # one slot, A = 10, sync every 8: the first request (longest prompt) ends after 3 generate calls, seen at the
+    # sync after 8; the second starts at call 8 and writes 5 tokens (8 + 5 > 10: it wraps)
+    rows = [{"id": "b", "tokens_in": 3, "tokens_out": 6}, {"id": "a", "tokens_in": 5, "tokens_out": 4}]
+    sched = pc.wrap_schedule(rows, slots=1, max_decode=10)
+    assert sched["a"] == {"start": 0, "index": 0, "writes": 3, "crosses": False}
+    assert sched["b"] == {"start": 8, "index": 8, "writes": 5, "crosses": True}
+    assert not pc.wrap_schedule(rows, slots=1, max_decode=16)["b"]["crosses"]
+    # two slots: both start at 0
+    assert {k: v["start"] for k, v in pc.wrap_schedule(rows, slots=2, max_decode=10).items()} == {"a": 0, "b": 0}
+    # a request that ran to the limit: its writes are max_decode - 1, no wrap from index 0
+    full = pc.wrap_schedule([{"id": "c", "tokens_in": 2, "tokens_out": 10}], slots=1, max_decode=10)["c"]
+    assert full["writes"] == 9 and not full["crosses"]
+
+
 def test_verdict_thresholds():
     assert pc.verdict(9, 10) == "goed" and pc.verdict(36, 40) == "goed"
     assert pc.verdict(35, 40) == "gemengd" and pc.verdict(20, 40) == "gemengd"
@@ -229,6 +244,9 @@ def test_collect_and_report_on_made_up_translations(tmp_path, capsys):
     assert e["group_later"]["n"] == 4 and e["only_ref_done"] == 4 and e["same_prompts"] == 12
     assert e["ref_heel"]["qe_mean"] == pytest.approx(1.5) and e["test"]["qe_mean"] == pytest.approx(2.0)
     assert e["similarity"] == {"n": 12, "identical": 8, "median": 1.0, "below_half": 4}
+    # the 4 loops started after the first 40-token round and ran to 1280 tokens: past the end of the cache
+    assert e["group_later_cross"]["n"] == 4 and e["group_later_inside"]["n"] == 0 and e["group_first_cross"]["n"] == 0
+    assert e["group_later_cross"]["similarity"]["below_half"] == 4
     md = (tmp_path / "report" / "prefill-check.md").read_text()
     assert "| T6 |" in md and "eerst ingevoegd" in md and "2249474b9" in md and "25,10" in md
 

@@ -227,6 +227,68 @@ def insertion_ranks(rows):
     return {rows[i]["id"]: k for k, i in enumerate(order)}
 
 
+class _Replay:
+    """decode_all's device for wrap_schedule: request i (prompt [i, 0, ...]) ends with EOS at its known length; counts
+    the generate calls before each insert"""
+
+    def __init__(self, lengths, slots, eos):
+        self.lengths, self.slots, self.eos = lengths, slots, eos
+        self.calls, self.owner, self.count, self.start = 0, {}, {}, {}
+
+    def prefill(self, tokens):
+        i = tokens[0]
+        return i, self.eos if self.lengths[i] == 1 else 2
+
+    def insert(self, prefix, slot):
+        self.owner[slot], self.count[slot], self.start[prefix] = prefix, 1, self.calls
+
+    def generate(self):
+        self.calls += 1
+        out = []
+        for s in range(self.slots):
+            i = self.owner.get(s)
+            if i is not None:
+                self.count[s] += 1
+            out.append(self.eos if i is not None and self.count[s] == self.lengths[i] else 2)
+        return out
+
+    @staticmethod
+    def fetch(arrays):
+        return arrays
+
+
+def wrap_schedule(rows, slots, max_decode, sync_every=8, eos=1):
+    """Added after the run (T6): translate.decode_all replayed on one shard's rows (in the shard's order) with their
+    known prompt and output lengths (tokens_in; tokens_out, the stop token included). Per id: the generate calls
+    before its insert (start), the shared decode-cache index it starts at (start mod A, A = max_decode, the length
+    of the decode cache), its writes (tokens_out - 1: the first token comes from the prefill) and whether they run past
+    the end of the cache and wrap to index 0 (crosses)."""
+    import translate as tr
+
+    lengths = [min(r["tokens_out"], max_decode) for r in rows]
+    prompts = [[i] + [0] * (r["tokens_in"] - 1) for i, r in enumerate(rows)]
+    device = _Replay(lengths, slots, eos)
+    tr.decode_all(prompts, slots, device, max_decode, sync_every, [eos])
+    out = {}
+    for i, r in enumerate(rows):
+        start = device.start[i]
+        out[r["id"]] = {"start": start, "index": start % max_decode, "writes": lengths[i] - 1,
+                        "crosses": start % max_decode + lengths[i] - 1 > max_decode}
+    return out
+
+
+def crossing(rows, slots, max_decode):
+    """wrap_schedule over the rows of every worker's shard (one decode_all each; rows of a shard sorted by id, the
+    order of translate.py's shards)"""
+    groups = collections.defaultdict(list)
+    for r in rows:
+        groups[(r.get("worker"), r.get("shard"))].append(r)
+    out = {}
+    for _, rs in sorted(groups.items(), key=lambda kv: tuple(str(x) for x in kv[0])):
+        out.update(wrap_schedule(sorted(rs, key=lambda r: r["id"]), slots, max_decode))
+    return out
+
+
 def read_shards(root, column):
     """{id: row} of translate.py's shards under root, with the worker, the shard and the turn in its decode_all"""
     out = {}
@@ -324,12 +386,16 @@ def retro(ref, part):
     for cls, slots in TRIAL_SLOTS[part].items():
         k = order.index(cls)
         low, high = (classes[order[k - 1]]["max_source"] if k else 0), classes[cls]["max_source"]
-        groups = {"first": [], "later": []}
+        groups = {"first": [], "later": [], "later_cross": [], "later_inside": []}
         for _, segs in sorted(ref["segments"].items()):
             rows = [heel[s["id"]] for s in segs if low < s["tokens"] <= high and s["id"] in heel]
             ranks = insertion_ranks(rows)
+            cross = wrap_schedule(rows, slots, classes[cls]["max_decode"])
             for r in rows:
-                groups["first" if ranks[r["id"]] < slots else "later"].append(r)
+                first = ranks[r["id"]] < slots
+                groups["first" if first else "later"].append(r)
+                if not first:
+                    groups["later_cross" if cross[r["id"]]["crosses"] else "later_inside"].append(r)
         out[cls] = {"slots": slots, **{g: {"n": len(rs), "done": sum(r["done"] for r in rs),
                                            "loop": sum(r["decode_loop"] for r in rs),
                                            "not_ended": sum(not r["ended"] for r in rs)}
@@ -388,6 +454,18 @@ def report(args):
                                    "not_ended": sum(not m["ended"] for m in rs),
                                    "verdict": verdict(sum(m["done"] for m in rs), len(rs)),
                                    "stats": stats(rs, qe, test)}
+            cross = crossing(fit_rows, t["slots"], t["decode"])
+            for g, test_of in (("later_cross", lambda m: not m["first_inserted"] and cross[m["id"]]["crosses"]),
+                               ("later_inside", lambda m: not m["first_inserted"] and not cross[m["id"]]["crosses"]),
+                               ("first_cross", lambda m: m["first_inserted"] and cross[m["id"]]["crosses"])):
+                rs = [m for m in fit_rows if test_of(m)]
+                e[f"group_{g}"] = {"n": len(rs), "done": sum(m["done"] for m in rs),
+                                   "loop": sum(m["decode_loop"] for m in rs),
+                                   "not_ended": sum(not m["ended"] for m in rs),
+                                   "verdict": verdict(sum(m["done"] for m in rs), len(rs)),
+                                   "stats": stats(rs, qe, test),
+                                   "similarity": similarity([(m["translation"], heel[m["id"]]["translation"])
+                                                             for m in rs if m["id"] in heel])}
         r["tests"][test] = e
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     Path(args.out).write_text(report_md(r))
@@ -445,6 +523,20 @@ def report_md(r):
                 x = e[f"group_{g}"]
                 lines.append(f"| {test} | {label} | {x['n']} | {x['done']} | {x['loop']} | {x['not_ended']} | "
                              f"{num(x['stats']['qe_mean'])} | {x['verdict']} |")
+        lines += ["", "Achteraf toegevoegd (na het zien van T6; niet vooraf vastgelegd): `decode_all` nagespeeld met de "
+                  "gemeten prompt- en uitvoerlengtes (`wrap_schedule`): begint een document op gedeelde index s van de "
+                  "decode-cache (lengte A) en schrijft het meer dan A − s tokens, dan loopt de index tijdens zijn "
+                  "decode rond (H-fork). Gelijkenis: met de bekende vertaling van hetzelfde document.", "",
+                  "| test | groep | n | af | lus | niet af | QE gem. | gelijkenis med. | gelijkenis < 0,5 |",
+                  "|---|---|---:|---:|---:|---:|---:|---:|---:|"]
+        for test, e in reuse:
+            for g, label in (("first_cross", "eerst ingevoegd, loopt rond"),
+                             ("later_cross", "later ingevoegd, loopt rond"),
+                             ("later_inside", "later ingevoegd, loopt niet rond")):
+                x = e[f"group_{g}"]
+                lines.append(f"| {test} | {label} | {x['n']} | {x['done']} | {x['loop']} | {x['not_ended']} | "
+                             f"{num(x['stats']['qe_mean'])} | {num(x['similarity']['median'], 3)} | "
+                             f"{x['similarity']['below_half']} |")
     lines += ["", "### De lengteproef zelf, per beurt in decode_all [gemeten, retrospectief]", "",
               "Uit `measured.parquet` en de segmenten van de lengteproef: per worker één shard; de eerste `slots` "
               "documenten (langste prompt eerst) beginnen in lege slots, de rest in slots die al gebruikt zijn.", "",
@@ -455,6 +547,16 @@ def report_md(r):
             f, la = x["first"], x["later"]
             lines.append(f"| {part} | {cls} | {x['slots']} | {f['n']} / {f['done']} / {f['loop']} / {f['not_ended']} | "
                          f"{la['n']} / {la['done']} / {la['loop']} / {la['not_ended']} |")
+    lines += ["", "Achteraf toegevoegd (na het zien van T6): de later ingevoegde documenten gesplitst naar `wrap_schedule` "
+              "(loopt de gedeelde index van de decode-cache rond tijdens hun decode). Alleen voor deel A (fork) is dat "
+              "het mechanisme van H-fork; deel B draaide op 0.2.5, waar het masker niet op posities rekent.", "",
+              "| deel | klasse | later, loopt rond: n / af / lus / niet af | later, loopt niet rond: n / af / lus / niet af |",
+              "|---|---|---|---|"]
+    for part, classes in r["retro"].items():
+        for cls, x in classes.items():
+            c, i = x["later_cross"], x["later_inside"]
+            lines.append(f"| {part} | {cls} | {c['n']} / {c['done']} / {c['loop']} / {c['not_ended']} | "
+                         f"{i['n']} / {i['done']} / {i['loop']} / {i['not_ended']} |")
     lines += ["", "### Kosten en MaxText per log [gemeten]", "",
               "| log | klasse | slots | prefill / decodeerlimiet | segmenten | laden (s) | decodeertijd (s) | "
               "piek HBM per chip (GiB) | geheugen op | MaxText |", "|---|---|---:|---|---:|---:|---:|---:|---|---|"]

@@ -18,6 +18,10 @@ gewichten in float32 (`weight_dtype` van MaxText), LR 1e-5, cosine met 10% warmu
 `sft_lora.py` vóór de eerste stap een regel `LORA_MODULES` schrijft (LoRA-parameters per moduletype, en de modules die de
 regex wel raakt maar die geen LoRA kregen).
 
+Het verlies is dat van MaxTexts `loss_fn` (`trainers/pre_train/train.py` r. 325–333) [code gelezen]: bij de 26B telt de
+load-balance-loss van de router mee (gewicht 0,001, `gemma4-26b.yml`). De verliezen van 26B en 31B zijn dus niet
+exact vergelijkbaar. De router zelf krijgt geen LoRA en traint niet.
+
 **Checkpoints** (13 nov 12:03–12:11 UTC, op de CPU van w2 en w3 van mbert-mix, `nice -n 19 ionice -c3`, rechtstreeks van
 Hugging Face, met MaxText 0.2.5's eigen `to_maxtext`: ongescand, alleen tekst, bf16):
 

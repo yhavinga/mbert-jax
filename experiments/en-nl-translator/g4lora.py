@@ -390,6 +390,15 @@ VARIANT_TEXT = {
 }
 
 
+def outcome_text(r):
+    if r["status"] == "oom":
+        return "geheugen op" + (f" ({_gib(r['hbm_used_of'][0])} van {_gib(r['hbm_used_of'][1])} GiB)"
+                                if r.get("hbm_used_of") else "")
+    if r["status"] == "error":
+        return "fout: " + (r.get("error_line") or "?")[:120].replace("|", "/")
+    return r["status"]
+
+
 def table(results):
     lines = ["| variant | run | model | rank / alpha | lengte | uitkomst | piek HBM per chip (GiB) | ≤ 29,5 | staptijd "
              "mediaan (s) | tokens/s (16 chips) | verlies stap 1 → 8 | LoRA-parameters | fallback |",
@@ -397,13 +406,7 @@ def table(results):
     for r in results:
         loss = r.get("loss") or []
         loss_text = " → ".join(f"{v:.3f}".replace(".", ",") for _, v in (loss[:1] + loss[-1:])) if loss else "–"
-        if r["status"] == "oom":
-            outcome = "geheugen op" + (f" ({_gib(r['hbm_used_of'][0])} van {_gib(r['hbm_used_of'][1])} GiB)"
-                                       if r.get("hbm_used_of") else "")
-        elif r["status"] == "error":
-            outcome = "fout: " + (r.get("error_line") or "?")[:120].replace("|", "/")
-        else:
-            outcome = r["status"]
+        outcome = outcome_text(r)
         lines.append(f"| {r['variant']} ({VARIANT_TEXT.get(r['variant'], '')}) | `{r['run']}` | {r['model']} | "
                      f"{r['rank']} / {r['alpha']} | {_num(r['length'])} | {outcome} | {_gib(r.get('peak_gib'))} | "
                      f"{'ja' if r.get('fits') else ('nee' if r.get('peak_gib') is not None else '–')} | "
@@ -416,9 +419,10 @@ def module_lines(results):
     lines = ["| variant | moduletype | modules met LoRA | LoRA-parameters |", "|---|---|---:|---:|"]
     for r in results:
         for kind, e in (r.get("lora_by_module") or {}).items():
-            lines.append(f"| {r['variant']} | `{kind}` | {e['modules']} | {_num(e['params'])} |")
+            lines.append(f"| {r['variant']} (`{r['run']}`) | `{kind}` | {e['modules']} | {_num(e['params'])} |")
         for kind, n in (r.get("matched_without_lora") or {}).items():
-            lines.append(f"| {r['variant']} | `{kind}` (regex raakt de module, **geen LoRA**) | 0 van {n} | 0 |")
+            lines.append(f"| {r['variant']} (`{r['run']}`) | `{kind}` (regex raakt de module, **geen LoRA**) | 0 van {n} "
+                         f"| 0 |")
     return lines
 
 
@@ -429,12 +433,13 @@ def report(results, data_json, tg):
     lines += ["### Verlies per stap", "", "| variant | stap 1–8 |", "|---|---|"]
     for r in results:
         if r.get("loss"):
-            lines.append(f"| {r['variant']} | " + " / ".join(f"{v:.3f}".replace(".", ",") for _, v in r["loss"]) + " |")
+            lines.append(f"| {r['variant']} (`{r['run']}`) | " + " / ".join(f"{v:.3f}".replace(".", ",")
+                                                                    for _, v in r["loss"]) + " |")
     lines.append("")
     lines += ["### Sharding en MoE-instellingen", "", "| variant | sharding | MoE |", "|---|---|---|"]
     for r in results:
         if r.get("sharding"):
-            lines.append(f"| {r['variant']} | {json.dumps(r['sharding'])} | {json.dumps(r.get('moe'))} |")
+            lines.append(f"| {r['variant']} (`{r['run']}`) | {json.dumps(r['sharding'])} | {json.dumps(r.get('moe'))} |")
     lines.append("")
     choice = best(results)
     advice = {"variant": choice}
@@ -454,8 +459,8 @@ def report(results, data_json, tg):
             x = long[-1]
             fits = usable(x)
             advice["fits_4096"] = fits
-            lines.append(f"- **Bij 4.096:** {'past' if fits else 'past niet of traint niet'} ({x['status']}, piek "
-                         f"{_gib(x.get('peak_gib'))} GiB, staptijd {_gib(x.get('step_s_median'))} s).")
+            lines.append(f"- **Bij 4.096:** {'past' if fits else 'past niet of traint niet'} ({outcome_text(x)}, "
+                         f"piek {_gib(x.get('peak_gib'))} GiB, staptijd {_gib(x.get('step_s_median'))} s).")
         model = data_json["models"].get(r["model"], {})
         for name in ("RL", "R2"):
             ratio = model.get("ratio", {}).get(name, {}).get("ratio")

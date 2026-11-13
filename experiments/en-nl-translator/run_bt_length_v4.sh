@@ -58,28 +58,38 @@ PREFLIGHT="timeout 600 $PY -c \"import jax; assert (jax.device_count(), jax.proc
 
 # The values translate_class reads, for the job bodies that define it
 VARS="PY=$PY C=$C D=$D W=$W TOK=$TOK CKPT=$CKPT SHM=$SHM O=$O"
-# translate_class COND CLASS SHARD OUT LOG [EXTRA...]: one class of this worker's segments; out of memory is marked in
-# the bucket and not fatal (as run_bt_length.sh)
+# translate_class COND CLASS SHARD OUT LOG [EXTRA...]: one class of this worker's segments. Out of memory: again with
+# half the slots, down to one (the slots of gemma4-31b-doc were sized on a v6e chip, 31.24 GiB; a v4 chip has 30.75,
+# and the decision rule counts a bin that could not be measured as failed); out of memory with one slot is marked in
+# the bucket and not fatal (as run_bt_length.sh). Each attempt has its own log (…-s<slots>.log after the first).
 TRANSLATE_CLASS='translate_class() {
-  local cond=$1 cls=$2 shard=$3 out=$4 log=$5 code
+  local cond=$1 cls=$2 shard=$3 out=$4 log=$5 code slots try
   shift 5
   if gsutil -q stat $out/oom.txt; then echo "$cond $cls: out of memory before ($out/oom.txt)"; return 0; fi
-  echo "== $cond $cls $(date -u +%T)"
-  $PY -u $C/bt_length_translate.py --segments $D/seg/$cond/segments-w$W.parquet --out $out --tokenizer $TOK \
-    --model gemma4-31b-doc --prompt natural-v1 --length-class $cls --source-lang nl --target-lang en --ckpt $CKPT \
-    --work-dir $SHM/work-len --shard-size $shard "$@" > $log 2>&1 && code=0 || code=$?
-  echo "EXIT $code" >> $log
-  gsutil -q cp $log $O/logs/$(basename $log .log)-w$W.log || true
-  grep -E "^(SHARD|DONE|MEM|engine)" $log | tail -n 4 | cut -c1-300
-  if [ $code != 0 ]; then
-    if grep -q -E "RESOURCE_EXHAUSTED|Ran out of memory|[Oo]ut of memory" $log; then
-      grep -m1 -E "RESOURCE_EXHAUSTED|Ran out of memory|[Oo]ut of memory" $log | cut -c1-500 | gsutil -q cp - $out/oom.txt
-      echo "$cond $cls: OUT OF MEMORY, marked ($out/oom.txt)"
+  case $cls in d512) slots=32 ;; d1k) slots=16 ;; d2k) slots=8 ;; d4k) slots=4 ;; d8k) slots=2 ;; *) slots=1 ;; esac
+  try=$log
+  while true; do
+    echo "== $cond $cls slots $slots $(date -u +%T)"
+    $PY -u $C/bt_length_translate.py --segments $D/seg/$cond/segments-w$W.parquet --out $out --tokenizer $TOK \
+      --model gemma4-31b-doc --prompt natural-v1 --length-class $cls --source-lang nl --target-lang en --ckpt $CKPT \
+      --work-dir $SHM/work-len --shard-size $shard --slots $slots "$@" > $try 2>&1 && code=0 || code=$?
+    echo "EXIT $code" >> $try
+    gsutil -q cp $try $O/logs/$(basename $try .log)-w$W.log || true
+    grep -E "^(SHARD|DONE|MEM|engine)" $try | tail -n 4 | cut -c1-300
+    [ $code = 0 ] && return 0
+    if grep -q -E "RESOURCE_EXHAUSTED|Ran out of memory|[Oo]ut of memory" $try; then
+      if [ $slots -gt 1 ]; then
+        slots=$((slots / 2)); try=${log%.log}-s$slots.log
+        echo "$cond $cls: out of memory, again with $slots slots"
+        continue
+      fi
+      grep -m1 -E "RESOURCE_EXHAUSTED|Ran out of memory|[Oo]ut of memory" $try | cut -c1-500 | gsutil -q cp - $out/oom.txt
+      echo "$cond $cls: OUT OF MEMORY with one slot, marked ($out/oom.txt)"
       return 0
     fi
-    tail -n 30 $log
+    tail -n 30 $try
     return $code
-  fi
+  done
 }'
 
 shard_size() {  # cond class: as run_bt_length.sh (256 pieces; whole stretches twice the class's slots)

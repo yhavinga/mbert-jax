@@ -156,13 +156,48 @@ def token_ratio(rows, metas, counter, sample=None, seed=SEED):
             "tokens_g4": int(sum(g4)), "tokens_tg": int(sum(tg)), "ratio": round(sum(g4) / sum(tg), 4)}
 
 
+def check_examples(messages, ens, path, model, labels):
+    """Each example (messages: one user and one assistant turn; ens: its English) through MaxText's own SFT steps
+    (apply_chat_template with TEMPLATE, tokenization, prompt masking) must give the prompt of the model's own chat
+    template (one user turn, generation prompt, thinking off), which must equal Gemma 4's turn around the English, then
+    the Dutch and <turn|>\\n, with the loss on those alone. Returns (lengths, loss tokens, pad id)."""
+    import transformers
+    from maxtext.input_pipeline import hf_data_processing as hfp
+    from maxtext.input_pipeline import input_pipeline_utils as ipu
+
+    # as hf_data_processing makes MaxText's tokenizer for SFT, and the model's own (its chat template)
+    mt_tok = transformers.AutoTokenizer.from_pretrained(path, add_bos_token=False, add_eos_token=False,
+                                                        legacy=False, extra_special_tokens={})
+    mt_tok.chat_template = TEMPLATE
+    own = transformers.AutoTokenizer.from_pretrained(path)
+    pad_id = hfp._get_pad_id(mt_tok)  # noqa: SLF001 - the id MaxText masks the prompt with
+    masking = ipu.SFTPromptMasking("messages", completion_only=True, max_target_length=10 ** 9, unk_id=pad_id)
+    lengths, loss_tokens = [], 0
+    for msgs, en, label in zip(messages, ens, labels):
+        example = ipu.apply_chat_template({"messages": msgs}, mt_tok, "messages")
+        example = ipu.tokenization(example, mt_tok, truncation=False, max_length=10 ** 9, column_names=["messages"])
+        got = masking.map(example)
+        expected = own.apply_chat_template([msgs[0]], tokenize=True, add_generation_prompt=True)
+        if isinstance(expected, dict) or hasattr(expected, "keys"):
+            expected = expected["input_ids"]
+        prompt = list(expected)
+        if prompt != own(prompt_text(en), add_special_tokens=False)["input_ids"]:
+            raise SystemExit(f"{model} {label}: the model's chat template differs from Gemma 4's turn")
+        completion = own(completion_text(msgs[1]["content"]), add_special_tokens=False)["input_ids"]
+        if got["inputs"].tolist() != prompt + completion or \
+                got["targets"].tolist() != [pad_id] * len(prompt) + completion:
+            raise SystemExit(f"{model} {label}: MaxText's SFT ids differ from the prompt of the model's own "
+                             f"chat template + Dutch + <turn|>\\n")
+        lengths.append(len(prompt) + len(completion))
+        loss_tokens += len(completion)
+    return lengths, loss_tokens, pad_id
+
+
 def data(args):
     import numpy as np
     import pyarrow as pa
     import pyarrow.parquet as pq
     import transformers
-    from maxtext.input_pipeline import hf_data_processing as hfp
-    from maxtext.input_pipeline import input_pipeline_utils as ipu
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -184,31 +219,9 @@ def data(args):
     r2_rows, r2_metas = read_set(args.r2)
     for spec in args.tokenizer:
         model, path = spec.split("=", 1)
-        # as hf_data_processing makes MaxText's tokenizer for SFT, and the model's own (its chat template)
-        mt_tok = transformers.AutoTokenizer.from_pretrained(path, add_bos_token=False, add_eos_token=False,
-                                                            legacy=False, extra_special_tokens={})
-        mt_tok.chat_template = TEMPLATE
         own = transformers.AutoTokenizer.from_pretrained(path)
-        pad_id = hfp._get_pad_id(mt_tok)  # noqa: SLF001 - the id MaxText masks the prompt with
-        masking = ipu.SFTPromptMasking("messages", completion_only=True, max_target_length=10 ** 9, unk_id=pad_id)
-        lengths, loss_tokens = [], 0
-        for k, msgs in enumerate(messages):
-            example = ipu.apply_chat_template({"messages": msgs}, mt_tok, "messages")
-            example = ipu.tokenization(example, mt_tok, truncation=False, max_length=10 ** 9, column_names=["messages"])
-            got = masking.map(example)
-            expected = own.apply_chat_template([msgs[0]], tokenize=True, add_generation_prompt=True)
-            if isinstance(expected, dict) or hasattr(expected, "keys"):
-                expected = expected["input_ids"]
-            prompt = list(expected)
-            if prompt != own(prompt_text(metas[chosen[k]]["en"]), add_special_tokens=False)["input_ids"]:
-                raise SystemExit(f"{model} row {chosen[k]}: the model's chat template differs from Gemma 4's turn")
-            completion = own(completion_text(msgs[1]["content"]), add_special_tokens=False)["input_ids"]
-            if got["inputs"].tolist() != prompt + completion or \
-                    got["targets"].tolist() != [pad_id] * len(prompt) + completion:
-                raise SystemExit(f"{model} row {chosen[k]}: MaxText's SFT ids differ from the prompt of the model's own "
-                                 f"chat template + Dutch + <turn|>\\n")
-            lengths.append(len(prompt) + len(completion))
-            loss_tokens += len(completion)
+        lengths, loss_tokens, pad_id = check_examples(messages, [metas[k]["en"] for k in chosen], path, model,
+                                                      [f"row {k}" for k in chosen])
         counter = G4Counter(own)
         total = int(np.sum(lengths))
         report["models"][model] = {

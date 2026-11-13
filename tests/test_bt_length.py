@@ -316,3 +316,39 @@ def test_docs_merge_chooses_over_the_sources_separate_runs(tmp_path):
     chosen = bl.read_rows(tmp_path / "m" / "docs.parquet")
     assert [r["id"] for r in chosen] == ["r0", "r1", "d0", "r2"]
     assert json.loads((tmp_path / "m" / "docs.json").read_text())["chosen"] == {"512": {"raad": 3, "dpc": 1}}
+
+
+def test_docs_reads_row_groups_and_writes_stretches_per_bin(tmp_path, monkeypatch):
+    """docs() end to end on made-up documents: a whitespace tokenizer, a fake HfFileSystem, two row groups"""
+    import json
+    import types
+
+    from tokenizers import Tokenizer, models, pre_tokenizers
+
+    import select_passages as sp
+
+    tok = Tokenizer(models.WordLevel({"[UNK]": 0}, unk_token="[UNK]"))
+    tok.pre_tokenizer = pre_tokenizers.WhitespaceSplit()
+    (tmp_path / "tok").mkdir()
+    tok.save(str(tmp_path / "tok" / "tokenizer.json"))
+    sentence = "De gemeente heeft het plan voor de nieuwe wijk besproken en goedgekeurd."  # 12 words
+    para = " ".join([sentence] * 3)  # 36 tokens
+    words = {w.lower().strip(".") for w in sentence.split()}
+    (tmp_path / "words.txt").write_text("\n".join(sorted(words)))
+    docs_by_group = {0: [{"doc_id": "a", "text": "\n\n".join([para] * 14)}],     # ~530 tokens
+                     1: [{"doc_id": "b", "text": "\n\n".join([para] * 30)},     # ~1130 tokens
+                         {"doc_id": "c", "text": "kort"}]}
+    monkeypatch.setitem(sys.modules, "huggingface_hub", types.SimpleNamespace(HfFileSystem=lambda: None))
+    monkeypatch.setattr(sp, "row_groups", lambda source, n, seed, fs: [("f", 0, 1), ("f", 1, 2)])
+    monkeypatch.setattr(sp, "read_docs", lambda source, groups, fs: (
+        [dict(d, content_type=["article"]) for d in docs_by_group[groups[0][1]]], {"docs_read": 1}))
+    bl.main(["docs", "--tokenizer", str(tmp_path / "tok"), "--wordlist", str(tmp_path / "words.txt"),
+             "--sources", "raad", "--bins", "512,1024", "--per-source", "1", "--out", str(tmp_path / "out")])
+    rows = bl.read_rows(tmp_path / "out" / "docs.parquet")
+    assert sorted((r["bin"], r["doc_id"]) for r in rows) == [(512, "a"), (1024, "b")]
+    for r in rows:
+        assert 0.75 * r["bin"] < r["tokens"] <= r["bin"]
+        assert r["text"] == "\n\n".join(r["paragraphs"]) and r["source"] == "raad"
+    report = json.loads((tmp_path / "out" / "docs.json").read_text())
+    assert report["chosen"] == {"512": {"raad": 1}, "1024": {"raad": 1}}
+    assert bl.read_rows(tmp_path / "out" / "stretches.parquet")

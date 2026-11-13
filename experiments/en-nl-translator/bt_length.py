@@ -312,7 +312,10 @@ def docs(args):
                     break
                 doc_id = str(doc["id"] if source in ("handelingen", "fineweb") else doc["doc_id"])
                 paragraphs, starts = document_paragraphs(source, doc, wordset)
-                if not paragraphs:
+                # Dutch has ~4-5 characters per Gemma token: a document under 3 per token of the smallest bin it
+                # could serve is too short, without counting its tokens
+                if not paragraphs or sum(map(len, paragraphs)) < 3 * LOW * min(wanted):
+                    counters["docs_too_short"] += 1
                     continue
                 counts = count(paragraphs)
                 total = sum(counts) + 2 * (len(counts) - 1)

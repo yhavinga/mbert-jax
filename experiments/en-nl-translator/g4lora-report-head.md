@@ -73,9 +73,23 @@ instellingen als de fallback werkte. De tabel noemt de fallback per run.
   false` rekent met `jnp.einsum` (`"BSM,EMH -> BSEH"`, `moe.py` r. 4248), en dan voor elk token alle 128 experts.
 - **MaxText zelf sluit de routed experts uit bij een ander MoE-model** [citaat, `configs/post_train/lora_module_path.yml`
   van de fork-basis `d1c0d0afe`, r. 23, bij `deepseek4`]: "Routed experts (MoeBlock) are excluded."
-- **[gevolgtrekking, te toetsen]** Verwachting voor v2: de regex raakt `MoeBlock_0`, maar qwix maakt er geen LoRA, dus v2
-  traint hetzelfde als v1. Het bewijs is de regel `LORA_MODULES` (moduletype `…/MoeBlock_0` onder "regex raakt de
-  module, geen LoRA"). Er wordt niet omheen gebouwd: `sparse_matmul=false` is niet geprobeerd.
+- **Speelgoedproef op de CPU** [gemeten, 13 nov, w3, in de SFT-venv: qwix 0.1.8, jax 0.11.0, flax 0.12.8; script
+  `gs://t5-dutch-english-usc2/mbert/translator/sft/g4lora/scratch/toy_lora.py`]. Een klein NNX-model met modules
+  `self_attention/{query,out}` en een blok `mlp/moe_block/MoeBlock_0` dat, zoals `RoutedMoE`, zijn expertgewicht
+  (experts × in × uit) als eigen parameter heeft en een router `gate` als eigen module:
+  - regex alleen attention: LoRA op `query` en `out`; de regel `LORA_MODULES` van de nieuwe code klopt;
+  - regex met het expertblok, gewicht via `jax.lax.ragged_dot`: qwix onderschept op de CPU de `dot_general` waarin
+    `ragged_dot` wordt uitgewerkt, herkent het gewicht aan zijn vorm (`find_param`, `flax_util.py` r. 274–279: een
+    parameter met dezelfde shape) en wil binnen die lowering-trace een LoRA maken. Dat faalt:
+    `flax.errors.TraceContextError: Cannot mutate RngCount from a different trace level` (frames
+    `qwix/_src/providers/lora.py:289 dot_general` → `lora.py:518 _get_or_create_lora_params`);
+  - regex met het expertblok, gewicht via `jnp.einsum("BSM,EMH->BSEH")` (het dichte pad van MaxText): qwix maakt wél een
+    LoRA, met A (in × r) gedeeld over de experts en B (r × experts × uit).
+- **[gevolgtrekking, te toetsen]** Op de TPU gaan de experts standaard door de Pallas-kernel `mblx.gmm`. Daar zijn twee
+  uitkomsten mogelijk: qwix doet niets (de tegels in de kernel hebben niet de vorm van het gewicht; dan traint v2 hetzelfde
+  als v1, en de regel `LORA_MODULES` toont `…/MoeBlock_0` onder "regex raakt de module, geen LoRA"), of qwix loopt vast
+  zoals hierboven (dan staat de traceback onder "Fouten"). Er wordt niet omheen gebouwd: `sparse_matmul=false` is niet
+  geprobeerd. Een fout van v2 krijgt alleen de fallback als v1 die nodig had; anders is de fout de uitkomst.
 - **[eigen berekening]** Zou LoRA de experts per expert raken zoals qwix dat bij een `dot_general` met batch-as doet (A:
   experts × in × r, B: experts × r × uit), dan is dat bij rank 64 2.595.225.600 parameters. Met 16 bytes per parameter
   (float32-waarde, gradiënt en twee AdamW-momenten) en LoRA gerepliceerd op elke chip (`lora_utils.apply_lora_to_model`)

@@ -218,9 +218,14 @@ def test_a_run_is_ok_oom_error_or_incomplete_from_its_four_logs():
     r = g.result(SPEC, [log(1, extra=oom)] + [log(1)] * 3, None)
     assert r["status"] == "oom" and r["hbm_used_of"] == [33.12, 30.75] and "RESOURCE_EXHAUSTED" in r["oom_line"]
     assert r["lora_params"] == 115   # the LoRA report comes before the first step
-    err = "Traceback (most recent call last):\n  File x\nValueError: Mosaic failed to compile the kernel"
+    err = ("Traceback (most recent call last):\n  File \"/dev/shm/x/venv/lib/python3.12/site-packages/qwix/_src/providers/"
+           "lora.py\", line 518, in _get_or_create_lora_params\n    init()\n"
+           "flax.errors.TraceContextError: Cannot mutate RngCount from a different trace level")
     r = g.result(SPEC, [log(1, extra=err)] * 4, None)
-    assert r["status"] == "error" and r["error_line"] == "ValueError: Mosaic failed to compile the kernel"
+    assert r["status"] == "error" and r["error_line"].startswith("flax.errors.TraceContextError: Cannot mutate")
+    assert r["error_frames"] == ["qwix/_src/providers/lora.py:518 _get_or_create_lora_params"]
+    text, _ = g.report([dict(r, status="error")], {"models": {}}, {})
+    assert "qwix/_src/providers/lora.py:518 _get_or_create_lora_params" in text
     assert g.result(SPEC, [log(None)] + [log(1)] * 3, None)["status"] == "incomplete"
 
 

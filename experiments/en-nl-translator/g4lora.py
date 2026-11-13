@@ -251,6 +251,15 @@ def parse_log(text):
         out["hbm_used_of"] = [round(gib[0], 2), round(gib[1], 2)]
     errors = [ln.strip() for ln in lines if ERROR.match(ln)]
     out["error"] = errors[-1][:400] if errors else None
+    # the last traceback's frames (where an error came from: qwix, MaxText, the kernel), site-packages/ dropped
+    starts = [k for k, ln in enumerate(lines) if ln.startswith("Traceback (most recent call last)")]
+    frames = []
+    if starts:
+        for ln in lines[starts[-1] + 1:]:
+            m = re.match(r'\s*File "(?:.*/site-packages/)?([^"]+)", line (\d+), in (\S+)', ln)
+            if m:
+                frames.append(f"{m.group(1)}:{m.group(2)} {m.group(3)}")
+    out["frames"] = frames[-12:]
     return out
 
 
@@ -303,7 +312,9 @@ def result(spec, logs, summary):
             out["hbm_used_of"] = max(hbm)
         return out
     out["status"] = "error"
-    out["error_line"] = next((p["error"] for p in parsed if p["error"]), None)
+    first = next((p for p in parsed if p["error"]), None)
+    out["error_line"] = first["error"] if first else None
+    out["error_frames"] = first["frames"] if first else []
     return out
 
 
@@ -436,6 +447,12 @@ def report(results, data_json, tg):
             lines.append(f"| {r['variant']} (`{r['run']}`) | " + " / ".join(f"{v:.3f}".replace(".", ",")
                                                                     for _, v in r["loss"]) + " |")
     lines.append("")
+    failed = [r for r in results if r["status"] == "error"]
+    if failed:
+        lines += ["### Fouten (laatste traceback, de laatste 12 frames)", ""]
+        for r in failed:
+            lines += [f"- {r['variant']} (`{r['run']}`): `{r.get('error_line')}`", "", "  ```",
+                      *[f"  {f}" for f in r.get("error_frames") or []], "  ```", ""]
     lines += ["### Sharding en MoE-instellingen", "", "| variant | sharding | MoE |", "|---|---|---|"]
     for r in results:
         if r.get("sharding"):

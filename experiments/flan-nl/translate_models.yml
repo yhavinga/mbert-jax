@@ -191,6 +191,27 @@ prompts:
       </{target_code}>
       </turn>
 
+  # The back-translation pilot of 12 Nov (experiments/en-nl-translator/bt_natural.py): TranslateGemma's English is wordier
+  # than the Dutch it comes from (median 0.967 Dutch words per English word, human translations ~1.05), and the
+  # translator trained on it learns to compress. natural-v1 asks for complete, faithful and natural text; bare-v1 is a
+  # plain request, to tell the model's own effect from the instruction's. Without context only (plain). Both stay
+  # within the 128 prompt tokens beside the source that the classes' prefill lengths allow (96 for tiny): natural-v1
+  # takes 89 in Gemma 4's turn, bare-v1 27.
+  natural-v1:
+    kind: instruct
+    plain: |-
+      Translate the following {source} text into natural, idiomatic {target}, as a native speaker would write it, not word for word. Translate everything: leave nothing out and add nothing; keep every name, number, detail and nuance, and the tone. Be as concise as the original. Keep the paragraphs, line breaks and formatting. Output only the translation, without explanation or commentary.
+
+
+      {text}
+  bare-v1:
+    kind: instruct
+    plain: |-
+      Translate the following {source} text into {target}. Output only the translation.
+
+
+      {text}
+
 models:
   gemma3-12b:
     maxtext_model: gemma3-12b

@@ -170,7 +170,7 @@ n_BT = het aantal boekparen (`--bt-per-book 1`), dus ~50 : 50 in voorbeelden, zo
 
 ### 4.1 Vertalen
 
-- `translate.py` in de venv van de MaxText-fork @ `2249474` (`setup_generic.sh venv`, `/dev/shm/translate-generic/venv-fork`),
+- `translate.py` in de venv van de MaxText-fork @ `2249474` (`setup_generic.sh venv`, `/dev/shm/translate-generic/venv-fork`; **@ `f4d8615` volgens het amendement van 14 nov ~00:55, §9**),
   model `gemma4-31b` van `translate_models.yml`, `--prompt natural-v1`, checkpoint `$R/judge/gemma-4-31b-it-maxtext`
   (dezelfde omzetting als die van de training: `_METADATA` byte-gelijk, `HANDOVER-g4lora.md` §1), greedy, elke worker
   een TPU van zijn eigen 4 chips.
@@ -284,4 +284,19 @@ TG-protocol (`protocol.md`, §2–§5 en §9); hammond `mbert/LEARNINGS.md`, de 
 
 ## 9. Amendementen na het vastleggen
 
-Geen.
+**Amendement 14 nov 2026 ~00:55 CET: vertalen op de fork met de fix van de gedeelde cache-index** [instructie van de
+hoofdsessie 00:50; vastgelegd vóór de bouw van de set, de eerste trainingsstap en elke uitslag]. Aanleiding: de
+fork-fix-controle van 14 nov (`mbert-ops/translator-sft/fork-fix-check.md`, `EXIT 0` om 00:43): branch
+`fix-decode-cache-shared-index` @ `f4d8615f478b6c18de9df8f2dff1f57f775a2521` (op `2249474`) laat Gemma 4 ook met
+slot-hergebruik en een decodeerlimiet boven 1.024 goed decoderen.
+- **Wat verandert** (§4.1): `translate.py` draait voor G4-1 en G4-0 in de venv van de fork @ `f4d8615`
+  (`FORK_COMMIT=f4d8615… setup_generic.sh venv`, `/dev/shm/translate-generic/venv-fork-f4d8615f4`) in plaats van
+  @ `2249474`. Ook de smoke-test (§6).
+- **Wat gelijk blijft**: de lengteklassen tiny–xlong (decodeerlimiet ≤ 832): alle evaluatiesegmenten passen erin, dus
+  het grotere bereik van de fix is niet nodig, en de klassen blijven die van de eerdere Gemma 4-evaluatie; de rest van
+  §4–§6.
+- **De training blijft op MaxText 0.2.5** (§3) [keuze]. De fix verandert alleen `_decode_cache_positions` in
+  `attention_op.py` (18 regels; de posities in de AR-cache bij het decoderen); een trainingsstap draait geen
+  decode-cache en roept die functie niet aan. Ook fout 1 van 0.2.5 (het masker in cache-slots) zit in het decodeerpad.
+  Trainen op de fork zou een andere SFT-stack betekenen (de Tunix en qwix die bij de fork horen), waarvan geheugen en
+  staptijd op Gemma 4 niet gemeten zijn; de stack van 0.2.5 is gemeten (24,6 GiB, 8,2 s per stap, 13 nov).

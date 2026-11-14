@@ -15,6 +15,11 @@ tags:
 - encoder
 - culturax
 - jax
+extra_gated_prompt: >-
+  This model was pretrained on Dutch web text (CulturaX) that was not filtered on the text-and-data-mining
+  reservations of site owners. By requesting access you agree to use the model in accordance with applicable law,
+  including copyright and data-protection law.
+extra_gated_button_content: "Agree and access the model"
 ---
 
 # dmbert-230m-culturax
@@ -128,6 +133,15 @@ One filter of our own: every document whose URL host is `hebban.nl` or a subdoma
 shuffling, because the book reviews of the DBRD benchmark come from that site. That removed 45,781 documents (all
 from `www.hebban.nl`, 35.6M tokens), leaving 117,346,885 documents. There was no other filtering or deduplication.
 
+### Opt-outs and personal data
+
+The data was not filtered on text-and-data-mining reservations of site owners (robots.txt rules for AI crawlers,
+TDMRep, ai.txt), and not on personal data beyond CulturaX's own cleaning. The model is an encoder that does not
+generate text, and it does not contain or redistribute the corpus.
+
+Estimated training compute: about 2.2·10^20 FLOP (6 × parameters × tokens), well below the indicative threshold of
+10^23 FLOP in the European Commission's guidelines on general-purpose AI models.
+
 ## Training
 
 | | |
@@ -215,7 +229,8 @@ not affected.
 - Pretrained on sequences of at most 1,024 tokens. The rotary embeddings accept longer inputs, but the model has not
   been trained or evaluated on them.
 - Trained on web text only (CulturaX: mC4 and OSCAR, both from Common Crawl). It reflects the content, opinions and
-  biases of the Dutch web, and the corpus can contain personal information.
+  biases of the Dutch web, and the corpus can contain personal information and text whose owners reserved it
+  from text and data mining (see "Opt-outs and personal data").
 - Dutch only; other languages were not part of the training data.
 - `hebban.nl` was excluded to keep DBRD out of the training data. We did not check the other evaluation sets for
   overlap with CulturaX.

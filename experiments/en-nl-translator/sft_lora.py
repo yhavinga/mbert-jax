@@ -390,8 +390,10 @@ def main(argv=None):
             raise SystemExit(f"eval {name}: a process got no batch of {path}: {counts}")
         eval_plan[name] = {"path": path, "batches": max(counts), "batches_per_process": counts,
                            "loss_tokens_here": loss_tokens, "end": end,
+                           # MaxText requires eval_steps > 0 with padding batches; this script runs that many itself
                            "config": pyconfig.initialize_pydantic(base + [f"steps={steps}", f"hf_eval_files={path}",
-                                                                          "generate_padding_batch_eval=true"])}
+                                                                          "generate_padding_batch_eval=true",
+                                                                          f"eval_steps={max(counts)}"])}
         print(f"EVAL_PLAN {json.dumps({k: v for k, v in eval_plan[name].items() if k != 'config'} | {'set': name})}",
               flush=True)
 

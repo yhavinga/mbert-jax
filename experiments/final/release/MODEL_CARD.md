@@ -200,12 +200,15 @@ The RobBERT models get the task heads of their own Hugging Face classes. These h
 any model, and they are not the settings the RobBERT authors used for their
 own published results, so the RobBERT numbers here differ from theirs.
 
-**Character offsets of RobBERT-2023.** The fast tokenizer of RobBERT-2023-base returns character offsets whose start
-is one character too late for every word (`ĠDe` of "De hoofdstad" maps to "e"). SQuAD-NL takes answer positions and
-answer texts from the offsets, so our evaluation turns off `trim_offsets` in that tokenizer's post-processor: the
-token ids stay the same and the offsets then cover the word. With the offsets as the tokenizer returns them,
-RobBERT-2023 scores F1 68.21 / EM 14.12 on SQuAD-NL (seed 42) instead of 84.08 / 73.63. RobBERT-2026's tokenizer and
-the tokenizer of this model do not have this problem.
+<details>
+<summary>RobBERT-2023 needed an offset correction for SQuAD-NL</summary>
+
+Its fast tokenizer returns word offsets that start one character late (`ĠDe` → "e"). Our evaluation turns off
+`trim_offsets` in its post-processor: same token ids, correct offsets. Without the correction RobBERT-2023 scores
+F1 68.21 / EM 14.12 on SQuAD-NL (seed 42) instead of 84.08 / 73.63. RobBERT-2026 and the tokenizer of this model are
+not affected.
+
+</details>
 
 ## Limitations
 

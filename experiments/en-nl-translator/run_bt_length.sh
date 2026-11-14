@@ -14,7 +14,9 @@
 #                                (tensor 4 x context 2, translate.mesh_of; Gemma 4 31B's 4 global KV heads bound tensor
 #                                at 4), after a smoke test of that layout on bin 1024 against part A; the comparison is
 #                                part A's stukken and their scores ($O/ref/, put there beforehand); report
-#                                $O/report/bt-length-a2-v6e.md (.json)
+#                                $O/report/bt-length-a2-v6e.md (.json). FIX_CLASSES (default "d4k d8k"): the classes
+#                                this call translates; the report needs d4k and d8k whole (or marked out of memory) and
+#                                every unit scored, else the step stops. Done: $O/stages/fix.done and "FIX DONE"
 # Everything done is in the bucket ($O) and every step skips it there: a preempted spot VM loses at most a shard.
 # Logs: ~/logs/len_*.log (one per half and class), copied to $O/logs/.
 set -euo pipefail
@@ -222,7 +224,9 @@ job_full() {  # log command...: the command in the environment of the 8-chip pro
   ( full; "$@" ) > ~/logs/$log.log 2>&1 && code=0 || code=$?
   echo "EXIT $code" >> ~/logs/$log.log
   gsutil -q cp ~/logs/$log.log "$O/logs/$log-$RUN_ID.log" || true
-  tail -n 6 ~/logs/$log.log | cut -c1-300
+  # indented: the job's own EXIT line at the start of a line of the run's log made the keeper take the run for ended
+  # (14 Nov: d4k's EXIT 0 while d8k ran; the VM was taken down)
+  tail -n 6 ~/logs/$log.log | cut -c1-300 | sed 's/^/  | /'
   return $code
 }
 
@@ -243,10 +247,14 @@ fix_classes() {  # classes...: each heel class on the 8-chip process, a job (log
   done
 }
 
-fix_report() {  # stage: collect (heel of the fix, part A's stukken), MetricX of the units not scored, report A2 (v6e)
-  local stage=$1 a b ca cb
+fix_report() {  # stage classes...: collect (heel of the fix, part A's stukken), MetricX of the units not scored, report
+  # A2 (v6e). Stops unless every class is whole (or marked out of memory) and, after MetricX, every unit has a score
+  local stage=$1 a b ca cb n
+  shift
   mkdir -p "$D/heel" "$D/scores" "$D/logs" "$D/report" "$D/collect"
   gsutil -m -q rsync -r "$O/heel" "$D/heel"
+  "$PY" "$C/bt_length.py" complete --segments "$D/seg/heel/segments-w0.parquet" --model gemma4-31b-doc \
+    --prompt natural-v1 --classes "$@" --root "$D/heel/all"
   gsutil -m -q rsync -r "$O/scores" "$D/scores" 2> /dev/null || true
   "$PY" -u "$C/bt_length.py" collect --docs "$D/data/docs.parquet" --heel "$D/heel" --stukken "$D/ref/stukken" \
     --pieces "$D/seg/stukken/segments-w0.parquet" --source nl --target en --out "$D/collect"
@@ -256,8 +264,13 @@ fix_report() {  # stage: collect (heel of the fix, part A's stukken), MetricX of
   job 1 "len_fix_metricx_${stage}_h1" metricx_half 1 "$stage" & b=$!
   wait $a && ca=0 || ca=$?
   wait $b && cb=0 || cb=$?
-  if [ $ca != 0 ] || [ $cb != 0 ]; then echo "MetricX failed: half 0 $ca, half 1 $cb"; tail -n 20 ~/logs/len_fix_metricx_${stage}_h*.log; exit 1; fi
+  if [ $ca != 0 ] || [ $cb != 0 ]; then echo "MetricX failed: half 0 $ca, half 1 $cb"; tail -n 20 ~/logs/len_fix_metricx_${stage}_h*.log | sed 's/^/  | /'; exit 1; fi
   gsutil -m -q rsync -r "$O/scores" "$D/scores"
+  # metricx_half skips a share whose file of this stage exists: a unit it left out would be a bin without QE
+  "$PY" -u "$C/bt_length.py" pending --units "$D/collect/units.parquet" --scored "$D"/scores/qe-*.parquet \
+    "$D/ref/qe-a-stukken.parquet" --workers 1 --out "$D/pending-after-$stage" > /dev/null
+  n=$("$PY" -c "import pyarrow.parquet as pq, sys; print(pq.read_metadata(sys.argv[1]).num_rows)" "$D/pending-after-$stage/pending-w0.parquet")
+  [ "$n" = 0 ] || { echo "after MetricX of stage $stage, $n units have no score"; exit 1; }
   gsutil -m -q cp "$O/logs/len_fix_heel_*" "$D/logs/"
   "$PY" "$C/bt_length.py" setup --out "$D/report/setup.json" \
     --item model "Gemma 4 31B-it (google/gemma-4-31B-it @ 842da37, MaxText 0.2.5-checkpoint van en-nl-judge), prompt natural-v1, greedy, eigen chat-template met lege denkruimte; heel: translate_models.yml gemma4-31b-doc (één klasse per bak, decodeerlimiet 1,25 x de bron); in stukken: deel A (13 nov, fork 2249474, alle stukken in klasse d512)" \
@@ -280,6 +293,7 @@ case $step in
 fix)
   [ -n "$FORK_COMMIT" ] || { echo "fix needs FORK_COMMIT"; exit 1; }
   case $O in */bt-length-fix) ;; *) echo "fix writes to a bt-length-fix root, not $O"; exit 1 ;; esac
+  code_commit=$(cat "$C/COMMIT")  # staged with the code (keeper_fix.sh)
   if [ ! -s "$V/done.txt" ] || [ ! -s "$TOK/tokenizer.json" ] || [ ! -s "$TOK_TG/tokenizer.json" ]; then
     FORK_COMMIT=$FORK_COMMIT HF_HUB_OFFLINE=0 bash "$C/setup_generic.sh" venv
   fi
@@ -304,17 +318,22 @@ fix)
   if gsutil -q stat "$O/smoke/d1k/oom.txt"; then echo "FIX SMOKE: out of memory at d1k with one slot"; exit 1; fi
   fix_smoke || exit 1
   echo "== heel ${FIX_CLASSES:-d4k d8k} on 8 chips $(date -u +%T)"
+  # FIX_CLASSES: the classes this call translates (one done before is in the bucket); the report needs all of them
   fix_classes ${FIX_CLASSES:-d4k d8k}
   wait $dl || { echo "MetricX download failed: ~/logs/len_metricx_download.log"; exit 1; }
-  fix_report f
+  reported="d4k d8k"
+  fix_report f $reported
   if "$PY" -c "import json, sys; v = json.load(open(sys.argv[1]))['verdict'].get('8192', {}); sys.exit(0 if v.get('pass') else 1)" \
       "$D/report/bt-length-a2-v6e.json"; then
     echo "== bin 8192 passes the rule: heel d16k $(date -u +%T)"
     fix_classes d16k
-    fix_report g
+    reported="d4k d8k d16k"
+    fix_report g $reported
   else
     echo "== bin 8192 does not pass the rule (bt-length-trial.md 1): no d16k"
   fi
+  # the keeper takes the run for done only with this mark (and FIX DONE as the run log's line before its EXIT 0)
+  echo "$code_commit $FORK_COMMIT $RUN_ID $(date -u +%FT%TZ) $reported" | gsutil -q cp - "$O/stages/fix.done"
   echo "FIX DONE $(date -u +%T)"
   ;;
 all)

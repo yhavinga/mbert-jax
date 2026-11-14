@@ -1071,6 +1071,38 @@ def merge(args):
         print(f"MERGE {json.dumps({'table': name, 'rows': len(rows), 'inputs': len(paths)})}", flush=True)
 
 
+def complete(args):
+    """Every class of --classes whole under --root/<class>: all its segments of --segments translated (translate.py's
+    choice of a class: more tokens than the class below, at most its own) or the class marked out of memory (oom.txt).
+    Else SystemExit: on 14 Nov a run's report would have taken a half or missing class as a bin with fewer or no
+    documents, and the run would have ended as if it were done"""
+    import translate as tr
+
+    classes = tr.with_prompt(tr.MODELS[args.model], args.prompt)["length_classes"]
+    order = list(classes)
+    rows = read_rows(args.segments, ["id", "tokens"])
+    bad = []
+    for cls in args.classes:
+        if cls not in classes:
+            raise SystemExit(f"{cls} is not a class of {args.model}: {', '.join(order)}")
+        k = order.index(cls)
+        low = classes[order[k - 1]]["max_source"] if k else 0
+        want = {r["id"] for r in rows if low < r["tokens"] <= classes[cls]["max_source"]}
+        root = Path(args.root) / cls
+        got = set()
+        for path in sorted(root.glob("shard-*.parquet")) if root.exists() else []:
+            got |= {r["id"] for r in read_rows(path, ["id"])}
+        oom = (root / "oom.txt").exists()
+        print(f"COMPLETE {json.dumps({'class': cls, 'segments': len(want), 'translated': len(want & got), 'oom': oom})}",
+              flush=True)
+        if not want:
+            bad.append(f"{cls}: no segments in {args.segments}")
+        elif not oom and not want <= got:
+            bad.append(f"{cls}: {len(want - got)} of {len(want)} segments not translated in {root}")
+    if bad:
+        raise SystemExit("not complete: " + "; ".join(bad))
+
+
 def smoke(args):
     def rows(root):
         out = {}
@@ -1157,6 +1189,12 @@ def main(argv=None):
     a.add_argument("--docs", type=int, required=True)
     a.add_argument("--ended", type=int, required=True)
     a.add_argument("--ratio", required=True, help="low,high bounds of the median output ratio")
+    a = sub.add_parser("complete")
+    a.add_argument("--segments", required=True)
+    a.add_argument("--model", required=True, help="translate_models.yml model of the segments")
+    a.add_argument("--prompt", default=None)
+    a.add_argument("--classes", nargs="+", required=True)
+    a.add_argument("--root", required=True, help="the classes' shards under <root>/<class>/")
     a = sub.add_parser("setup")
     a.add_argument("--out", required=True)
     a.add_argument("--item", nargs=2, action="append", default=[], metavar=("KEY", "VALUE"))
@@ -1179,7 +1217,7 @@ def main(argv=None):
                     counts[r["id"].split("#c")[0]] += 1
             args.expect_pieces = counts
     {"docs": docs, "docs-merge": docs_merge, "segments": segments, "collect": collect, "pending": pending, "report": report,
-     "english": english, "merge": merge, "smoke": smoke, "setup": setup_json}[args.cmd](args)
+     "english": english, "merge": merge, "smoke": smoke, "complete": complete, "setup": setup_json}[args.cmd](args)
 
 
 if __name__ == "__main__":

@@ -460,6 +460,42 @@ def test_smoke_compares_ended_and_output_length_with_the_earlier_run(tmp_path):
         bl.main(args + ["--ended", "3", "--ratio", "0.9,1.05"])
 
 
+def test_complete_needs_every_segment_of_a_class_or_its_out_of_memory_mark(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    # d4k takes 2049-4096 tokens, d8k 4097-8192 (gemma4-31b-doc); the d1k segment is no part of either
+    pq.write_table(pa.table({"id": ["a", "b", "c", "d", "e"], "tokens": [900, 3000, 4096, 4097, 8000]}),
+                   tmp_path / "segments-w0.parquet")
+    root = tmp_path / "all"
+
+    def shard(cls, name, ids):
+        (root / cls).mkdir(parents=True, exist_ok=True)
+        pq.write_table(pa.table({"id": ids}), root / cls / name)
+
+    args = ["complete", "--segments", str(tmp_path / "segments-w0.parquet"), "--model", "gemma4-31b-doc",
+            "--root", str(root), "--classes"]
+    shard("d4k", "shard-00000.parquet", ["b", "c"])
+    bl.main(args + ["d4k"])
+    # 14 Nov: d4k whole, d8k not run at all (the VM taken away while it ran)
+    with pytest.raises(SystemExit, match=r"d8k: 2 of 2 segments not translated"):
+        bl.main(args + ["d4k", "d8k"])
+    shard("d8k", "shard-00000.parquet", ["d"])
+    with pytest.raises(SystemExit, match=r"d8k: 1 of 2 segments not translated"):
+        bl.main(args + ["d4k", "d8k"])
+    shard("d8k", "shard-00001.parquet", ["e"])
+    bl.main(args + ["d4k", "d8k"])
+    (root / "d16k").mkdir()
+    (root / "d16k" / "oom.txt").write_text("RESOURCE_EXHAUSTED")
+    with pytest.raises(SystemExit, match=r"d16k: no segments"):  # a class asked for that has none is no pass either
+        bl.main(args + ["d16k"])
+    (root / "d8k" / "shard-00001.parquet").unlink()
+    (root / "d8k" / "oom.txt").write_text("RESOURCE_EXHAUSTED")
+    bl.main(args + ["d4k", "d8k"])  # out of memory with one slot: marked, the report has the bin as not measured
+    with pytest.raises(SystemExit, match="not a class"):
+        bl.main(args + ["d3k"])
+
+
 def test_setup_writes_its_items(tmp_path):
     import json
 

@@ -300,3 +300,13 @@ def test_a_tag_prompt_replaces_both_prompts_of_translategemma(name):
     else:
         assert tagged == plain.replace("commentary. ", "commentary. Translate into natural, original-sounding Dutch. ")
     assert "<unused0>" in "".join(map(chr, prompts.encode("x", CONTEXT))) or name != "chat-v1-tag-token"
+
+
+def test_mesh_of_puts_the_chips_on_tensor_or_splits_off_a_context_axis():
+    assert tr.mesh_of(4) == {"ici_fsdp_parallelism": 1, "ici_tensor_parallelism": 4}
+    # Gemma 4 31B on a v6e-8 as one process: its 4 global KV heads bound tensor at 4, context takes the other 2
+    assert tr.mesh_of(8, 2) == {"ici_fsdp_parallelism": 1, "ici_tensor_parallelism": 4, "ici_context_parallelism": 2,
+                                "context_parallel_load_balance": False}
+    for chips, context in ((8, 3), (4, 0)):
+        with pytest.raises(ValueError):
+            tr.mesh_of(chips, context)

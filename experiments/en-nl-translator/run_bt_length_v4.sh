@@ -20,14 +20,28 @@
 #   bash run_bt_length_v4.sh report       w0 (CPU): report A ($O/report/bt-length-a.md, .json), the English for part
 #                                         B ($O/report/docs-en.parquet); VERDICT8192 pass|fail
 # Translate skips every shard already in the bucket (translate.py), so a stage started again resumes.
+# The repeat of 14 Nov on mbert-mix (heel d512 d1k d2k on the fork's fix of the decode cache, beside part A's stukken)
+# sets, for every stage: FORK_COMMIT (the fork's commit: venv-fork-<first 9> of setup_generic.sh), O and D (its bucket
+# and local directories; part A's data, segments and stukken copied there beforehand, so translate skips the stukken,
+# and the scores of part A's stukken as $O/scores/qe-a-stukken.parquet), REPORT (the report's name), TITLE, BEFORE
+# (part A's report .json in the bucket: report --before, and --relative), ENGLISH=0 (no English for part B) and VMNAME.
+# Unset, each is what part A used.
 # The code is beside this script (a copy of $O/scripts/, stage.sh). TAG names the jobs of one chain.
 set -euo pipefail
 STAGE=${1:?a stage: setup, mxdl, data, smoke, translate, collect, metricx, report}
 SHM=/dev/shm/translate-generic
 C=$(cd "$(dirname "$0")" && pwd)
-D=$SHM/bt-length
-PY=$SHM/venv-fork/bin/python
+D=${D:-$SHM/bt-length}
+FORK_COMMIT=${FORK_COMMIT:-}
+V=$SHM/venv-fork
+[ -n "$FORK_COMMIT" ] && V=$SHM/venv-fork-${FORK_COMMIT:0:9}
+PY=$V/bin/python
 O=${O:-gs://t5-dutch-english-usc2/mbert/translator/bt-length}
+REPORT=${REPORT:-bt-length-a}
+TITLE=${TITLE:-Deel A: Gemma 4 31B-it nl→en, heel tegen in stukken}
+BEFORE=${BEFORE:-}
+ENGLISH=${ENGLISH:-1}
+VMNAME=${VMNAME:-mbert-corpus}
 CKPT=${CKPT:-gs://t5-dutch-english-usc2/mbert/translator/judge/gemma-4-31b-it-maxtext/0/items}
 TOK=$SHM/tokenizer-gemma4
 TOK_TG=$SHM/tokenizer-tg27b
@@ -108,7 +122,8 @@ setup)
   cat > ~/job_body_lenv4_setup_$TAG.sh <<EOF
 set -euo pipefail
 sudo -n loginctl enable-linger "\$(id -un)"
-HF_HUB_OFFLINE=0 bash $C/setup_generic.sh venv
+FORK_COMMIT=$FORK_COMMIT HF_HUB_OFFLINE=0 bash $C/setup_generic.sh venv
+[ -z "$FORK_COMMIT" ] || grep -q "$FORK_COMMIT" $V/done.txt || { echo "$V is not at $FORK_COMMIT"; exit 1; }
 $ONE_HOST
 $PREFLIGHT
 echo "READY w$W: /dev/shm \$(df -h /dev/shm | tail -1 | awk '{print \$4}') free"
@@ -232,28 +247,29 @@ gsutil -m -q rsync -r $O/scores $D/scores
 gsutil -m -q cp $O/collect/measured.parquet $O/collect/units.parquet $D/collect/
 gsutil -m -q cp $O/data/docs.parquet $O/data/docs.json $D/data/
 gsutil -m -q cp "$O/logs/len_heel_*" "$O/logs/len_stukken_*" $D/logs/
-$PY - $D/report/setup.json <<'PYEOF'
-import json, sys
-from pathlib import Path
-fork = Path("/dev/shm/translate-generic/venv-fork/done.txt").read_text().strip()
-Path(sys.argv[1]).write_text(json.dumps({
-    "model": "Gemma 4 31B-it (google/gemma-4-31B-it @ 842da37, MaxText 0.2.5-checkpoint van en-nl-judge), prompt "
-             "natural-v1, greedy, eigen chat-template met lege denkruimte; heel: translate_models.yml gemma4-31b-doc "
-             "(één klasse per bak, decodeerlimiet 1,25 x de bron); in stukken: dezelfde, alle stukken in klasse d512",
-    "MaxText": "fork yhavinga/maxtext, branch fix-nnx-decode-cache-abstract-init @ 2249474b9; pakketten: " + fork,
-    "MetricX": "google/metricx-24-hybrid-xxl-v2p6-bfloat16 @ 3d9c6f7, metricx_qe.py (JAX), QE nl->en per uitgelijnde "
-               "eenheid (bron: de Nederlandse alinea's, kandidaat: het Engels), invoer afgekapt op 1.536 tokens",
-    "VM": "mbert-corpus (v4-32 on-demand, us-central2-b), elke worker als TPU van 4 chips (4 processen)"}, ensure_ascii=False))
-PYEOF
+if [ -n "$BEFORE" ]; then stukken="deel A (13 nov, fork 2249474, alle stukken in klasse d512)"; else stukken="dezelfde, alle stukken in klasse d512"; fi
+$PY $C/bt_length.py setup --out $D/report/setup.json \
+  --item model "Gemma 4 31B-it (google/gemma-4-31B-it @ 842da37, MaxText 0.2.5-checkpoint van en-nl-judge), prompt natural-v1, greedy, eigen chat-template met lege denkruimte; heel: translate_models.yml gemma4-31b-doc (één klasse per bak, decodeerlimiet 1,25 x de bron); in stukken: \$stukken" \
+  --item MaxText "fork yhavinga/maxtext; pakketten: \$(cat $V/done.txt)" \
+  --item MetricX "google/metricx-24-hybrid-xxl-v2p6-bfloat16 @ 3d9c6f7, metricx_qe.py (JAX), QE nl->en per uitgelijnde eenheid (bron: de Nederlandse alinea's, kandidaat: het Engels), invoer afgekapt op 1.536 tokens" \
+  --item VM "$VMNAME (v4-32 on-demand, us-central2-b), elke worker als TPU van 4 chips (4 processen)"
+extra=()
+if [ -n "$BEFORE" ]; then
+  gsutil -q cp $BEFORE $D/report/before.json
+  extra=(--relative --before $D/report/before.json)
+fi
 $PY -u $C/bt_length.py report --measured $D/collect/measured.parquet --units $D/collect/units.parquet \
   --qe $D/scores/qe-*.parquet --logs $D/logs --setup $D/report/setup.json --source nl --target en \
-  --title "Deel A: Gemma 4 31B-it nl→en, heel tegen in stukken" --out $D/report/bt-length-a.md > /dev/null
-$PY -u $C/bt_length.py english --docs $D/data/docs.parquet --measured $D/collect/measured.parquet \
-  --tokenizer $TOK_TG --out $D/report/docs-en.parquet
-gsutil -m -q cp $D/report/bt-length-a.md $D/report/bt-length-a.json $D/report/setup.json $D/report/docs-en.parquet $O/report/
-v=\$($PY -I -c "import json, sys; v = json.load(open(sys.argv[1]))['verdict'].get('8192', {}); print('pass' if v.get('pass') else 'fail')" $D/report/bt-length-a.json)
+  \${extra[@]+"\${extra[@]}"} --title "$TITLE" --out $D/report/$REPORT.md > /dev/null
+gsutil -m -q cp $D/report/$REPORT.md $D/report/$REPORT.json $D/report/setup.json $O/report/
+if [ "$ENGLISH" = 1 ]; then
+  $PY -u $C/bt_length.py english --docs $D/data/docs.parquet --measured $D/collect/measured.parquet \
+    --tokenizer $TOK_TG --out $D/report/docs-en.parquet
+  gsutil -q cp $D/report/docs-en.parquet $O/report/
+fi
+v=\$($PY -I -c "import json, sys; v = json.load(open(sys.argv[1]))['verdict'].get('8192', {}); print('pass' if v.get('pass') else 'fail')" $D/report/$REPORT.json)
 echo "VERDICT8192 \$v"
-echo "REPORT: $O/report/bt-length-a.md"
+echo "REPORT: $O/report/$REPORT.md"
 EOF
   detach "lenv4_report_$TAG" bash ~/job_body_lenv4_report_$TAG.sh
   ;;

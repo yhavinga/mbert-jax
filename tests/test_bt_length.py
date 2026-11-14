@@ -260,8 +260,96 @@ def test_throughput_reads_classes_shards_and_the_mem_line(tmp_path):
         "jaxlib.xla_extension.XlaRuntimeError: RESOURCE_EXHAUSTED: Out of memory\n")
     t = bl.throughput(tmp_path)
     assert t[0]["class"] == "d8k" and t[0]["load_s"] == 120 and t[0]["tokens_out"] == 50000
-    assert t[0]["peak_gib"] == 27.5 and not t[0]["oom"]
-    assert t[1]["class"] == "d16k" and t[1]["oom"]
+    assert t[0]["peak_gib"] == 27.5 and not t[0]["oom"] and t[0]["chips"] == 4
+    assert t[1]["class"] == "d16k" and t[1]["oom"] and t[1]["chips"] is None
+
+
+def test_a_bin_that_could_not_be_measured_leaves_out_every_larger_bin():
+    ok = {"heel": stat(40, 40, 40, 1000, 10, 3.0), "stukken": stat(40, 40, 40, 1000, 10, 3.0)}
+    stats = {512: ok, 1024: ok, 2048: {"heel": stat(0, 0, 0, 0, 0, None), "stukken": stat(40, 40, 40, 1000, 10, 3.0)},
+             4096: ok}
+    verdict, length = bl.rule(stats)
+    assert verdict[4096]["pass"] and not verdict[2048]["measured"]
+    assert length == 1024  # bt-length-trial.md 1: "een grotere bak telt dan niet"
+    del stats[2048]
+    assert bl.rule(stats)[1] == 4096
+
+
+def test_relative_rule_compares_heel_with_stukken_only():
+    stats = {
+        # one document fewer done, +1.0 pp and +0.2 exactly: inside; the paragraph count does not decide
+        512: {"heel": stat(40, 37, 30, 1000, 20, 3.4), "stukken": stat(40, 38, 36, 1000, 10, 3.2)},
+        # two documents fewer done
+        1024: {"heel": stat(40, 36, 36, 1000, 10, 3.0), "stukken": stat(40, 38, 36, 1000, 10, 3.0)},
+        2048: {"heel": stat(40, 39, 36, 1000, 21, 3.0), "stukken": stat(40, 39, 36, 1000, 10, 3.0)},
+        4096: {"heel": stat(40, 40, 36, 1000, 10, 3.201), "stukken": stat(40, 39, 36, 1000, 10, 3.0)},
+        8192: {"heel": stat(40, 39, 36, 1000, 10, 3.0), "stukken": stat(40, 39, 36, 1000, 10, 3.0)},
+    }
+    out, length = bl.relative(stats)
+    assert out[512]["pass"] and out[512]["done_diff"] == -1 and out[512]["paragraphs_kept_diff"] == -6
+    assert not out[1024]["done"] and out[1024]["omissions"] and out[1024]["qe"]
+    assert not out[2048]["omissions"] and not out[4096]["qe"] and out[4096]["done_diff"] == 1
+    assert length == 8192
+    stats[16384] = {"heel": stat(0, 0, 0, 0, 0, None), "stukken": stat(40, 39, 36, 1000, 10, 3.0)}
+    out, length = bl.relative(stats)
+    assert not out[16384]["measured"] and length == 8192
+    stats[4096]["heel"] = stat(0, 0, 0, 0, 0, None)
+    assert bl.relative(stats)[1] == 512  # 4096 not measured: 8192 does not count
+
+
+def test_merge_keeps_one_of_equal_rows_and_refuses_different_ones(tmp_path):
+    def m(i, cond, text):
+        return {"id": i, "condition": cond, "translation": text, "ended": True, "done": True, "omitted": 0, "bin": 512}
+
+    def u(i, cand):
+        return {"id": i, "src": "x", "cand": cand, "n_source": 1}
+
+    bl.write_parquet([m("a", "heel", "A"), m("a", "stukken", "S")], tmp_path / "m1.parquet")
+    bl.write_parquet([m("b", "heel", "B"), m("a", "stukken", "S")], tmp_path / "m2.parquet")
+    bl.write_parquet([u("a|heel|u0000", "A"), u("a|stukken|u0000", "S")], tmp_path / "u1.parquet")
+    bl.write_parquet([u("b|heel|u0000", "B"), u("a|stukken|u0000", "S")], tmp_path / "u2.parquet")
+    bl.main(["merge", "--measured", str(tmp_path / "m1.parquet"), str(tmp_path / "m2.parquet"),
+             "--units", str(tmp_path / "u1.parquet"), str(tmp_path / "u2.parquet"), "--out", str(tmp_path / "out")])
+    rows = bl.read_rows(tmp_path / "out" / "measured.parquet")
+    assert sorted((r["id"], r["condition"]) for r in rows) == [("a", "heel"), ("a", "stukken"), ("b", "heel")]
+    assert len(bl.read_rows(tmp_path / "out" / "units.parquet")) == 3
+    bl.write_parquet([m("a", "stukken", "other")], tmp_path / "m3.parquet")
+    with pytest.raises(SystemExit, match="differs"):
+        bl.main(["merge", "--measured", str(tmp_path / "m1.parquet"), str(tmp_path / "m3.parquet"),
+                 "--units", str(tmp_path / "u1.parquet"), "--out", str(tmp_path / "out3")])
+
+
+def test_report_with_relative_and_before_sections(tmp_path):
+    import json
+
+    rows, units, scores = [], [], []
+    for cond, done in (("heel", True), ("stukken", True)):
+        for k in range(2):
+            i = f"d{k}"
+            rows.append({"id": i, "source": "dpc", "bin": 512, "condition": cond, "done": done, "ended": True,
+                         "decode_loop": False, "cut": False, "empty": False, "source_left": False, "chatter": False,
+                         "added_formatting": [], "paragraphs_kept": cond == "stukken" or k == 0,
+                         "paragraphs_source": 2, "omitted": 0,
+                         "omitted_none": 0, "omitted_short": 0, "omitted_long": 0, "added_paragraphs": 0,
+                         "word_ratio_nl_en": 1.0, "tokens_source": 400, "tokens_out": 380, "paragraphs_target": 2})
+            units.append({"id": f"{i}|{cond}|u0000", "doc": i, "condition": cond, "n_source": 2})
+            scores.append({"id": f"{i}|{cond}|u0000", "qe_src_cand": 3.0 if cond == "heel" else 2.9})
+    bl.write_parquet(rows, tmp_path / "measured.parquet")
+    bl.write_parquet(units, tmp_path / "units.parquet")
+    bl.write_parquet(scores, tmp_path / "qe.parquet")
+    before = {"title": "Deel A", "setup": {}, "stats": {"512": {"heel": {"docs": 2, "done": 1, "decode_loop": 1,
+                                                                        "paragraphs_kept": 1, "omitted": 1,
+                                                                        "paragraphs": 4, "qe_mean": 5.0}}}}
+    (tmp_path / "a.json").write_text(json.dumps(before))
+    bl.main(["report", "--measured", str(tmp_path / "measured.parquet"), "--units", str(tmp_path / "units.parquet"),
+             "--qe", str(tmp_path / "qe.parquet"), "--source", "nl", "--target", "en", "--title", "A2", "--relative",
+             "--before", str(tmp_path / "a.json"), "--out", str(tmp_path / "r.md")])
+    md = (tmp_path / "r.md").read_text()
+    r = json.loads((tmp_path / "r.json").read_text())
+    # heel keeps the paragraph count in 1 of 2 documents: rule (ii) fails, the relative rule does not look at it
+    assert r["L"] is None and not r["verdict"]["512"]["ii"] and r["L_relative"] == 512
+    assert "geen deel van de beslisregel" in md and "| 512 | 2 / 2 (+0) | 1 / 2 (-1) |" in md
+    assert "| 512 | 2/2 (100,0%) / 1/2 (50,0%) | 0 / 1 | 1/2 (50,0%) / 1/2 (50,0%) |" in md
 
 
 def test_document_models_fit_their_sources_and_leave_the_others_as_they_were():
@@ -351,3 +439,29 @@ def test_docs_reads_row_groups_and_writes_stretches_per_bin(tmp_path, monkeypatc
     report = json.loads((tmp_path / "out" / "docs.json").read_text())
     assert report["chosen"] == {"512": {"raad": 1}, "1024": {"raad": 1}}
     assert bl.read_rows(tmp_path / "out" / "stretches.parquet")
+
+
+def test_smoke_compares_ended_and_output_length_with_the_earlier_run(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    def shard(root, ended, tokens):
+        (root / "d1k").mkdir(parents=True)
+        pq.write_table(pa.table({"id": [f"d{k}" for k in range(4)], "ended": ended, "tokens_out": tokens}),
+                       root / "d1k" / "shard-00000.parquet")
+
+    shard(tmp_path / "before", [True] * 4, [100, 200, 300, 400])
+    shard(tmp_path / "now", [True, True, True, False], [105, 190, 330, 1280])
+    args = ["smoke", "--now", str(tmp_path / "now"), "--before", str(tmp_path / "before"), "--docs", "4"]
+    bl.main(args + ["--ended", "3", "--ratio", "0.9,1.1"])  # ratios 1.05, 0.95, 1.1, 3.2: median 1.075
+    with pytest.raises(SystemExit, match="smoke failed"):
+        bl.main(args + ["--ended", "4", "--ratio", "0.9,1.1"])
+    with pytest.raises(SystemExit, match="smoke failed"):
+        bl.main(args + ["--ended", "3", "--ratio", "0.9,1.05"])
+
+
+def test_setup_writes_its_items(tmp_path):
+    import json
+
+    bl.main(["setup", "--out", str(tmp_path / "s.json"), "--item", "model", "Gemma 4", "--item", "VM (heel)", "v6e"])
+    assert json.loads((tmp_path / "s.json").read_text()) == {"model": "Gemma 4", "VM (heel)": "v6e"}

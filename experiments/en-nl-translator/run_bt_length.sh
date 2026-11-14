@@ -8,6 +8,13 @@
 #                                and, when bin 8192 passes the decision rule (AUTO_D16K=1, the default), the step d16k
 #   bash run_bt_length.sh d16k   the bin 16384 whole on both halves, then collect, MetricX and the report of all bins
 #   bash run_bt_length.sh report collect, MetricX of what is not scored, the report (what is in the bucket)
+#   FORK_COMMIT=<sha> O=$B/bt-length-fix D=$SHM/bt-length-fix bash run_bt_length.sh fix
+#                                the repeat of 14 Nov on the fork's fix of the decode cache (venv-fork-<sha9>): the bins
+#                                4096 and 8192 whole (16384 when 8192 passes the rule) as one process of all 8 chips
+#                                (tensor 4 x context 2, translate.mesh_of; Gemma 4 31B's 4 global KV heads bound tensor
+#                                at 4), after a smoke test of that layout on bin 1024 against part A; the comparison is
+#                                part A's stukken and their scores ($O/ref/, put there beforehand); report
+#                                $O/report/bt-length-a2-v6e.md (.json)
 # Everything done is in the bucket ($O) and every step skips it there: a preempted spot VM loses at most a shard.
 # Logs: ~/logs/len_*.log (one per half and class), copied to $O/logs/.
 set -euo pipefail
@@ -15,8 +22,12 @@ set -euo pipefail
 sudo -n loginctl enable-linger "$(id -un)"
 SHM=/dev/shm/translate-generic
 C=$SHM/code-len
-D=$SHM/bt-length
-PY=$SHM/venv-fork/bin/python
+D=${D:-$SHM/bt-length}
+# FORK_COMMIT: another commit of the fork in venv-fork-<first 9> (setup_generic.sh); unset: venv-fork as before
+FORK_COMMIT=${FORK_COMMIT:-}
+V=$SHM/venv-fork
+[ -n "$FORK_COMMIT" ] && V=$SHM/venv-fork-${FORK_COMMIT:0:9}
+PY=$V/bin/python
 ZONE=$(curl -fs -H Metadata-Flavor:Google http://metadata.google.internal/computeMetadata/v1/instance/zone | awk -F/ '{print $NF}')
 case ${ZONE%-*} in
   europe-west4) BUCKET=gs://t5-dutch-english ;;
@@ -162,8 +173,147 @@ EOF
   echo "== report $stage done $(date -u +%T)"
 }
 
+# ---- fix: the repeat on the fork's fix, all 8 chips in one process
+full() {  # the environment of one process of all 8 chips (none of half's variables)
+  unset TPU_CHIPS_PER_PROCESS_BOUNDS TPU_PROCESS_BOUNDS TPU_VISIBLE_CHIPS TPU_PROCESS_PORT TPU_PROCESS_ADDRESSES \
+    CLOUD_TPU_TASK_ID ALLOW_MULTIPLE_LIBTPU_LOAD
+  timeout 600 "$PY" -c "import jax; assert (jax.device_count(), jax.process_count()) == (8, 1), (jax.device_count(), jax.process_count()); print('devices', jax.devices())" \
+    || { echo "preflight failed: not 8 chips of one process"; exit 2; }
+}
+
+translate_full() {  # class segments out log [extra...]: one heel class on all 8 chips; out of memory: again with half
+  # the slots, down to one, each attempt its own log (…-s<slots>.log); with one slot out of memory is marked (oom.txt)
+  local cls=$1 seg=$2 out=$3 log=$4 slots try code
+  shift 4
+  if gsutil -q stat "$out/oom.txt"; then echo "$cls: out of memory before ($out/oom.txt)"; return 0; fi
+  case $cls in d512) slots=32 ;; d1k) slots=16 ;; d2k) slots=8 ;; d4k) slots=4 ;; d8k) slots=2 ;; *) slots=1 ;; esac
+  try=$log
+  while true; do
+    echo "== full $cls slots $slots $(date -u +%T)"
+    "$PY" -u "$C/bt_length_translate.py" --segments "$seg" --out "$out" --tokenizer "$TOK" --model gemma4-31b-doc \
+      --prompt natural-v1 --length-class "$cls" --source-lang nl --target-lang en --ckpt "$CKPT" \
+      --work-dir "$SHM/work-len-full" --shard-size "$(shard_size heel "$cls")" --slots "$slots" --chips 8 \
+      --context-parallelism 2 "$@" > "$try" 2>&1 && code=0 || code=$?
+    echo "EXIT $code" >> "$try"
+    gsutil -q cp "$try" "$O/logs/$(basename "$try" .log)-$RUN_ID.log" || true
+    grep -E '^(SHARD|DONE|MEM|engine|MAXTEXT)' "$try" | tail -n 5 | cut -c1-400
+    [ "$code" = 0 ] && return 0
+    if grep -q -E 'RESOURCE_EXHAUSTED|Ran out of memory|[Oo]ut of memory' "$try"; then
+      if [ "$slots" -gt 1 ]; then
+        slots=$((slots / 2)); try=${log%.log}-s$slots.log
+        echo "$cls: out of memory, again with $slots slots"
+        continue
+      fi
+      grep -m1 -E 'RESOURCE_EXHAUSTED|Ran out of memory|[Oo]ut of memory' "$try" | cut -c1-500 | gsutil -q cp - "$out/oom.txt"
+      echo "$cls: OUT OF MEMORY with one slot, marked ($out/oom.txt)"
+      return 0
+    fi
+    echo "$cls: EXIT $code"; tail -n 30 "$try"
+    return "$code"
+  done
+}
+
+job_full() {  # log command...: the command in the environment of the 8-chip process, its log ending in an EXIT line
+  local log=$1 code
+  shift
+  ( full; "$@" ) > ~/logs/$log.log 2>&1 && code=0 || code=$?
+  echo "EXIT $code" >> ~/logs/$log.log
+  gsutil -q cp ~/logs/$log.log "$O/logs/$log-$RUN_ID.log" || true
+  tail -n 6 ~/logs/$log.log | cut -c1-300
+  return $code
+}
+
+fix_smoke() {  # bin 1024 whole on the 8-chip layout against part A's heel d1k (4 chips, same documents and prompts).
+  # Passes (fixed before the run, 14 Nov) when there are 40 documents, at least 38 end with a stop token and the median
+  # of their output tokens over part A's is within 0.9-1.1; else the step stops (the layout is not trusted)
+  mkdir -p "$D/smoke"
+  gsutil -m -q rsync -r "$O/smoke/d1k" "$D/smoke"
+  "$PY" "$C/bt_length.py" smoke --now "$D/smoke" --before "$D/ref/heel-d1k" --docs 40 --ended 38 --ratio 0.9,1.1
+}
+
+fix_classes() {  # classes...: each heel class on the 8-chip process, a job (log ending in EXIT) per class
+  local cls
+  for cls in "$@"; do
+    grep -qw "$cls" "$D/seg/heel/classes.txt" || { echo "no heel segments of class $cls"; exit 1; }
+    job_full "len_fix_job_$cls" translate_full "$cls" "$D/seg/heel/segments-w0.parquet" "$O/heel/all/$cls" \
+      ~/logs/len_fix_heel_${cls}_full.log || exit 1
+  done
+}
+
+fix_report() {  # stage: collect (heel of the fix, part A's stukken), MetricX of the units not scored, report A2 (v6e)
+  local stage=$1 a b ca cb
+  mkdir -p "$D/heel" "$D/scores" "$D/logs" "$D/report" "$D/collect"
+  gsutil -m -q rsync -r "$O/heel" "$D/heel"
+  gsutil -m -q rsync -r "$O/scores" "$D/scores" 2> /dev/null || true
+  "$PY" -u "$C/bt_length.py" collect --docs "$D/data/docs.parquet" --heel "$D/heel" --stukken "$D/ref/stukken" \
+    --pieces "$D/seg/stukken/segments-w0.parquet" --source nl --target en --out "$D/collect"
+  "$PY" -u "$C/bt_length.py" pending --units "$D/collect/units.parquet" --scored "$D"/scores/qe-*.parquet \
+    "$D/ref/qe-a-stukken.parquet" --workers 2 --out "$D/pending"
+  job 0 "len_fix_metricx_${stage}_h0" metricx_half 0 "$stage" & a=$!
+  job 1 "len_fix_metricx_${stage}_h1" metricx_half 1 "$stage" & b=$!
+  wait $a && ca=0 || ca=$?
+  wait $b && cb=0 || cb=$?
+  if [ $ca != 0 ] || [ $cb != 0 ]; then echo "MetricX failed: half 0 $ca, half 1 $cb"; tail -n 20 ~/logs/len_fix_metricx_${stage}_h*.log; exit 1; fi
+  gsutil -m -q rsync -r "$O/scores" "$D/scores"
+  gsutil -m -q cp "$O/logs/len_fix_heel_*" "$D/logs/"
+  "$PY" "$C/bt_length.py" setup --out "$D/report/setup.json" \
+    --item model "Gemma 4 31B-it (google/gemma-4-31B-it @ 842da37, MaxText 0.2.5-checkpoint van en-nl-judge), prompt natural-v1, greedy, eigen chat-template met lege denkruimte; heel: translate_models.yml gemma4-31b-doc (één klasse per bak, decodeerlimiet 1,25 x de bron); in stukken: deel A (13 nov, fork 2249474, alle stukken in klasse d512)" \
+    --item "MaxText (heel)" "fork yhavinga/maxtext, branch fix-decode-cache-shared-index; pakketten: $(cat "$V/done.txt")" \
+    --item MetricX "google/metricx-24-hybrid-xxl-v2p6-bfloat16 @ 3d9c6f7, metricx_qe.py (JAX), QE nl->en per uitgelijnde eenheid (bron: de Nederlandse alinea's, kandidaat: het Engels), invoer afgekapt op 1.536 tokens; in stukken: de scores van deel A" \
+    --item "VM (heel)" "$(hostname), v6e-8 spot in $ZONE, één proces van 8 chips (tensor 4 x context 2)"
+  "$PY" -u "$C/bt_length.py" report --measured "$D/collect/measured.parquet" --units "$D/collect/units.parquet" \
+    --qe "$D"/scores/qe-*.parquet "$D/ref/qe-a-stukken.parquet" --logs "$D/logs" --setup "$D/report/setup.json" \
+    --source nl --target en --relative --before "$D/ref/bt-length-a.json" \
+    --title "Deel A2 (v6e-8): heel op de fork met de fix van de decode-cache tegen in stukken van deel A" \
+    --out "$D/report/bt-length-a2-v6e.md" > /dev/null
+  gsutil -m -q cp "$D/report/bt-length-a2-v6e.md" "$D/report/bt-length-a2-v6e.json" "$D/report/setup.json" "$O/report/"
+  gsutil -m -q cp "$D/collect/measured.parquet" "$D/collect/units.parquet" "$O/collect/"
+  head -c 4000 "$D/report/bt-length-a2-v6e.md"; echo
+  echo "== fix report $stage done $(date -u +%T)"
+}
+
 step=${1:-}
 case $step in
+fix)
+  [ -n "$FORK_COMMIT" ] || { echo "fix needs FORK_COMMIT"; exit 1; }
+  case $O in */bt-length-fix) ;; *) echo "fix writes to a bt-length-fix root, not $O"; exit 1 ;; esac
+  if [ ! -s "$V/done.txt" ] || [ ! -s "$TOK/tokenizer.json" ] || [ ! -s "$TOK_TG/tokenizer.json" ]; then
+    FORK_COMMIT=$FORK_COMMIT HF_HUB_OFFLINE=0 bash "$C/setup_generic.sh" venv
+  fi
+  grep -q "$FORK_COMMIT" "$V/done.txt" || { echo "$V is not at $FORK_COMMIT: $(cat "$V/done.txt")"; exit 1; }
+  ( HF_HUB_OFFLINE=0 "$PY" -c "import sys; sys.path.insert(0, '$C'); import metricx_qe as m; print(m.download('xxl', '$SHM/metricx'))" ) \
+    > ~/logs/len_metricx_download.log 2>&1 & dl=$!
+  mkdir -p "$D/data" "$D/ref" "$D/seg"
+  gsutil -m -q cp "$O/data/docs.parquet" "$O/data/docs.json" "$D/data/"
+  gsutil -m -q rsync -r "$O/ref" "$D/ref"
+  [ -s "$D/ref/qe-a-stukken.parquet" ] && [ -s "$D/ref/bt-length-a.json" ] && [ -d "$D/ref/stukken" ] \
+    && [ -d "$D/ref/heel-d1k" ] || { echo "$O/ref/ lacks part A's stukken, scores, report or heel d1k"; exit 1; }
+  echo "== segments (one process: 1 worker) $(date -u +%T)"
+  if [ ! -s "$D/seg/segments.json" ]; then
+    "$PY" -u "$C/bt_length.py" segments --docs "$D/data/docs.parquet" --tokenizer "$TOK" --model gemma4-31b-doc \
+      --doc-model gemma4-31b-doc --prompt natural-v1 --source nl --target en --workers 1 \
+      --bins "${FIX_BINS:-1024,4096,8192,16384}" --out "$D/seg"
+  fi
+  cat "$D/seg/segments.json"; echo
+  echo "== smoke: heel d1k on 8 chips $(date -u +%T)"
+  job_full len_fix_smoke translate_full d1k "$D/seg/heel/segments-w0.parquet" "$O/smoke/d1k" \
+    ~/logs/len_fix_smoke_d1k_full.log || exit 1
+  if gsutil -q stat "$O/smoke/d1k/oom.txt"; then echo "FIX SMOKE: out of memory at d1k with one slot"; exit 1; fi
+  fix_smoke || exit 1
+  echo "== heel ${FIX_CLASSES:-d4k d8k} on 8 chips $(date -u +%T)"
+  fix_classes ${FIX_CLASSES:-d4k d8k}
+  wait $dl || { echo "MetricX download failed: ~/logs/len_metricx_download.log"; exit 1; }
+  fix_report f
+  if "$PY" -c "import json, sys; v = json.load(open(sys.argv[1]))['verdict'].get('8192', {}); sys.exit(0 if v.get('pass') else 1)" \
+      "$D/report/bt-length-a2-v6e.json"; then
+    echo "== bin 8192 passes the rule: heel d16k $(date -u +%T)"
+    fix_classes d16k
+    fix_report g
+  else
+    echo "== bin 8192 does not pass the rule (bt-length-trial.md 1): no d16k"
+  fi
+  echo "FIX DONE $(date -u +%T)"
+  ;;
 all)
   if [ ! -s "$SHM/venv-fork/done.txt" ] || [ ! -s "$TOK/tokenizer.json" ] || [ ! -s "$TOK_TG/tokenizer.json" ]; then
     HF_HUB_OFFLINE=0 bash "$C/setup_generic.sh" venv

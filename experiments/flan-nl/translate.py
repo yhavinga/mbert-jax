@@ -13,7 +13,8 @@ models are TranslateGemma 12B and 27B (gemma3-12b, gemma3-27b) and Gemma 4 31B-i
 
 The model runs in MaxText's MaxEngine: a KV cache of fixed shape (slots x max_target_length), prompts padded to a few
 prefill lengths, continuous batching over the slots (decode_all), greedy decoding, a stop at the model's stop tokens.
-The tensor axis of the mesh is the process's chips. Segments are taken in shards of consecutive ids (similar lengths,
+The tensor axis of the mesh is the process's chips (with --context-parallelism K: the chips / K, and a context axis of
+K that splits the prompt's positions, mesh_of). Segments are taken in shards of consecutive ids (similar lengths,
 as the plan sorts them); a shard is written to the bucket at once when it is done, so a restart skips every shard
 that is there. A segment that hits the decode limit is written with ended = false; the assemble step drops its
 examples.
@@ -285,7 +286,21 @@ def patch_maxtext():
     return applied
 
 
-def make_engine(args, shapes, chips=4):
+def mesh_of(chips, context=1):
+    """MaxText's parallelism of one process's chips: all on the tensor axis, or with context > 1 a context axis of that
+    size and the rest on tensor. Tensor parallelism splits the KV heads, so it is bounded by the model's fewest (Gemma 4
+    31B's global layers have 4); the context axis splits the positions of the prefill (its attention scores and
+    logits) and, with the embedding dimension of the weights, takes the chips beyond that."""
+    if context < 1 or chips % context:
+        raise ValueError(f"{chips} chips cannot be split into a context axis of {context}")
+    mesh = {"ici_fsdp_parallelism": 1, "ici_tensor_parallelism": chips // context}
+    if context > 1:
+        # MaxText's load balancing reorders the positions of training batches; inference keeps them in order
+        mesh.update(ici_context_parallelism=context, context_parallel_load_balance=False)
+    return mesh
+
+
+def make_engine(args, shapes, chips=4, context=1):
     """MaxText's MaxEngine with the converted checkpoint: (engine, params)."""
     from maxtext.configs import pyconfig
     from maxtext.inference.maxengine import maxengine
@@ -300,7 +315,7 @@ def make_engine(args, shapes, chips=4):
         jax_cache_dir=f"{args.work_dir}/jax_cache",
         enable_checkpointing=False, async_checkpointing=False, skip_jax_distributed_system=True, scan_layers=False,
         use_multimodal=False, attention="dot_product", dtype="bfloat16", weight_dtype="bfloat16",
-        ici_fsdp_parallelism=1, ici_tensor_parallelism=chips, per_device_batch_size=shapes["slots"] / chips,
+        **mesh_of(chips, context), per_device_batch_size=shapes["slots"] / chips,
         max_prefill_predict_length=max_prefill, max_target_length=max_prefill + shapes["max_decode"],
         decode_sampling_strategy="greedy", return_log_prob=False, tokenizer_type="huggingface",
         tokenizer_path=args.tokenizer)
@@ -567,6 +582,10 @@ def main(argv=None):
     parser.add_argument("--model", default="gemma3-27b", choices=sorted(MODELS), help="A model of translate_models.yml")
     parser.add_argument("--length-class", required=True)
     parser.add_argument("--slots", type=int, default=None, help="Override the class's number of decode slots")
+    parser.add_argument("--chips", type=int, default=None,
+                        help="Chips of this process instead of the model's (translate_models.yml chips)")
+    parser.add_argument("--context-parallelism", type=int, default=1,
+                        help="A context axis of this many chips in the mesh, the rest tensor (mesh_of; default 1)")
     parser.add_argument("--shard-size", type=int, default=4096, help="Segments per shard (default: 4096)")
     parser.add_argument("--max-shards", type=int, default=None, help="Stop after this many new shards (pilot)")
     parser.add_argument("--sync-every", type=int, default=8, help="Generate steps between transfers (default: 8)")
@@ -594,7 +613,11 @@ def main(argv=None):
     import pyarrow.parquet as pq
     from transformers import AutoTokenizer
 
-    chips = model["chips"]
+    chips = args.chips or model["chips"]
+    try:
+        mesh_of(chips, args.context_parallelism)
+    except ValueError as e:
+        parser.error(str(e))
     if (jax.device_count(), jax.process_count()) != (chips, 1):
         raise SystemExit(f"needs one process with {chips} chips, has {jax.process_count()} process(es) with "
                          f"{jax.device_count()} devices: set the TPU_* variables of translate.sh")
@@ -630,9 +653,9 @@ def main(argv=None):
     probe = texts[:3] + texts[-3:]
     codec.check(probe, [context_of[i] for i in ids[:3] + ids[-3:]] if context_of else None,
                 [label_of[i] for i in ids[:3] + ids[-3:]] if label_of else None)
-    print(f"MAXTEXT {json.dumps({'model': args.model, 'prompt': model['prompt'], 'context_prompt': model.get('context_prompt'), 'lora': args.lora, 'ckpt': args.ckpt, **maxtext_source(), 'patches': patch_maxtext()})}", flush=True)
+    print(f"MAXTEXT {json.dumps({'model': args.model, 'prompt': model['prompt'], 'context_prompt': model.get('context_prompt'), 'lora': args.lora, 'ckpt': args.ckpt, 'chips': chips, 'mesh': mesh_of(chips, args.context_parallelism), **maxtext_source(), 'patches': patch_maxtext()})}", flush=True)
     started = time.time()
-    engine, params = make_engine(args, shapes, chips)
+    engine, params = make_engine(args, shapes, chips, args.context_parallelism)
     if args.lora:
         params = load_lora(params, args.lora)
     device = EngineSlots(engine, params, shapes["prefill_lengths"])

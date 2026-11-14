@@ -15,6 +15,7 @@ Dutch the same two ways (part B, on mbert-mix). The decision rule is in mbert-op
     python bt_length.py report --measured measured.parquet --units units.parquet --qe qe-*.parquet --logs DIR \\
         --out bt-length.md
     python bt_length.py english --docs docs.parquet --measured measured.parquet --tokenizer TOK --out docs-en.parquet
+    python bt_length.py merge --measured m1.parquet m2.parquet --units u1.parquet u2.parquet --out DIR
 
 docs: per source (SOURCES of select_passages.py, read straight from Hugging Face, row group by row group) documents
 that pass the document filters of the back-translation's selection; from each at most one stretch of whole,
@@ -38,6 +39,18 @@ lies outside R2's length bound of its source), and the units for MetricX-24-QE (
 pending: the units not scored yet (no id in --scored), split over --workers for metricx_qe.py.
 
 report: the tables per bin and condition, the decision rule (exact on k/n) and the costs from translate.py's logs.
+With --relative also heel against stukken per bin as differences, and the outcome of a proposed relative rule
+(RELATIVE), marked as no part of the decision rule; with --before an earlier report's .json, its heel per bin beside
+this one's (part A's heel, before the fork's fix of the decode cache, beside the repeat of 14 Nov).
+
+smoke: a check of a translate.py run of whole stretches (--now, its shards) against an earlier run of the same
+stretches (--before): the number of stretches, how many ended with a stop token, and the median of their output tokens
+over the earlier ones; exit 1 when one is outside the given bounds.
+
+setup: the setup lines of a report (key, value) as its --setup json.
+
+merge: the measured rows and units of collects over different bins into one set (a row or unit that two inputs both
+have must be the same there: the condition stukken of the same pieces).
 
 english: the English of the condition stukken of part A as the documents of part B (its paragraphs, TranslateGemma's
 token count), for the stretches whose pieces all ended.
@@ -90,6 +103,10 @@ SKIP = 4.5
 SIGMA = 0.2
 SIGMA_SHORT = 2.0               # sigma = SIGMA + SIGMA_SHORT / sqrt(characters of the source side)
 RULE = {"ended": 0.98, "paragraphs": 0.95, "omission_pp": 1.0, "qe": 0.2}
+# A proposed amendment (14 Nov, after part A and the fork fix check; not the rule of bt-length-trial.md 1): heel against
+# stukken in the same bin only, as the rule of the condition ctx (13 Nov): at most this many documents fewer done, the
+# omissions and the QE within the margins of RULE; the paragraph count reported, not in it
+RELATIVE = {"ended_docs": 1, "omission_pp": 1.0, "qe": 0.2}
 # Formatting that the translation adds: these categories of structure.py more often in the translation than in the
 # source (paragraph and line breaks are the paragraph count's business)
 FORMAT_CATEGORIES = ("heading", "bullet", "number", "bold", "italic", "code_block", "inline_code", "table_row",
@@ -780,8 +797,34 @@ def rule(stats, rule_spec=RULE):
                       "omission_diff_pp": (om_h - om_p) * 100,
                       "qe_diff": h["qe_mean"] - p["qe_mean"] if qe_known else None,
                       "pass": bool(i and ii and iii and iv)}
-    passing = [b for b, v in verdict.items() if v["pass"]]
-    return verdict, (max(passing) if passing else None)
+    return verdict, largest_passing(verdict)
+
+
+def largest_passing(verdict):
+    """The largest bin that passes, below the smallest bin that could not be measured (bt-length-trial.md 1: a bin
+    that could not be measured does not pass, and a larger bin does not count then)"""
+    unmeasured = [b for b, v in verdict.items() if not v["measured"]]
+    passing = [b for b, v in verdict.items() if v["pass"] and (not unmeasured or b < min(unmeasured))]
+    return max(passing) if passing else None
+
+
+def relative(stats, spec=RELATIVE):
+    """Per bin heel against stukken as differences (documents done and with their paragraph count, omissions in
+    percentage points, mean QE) and whether the proposed relative rule passes; L of that rule as largest_passing"""
+    out = {}
+    for b, s in stats.items():
+        h, p = s.get("heel"), s.get("stukken")
+        if not h or not h["docs"] or not p or not p["docs"]:
+            out[b] = {"measured": False, "pass": False}
+            continue
+        om = (h["omitted"] / h["paragraphs"] - p["omitted"] / p["paragraphs"]) * 100
+        qe = h["qe_mean"] - p["qe_mean"] if h["qe_mean"] is not None and p["qe_mean"] is not None else None
+        done = h["done"] - p["done"]
+        parts = {"done": done >= -spec["ended_docs"], "omissions": om <= spec["omission_pp"] + 1e-12,
+                 "qe": qe is not None and qe <= spec["qe"] + 1e-12}
+        out[b] = {"measured": True, "done_diff": done, "paragraphs_kept_diff": h["paragraphs_kept"] - p["paragraphs_kept"],
+                  "omission_diff_pp": om, "qe_diff": qe, **parts, "pass": all(parts.values())}
+    return out, largest_passing(out)
 
 
 def throughput(logs_dir):
@@ -795,7 +838,7 @@ def throughput(logs_dir):
             if m:
                 current = {"log": path.name, "class": m.group(1), "shapes": json.loads(m.group(3)),
                            "segments": 0, "tokens_in": 0, "tokens_out": 0, "seconds": 0.0, "load_s": None,
-                           "peak_gib": None, "oom": False}
+                           "peak_gib": None, "chips": None, "oom": False}
                 out.append(current)
                 continue
             if current is None:
@@ -812,6 +855,7 @@ def throughput(logs_dir):
             elif line.startswith("MEM "):
                 s = json.loads(line[len("MEM "):])
                 current["peak_gib"] = s.get("peak_gib_max")
+                current["chips"] = len(s["peak_gib"]) if s.get("peak_gib") else None
             elif "RESOURCE_EXHAUSTED" in line or "Ran out of memory" in line:
                 current["oom"] = True
     return out
@@ -835,6 +879,13 @@ def report(args):
          "L": length, "throughput": speed, "setup": setup, "qe_column": args.column,
          "per_source": {b: {s: bin_stats([x for x in measured if x["source"] == s], qe, [b])[b]
                             for s in SOURCE_ORDER} for b in bins}}
+    if getattr(args, "relative", False):
+        r["relative"], r["L_relative"] = relative(stats)
+        r["relative_spec"] = RELATIVE
+    if getattr(args, "before", None):
+        earlier = json.loads(Path(args.before).read_text())
+        r["before"] = {"title": earlier.get("title"), "setup": earlier.get("setup"),
+                       "heel": {int(b): s.get("heel") for b, s in earlier["stats"].items()}}
     md = report_md(r, measured, args)
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     Path(args.out).write_text(md)
@@ -895,6 +946,10 @@ def report_md(r, measured, args):
             f"| {'ja' if v['iv'] else 'nee'} ({num(v['qe_diff'], 3, True) if v['qe_known'] else 'geen QE'}) "
             f"| **{'ja' if v['pass'] else 'nee'}** |")
     lines += ["", f"**L = {r['L'] if r['L'] else 'geen bak haalt de regel'}**", ""]
+    if "relative" in r:
+        lines += relative_md(r, stats, bins)
+    if "before" in r:
+        lines += before_md(r, stats, bins)
     lines += ["### Per bron (heel / in stukken)", "",
               "| bak | bron | n | af | alinea's behouden | weglatingen | QE gem. |", "|---:|---|---:|---|---|---|---|"]
     for b in bins:
@@ -909,13 +964,13 @@ def report_md(r, measured, args):
                 f"| {h['paragraphs_kept']} / {p['paragraphs_kept'] if p else '–'} "
                 f"| {pct(frac(h['omitted'], h['paragraphs']))} / {pct(frac(p['omitted'], p['paragraphs'])) if p else '–'} "
                 f"| {num(h['qe_mean'])} / {num(p['qe_mean']) if p else '–'} |")
-    lines += ["", "### Kosten (translate.py per lengteklasse en proces van 4 chips)", "",
-              "| log | klasse | slots | prefill / decodeerlimiet | segmenten | laden (s) | decodeertijd (s) | s per segment | uitvoertokens/s | piek HBM per chip (GiB) | geheugen op |",
-              "|---|---|---:|---|---:|---:|---:|---:|---:|---:|---|"]
+    lines += ["", "### Kosten (translate.py per lengteklasse en proces)", "",
+              "| log | klasse | chips | slots | prefill / decodeerlimiet | segmenten | laden (s) | decodeertijd (s) | s per segment | uitvoertokens/s | piek HBM per chip (GiB) | geheugen op |",
+              "|---|---|---:|---:|---|---:|---:|---:|---:|---:|---:|---|"]
     for t in r["throughput"]:
         sh = t["shapes"]
         lines.append(
-            f"| {t['log']} | {t['class']} | {sh.get('slots')} | {sh.get('prefill_lengths', ['?'])[-1]} / "
+            f"| {t['log']} | {t['class']} | {t.get('chips') or '–'} | {sh.get('slots')} | {sh.get('prefill_lengths', ['?'])[-1]} / "
             f"{sh.get('max_decode')} | {t['segments']} | {t['load_s'] if t['load_s'] is not None else '–'} "
             f"| {num(t['seconds'], 0)} | {num(t['seconds'] / t['segments'], 1) if t['segments'] else '–'} "
             f"| {num(t['tokens_out'] / t['seconds'], 0) if t['seconds'] else '–'} "
@@ -930,6 +985,116 @@ def report_md(r, measured, args):
                          f"{'ja' if x['done'] else 'nee'} | {int(not x['ended'])} / {int(x['decode_loop'])} / "
                          f"{int(x['cut'])} | {x['paragraphs_source']} → {x['paragraphs_target']} | {x['omitted']} |")
     return "\n".join(lines) + "\n"
+
+
+def relative_md(r, stats, bins):
+    """The section of --relative: heel against stukken per bin, and the proposed relative rule"""
+    spec = r["relative_spec"]
+    lines = ["### Heel tegen in stukken per bak, relatief (geen deel van de beslisregel)", "",
+             "Verschil heel − in stukken op dezelfde documenten van de bak. Alinea-aantal: documenten met behouden "
+             "alinea-aantal.", "",
+             "| bak | af: heel / stukken (verschil) | alinea-aantal: heel / stukken (verschil) | weglatingen: heel / stukken (verschil) | QE gem.: heel / stukken (verschil) |",
+             "|---:|---|---|---|---|"]
+    for b in bins:
+        v, h, p = r["relative"][b], stats[b].get("heel"), stats[b].get("stukken")
+        if not v["measured"]:
+            lines.append(f"| {b} | niet gemeten | | | |")
+            continue
+        lines.append(
+            f"| {b} | {h['done']} / {p['done']} ({v['done_diff']:+d}) "
+            f"| {h['paragraphs_kept']} / {p['paragraphs_kept']} ({v['paragraphs_kept_diff']:+d}) "
+            f"| {pct(frac(h['omitted'], h['paragraphs']))} / {pct(frac(p['omitted'], p['paragraphs']))} "
+            f"({num(v['omission_diff_pp'], 2, True)} pp) "
+            f"| {num(h['qe_mean'])} / {num(p['qe_mean'])} ({num(v['qe_diff'], 3, True)}) |")
+    lines += ["", f"**Voorstel voor een amendement (beslist Yeb; niet de regel van §1).** Een bak haalt de relatieve "
+              f"regel als heel, op dezelfde documenten, (a) hoogstens {spec['ended_docs']} document minder af heeft "
+              f"dan in stukken, (b) hoogstens {num(spec['omission_pp'], 0)} procentpunt meer weglatingen en (c) een "
+              f"gemiddelde QE per alinea hoogstens {num(spec['qe'], 1)} hoger; het alinea-aantal wordt gerapporteerd "
+              f"en beslist niet mee; een bak die niet gemeten kon worden haalt de regel niet en een grotere bak telt "
+              f"dan niet.", "",
+              "| bak | (a) af ≥ stukken − 1 | (b) weglatingen ≤ +1 pp | (c) QE ≤ +0,2 | haalt de relatieve regel |",
+              "|---:|---|---|---|---|"]
+    for b in bins:
+        v = r["relative"][b]
+        if not v["measured"]:
+            lines.append(f"| {b} | niet gemeten | | | nee |")
+            continue
+        lines.append(f"| {b} | {'ja' if v['done'] else 'nee'} ({v['done_diff']:+d}) "
+                     f"| {'ja' if v['omissions'] else 'nee'} ({num(v['omission_diff_pp'], 2, True)} pp) "
+                     f"| {'ja' if v['qe'] else 'nee'} ({num(v['qe_diff'], 3, True)}) "
+                     f"| **{'ja' if v['pass'] else 'nee'}** |")
+    lines += ["", f"**L volgens het voorstel = {r['L_relative'] if r['L_relative'] else 'geen bak'}** "
+              "(geen deel van de beslisregel)", ""]
+    return lines
+
+
+def before_md(r, stats, bins):
+    """The section of --before: the earlier report's heel per bin beside this one's"""
+    lines = [f"### Heel nu tegen heel in het eerdere rapport ({r['before']['title']})", "",
+             "| bak | af: nu / eerder | lus: nu / eerder | alinea-aantal: nu / eerder | weglatingen: nu / eerder | QE gem.: nu / eerder |",
+             "|---:|---|---|---|---|---|"]
+    for b in bins:
+        h, e = stats[b].get("heel"), r["before"]["heel"].get(b)
+        h = h if h and h["docs"] else None
+        e = e if e and e.get("docs") else None
+        if not h and not e:
+            continue
+
+        def cell(f, x):
+            return f(x) if x else "niet gemeten"
+        lines.append(
+            f"| {b} | {cell(lambda x: kn(x['done'], x['docs']), h)} / {cell(lambda x: kn(x['done'], x['docs']), e)} "
+            f"| {cell(lambda x: str(x['decode_loop']), h)} / {cell(lambda x: str(x['decode_loop']), e)} "
+            f"| {cell(lambda x: kn(x['paragraphs_kept'], x['docs']), h)} / {cell(lambda x: kn(x['paragraphs_kept'], x['docs']), e)} "
+            f"| {cell(lambda x: kn(x['omitted'], x['paragraphs']), h)} / {cell(lambda x: kn(x['omitted'], x['paragraphs']), e)} "
+            f"| {cell(lambda x: num(x['qe_mean']), h)} / {cell(lambda x: num(x['qe_mean']), e)} |")
+    return lines + [""]
+
+
+def merge(args):
+    """One measured.parquet and units.parquet from several collects; a row or unit in two inputs must be equal"""
+    out = Path(args.out)
+    for name, paths, key, same in (("measured", args.measured, lambda r: (r["id"], r["condition"]),
+                                    ("translation", "ended", "done", "omitted")),
+                                   ("units", args.units, lambda r: r["id"], ("src", "cand", "n_source"))):
+        rows, seen = [], {}
+        for path in paths:
+            for r in read_rows(path):
+                k = key(r)
+                if k in seen:
+                    if any(seen[k][c] != r[c] for c in same):
+                        raise SystemExit(f"{name}: {k} differs between the inputs ({path})")
+                    continue
+                seen[k] = r
+                rows.append(r)
+        write_parquet(rows, out / f"{name}.parquet")
+        print(f"MERGE {json.dumps({'table': name, 'rows': len(rows), 'inputs': len(paths)})}", flush=True)
+
+
+def smoke(args):
+    def rows(root):
+        out = {}
+        for path in sorted(Path(root).rglob("shard-*.parquet")):
+            for r in read_rows(path, ["id", "ended", "tokens_out"]):
+                out[r["id"]] = r
+        return out
+
+    now, before = rows(args.now), rows(args.before)
+    ended = sum(bool(r["ended"]) for r in now.values())
+    ratios = [now[i]["tokens_out"] / before[i]["tokens_out"] for i in now if before.get(i, {}).get("tokens_out")]
+    median = statistics.median(ratios) if ratios else None
+    low, high = (float(x) for x in args.ratio.split(","))
+    ok = len(now) == args.docs and ended >= args.ended and median is not None and low <= median <= high
+    print(f"SMOKE {json.dumps({'documents': len(now), 'ended': ended, 'compared': len(ratios), 'median_ratio': median, 'pass': ok})}",
+          flush=True)
+    if not ok:
+        raise SystemExit(f"smoke failed: {len(now)} documents (need {args.docs}), {ended} ended (need {args.ended}), "
+                         f"median output ratio {median} (need {low}-{high})")
+
+
+def setup_json(args):
+    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+    Path(args.out).write_text(json.dumps(dict(args.item), ensure_ascii=False))
 
 
 def main(argv=None):
@@ -983,6 +1148,21 @@ def main(argv=None):
     a.add_argument("--source", required=True)
     a.add_argument("--target", required=True)
     a.add_argument("--title", required=True)
+    a.add_argument("--relative", action="store_true", help="heel against stukken per bin and the proposed relative rule")
+    a.add_argument("--before", default=None, help="an earlier report's .json: its heel per bin beside this one's")
+    a.add_argument("--out", required=True)
+    a = sub.add_parser("smoke")
+    a.add_argument("--now", required=True)
+    a.add_argument("--before", required=True)
+    a.add_argument("--docs", type=int, required=True)
+    a.add_argument("--ended", type=int, required=True)
+    a.add_argument("--ratio", required=True, help="low,high bounds of the median output ratio")
+    a = sub.add_parser("setup")
+    a.add_argument("--out", required=True)
+    a.add_argument("--item", nargs=2, action="append", default=[], metavar=("KEY", "VALUE"))
+    a = sub.add_parser("merge")
+    a.add_argument("--measured", nargs="+", required=True)
+    a.add_argument("--units", nargs="+", required=True)
     a.add_argument("--out", required=True)
     a = sub.add_parser("english")
     a.add_argument("--docs", required=True)
@@ -999,7 +1179,7 @@ def main(argv=None):
                     counts[r["id"].split("#c")[0]] += 1
             args.expect_pieces = counts
     {"docs": docs, "docs-merge": docs_merge, "segments": segments, "collect": collect, "pending": pending, "report": report,
-     "english": english}[args.cmd](args)
+     "english": english, "merge": merge, "smoke": smoke, "setup": setup_json}[args.cmd](args)
 
 
 if __name__ == "__main__":

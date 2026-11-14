@@ -31,6 +31,7 @@ import time  # noqa: E402
 import jax  # noqa: E402
 import jax.numpy as jnp  # noqa: E402
 import numpy as np  # noqa: E402
+from flax import jax_utils  # noqa: E402
 
 from mmbjax.hf_encoders import HFEncoderConfig, HFEncoderForMaskedLM, load_tokenizer  # noqa: E402
 
@@ -93,7 +94,7 @@ def masked_rows(token_lists, tokenizer, eb):
 
 def score_copies(model, params, copies, pad_token_id, rows_per_device):
     """The log-probability of each copy's target at its position, in batches over the local devices; params replicated
-    on them (jax.device_put_replicated)."""
+    on them (flax.jax_utils.replicate)."""
     devices = jax.local_device_count()
     length = -(-max(len(c[0]) for c in copies) // 8) * 8
     per_batch = rows_per_device * devices
@@ -150,7 +151,7 @@ def main(argv=None):
     copies = masked_rows(token_lists, tokenizer, eb)
     if max(len(c[0]) for c in copies) > config.max_length:
         raise ValueError(f"a sentence is longer than the {config.max_length} tokens of {config.model_name}")
-    log_probs = score_copies(model, jax.device_put_replicated(params, jax.local_devices()), copies,
+    log_probs = score_copies(model, jax_utils.replicate(params), copies,
                              tokenizer.pad_token_id, args.rows_per_device)
     pll = np.zeros(len(sentences))
     np.add.at(pll, np.asarray([c[3] for c in copies]), log_probs)

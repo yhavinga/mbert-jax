@@ -300,3 +300,152 @@ slot-hergebruik en een decodeerlimiet boven 1.024 goed decoderen.
   decode-cache en roept die functie niet aan. Ook fout 1 van 0.2.5 (het masker in cache-slots) zit in het decodeerpad.
   Trainen op de fork zou een andere SFT-stack betekenen (de Tunix en qwix die bij de fork horen), waarvan geheugen en
   staptijd op Gemma 4 niet gemeten zijn; de stack van 0.2.5 is gemeten (24,6 GiB, 8,2 s per stap, 13 nov).
+
+**Amendement 14 nov 2026 (tijdstip: de commit van deze sectie op branch `en-nl-g4arm2`): arm G4-2** [besluiten van Yeb
+14 nov; uitwerking door een subagent, labels als in de kop]. Vastgelegd vóór de bouw van de set van G4-2, vóór de
+eerste trainingsstap en vóór elke uitslag van G4-2. Waar deze sectie niets zegt, gelden §1–§8 voor G4-2 met "G4-2" in
+plaats van "G4-1".
+
+*G4-2.1 Aanleiding.* G4-1 hielp niet ((b) −1,4 pp tegen G4-0, `mbert-ops/translator-sft/g4-1-report.md`) en was
+volgens Yeb te zwak getraind [besluit 14 nov]: LR 1e-5 met cosine (stap 1: 2,6e-7), verlies 2,31 (stap 1) → 1,07
+(gemiddeld stap 41–80) → 0,81 (stap 301–390) [gemeten: `$G/runs/g4arm_G4-1/summary.json`], relatieve update-norm
+0,0009. Besluit Yeb: **haalt G4-2 de regel van §5 ook niet, dan stoppen we met fine-tunen en wordt G4-0 de vertaler.**
+
+*G4-2.2 Arm.* Gemma 4 31B-it met LoRA rank 32 / alpha 16 op dezelfde 410 modules als G4-1 (§1). Ongewijzigd: stack
+(MaxText 0.2.5 + Tunix + qwix, `run_sft.sh`, 16 chips, één multi-host-job), sequenties van 2.048 met packing, één per
+chip, AdamW (β2 0,999, weight decay 0,01), clipping 1,0, `num_vocab_tiling=8`, verlies alleen op het Nederlands en
+`<turn|>\n`, prompt `natural-v1` in het template van §2.6.
+
+*G4-2.3 Data* [besluit Yeb: dezelfde data als G4-1 plus FLAN-replay uit de nieuwe Gemma 4-vertaling van FLAN-nl, nooit
+de TranslateGemma-versie]. Code `g4arm.py build2`; set `$G/data/G4-2/`.
+1. **De voorbeelden van G4-1**, letterlijk: `$G/data/G4-1/train.parquet` en `train-meta.parquet` (sha256 in het
+   manifest van G4-2), dus dezelfde 12.521 BT-voorbeelden en 12.521 boekparen, **zonder de held-out boeken** van
+   G4-2.5 [keuze: de BT niet opnieuw trekken, zodat de BT-kant van G4-2 die van G4-1 is; BT : boeken wordt daardoor
+   ~51 : 49].
+2. **FLAN-replay: 20% van de voorbeelden** van G4-2 (replay = round(n × 0,25), n = de voorbeelden van punt 1)
+   [keuze]. Onderbouwing: 20% is het aandeel van arm N (TG-protocol §2.3), de enige eerdere arm met replay; N had de
+   faalwijze op FLAN (de instructie in de bron uitvoeren in plaats van vertalen) minder dan de armen zonder replay
+   (LEARNINGS, armen RB3 en RE: 5 keer uitgevoerd bij RE; G4-1 liet op FLAN vaker Engels staan, 52 tegen 40, en
+   zakte op FLAN-"origineel" van 13,5% naar 10,7%). Een kleiner aandeel is niet gemeten. Prijs [gevolgtrekking]: het
+   Nederlands van de replay is Gemma 4's eigen vertaling (prompt `flan-v1`), dus vertaald Nederlands; de replay trekt
+   de uitvoer op FLAN-achtige invoer naar G4-0 en kan (b) op FLAN drukken.
+3. **Bron van de replay**: de volle Gemma 4-vertaling van FLAN-nl (keten `flan_g4_full_run.sh`, flan-nl `fd5e585`,
+   fork `f4d8615`), na de nabewerking: de segmenten van plan 2 (`mbert/flan-nl/plan2/`), hun vertalingen
+   (`mbert/flan-nl/translations/g4/`), de maten per segment (`mbert/flan-nl/g4-full/report/measures.parquet`) en de
+   voorbeelden die `flan_nl.py assemble` hield (`mbert/flan-nl/nl-g4/w*.parquet`). `g4arm.py replay` eist dat
+   `g4-full/report/setup.json` Gemma 4 31B-it en `flan-v1` noemt, en weigert elk ander pad; de build weigert zoals in
+   §2.5 elke rij waarvan `model` niet Gemma 4 is.
+4. **Welke replayvoorbeelden** (paren Engels segment → Nederlands segment, zoals bij N) [keuze]: een segment komt in
+   aanmerking als (i) het een S-stuk is (instructie of antwoord) van een voorbeeld dat assemble hield, en geen
+   templatesegment (`plan.json`, `template_segments`); (ii) de maten van de nabewerking zeggen: `check` leeg (de
+   controle van assemble), af, geen lus, niet `executed`, geen `chatter`, geen Engels over, niet gelijk aan de bron, en
+   geen reparatie nodig (`repairs` leeg: dan is de opgeslagen tekst de tekst die assemble gebruikt); (iii) 48–384
+   Gemma 4-tokens Nederlands (`tokens_out`; het venster van N, TG-protocol §2.3: geen losse woorden of
+   templatestukken); daarna, zoals §2.5: geen segment van de FLAN-evaluatierijen (`eval-rows.parquet`, sets
+   `classifier` en `yeb`), geen 13-gram met een evaluatieset of blinde passage, hoogstens 2.048 tokens. `g4arm.py
+   replay` trekt uit de kandidaten van (i)–(iii) eerst uniform 30.000 (seed `en-nl-g4arm/0/G4-2/replay-pool`), de
+   build daaruit na de rest uniform het aantal van punt 2 (seed `en-nl-g4arm/0/replay`). Taak (`task`): de `source` van
+   het eerste gehouden voorbeeld met dat segment.
+5. Prompt van de replay: `natural-v1` **zonder** instructiezin (§2.5).
+6. **Drie epochs** [besluit Yeb]: `train.parquet` bevat de set drie keer, elke doorgang apart geschud (seeds
+   `en-nl-g4arm/0/G4-2/shuffle/<1|2|3>`); MaxText leest het bestand in volgorde (geen eigen schudding,
+   `num_epoch=1`), elke host elk vierde voorbeeld [gemeten in de code van 0.2.5: `split_dataset_by_node` op één
+   bestand], dus de doorgangen volgen elkaar op. `check` legt alle rijen langs MaxText's eigen SFT-stappen.
+7. FineWeb-2-crawlgrens: geen (zoals G4-1).
+
+*G4-2.4 Training* [besluit Yeb: LR 1e-4, korte warmup, daarna constant of langzaam dalend, 3 epochs].
+- **LR 1e-4, schema warmup–constant–afbouw** (MaxText `lr_schedule_type=wsd`) [keuze]: lineaire warmup van 0 over de
+  eerste **3%** van de stappen, dan **constant 1e-4**, dan in de laatste **10%** lineair naar **1e-5**
+  (`learning_rate_final_fraction=0.1`, `wsd_decay_steps_fraction=0.1`, `wsd_decay_style=linear`). Onderbouwing:
+  (1) constant na een warmup van 3% bij LR 1e-4 is het recept van QLoRA voor de 33B- en 65B-modellen
+  (`github.com/artidoro/qlora`, `scripts/finetune_guanaco_33b.sh` en `_65b.sh`: `--learning_rate 0.0001
+  --lr_scheduler_type constant --warmup_ratio 0.03`; ook LoRA rank 64 / alpha 16); (2) het probleem van G4-1 was een
+  te kleine update; een constante LR houdt de stap groot over alle drie de epochs (gemiddelde LR ~0,95e-4 tegen
+  ~0,5e-5 bij G4-1 [berekening: cosine gemiddeld de helft van de piek]); (3) de afbouw aan het eind omdat het
+  geëvalueerde model de laatste stap is (geen keuze van een checkpoint): Hägele e.a. 2024 (arXiv 2405.18392,
+  "Scaling Laws and Compute-Optimal Training Beyond Fixed Training Durations") vinden dat een constante LR met een
+  afkoeling aan het eind zich gedraagt als cosine; 10% is de standaard van MaxText. Warmup 3%: ~40 stappen
+  [schatting], de helft van de 80 waarin het verlies van G4-1 viel.
+- **Drie epochs**: `STEPS=auto` telt de drie doorgangen (`sft_lora.step_limit`: de kleinste telling van de processen
+  min de marge, ~1%). Verwacht [schatting]: ~13,7 M tokens per epoch (G4-1 12,1 M − ~0,4 M held-out boeken + ~2 M
+  replay) → ~1.350 stappen × 8,2 s ≈ 3,1 uur, plus ~15 min evaluatie tijdens de training en ~12 min laden en compileren.
+  Geheugen als G4-1 (24,3 GiB per chip; LR en schema veranderen het niet).
+- **MaxText 0.2.5 voor de training, de fork @ `f4d8615` voor het vertalen**, zoals G4-1 (amendement van 00:49): de fix
+  zit alleen in `_decode_cache_positions` van het decodeerpad.
+- **Evaluatie tijdens de training** (de directe maat, G4-2.6): op stap 0 (vóór de eerste update; LoRA-B is nul, dus
+  het basismodel = G4-0 in de trainingsstack), elke 150 stappen en na de laatste stap: het verlies op drie held-out
+  sets (G4-2.5), elk volledig (`generate_padding_batch_eval`: een host zonder data rekent een lege batch mee, zodat
+  alle processen even veel stappen doen), token-gewogen (`xent_sum` / `total_weights` van MaxText's `loss_fn`).
+- **Smoke-test vooraf** (op mbert-mix, binnen de lock, terwijl de keten op de FLAN-nabewerking wacht): 8 stappen met
+  de instellingen van G4-2 op de set van G4-1 (de set van G4-2 bestaat dan nog niet; technisch, geen uitslag),
+  evaluatie op stap 0, 4 en 8, run `g4arm_G4-2_s8`. Geslaagd als: alle 4 workers `EXIT 0`, 8 eindige verliezen, piek
+  ≤ 29,5 GiB per chip, adapter rank 32 / alpha 16 / schaal 0,5, van elke held-out set drie eindige verliezen met
+  ≥ 1 token, en het **verlies van het basismodel (stap 0) op zijn eigen greedy vertalingen ("eigen") ≤ 1,0**
+  [keuze]. Die laatste eis is een controle van template en stack: de greedy uitvoer van G4-0 is per token de meest
+  waarschijnlijke van het model in de decodeerstack; geeft de trainingsstack daar meer dan 1,0 nat per token, dan
+  ziet de training een ander model of een ander formaat dan het vertalen, en heeft trainen geen zin. Faalt de
+  smoke-test, dan stopt de keten vóór de training.
+
+*G4-2.5 Held-out data* [besluit Yeb: een held-out stuk van de boeken en de BT-validatie]. Code `g4arm.py heldout`;
+`$G/data/heldout/`.
+- **Boeken: hele boeken** [keuze; een boek is het paar boek-id's in het id van een boekpaar, `books:<nl>-<en>-b1-<k>`;
+  31 boeken met 59–1.425 paren in de set van G4-1 (gemeten)]: de boeken met ≤ 600 paren in volgorde van seed
+  `en-nl-g4arm/0/G4-2/heldout-books`, genomen tot er ≥ 500 paren en ≥ 2 boeken zijn. Al hun paren gaan uit de
+  training van G4-2. Waarom hele boeken: losse passages uit een boek dat in de training zit, delen namen, personages
+  en stijl met de trainingspassages; dan meet de maat ook het onthouden van dat boek. Waarom ≤ 600: geen boek met een
+  groot deel van de boekparen (de drie grootste hebben 813–1.425). Voor de maat: hun paren die in de decodeerklassen
+  passen (Engels ≤ 512 Gemma 4-tokens, Nederlands ≤ 0,8 × de decodeerlimiet van de klasse van het Engels), hoogstens
+  500 (seed `en-nl-g4arm/0/G4-2/heldout-books/sample`).
+- **BT-validatie**: de split `validation` van de vijf datasets van §2.1 op dezelfde revisies (sha256 in
+  `$G/input/bt-val/revisions.json`), door de regels 1–4 van de pool van §2.1 (lengtegrenzen: die van de train-rijen in
+  het verslag van G4-1) en de decodeerpassing van hierboven; daaruit 800 uniform (seed
+  `en-nl-g4arm/0/G4-2/heldout-btval`).
+- **Eigen**: de greedy vertalingen van G4-0 (dezelfde keten als §4.1) van de 800 Engelse bronnen van de BT-validatie
+  (alleen af, geen lus, niet leeg), als doel. Geen maat van kwaliteit: de controle van G4-2.4 en, na de training, hoe
+  ver G4-2 van G4-0 af is gegaan.
+
+*G4-2.6 De directe maat: rapporteren, beslist niet* [keuze; voorstel van Yeb was rapporteren of een extra eis].
+- Maten, per held-out set (boeken, BT-validatie; BT ook per bron): (i) het **verlies** van G4-2.4 op het originele
+  Nederlands, stap 0 (G4-0) tegen de laatste stap (G4-2), met het verloop; (ii) **chrF** (sacrebleu chrF2, over het
+  corpus en gemiddeld per segment) van de vertalingen van G4-2 en G4-0 (§4.1, dezelfde klassen en slots) tegen het
+  originele Nederlands; daarbij niet af / lus / leeg en de lengte tegen het origineel.
+- Vooraf vastgelegde lezing: **"dichter bij het originele Nederlands"** als op beide sets het verlies van de laatste
+  stap lager is dan op stap 0 én chrF(G4-2) > chrF(G4-0) (corpus); **"niet dichter"** als op beide sets geen van de
+  twee geldt; anders **"gemengd"**, met de getallen.
+- Waarom niet beslissen: (1) Yeb legde voor G4-2 dezelfde regels (a1), (a2), (b), (c) tegen G4-0 vast als voor G4-1;
+  een extra eis maakt G4-2 en G4-1 onvergelijkbaar; (2) chrF tegen één referentie meet gelijkenis met die tekst, geen
+  kwaliteit: bij de TG-armen B en N steeg chrF tegen het origineel op het in-domeindeel (64,3 → 70,8) terwijl MetricX
+  slechter werd en beide armen faalden (LEARNINGS, "27B-armen B en N"); op de BT-validatie is het Engels bovendien
+  Gemma 4's eigen letterlijke terugvertaling; (3) het verlies op held-out origineel Nederlands is het trainingsdoel
+  op ongeziene data: het laat zien of de training generaliseert of onthoudt, en of de uitvoer dichter bij het
+  originele Nederlands komt, wat Yeb wil zien; de oordelen over kwaliteit blijven bij MetricX-QE (a1), de blinde
+  beoordeling (a2, c) en de classifier (b).
+
+*G4-2.7 Evaluatie en beslisregel* (§4, §5): ongewijzigd, met G4-2 als arm en G4-0 als uitgangspunt: (a1) QE ≤ de
+mens (2,3917784375 / 1,4938481225 / 1,8419510766), (a2) fouten(G4-2) ≤ fouten(G4-0), (b) "origineel"(G4-2) −
+"origineel"(G4-0) ≥ 0,10 op WMT24++ (960) + FLAN (1.000), (c) ≥ 60% van de niet-gelijke oordelen; blind alleen als (a1)
+en (b) gelden; pakket G4-2 tegen G4-0 in `$S/blind/G4-2/` (seed `en-nl-sft/blind/ab/G4-2/<blind_id>`) en tegen TG in
+`$S/blind/G4-2-tg/`. **G4-0 = de vertalingen en scores van G4-0 uit de run van G4-1** (`$G/eval/G4-0/`, 14 nov,
+tag `g4f1114a`), niet opnieuw vertaald [keuze]: dezelfde `translate.py`, fork `f4d8615`, segmenten
+(`$G/data/eval/`), klassen en slots op hetzelfde VM-type, dus wat §1 met "dezelfde keten" bedoelt; zo is het
+uitgangspunt van G4-1 en G4-2 hetzelfde. De classifier draait opnieuw in één run over G4-2, G4-0 en (ter informatie)
+G4-1, zodat (b) G4-2 en G4-0 uit dezelfde run neemt.
+
+*G4-2.8 Template* (opdracht Yeb: controleren of het template van de trainingsvoorbeelden gelijk is aan dat van het
+vertalen). Gemeten 14 nov op de CPU van mbert-mix w3 (tokenizer `google/gemma-4-31B-it` @ `842da37`, code
+`43c1e2d`): de prompt van de training (`g4lora.prompt_text`, ook het renderen van `g4lora.TEMPLATE` met jinja2) is
+tekst voor tekst gelijk aan die van `translate.py` (`turn.prefix` + `user_text(natural-v1)` + `turn.suffix`) en aan
+het eigen chat-template van het model met `add_generation_prompt` (standaard en `enable_thinking=False`: het lege
+denkkanaal `<|channel>thought\n<channel|>`); de completion is het Nederlands + `<turn|>\n`, en `<turn|>` (106) is een
+stoptoken van het vertalen (`eos_ids` 1, 106, 50). `check` legde dat voor alle 25.042 voorbeelden van G4-1 op
+token-niveau vast. Wel anders: het eigen template zet een eerdere modelbeurt (geschiedenis) zónder het lege
+denkkanaal (`<|turn>model\nDe kat…<turn|>\n`); dat raakt het vertalen niet, dat altijd met de generatieprompt
+begint. De snelle daling van het verlies is niet eigen aan Gemma 4: RL (TranslateGemma 27B, zelfde soort data, LR
+1e-5) ging van 2,27 (stap 1–5) naar 0,95 (stap 21–40) en 0,83 (stap 41–80) [gemeten:
+`$S/rl/runs/arm27b_rl_RL/summary.json`]. Of die daling een formaat is of iets dat generaliseert, laten de held-out
+verliezen en de eis "eigen ≤ 1,0" van G4-2.4 zien.
+
+*G4-2.9 Uitvoer.* Run `$G/runs/g4arm_G4-2/`, adapter `$G/G4-2/`, vertalingen en scores `$G/eval/G4-2/`, held-out
+`$G/heldout/{G4-2,G4-0}/`, classifier `$G/naturalness-G4-2/`, blind `$S/blind/G4-2/` en `$S/blind/G4-2-tg/`, verslag
+`$G/report-G4-2/report.md` (kopie `mbert-ops/translator-sft/g4-2-report.md`), stappen in `$G/stages/g4-2/`. Keten
+`mbert-ops/scripts/g4arm2_run.sh` op mbert-mix.

@@ -321,3 +321,48 @@ def test_the_smoke_verdict_needs_every_check():
 def test_lora_line_reads_translates_merge_line():
     log = 'x\nLORA {"dir": "/a", "rank": 32, "alpha": 16.0, "modules": 410, "relative_update_norm": 0.01}\nSHARD {}\n'
     assert g4arm.lora_line(log)["modules"] == 410 and g4arm.lora_line("nothing") is None
+
+
+def test_report_reads_the_chains_outputs_and_decides_a1_and_b(tmp_path, monkeypatch):
+    monkeypatch.setattr(g4arm, "N_WMT_GOOD", 2)
+    monkeypatch.setattr(g4arm, "N_FLAN", 1)
+    evalsets = [{"id": f"{s}-{k}", "set": s, "source": "a b c", "reference": None if s in ("flan", "blind") else "x y z",
+                 "tokens": 3, "over_512": False, "length_class": "tiny", "meta": "{}"}
+                for s in ("wmt24pp", "flores", "ntrex", "europarl", "flan", "blind") for k in range(2)]
+    evalsets = [r for r in evalsets if r["id"] != "flan-1"]
+    write(evalsets, tmp_path / "evalsets.parquet")
+    for name, qe in (("G4-1", 1.0), ("G4-0", 2.0)):
+        d = tmp_path / name
+        pairs = [{"id": r["id"], "set": r["set"], "source": r["source"], "hypothesis": "p q r", "reference": r["reference"],
+                  "ended": True, "decode_loop": False, "english_left": False, "empty": False} for r in evalsets]
+        write(pairs, d / "pairs" / "pairs-w0.parquet")
+        write([{"id": r["id"], "qe_source_hypothesis": qe,
+                "ref_source_hypothesis_reference": qe if r["reference"] else None} for r in evalsets],
+              d / "scores" / "metricx-w0.parquet")
+        write([{"id": r["id"], "comet22": 0.85} for r in evalsets if r["reference"]], d / "scores" / "comet-w0.parquet")
+    write([{"id": r["id"], "set": r["set"], "metricx_qe": 1.5, "metricx_ref": 1.4, "comet22": 0.86}
+           for r in evalsets if r["set"] in g4arm.FOUR_SETS], tmp_path / "tg.parquet")
+    preds = []
+    for model, p in (("G4-1", 0.9), ("G4-0", 0.1), ("TG", 0.1)):
+        preds += [{"model": model, "set": s, "id": i, "p_original": p, "truncated": False}
+                  for s, i in (("wmt24pp", "wmt24pp-0"), ("wmt24pp", "wmt24pp-1"), ("flan", "flan-0"))]
+    write(preds, tmp_path / "pred.parquet")
+    (tmp_path / "cls.json").write_text(json.dumps({"test_accuracy": 0.9575}))
+    out = tmp_path / "report.md"
+    args = type("Args", (), {"evalsets": str(tmp_path / "evalsets.parquet"), "arm": str(tmp_path / "G4-1"),
+                             "base": str(tmp_path / "G4-0"), "tg_scores": str(tmp_path / "tg.parquet"),
+                             "predictions": str(tmp_path / "pred.parquet"), "classifier_results": str(tmp_path / "cls.json"),
+                             "lora_line": [], "train_summary": None, "tally": None, "out": str(out)})()
+    g4arm.report(args)
+    r = json.loads(out.with_suffix(".json").read_text())
+    assert r["a1"]["holds"] and not r["a1_base"]["sets"]["flores"]["holds"]
+    assert r["b"]["holds"] and r["b"]["delta"] == pytest.approx(1.0) and r["classifier_accuracy"] == 0.9575
+    assert r["verdict"].startswith("wacht op de blinde beoordeling")
+    assert r["sets"]["wmt24pp"]["TG"]["metricx_qe"] == 1.5 and r["sets"]["flan"]["G4-1"]["n"] == 1
+    assert "(a1) gehaald" in out.read_text() and "2,230" in out.read_text()
+    tally = {"a2": True, "c": False, "arm": "G4-1", "arm_better": 40, "base_better": 30, "equal": 30,
+             "share_of_unequal": 40 / 70, "errors_arm": 10, "errors_base": 12, "doubt": 3}
+    (tmp_path / "tally.json").write_text(json.dumps(tally))
+    args.tally = str(tmp_path / "tally.json")
+    g4arm.report(args)
+    assert json.loads(out.with_suffix(".json").read_text())["verdict"] == "helpt niet"

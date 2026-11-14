@@ -61,6 +61,9 @@ SMOKE_MODULES = 410
 MEM_MAX_GIB = g4lora.MEM_MAX_GIB    # 29.5
 # (a1): the human reference's mean MetricX-24-QE as a candidate, unrounded (refqe.json of 12 Nov, ref_mean)
 HUMAN_QE = {"wmt24pp": 2.3917784375, "flores": 1.4938481225296443, "ntrex": 1.8419510766149223}
+# protocol-g4.md §1: Gemma 4 31B-it without fine-tune on a v6e-8 (12/13 Nov, fork @ 2249474), reported beside G4-0 as a
+# check (LEARNINGS, "Kleinere Gemma 4-modellen"); it decides nothing
+G4_V6E_QE = {"wmt24pp": 2.230, "flores": 1.160, "ntrex": 1.554}
 RULE_B = 0.10
 RULE_C = 0.60
 TOLERANCE = 1e-9
@@ -821,6 +824,8 @@ def report_text(r):
                  f"{f3(r['sets'][s].get('TG', {}).get('metricx_qe'))} | {f3(v['human'])} | "
                  f"{'ja' if v['holds'] else 'nee'} |")
     b = r["b"]
+    L += ["", "Ter controle Gemma 4 zonder fine-tune op de v6e-8 (12/13 nov): " + " / ".join(
+        f3(G4_V6E_QE[s]) for s in HUMAN_QE) + " (WMT24++ / FLORES / NTREX)."]
     L += ["", f"**(a1) {'gehaald' if r['a1']['holds'] else 'niet gehaald'}.**", "",
           "## (b) classifier: aandeel \"origineel\" (WMT24++ 960 + FLAN 1.000)", "",
           "| model | WMT24++ | FLAN | samen | n |", "|---|---:|---:|---:|---:|"]

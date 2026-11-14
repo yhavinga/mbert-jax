@@ -430,3 +430,57 @@ def test_sft_lora_eval_helpers():
     assert not sft_lora.needs_final_eval([], 8)
     assert sft_lora.lr_points(1350, 0.03, 0.1) == [0, 1, 40, 41, 675, 1215, 1349]
     assert sft_lora.lr_points(8, 0.03, 0.1) == [0, 1, 4, 7]
+
+
+def test_report_of_g4_2_names_the_arm_and_adds_the_direct_measure(tmp_path, monkeypatch):
+    import armeval
+
+    monkeypatch.setattr(g4arm, "N_WMT_GOOD", 2)
+    monkeypatch.setattr(g4arm, "N_FLAN", 1)
+    monkeypatch.setattr(armeval, "chrf", lambda h, r: 50.0 if h == r else 10.0)
+    monkeypatch.setattr(armeval, "corpus_chrf", lambda hs, rs: sum(50.0 if h == r else 10.0 for h, r in zip(hs, rs)) / len(hs))
+    evalsets = [{"id": f"{s}-{k}", "set": s, "source": "a b c", "reference": None if s in ("flan", "blind") else "x y z",
+                 "tokens": 3, "over_512": False, "length_class": "tiny", "meta": "{}"}
+                for s in ("wmt24pp", "flores", "ntrex", "europarl", "flan", "blind") for k in range(2)]
+    evalsets = [r for r in evalsets if r["id"] != "flan-1"]
+    write(evalsets, tmp_path / "evalsets.parquet")
+    for name, qe in (("G4-2", 1.0), ("G4-0", 2.0)):
+        d = tmp_path / name
+        write([{"id": r["id"], "set": r["set"], "source": r["source"], "hypothesis": "p q r", "reference": r["reference"],
+                "ended": True, "decode_loop": False, "english_left": False, "empty": False} for r in evalsets],
+              d / "pairs" / "pairs-w0.parquet")
+        write([{"id": r["id"], "qe_source_hypothesis": qe,
+                "ref_source_hypothesis_reference": qe if r["reference"] else None} for r in evalsets],
+              d / "scores" / "metricx-w0.parquet")
+        write([{"id": r["id"], "comet22": 0.85} for r in evalsets if r["reference"]], d / "scores" / "comet-w0.parquet")
+    write([{"id": r["id"], "set": r["set"], "metricx_qe": 1.5, "metricx_ref": 1.4, "comet22": 0.86}
+           for r in evalsets if r["set"] in g4arm.FOUR_SETS], tmp_path / "tg.parquet")
+    preds = []
+    for model, p in (("G4-2", 0.9), ("G4-0", 0.1), ("G4-1", 0.1), ("TG", 0.1)):
+        preds += [{"model": model, "set": s, "id": i, "p_original": p, "truncated": False}
+                  for s, i in (("wmt24pp", "wmt24pp-0"), ("wmt24pp", "wmt24pp-1"), ("flan", "flan-0"))]
+    write(preds, tmp_path / "pred.parquet")
+    held = [{"id": f"heldout:{s}:{k}", "set": s, "source": "e n", "reference": "o r", "tokens": 2, "over_512": False,
+             "length_class": "tiny", "meta": json.dumps({"source": "raad" if s == "btval" else "books:a-b"})}
+            for s in ("books", "btval") for k in range(2)]
+    write(held, tmp_path / "held.parquet")
+    for name, hyp in (("G4-2", "o r"), ("G4-0", "x")):
+        write([{"id": r["id"], "set": r["set"], "hypothesis": hyp, "reference": r["reference"], "ended": True,
+                "decode_loop": False, "empty": False} for r in held], tmp_path / "h" / name / "pairs-w0.parquet")
+    summary = {"steps": 300, "steps_done": 300, "loss": [[1, 2.3], [300, 0.8]],
+               "eval": [{"step": st, "set": s, "loss": x, "tokens": 9} for st, x in ((0, 2.2), (300, 1.4))
+                        for s in ("books", "btval", "own")], "lr_at": {"0": 0.0, "100": 1e-4}}
+    (tmp_path / "summary.json").write_text(json.dumps(summary))
+    out = tmp_path / "report.md"
+    args = ns(evalsets=str(tmp_path / "evalsets.parquet"), arm=str(tmp_path / "G4-2"), base=str(tmp_path / "G4-0"),
+              tg_scores=str(tmp_path / "tg.parquet"), predictions=str(tmp_path / "pred.parquet"), classifier_results=None,
+              lora_line=[], train_summary=str(tmp_path / "summary.json"), tally=None, arm_name="G4-2",
+              heldout=str(tmp_path / "held.parquet"), heldout_arm=str(tmp_path / "h" / "G4-2" / "pairs-w*.parquet"),
+              heldout_base=str(tmp_path / "h" / "G4-0" / "pairs-w*.parquet"), out=str(out))
+    g4arm.report(args)
+    r = json.loads(out.with_suffix(".json").read_text())
+    assert r["arm"] == "G4-2" and r["b"]["arm"] == pytest.approx(1.0) and r["b"]["holds"]
+    assert r["heldout"]["verdict"] == "dichter bij het originele Nederlands"
+    assert r["heldout"]["reading"]["books"]["loss_step0"] == 2.2 and r["training"]["lr_at"]["100"] == 1e-4
+    text = out.read_text()
+    assert "# Arm G4-2" in text and "$S/blind/G4-2/" in text and "De directe maat" in text

@@ -43,6 +43,7 @@ from flax import jax_utils  # noqa: E402
 from tqdm import tqdm  # noqa: E402
 from transformers import AutoTokenizer  # noqa: E402
 
+from mmbjax import hf_encoders  # noqa: E402
 from mmbjax.heads.classification import ModernBertForTokenClassification  # noqa: E402
 from mmbjax.heads.qa import ModernBertForQuestionAnswering  # noqa: E402
 
@@ -64,17 +65,23 @@ def learning_rate_schedule(learning_rate, kind, total_updates, warmup_steps):
 
 def create_model_and_state(kind, config, pretrained_params, num_labels, schedule, rng, gradient_accumulation_steps=1):
     """As finetune.create_model_and_state, for a token or span head, and failing when the checkpoint lacks the encoder
-    or the prediction head instead of leaving it at its random initialization."""
+    or the prediction head instead of leaving it at its random initialization. RoBERTa and NeoBERT
+    (mmbjax.hf_encoders) take only their encoder; their task heads are new, as in their Hugging Face classes."""
     config.num_labels = num_labels
-    model = (ModernBertForQuestionAnswering if kind == "qa" else ModernBertForTokenClassification)(config=config)
+    hf = isinstance(config, hf_encoders.HFEncoderConfig)
+    if hf:
+        model = (hf_encoders.HFEncoderForQuestionAnswering if kind == "qa" else hf_encoders.HFEncoderForTokenClassification)(config=config)
+    else:
+        model = (ModernBertForQuestionAnswering if kind == "qa" else ModernBertForTokenClassification)(config=config)
     init_rng, dropout_rng = jax.random.split(rng)
     params = model.init(init_rng, jnp.ones((1, 128), dtype=jnp.int32), deterministic=True)["params"]
-    missing = [name for name in ("model", "prediction_head") if name not in pretrained_params]
+    missing = [name for name in (("model",) if hf else ("model", "prediction_head")) if name not in pretrained_params]
     if missing:
         raise ValueError(f"the checkpoint has no {missing}, only {sorted(pretrained_params)}")
     new_params = dict(params)
     new_params["model"] = pretrained_params["model"]
-    new_params["head"] = pretrained_params["prediction_head"]
+    if not hf:
+        new_params["head"] = pretrained_params["prediction_head"]
     optimizer = optax.adamw(learning_rate=schedule, weight_decay=WEIGHT_DECAY)
     if gradient_accumulation_steps > 1:
         optimizer = optax.MultiSteps(optimizer, every_k_schedule=gradient_accumulation_steps)
@@ -259,7 +266,10 @@ def main(argv=None):
     print(f"Devices: {finetune.NUM_DEVICES}, Per-device batch size: {args.batch_size}, Total batch size: {args.batch_size * finetune.NUM_DEVICES}")
 
     pretrained_params, config = finetune.load_pretrained_params(Path(args.checkpoint))
-    tokenizer = AutoTokenizer.from_pretrained(config.tokenizer_name or "yhavinga/dutch-llama-tokenizer")
+    if isinstance(config, hf_encoders.HFEncoderConfig):
+        tokenizer = hf_encoders.load_tokenizer(config, split_into_words=task["kind"] == "token")
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(config.tokenizer_name or "yhavinga/dutch-llama-tokenizer")
     data = load_task_data(args, tokenizer)
     print("Rows / examples: " + ", ".join(f"{role} {len(rows)} / {len(examples)}" for role, (rows, examples) in data.items()))
 

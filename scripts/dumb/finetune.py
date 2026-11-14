@@ -30,6 +30,7 @@ from flax.training import train_state
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
+from mmbjax import hf_encoders
 from mmbjax.configuration_mmbbert import MMBertConfig
 from mmbjax.heads.classification import ModernBertForSequenceClassification
 
@@ -59,6 +60,10 @@ def load_pretrained_params(checkpoint_path: Path) -> tuple[dict, MMBertConfig]:
     with open(config_path, "r") as f:
         config_dict = json.load(f)
 
+    # RoBERTa or NeoBERT of scripts/convert_hf_encoder.py (experiments/robbert)
+    if config_dict.get("model_type") in hf_encoders.MODEL_TYPES:
+        return params, hf_encoders.HFEncoderConfig.from_dict(config_dict)
+
     # Filter to only valid MMBertConfig parameters
     import inspect
     valid_params = set(inspect.signature(MMBertConfig.__init__).parameters.keys())
@@ -87,7 +92,10 @@ def create_model_and_state(
     # Update config for classification
     config.num_labels = num_labels
 
-    model = ModernBertForSequenceClassification(config=config)
+    hf = isinstance(config, hf_encoders.HFEncoderConfig)
+    if hf and "model" not in pretrained_params:
+        raise ValueError(f"the checkpoint has no encoder ('model'), only {sorted(pretrained_params)}")
+    model = (hf_encoders.HFEncoderForSequenceClassification if hf else ModernBertForSequenceClassification)(config=config)
 
     # Initialize with dummy input to get parameter structure
     dummy_input = jnp.ones((1, 128), dtype=jnp.int32)
@@ -103,8 +111,8 @@ def create_model_and_state(
     if "model" in pretrained_params:
         new_params["model"] = pretrained_params["model"]
 
-    # Copy prediction head -> head (same structure: dense + layer_norm)
-    if "prediction_head" in pretrained_params:
+    # Copy prediction head -> head (same structure: dense + layer_norm); RoBERTa and NeoBERT get their own new head
+    if not hf and "prediction_head" in pretrained_params:
         new_params["head"] = pretrained_params["prediction_head"]
 
     # classifier is randomly initialized (new task-specific layer)
@@ -290,7 +298,10 @@ def main():
     pretrained_params, config = load_pretrained_params(checkpoint_path)
 
     # Get tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(config.tokenizer_name or "yhavinga/dutch-llama-tokenizer")
+    if isinstance(config, hf_encoders.HFEncoderConfig):
+        tokenizer = hf_encoders.load_tokenizer(config)
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(config.tokenizer_name or "yhavinga/dutch-llama-tokenizer")
 
     # Load dataset
     task_config = get_task(args.task)

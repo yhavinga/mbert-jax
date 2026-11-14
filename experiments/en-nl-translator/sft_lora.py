@@ -15,10 +15,10 @@ LoRA regex matches but that got none (qwix adds LoRA only where it intercepts a 
 
 With --eval NAME=FILE (repeatable) and --eval-every N, the loss on each held-out file (examples in the training data's
 format) before the first step (LoRA's B is zero, so the base model), every N steps (Tunix's eval_every_n_steps) and
-after the last: each file in full, token-weighted (MaxText's xent_sum over total_weights). Every eval makes a fresh
-iterator (MaxText's HF source cannot restart), and every process runs the same number of batches, the largest count of
-any process (counted before training): a process past its data gets MaxText's zero padding batch
-(generate_padding_batch_eval), which weighs nothing. Each eval prints an EVAL line; summary.json keeps them under "eval".
+after the last: each file (see below for the batches), token-weighted (MaxText's xent_sum over total_weights). Every eval makes a fresh
+iterator (MaxText's HF source cannot restart), and every process runs the same number of batches, the smallest count
+of any process (counted before training), without padding batches; the last batches of the larger shares are left out,
+the same ones at every eval. Each eval prints an EVAL line; summary.json keeps them under "eval".
 Writes to DIR (process 0): summary.json (configuration, times, throughput, memory per chip, loss per step), adapter.npz
 (the LoRA parameters in float32, keys as decoder/layers_0/self_attention/query/kernel_lora_a), adapter.json (rank,
 alpha, module regex, model, checkpoint, original dtype); MaxText's output (metrics file, tensorboard, Tunix's checkpoint
@@ -388,12 +388,14 @@ def main(argv=None):
             counts = [int(x) for x in np.asarray(multihost_utils.process_allgather(np.array([n], np.int64))).reshape(-1)]
         if not min(counts):
             raise SystemExit(f"eval {name}: a process got no batch of {path}: {counts}")
-        eval_plan[name] = {"path": path, "batches": max(counts), "batches_per_process": counts,
+        # Every process runs the same number of eval batches, the smallest count, without padding batches: on a
+        # v4-32 (4 processes) a padding batch on one host while the others still had data aborted the slice
+        # (SLICE_FAILURE_SW_INJECT_ERROR, G4-2 smoke test 14 Nov). The last batches of the larger shares are left out.
+        eval_plan[name] = {"path": path, "batches": min(counts), "batches_per_process": counts,
                            "loss_tokens_here": loss_tokens, "end": end,
-                           # MaxText requires eval_steps > 0 with padding batches; this script runs that many itself
                            "config": pyconfig.initialize_pydantic(base + [f"steps={steps}", f"hf_eval_files={path}",
-                                                                          "generate_padding_batch_eval=true",
-                                                                          f"eval_steps={max(counts)}"])}
+                                                                          "generate_padding_batch_eval=false",
+                                                                          f"eval_steps={min(counts)}"])}
         print(f"EVAL_PLAN {json.dumps({k: v for k, v in eval_plan[name].items() if k != 'config'} | {'set': name})}",
               flush=True)
 

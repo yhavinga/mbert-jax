@@ -12,6 +12,13 @@ unchanged, with two wrapped hooks that keep, per step, the loss, the time it end
 
 Before the first step every process prints LORA_MODULES: the LoRA parameters per module type and the modules that the
 LoRA regex matches but that got none (qwix adds LoRA only where it intercepts a matmul of a module's own weight).
+
+With --eval NAME=FILE (repeatable) and --eval-every N, the loss on each held-out file (examples in the training data's
+format) before the first step (LoRA's B is zero, so the base model), every N steps (Tunix's eval_every_n_steps) and
+after the last: each file in full, token-weighted (MaxText's xent_sum over total_weights). Every eval makes a fresh
+iterator (MaxText's HF source cannot restart), and every process runs the same number of batches, the largest count of
+any process (counted before training): a process past its data gets MaxText's zero padding batch
+(generate_padding_batch_eval), which weighs nothing. Each eval prints an EVAL line; summary.json keeps them under "eval".
 Writes to DIR (process 0): summary.json (configuration, times, throughput, memory per chip, loss per step), adapter.npz
 (the LoRA parameters in float32, keys as decoder/layers_0/self_attention/query/kernel_lora_a), adapter.json (rank,
 alpha, module regex, model, checkpoint, original dtype); MaxText's output (metrics file, tensorboard, Tunix's checkpoint
@@ -164,6 +171,101 @@ def choose_steps(requested, batches_per_process):
     return int(requested)
 
 
+def parse_evals(specs):
+    """{name: file} of --eval NAME=FILE, in the given order; names unique"""
+    out = {}
+    for spec in specs or []:
+        name, sep, path = spec.partition("=")
+        if not sep or not name or not path:
+            raise SystemExit(f"--eval {spec!r}: NAME=FILE")
+        if name in out:
+            raise SystemExit(f"--eval {name} twice")
+        out[name] = path
+    return out
+
+
+def eval_overrides(evals, every):
+    """MaxText's keys for Tunix's eval schedule; the data hooks build an eval iterator of the first file, which this
+    script replaces by its own per file"""
+    if not evals:
+        return []
+    if every < 1:
+        raise SystemExit("--eval needs --eval-every >= 1")
+    return [f"eval_interval={every}", f"hf_eval_files={next(iter(evals.values()))}", "hf_eval_split=train",
+            "eval_steps=-1"]
+
+
+def eval_loss(name, step, parts, batches, seconds):
+    """One file's eval at a step from the (xent_sum, total_weights) of its batches"""
+    if len(parts) != batches:
+        raise SystemExit(f"eval {name} at step {step}: {len(parts)} batches ran, {batches} planned")
+    xent = sum(x for x, _ in parts)
+    weights = sum(w for _, w in parts)
+    if weights <= 0:
+        raise SystemExit(f"eval {name} at step {step}: no target token")
+    return {"step": step, "set": name, "batches": batches, "tokens": int(round(weights)), "loss": xent / weights,
+            "seconds": round(seconds, 1)}
+
+
+def needs_final_eval(evals, steps):
+    """Tunix evaluates at step 0 and every N steps; the last step only when N divides it"""
+    return bool(evals) and evals[-1]["step"] != steps
+
+
+def lr_points(steps, warmup_fraction, decay_fraction):
+    """The steps whose learning rate summary.json records: start, end of warmup, middle, start of the decay, last"""
+    warmup = int(steps * warmup_fraction)
+    decay = int(steps * decay_fraction)
+    return sorted({0, 1, warmup, warmup + 1, steps // 2, max(0, steps - decay), steps - 1} & set(range(steps)))
+
+
+def learning_rates(config, steps):
+    """{step: the learning rate of MaxText's schedule} at lr_points (optax counts updates from 0)"""
+    from maxtext.utils import maxtext_utils
+
+    schedule = maxtext_utils.create_learning_rate_schedule(config)
+    decay = config.wsd_decay_steps_fraction if str(config.lr_schedule_type).lower().endswith("wsd") else 0.0
+    return {str(k): float(schedule(k)) for k in lr_points(steps, config.warmup_steps_fraction, decay)}
+
+
+def scalar(x):
+    """A replicated device scalar on the host (this process's copy)"""
+    import numpy as np
+
+    value = x.addressable_data(0) if hasattr(x, "addressable_data") else x
+    return float(np.asarray(value))
+
+
+def count_batches(iterator):
+    """(batches, target tokens of this process, how it ended) of a MaxText iterator without padding batches"""
+    n, loss_tokens = 0, 0
+    try:
+        while True:
+            batch = next(iterator)
+            n += 1
+            loss_tokens += local_nonzero(batch["targets_segmentation"])
+    except Exception as end:  # noqa: BLE001 - the pipeline's way to say the data ran out, checked below
+        text = f"{type(end).__name__}: {end}"
+        if not isinstance(end, StopIteration) and "Run out of shards" not in text:
+            raise
+        return n, loss_tokens, text[:300]
+
+
+def eval_iterator(config, mesh):
+    """MaxText's HF eval iterator of config.hf_eval_files, as create_data_iterator makes it, without a train iterator"""
+    from maxtext.input_pipeline import input_pipeline_interface as ipi
+    from maxtext.input_pipeline.hf_data_processing import make_hf_eval_iterator
+
+    indices = ipi.get_process_loading_real_data(config.data_sharding, config.global_batch_size_to_load_eval,
+                                                config.global_batch_size_to_eval_on, config.max_target_length, mesh)
+    return ipi.create_process_specific_iterator(config, mesh, indices, make_hf_eval_iterator, is_training=False)
+
+
+def close(iterator):
+    if iterator is not None and hasattr(iterator, "close"):
+        iterator.close()
+
+
 def throughput(records, tokens, loss_tokens):
     """Steady-state rates from per-step end times: the first step carries the compilation, so the rates run from the
     end of step 1 to the end of the last; compile_s is step 1's time minus the median of the others."""
@@ -196,7 +298,13 @@ def main(argv=None):
     parser.add_argument("--distributed", action="store_true",
                         help="One job over several hosts: jax.distributed.initialize() here, before anything touches "
                              "the TPU (pass skip_jax_distributed_system=True to MaxText)")
+    parser.add_argument("--eval", action="append", default=[],
+                        help="NAME=FILE: a held-out file in the training data's format, its loss at step 0, every "
+                             "--eval-every steps and after the last (repeatable)")
+    parser.add_argument("--eval-every", type=int, default=0)
     args = parser.parse_args(own)
+    evals_wanted = parse_evals(args.eval)
+    overrides = overrides + eval_overrides(evals_wanted, args.eval_every)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
 
@@ -232,7 +340,8 @@ def main(argv=None):
     # A multi-host job counts also when given a number of steps, to hold that number to step_limit
     if args.steps == "auto" or jax.process_count() > 1:
         mesh = maxtext_utils.get_mesh_from_config(config)
-        iterator, _ = create_data_iterator(config, mesh)
+        iterator, unused_eval = create_data_iterator(config, mesh)
+        close(unused_eval)
         try:
             while True:
                 batch = next(iterator)
@@ -259,6 +368,32 @@ def main(argv=None):
     steps = choose_steps(args.steps, batches_per_process)
     print(f"EPOCH {json.dumps(count | {'requested': args.steps, 'steps': steps})}", flush=True)
     config = pyconfig.initialize_pydantic(base + [f"steps={steps}"])
+    # before the training, so that a schedule this cannot read stops the run before it costs anything
+    lr_at = learning_rates(config, steps)
+    print(f"LR {json.dumps({'type': str(config.lr_schedule_type), 'at': lr_at})}", flush=True)
+
+    # The held-out files: per file a config of its own; the batches every process runs, the largest count of any
+    # process (counted without padding batches, so the count ends with the data)
+    eval_plan = {}
+    count_mesh = maxtext_utils.get_mesh_from_config(config) if evals_wanted else None
+    for name, path in evals_wanted.items():
+        it = eval_iterator(pyconfig.initialize_pydantic(base + [f"steps={steps}", f"hf_eval_files={path}",
+                                                                "generate_padding_batch_eval=false"]), count_mesh)
+        n, loss_tokens, end = count_batches(it)
+        close(it)
+        counts = [n]
+        if jax.process_count() > 1:
+            from jax.experimental import multihost_utils
+
+            counts = [int(x) for x in np.asarray(multihost_utils.process_allgather(np.array([n], np.int64))).reshape(-1)]
+        if not min(counts):
+            raise SystemExit(f"eval {name}: a process got no batch of {path}: {counts}")
+        eval_plan[name] = {"path": path, "batches": max(counts), "batches_per_process": counts,
+                           "loss_tokens_here": loss_tokens, "end": end,
+                           "config": pyconfig.initialize_pydantic(base + [f"steps={steps}", f"hf_eval_files={path}",
+                                                                          "generate_padding_batch_eval=true"])}
+        print(f"EVAL_PLAN {json.dumps({k: v for k, v in eval_plan[name].items() if k != 'config'} | {'set': name})}",
+              flush=True)
 
     t_setup = time.time()
     trainer, mesh = train_sft.setup_trainer_state(config)
@@ -292,6 +427,66 @@ def main(argv=None):
         return on_step_end(ctx, train_step, train_loss, step_time)
 
     hooks.on_train_start, hooks.on_train_step_start, hooks.on_train_step_end = train_start, step_start, step_end
+
+    evals = []
+    if eval_plan:
+        # Tunix's eval loop, file by file: our batches (data_hooks.load_next_eval_batch), the planned number of them
+        # from a fresh iterator; the jitted eval step wrapped to keep each batch's xent_sum and total_weights
+        data_hooks = trainer.data_hooks
+        close(data_hooks.eval_data_iterator)          # the hooks' own iterator of the first file, never read
+        data_hooks.eval_data_iterator = [None]        # truthy for Tunix's `if eval_ds`; iterated, never read
+        feed = {"iter": None, "left": 0, "parts": [], "eval_step": None}
+
+        def load_next_eval_batch(ctx):  # noqa: ARG001 - Tunix's signature
+            if feed["left"] <= 0:
+                data_hooks.eval_batch = None
+                return None
+            feed["left"] -= 1
+            data_hooks.eval_batch = next(feed["iter"])
+            return data_hooks.eval_batch
+
+        data_hooks.load_next_eval_batch = load_next_eval_batch
+        jit_both = trainer.jit_train_and_eval_step
+
+        def jit_recorded(*a, **k):
+            train_step, eval_step = jit_both(*a, **k)
+
+            def eval_recorded(*args_, **kwargs_):
+                loss, aux = eval_step(*args_, **kwargs_)
+                feed["parts"].append((aux["xent_sum"], aux["total_weights"]))
+                return loss, aux
+
+            feed["eval_step"] = eval_recorded
+            return train_step, eval_recorded
+
+        trainer.jit_train_and_eval_step = jit_recorded
+        run_eval_tunix = trainer._run_eval  # noqa: SLF001 - wrapped, not replaced
+
+        def run_eval(eval_ds, eval_step_fn):
+            step = trainer.train_steps
+            for name, plan in eval_plan.items():
+                feed["iter"] = eval_iterator(plan["config"], mesh)
+                feed["left"], feed["parts"] = plan["batches"], []
+                t0 = time.perf_counter()
+                run_eval_tunix(eval_ds, eval_step_fn)
+                close(feed["iter"])
+                if feed["left"]:
+                    raise SystemExit(f"eval {name} at step {step}: {feed['left']} planned batches not run")
+                record = eval_loss(name, step, [(scalar(x), scalar(w)) for x, w in feed["parts"]], plan["batches"],
+                                   time.perf_counter() - t0)
+                evals.append(record)
+                print(f"EVAL {json.dumps(record)}", flush=True)
+
+        trainer._run_eval = run_eval  # noqa: SLF001
+        on_end = hooks.on_train_end
+
+        def train_end(ctx):
+            # after the loop, before MaxText's hook flushes its metric logger and Tunix closes the trainer
+            if needs_final_eval(evals, ctx.train_steps):
+                run_eval(data_hooks.eval_data_iterator, feed["eval_step"])
+            return on_end(ctx)
+
+        hooks.on_train_end = train_end
 
     t_train = time.time()
     train_sft.train_model(config, trainer, mesh)
@@ -329,7 +524,8 @@ def main(argv=None):
         "config": {k: getattr(config, k) for k in (
             "per_device_batch_size", "global_batch_size_to_train_on", "gradient_accumulation_steps",
             "max_target_length", "packing", "learning_rate", "learning_rate_final_fraction", "warmup_steps_fraction",
-            "opt_type", "adam_b1", "adam_b2", "adam_weight_decay", "gradient_clipping_threshold", "weight_dtype",
+            "lr_schedule_type", "wsd_decay_steps_fraction", "wsd_decay_style", "eval_interval", "opt_type", "adam_b1",
+            "adam_b2", "adam_weight_decay", "gradient_clipping_threshold", "weight_dtype",
             "dtype", "remat_policy", "attention", "scan_layers", "ici_fsdp_parallelism", "ici_tensor_parallelism",
             "dcn_data_parallelism", "dcn_fsdp_parallelism", "sft_train_on_completion_only", "enable_data_shuffling")},
         "epoch": count, "steps": steps, "steps_done": len(records),
@@ -341,6 +537,10 @@ def main(argv=None):
         "tokens": {"total": sum(tokens), "loss": sum(loss_tokens), "per_step": tokens, "loss_per_step": loss_tokens},
         "memory": memory, "peak_gib_max": max(m["peak_gib"] for m in memory),
         "loss": [[r["step"], round(r["loss"], 5)] for r in records],
+        "eval": evals,
+        "eval_plan": {k: {x: v[x] for x in ("path", "batches", "batches_per_process", "end")}
+                      for k, v in eval_plan.items()},
+        "lr_at": lr_at,
     }
     if summary["throughput"]:
         summary["throughput"]["tokens_per_s_per_chip"] = round(summary["throughput"]["tokens_per_s"] / jax.device_count(), 1)

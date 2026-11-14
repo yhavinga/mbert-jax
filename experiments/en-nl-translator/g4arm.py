@@ -18,6 +18,14 @@ run_g4arm.sh runs these on a worker:
   report    (a1) and (b) of protocol-g4.md §5, the state of (a2) and (c), TranslateGemma as a second reference
   tally     (a2) and (c) from the blind judge's lines and the key
   smoke     the smoke test's verdict (protocol-g4.md §6)
+Arm G4-2 (protocol-g4.md §9, amendment G4-2):
+  fetch --split validation   the five datasets' validation split at the same revisions
+  heldout   the held-out data: whole books out of G4-1's set, the BT validation, as evaluation segments (classes
+            tiny-xlong, whole classes per worker) and as eval files of the training (messages)
+  own       the eval file of G4-0's own greedy translations of the BT validation (the template and stack check)
+  replay    the replay candidates from the Gemma 4 FLAN-nl after its post step (segments of kept examples, measures)
+  build2    G4-2's set: G4-1's examples without the held-out books, the FLAN replay, three shuffled passes
+  smoke2    the verdict of G4-2's smoke test (8 steps with the held-out evals; the own-output loss at step 0)
 """
 
 import argparse
@@ -124,14 +132,15 @@ def fetch(args):
     from huggingface_hub import snapshot_download
 
     out = Path(args.out)
+    split = getattr(args, "split", "train")
     info = {}
     for source, (repo, revision) in BT_REPOS.items():
         d = out / source
         snapshot_download(repo, repo_type="dataset", revision=revision, local_dir=str(d),
-                          allow_patterns=["data/train-*.parquet", "README.md"])
-        files = sorted(d.glob("data/train-*.parquet"))
+                          allow_patterns=[f"data/{split}-*.parquet", "README.md"])
+        files = sorted(d.glob(f"data/{split}-*.parquet"))
         if not files:
-            raise SystemExit(f"{repo}@{revision}: no data/train-*.parquet")
+            raise SystemExit(f"{repo}@{revision}: no data/{split}-*.parquet")
         info[source] = {"repo": repo, "revision": revision,
                         "files": {f.name: sha256_file(f) for f in files}}
         print(f"FETCH {source} {repo}@{revision[:9]}: {len(files)} files", flush=True)
@@ -151,15 +160,15 @@ def crawl_key(value):
     return int(m.group(1)), int(m.group(2))
 
 
-def read_bt(directory, revisions):
-    """The train rows of the five datasets as {pid, source, nl, en, hard_fails, chrf, model, dump}; every file's sha256
-    must be the one fetch recorded"""
+def read_bt(directory, revisions, split="train"):
+    """The rows of a split of the five datasets as {pid, source, nl, en, hard_fails, chrf, model, dump}; every file's
+    sha256 must be the one fetch recorded"""
     import pyarrow.parquet as pq
 
     rows = []
     for source in BT_REPOS:
         d = Path(directory) / source / "data"
-        files = sorted(d.glob("train-*.parquet"))
+        files = sorted(d.glob(f"{split}-*.parquet"))
         want = revisions[source]["files"]
         if sorted(f.name for f in files) != sorted(want):
             raise SystemExit(f"{d}: files {[f.name for f in files]}, revisions.json has {sorted(want)}")
@@ -738,8 +747,9 @@ def scored_dir(directory):
 def report(args):
     import armeval
 
+    arm = getattr(args, "arm_name", None) or ARM
     evalsets = {r["id"]: r for r in read_rows(args.evalsets)}
-    models = {ARM: scored_dir(args.arm), BASE: scored_dir(args.base)}
+    models = {arm: scored_dir(args.arm), BASE: scored_dir(args.base)}
     for name, rows in models.items():
         if set(rows) != set(evalsets):
             raise SystemExit(f"{name}: scores for {len(rows)} of {len(evalsets)} segments")
@@ -755,17 +765,17 @@ def report(args):
             tg_sets["wmt24pp"].append(r)
     predictions = read_rows(args.predictions)
     shares = armeval.classifier_shares(predictions)
-    for name in (ARM, BASE):
+    for name in (arm, BASE):
         if shares.get(name, {}).get("n") != N_WMT_GOOD + N_FLAN:
             raise SystemExit(f"{args.predictions}: {name} has {shares.get(name, {}).get('n')} texts")
     accuracy = json.loads(Path(args.classifier_results).read_text())["test_accuracy"] if args.classifier_results else None
-    result = {"arm": ARM, "base": BASE, "a1": rule_a1(sets[ARM]), "a1_base": rule_a1(sets[BASE]),
-              "b": rule_b(shares), "b_against_tg": rule_b(shares, ARM, "TG") if "TG" in shares else None,
+    result = {"arm": arm, "base": BASE, "a1": rule_a1(sets[arm]), "a1_base": rule_a1(sets[BASE]),
+              "b": rule_b(shares, arm), "b_against_tg": rule_b(shares, arm, "TG") if "TG" in shares else None,
               "b_base_against_tg": rule_b(shares, BASE, "TG") if "TG" in shares else None,
               "shares": shares, "classifier_accuracy": accuracy, "sets": {}}
     for s in ("wmt24pp", "wmt24pp_all", "flores", "ntrex", "europarl", "flan", "blind"):
         entry = {}
-        for name in (ARM, BASE):
+        for name in (arm, BASE):
             rows = sets[name].get(s, [])
             entry[name] = {**armeval.counts(rows), "metricx_qe": mean(r["metricx_qe"] for r in rows),
                            "metricx_ref": mean(r["metricx_ref"] for r in rows),
@@ -782,6 +792,18 @@ def report(args):
         t = json.loads(Path(args.train_summary).read_text())
         result["training"] = {k: t.get(k) for k in ("steps", "steps_done", "throughput", "peak_gib_max", "times")}
         result["training"]["loss_first_last"] = [t["loss"][:3], t["loss"][-3:]] if t.get("loss") else None
+        result["training"]["lr_at"] = t.get("lr_at")
+    if getattr(args, "heldout", None):
+        t = json.loads(Path(args.train_summary).read_text()) if args.train_summary else {}
+
+        def pairs_of(pattern):
+            rows = {}
+            for f in sorted(glob.glob(pattern)):
+                rows.update((r["id"], r) for r in read_rows(f))
+            return rows
+
+        result["heldout"] = heldout_measure(read_rows(args.heldout), pairs_of(args.heldout_arm),
+                                            pairs_of(args.heldout_base), t.get("eval"), arm, BASE)
     if args.tally:
         result["blind"] = json.loads(Path(args.tally).read_text())
         result["a2"] = result["blind"]["a2"]
@@ -844,7 +866,7 @@ def report_text(r):
                  f"betekenisfouten {x['errors_arm']} tegen {x['errors_base']}: **(a2) {'gehaald' if x['a2'] else 'niet gehaald'}**; "
                  f"twijfel {x['doubt']}.")
     else:
-        L.append("Nog niet beoordeeld (pakket `$S/blind/G4-1/`; alleen als (a1) en (b) gelden, protocol-g4.md §5).")
+        L.append(f"Nog niet beoordeeld (pakket `$S/blind/{r['arm']}/`; alleen als (a1) en (b) gelden, protocol-g4.md §5).")
     L += ["", "## Per set (gerapporteerd, beslist niet)", "",
           "| set | model | n | QE | MetricX-ref | COMET-22 | uitvoer / referentie | < 0,7 × ref | niet af | lus | Engels over | leeg |",
           "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
@@ -855,6 +877,8 @@ def report_text(r):
                      f"{f3(v.get('comet22'))} | {f3(length.get('out_per_ref'))} | {pct(length.get('under_0_7_of_ref'))} | "
                      f"{v.get('not_ended', '–')} | {v.get('decode_loop', '–')} | {v.get('english_left', '–')} | "
                      f"{v.get('empty', '–')} |")
+    if r.get("heldout"):
+        L += heldout_text(r["heldout"], r["arm"], r["base"])
     if r.get("lora_merge"):
         L += ["", "LoRA-samenvoeging (`translate.py`, regel LORA): " + "; ".join(json.dumps(x) for x in r["lora_merge"][:4])]
     if r.get("training"):
@@ -862,6 +886,33 @@ def report_text(r):
     if r.get("classifier_accuracy") is not None:
         L += ["", f"Nauwkeurigheid van de classifier: {r['classifier_accuracy']}."]
     return "\n".join(L) + "\n"
+
+
+def heldout_text(h, arm, base):
+    """The direct measure (amendment G4-2.6) as Markdown: reported, it decides nothing"""
+    L = ["", "## De directe maat: dichter bij het originele Nederlands? (amendement G4-2.6, rapporteren, beslist niet)", "",
+         f"**Lezing (vooraf vastgelegd): {h['verdict']}.**", "",
+         "| set | verlies stap 0 (G4-0) | verlies laatste stap | lager | chrF " + arm + " | chrF " + base + " | hoger |",
+         "|---|---:|---:|---|---:|---:|---|"]
+    for name, v in h["reading"].items():
+        sets = h["sets"][name]
+        L.append(f"| {name} | {f3(v['loss_step0'])} | {f3(v['loss_last'])} (stap {v['last_step']}) | "
+                 f"{'ja' if v['loss_down'] else 'nee'} | {f2(sets[arm]['chrf_corpus'])} | {f2(sets[base]['chrf_corpus'])} | "
+                 f"{'ja' if v['chrf_up'] else 'nee'} |")
+    L += ["", "| set | model | n | chrF (corpus) | chrF (gem.) | uitvoer / origineel (tekens) | niet af | lus | leeg |",
+          "|---|---|---:|---:|---:|---:|---:|---:|---:|"]
+    for name, entry in h["sets"].items():
+        for model, v in entry.items():
+            L.append(f"| {name} | {model} | {v['n']} | {f2(v['chrf_corpus'])} | {f2(v['chrf_mean'])} | "
+                     f"{f3(v['chars_out_per_ref'])} | {v['not_ended']} | {v['decode_loop']} | {v['empty']} |")
+    L += ["", "Verlies per stap (token-gewogen, het Nederlands en `<turn|>\\n`; stap 0 = het basismodel in de "
+          "trainingsstack; `own` = G4-0's eigen greedy vertalingen als doel): " + "; ".join(
+              f"{name} " + ", ".join(f"{k}: {f3(x)}" for k, x in curve.items()) for name, curve in h["loss"].items())]
+    return L
+
+
+def f2(x):
+    return "–" if x is None else f"{x:.2f}".replace(".", ",")
 
 
 # ---------------------------------------------------------------------------------------------------- smoke
@@ -934,6 +985,491 @@ def smoke(args):
         raise SystemExit(1)
 
 
+# ---------------------------------------------------------------------------------------------------- G4-2
+
+ARM2 = "G4-2"
+SEED2 = f"{SEED}/G4-2"
+EPOCHS2 = 3
+REPLAY_SHARE2 = 0.20                 # amendment G4-2.3 point 2: arm N's share
+REPLAY_POOL2 = 30000
+REPLAY_TOKENS2 = (48, 384)           # amendment G4-2.3 point 4 (iii): arm N's window, in Gemma 4 tokens of the Dutch
+REPLAY_MODEL2 = "google/gemma-4-31B-it@842da37 (prompt flan-v1, MaxText fork f4d8615, flan-nl fd5e585)"
+# the bucket places of the Gemma 4 FLAN-nl after its post step (flan_g4_full_run.sh); nothing else is a replay source
+REPLAY_URIS2 = {"plan": "/mbert/flan-nl/plan2", "shards": "/mbert/flan-nl/translations/g4",
+                "measures": "/mbert/flan-nl/g4-full/report/measures.parquet", "nl": "/mbert/flan-nl/nl-g4",
+                "setup": "/mbert/flan-nl/g4-full/report/setup.json"}
+HELDOUT_BOOK_MAX_PAIRS = 600         # amendment G4-2.5: books with at most this many pairs
+HELDOUT_BOOKS_MIN_PAIRS = 500
+HELDOUT_BOOKS_MIN_BOOKS = 2
+HELDOUT_BOOKS_SAMPLE = 500
+HELDOUT_BTVAL = 800
+DECODE_FIT = 0.8                     # the Dutch at most this share of its class's decode limit
+OWN_MAX_LOSS = 1.0                   # amendment G4-2.4: the base model's loss on its own greedy output, at step 0
+EVAL_SETS2 = ("books", "btval", "own")
+SMOKE2_EVAL_STEPS = [0, 4, 8]
+LR2 = 1e-4
+BOOK_ID = re.compile(r"^book:books:(\d+-\d+)-b1-\d+$")
+
+
+def book_key(meta_id):
+    """The book of a book pair of G4-1's set: the pair of book ids in book:books:<nl>-<en>-b1-<k>"""
+    m = BOOK_ID.match(meta_id)
+    if not m:
+        raise SystemExit(f"{meta_id}: not a book pair's id (book:books:<nl>-<en>-b1-<k>)")
+    return m.group(1)
+
+
+def choose_heldout_books(counts, seed=f"{SEED2}/heldout-books"):
+    """amendment G4-2.5: the books with at most HELDOUT_BOOK_MAX_PAIRS pairs in a seeded order, taken until there are
+    HELDOUT_BOOKS_MIN_PAIRS pairs and HELDOUT_BOOKS_MIN_BOOKS books"""
+    order = sorted(k for k, n in counts.items() if n <= HELDOUT_BOOK_MAX_PAIRS)
+    random.Random(seed).shuffle(order)
+    chosen, total = {}, 0
+    for k in order:
+        if total >= HELDOUT_BOOKS_MIN_PAIRS and len(chosen) >= HELDOUT_BOOKS_MIN_BOOKS:
+            break
+        chosen[k] = counts[k]
+        total += counts[k]
+    if total < HELDOUT_BOOKS_MIN_PAIRS or len(chosen) < HELDOUT_BOOKS_MIN_BOOKS:
+        raise SystemExit(f"the books with <= {HELDOUT_BOOK_MAX_PAIRS} pairs hold only {total} pairs in {len(chosen)}")
+    return chosen
+
+
+def decode_class(src_tokens, nl_tokens):
+    """The class of a held-out pair if the Dutch fits its decode limit (DECODE_FIT), else None; above xlong None"""
+    import translate
+
+    classes = translate.MODELS[MODEL]["length_classes"]
+    for name in EVAL_CLASSES:
+        if src_tokens <= classes[name]["max_source"]:
+            return name if nl_tokens <= DECODE_FIT * classes[name]["max_decode"] else None
+    return None
+
+
+def g41_set(directory):
+    """G4-1's set as [(messages row, meta row)], checked against its manifest"""
+    d = Path(directory)
+    manifest = json.loads((d / "manifest.json").read_text())
+    msgs = read_rows(d / "train.parquet")
+    metas = read_rows(d / "train-meta.parquet")
+    if manifest.get("set") != ARM or len(msgs) != len(metas) or len(metas) != manifest.get("examples"):
+        raise SystemExit(f"{d}: not G4-1's set ({manifest.get('set')}, {len(msgs)} examples, {len(metas)} meta rows, "
+                         f"manifest {manifest.get('examples')})")
+    if (d / "template.jinja").read_text(encoding="utf-8") != g4lora.TEMPLATE:
+        raise SystemExit(f"{d}/template.jinja is not g4lora.TEMPLATE")
+    return list(zip(msgs, metas)), manifest
+
+
+def messages_row(en, nl):
+    return {"messages": [{"role": "user", "content": g4lora.user_turn(en)}, {"role": "assistant", "content": nl.strip()}]}
+
+
+EVAL_SCHEMA = (("id", "string"), ("set", "string"), ("source", "string"), ("reference", "string"),
+               ("tokens", "int64"), ("over_512", "bool"), ("length_class", "string"), ("meta", "string"))
+SEGMENT_SCHEMA = (("id", "string"), ("text", "string"), ("tokens", "int64"))
+
+
+def schema(fields):
+    import pyarrow as pa
+
+    return pa.schema([(n, getattr(pa, "bool_" if t == "bool" else t)()) for n, t in fields])
+
+
+def heldout(args, counter=None):
+    """amendment G4-2.5: the held-out books and BT validation, as evaluation segments and as eval files"""
+    import evalsets
+
+    counter = counter or TokenCounter(args.tokenizer)
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    pairs, manifest = g41_set(args.g41)
+    books = [{"pid": m["id"], "key": book_key(m["id"]), "en": m["en"].strip(), "nl": x["messages"][1]["content"].strip()}
+             for x, m in pairs if m["kind"] == "book"]
+    counts = collections.Counter(b["key"] for b in books)
+    chosen = choose_heldout_books(counts)
+    report = {"books_in_g41": len(counts), "book_pairs_in_g41": len(books), "heldout_books": chosen,
+              "heldout_book_pairs": sum(chosen.values())}
+
+    def fitted(rows, label):
+        src = counter.lengths(r["en"] for r in rows)
+        nl = counter.lengths(r["nl"] for r in rows)
+        keep, lost = [], 0
+        for r, a, b in zip(rows, src, nl):
+            cls = decode_class(a, b)
+            if cls is None:
+                lost += 1
+            else:
+                keep.append({**r, "tokens": a, "tokens_nl": b, "length_class": cls})
+        report[f"{label}_not_fitting_the_classes"] = lost
+        return keep
+
+    candidates = fitted([b for b in books if b["key"] in chosen], "books")
+    candidates.sort(key=lambda r: r["pid"])
+    sample = sorted(random.Random(f"{SEED2}/heldout-books/sample").sample(
+        candidates, min(HELDOUT_BOOKS_SAMPLE, len(candidates))), key=lambda r: r["pid"])
+    report["books_measured"] = len(sample)
+
+    revisions = json.loads((Path(args.btval) / "revisions.json").read_text())
+    for source, (repo, revision) in BT_REPOS.items():
+        got = revisions.get(source, {})
+        if (got.get("repo"), got.get("revision")) != (repo, revision):
+            raise SystemExit(f"{args.btval}/revisions.json: {source} is {got.get('repo')}@{got.get('revision')}")
+    rows = read_bt(args.btval, revisions, split="validation")
+    train_ids = {m["id"][len("bt:"):] for _, m in pairs if m["kind"] == "bt"}   # bt:<the dataset's id>
+    overlap = sorted(train_ids & {r["pid"] for r in rows})
+    if overlap:
+        raise SystemExit(f"{len(overlap)} validation rows are training rows of G4-1, e.g. {overlap[:3]}")
+    bounds = json.loads(Path(args.data_report).read_text())["bt"]["length_bounds"]
+    evalsets_rows = read_rows(args.evalsets)
+    blind = read_jsonl(args.blind)
+    if sha256_file(args.blind) != blind_sha256():
+        raise SystemExit(f"{args.blind}: not the blind passages of the TG protocol (§4.2.4)")
+    blocked = blocked_grams(evalsets_rows, blind)
+    funnel = collections.Counter(rows=len(rows))
+    pool = []
+    for r in rows:
+        if r["hard_fails"]:
+            funnel["hard_fails"] += 1
+        elif sft_build.length_fails(r, bounds):
+            funnel["length"] += 1
+        elif shares_gram(r, blocked):
+            funnel["eval_13gram"] += 1
+        else:
+            pool.append(r)
+    prompts, targets = counter.examples(pool)
+    within = []
+    for r, a, b in zip(pool, prompts, targets):
+        if a + b > MAX_TOKENS:
+            funnel["too_long"] += 1
+        else:
+            within.append(r)
+    fit = fitted(within, "btval")
+    fit.sort(key=lambda r: r["pid"])
+    if len(fit) < HELDOUT_BTVAL:
+        raise SystemExit(f"{len(fit)} BT validation rows pass the bounds, {HELDOUT_BTVAL} wanted")
+    btval = sorted(random.Random(f"{SEED2}/heldout-btval").sample(fit, HELDOUT_BTVAL), key=lambda r: r["pid"])
+    funnel["eligible"] = len(fit)
+    report["btval_funnel"] = dict(funnel)
+    report["btval_by_source"] = dict(sorted(collections.Counter(r["source"] for r in btval).items()))
+
+    eval_rows = []
+    for name, part in (("books", sample), ("btval", btval)):
+        for r in part:
+            src = f"books:{r['key']}" if name == "books" else r["source"]
+            eval_rows.append({"id": f"heldout:{name}:{r['pid']}", "set": name, "source": r["en"], "reference": r["nl"],
+                              "tokens": r["tokens"], "over_512": r["tokens"] > 512, "length_class": r["length_class"],
+                              "meta": json.dumps({"source": src, "pid": r["pid"], "tokens_nl": r["tokens_nl"]})})
+        prompts, targets = counter.examples([{"en": r["en"], "nl": r["nl"]} for r in part])
+        if max(a + b for a, b in zip(prompts, targets)) > MAX_TOKENS:
+            raise SystemExit(f"a held-out {name} example above {MAX_TOKENS} tokens")
+        write_parquet([messages_row(r["en"], r["nl"]) for r in part], out / f"eval-{name}.parquet")
+    write_parquet(eval_rows, out / "evalsets.parquet", schema(EVAL_SCHEMA))
+    assignment = evalsets.assign_workers(eval_rows, args.workers)
+    for k, part in assignment.items():
+        write_parquet([{"id": r["id"], "text": r["source"], "tokens": r["tokens"]} for r in part],
+                      out / f"segments-w{k}.parquet", schema(SEGMENT_SCHEMA))
+        (out / f"classes-w{k}.txt").write_text(
+            " ".join(c for c in EVAL_CLASSES if any(r["length_class"] == c for r in part)) + "\n")
+    report["workers"] = {f"w{k}": {"segments": len(p), "classes": sorted({r["length_class"] for r in p},
+                                                                         key=EVAL_CLASSES.index)}
+                         for k, p in assignment.items()}
+    report["classes"] = {name: dict(collections.Counter(r["length_class"] for r in eval_rows if r["set"] == name))
+                         for name in ("books", "btval")}
+    report["inputs"] = {"g41": {f: sha256_file(Path(args.g41) / f) for f in ("train.parquet", "train-meta.parquet")},
+                        "btval": revisions, "evalsets": sha256_file(args.evalsets), "blind": sha256_file(args.blind),
+                        "length_bounds": bounds}
+    (out / "books.json").write_text(json.dumps({"books": chosen, "pairs": sum(chosen.values())}, indent=1) + "\n")
+    (out / "manifest.json").write_text(json.dumps(report, indent=1) + "\n")
+    print(f"HELDOUT {json.dumps({k: report[k] for k in ('heldout_books', 'heldout_book_pairs', 'books_measured', 'btval_funnel', 'btval_by_source', 'workers')})}",
+          flush=True)
+
+
+def own(args, counter=None):
+    """amendment G4-2.5 "eigen": G4-0's greedy translations of the BT validation as the targets of an eval file"""
+    counter = counter or TokenCounter(args.tokenizer)
+    english = {r["id"]: r for r in read_rows(args.heldout, ["id", "set", "source"])}
+    rows = {}
+    for f in sorted(glob.glob(args.pairs)):
+        for r in read_rows(f, ["id", "set", "hypothesis", "ended", "decode_loop", "empty"]):
+            rows[r["id"]] = r
+    btval = sorted(i for i, r in english.items() if r["set"] == "btval")
+    missing = [i for i in btval if i not in rows]
+    if missing:
+        raise SystemExit(f"{len(missing)} BT validation segments without G4-0's translation, e.g. {missing[:3]}")
+    kept = [i for i in btval if rows[i]["ended"] and not rows[i]["decode_loop"] and not rows[i]["empty"]]
+    pairs = [{"en": english[i]["source"], "nl": rows[i]["hypothesis"].strip()} for i in kept]
+    prompts, targets = counter.examples(pairs)
+    pairs = [p for p, a, b in zip(pairs, prompts, targets) if a + b <= MAX_TOKENS]
+    if len(pairs) < len(btval) // 2:
+        raise SystemExit(f"only {len(pairs)} of {len(btval)} of G4-0's translations are usable as targets")
+    write_parquet([messages_row(p["en"], p["nl"]) for p in pairs], args.out)
+    info = {"btval": len(btval), "ended_ok": len(kept), "within_tokens": len(pairs)}
+    Path(args.out).with_suffix(".json").write_text(json.dumps(info) + "\n")
+    print(f"OWN {json.dumps(info)}", flush=True)
+
+
+def check_replay_uris(uris):
+    """amendment G4-2.3 point 3: the replay comes only from the Gemma 4 FLAN-nl's places in the bucket"""
+    for key, want in REPLAY_URIS2.items():
+        got = str(uris.get(key) or "").rstrip("/")
+        if not got.startswith("gs://") or not got.endswith(want):
+            raise SystemExit(f"replay {key}: {got!r} is not the Gemma 4 FLAN-nl's {want}")
+
+
+def replay_candidates(args):
+    """amendment G4-2.3 point 4 (i)-(iii): the candidates of the replay from the Gemma 4 FLAN-nl after its post step,
+    a seeded uniform pool of REPLAY_POOL2 of them, as a parquet for build2 (id, en, nl, task, model)"""
+    import pyarrow.parquet as pq
+
+    uris = dict(u.split("=", 1) for u in args.uri)
+    check_replay_uris(uris)
+    setup = Path(args.setup).read_text(encoding="utf-8")
+    if "Gemma 4 31B-it" not in setup or "flan-v1" not in setup:
+        raise SystemExit(f"{args.setup}: not the setup of the Gemma 4 FLAN-nl (Gemma 4 31B-it, flan-v1)")
+    report = {"uris": uris}
+    kept = set()
+    for path in sorted(Path(args.nl).glob("w*.parquet")):
+        h = int(path.stem[1:])
+        kept |= {(h, int(p)) for p in pq.read_table(path, columns=["position"]).column("position").to_pylist()}
+    if not kept:
+        raise SystemExit(f"{args.nl}: no example kept by assemble")
+    plan = json.loads((Path(args.plan) / "plan.json").read_text())
+    template_ids = {int(v) for v in plan.get("template_segments", {}).values()}
+    ex = pq.read_table(Path(args.plan) / "examples.parquet",
+                       columns=["host", "position", "source", "status", "instruction", "answer"]).to_pydict()
+    task = {}
+    for h, p, source, status, ins, ans in zip(*(ex[c] for c in ("host", "position", "source", "status", "instruction",
+                                                                 "answer"))):
+        if status != "translate" or (int(h), int(p)) not in kept:
+            continue
+        for kind, value in json.loads(ins) + json.loads(ans):
+            if kind == "S" and int(value) not in template_ids:
+                task.setdefault(int(value), source)
+    report["kept_examples"] = len(kept)
+    report["segments_of_kept_examples"] = len(task)
+    m = pq.read_table(args.measures, columns=["id", "check", "af", "executed", "chatter", "english_left",
+                                              "identical_to_source", "repairs", "tokens_out"]).to_pydict()
+    funnel = collections.Counter()
+    lo, hi = REPLAY_TOKENS2
+    passing = []
+    for k in range(len(m["id"])):
+        i = int(m["id"][k])
+        if i not in task:
+            continue
+        funnel["measured"] += 1
+        why = ("check" if m["check"][k] else "not_af" if not m["af"][k] else "executed" if m["executed"][k] else
+               "chatter" if m["chatter"][k] else "english_left" if m["english_left"][k] else
+               "identical" if m["identical_to_source"][k] else "repaired" if m["repairs"][k] else
+               "tokens" if not lo <= int(m["tokens_out"][k]) <= hi else None)
+        if why:
+            funnel[why] += 1
+        else:
+            passing.append(i)
+    if funnel["measured"] != len(task):
+        raise SystemExit(f"{args.measures}: {funnel['measured']} of the {len(task)} segments of kept examples measured")
+    passing.sort()
+    pool = sorted(random.Random(f"{SEED2}/replay-pool").sample(passing, min(REPLAY_POOL2, len(passing))))
+    want = set(pool)
+    report["funnel"] = dict(funnel)
+    report["candidates"] = len(passing)
+    report["pool"] = len(pool)
+    en, nl = {}, {}
+    for path in sorted(Path(args.plan).glob("segments-w*.parquet")):
+        t = pq.read_table(path, columns=["id", "text"]).to_pydict()
+        en.update((int(i), x) for i, x in zip(t["id"], t["text"]) if int(i) in want)
+    for path in sorted(Path(args.shards).rglob("*.parquet")):
+        t = pq.read_table(path, columns=["id", "text_nl"]).to_pydict()
+        for i, x in zip(t["id"], t["text_nl"]):
+            if int(i) in want:
+                if int(i) in nl:
+                    raise SystemExit(f"segment {i} translated twice ({path})")
+                nl[int(i)] = x
+    lost = [i for i in pool if i not in en or i not in nl]
+    if lost:
+        raise SystemExit(f"{len(lost)} pool segments without English or Dutch, e.g. {lost[:3]}")
+    import pyarrow as pa
+
+    write_parquet([{"id": i, "en": en[i].strip(), "nl": nl[i].strip(), "task": task[i], "model": REPLAY_MODEL2}
+                   for i in pool], args.out,
+                  pa.schema([("id", pa.int64()), ("en", pa.string()), ("nl", pa.string()), ("task", pa.string()),
+                             ("model", pa.string())]))
+    report["by_task_top"] = collections.Counter(task[i] for i in pool).most_common(15)
+    Path(args.out).with_suffix(".json").write_text(json.dumps(report, indent=1) + "\n")
+    print(f"REPLAY {json.dumps({k: report[k] for k in ('kept_examples', 'segments_of_kept_examples', 'funnel', 'candidates', 'pool')})}",
+          flush=True)
+
+
+def build2(args, counter=None):
+    """amendment G4-2.3: G4-1's examples without the held-out books, the FLAN replay (20%), three shuffled passes"""
+    import pyarrow as pa
+
+    counter = counter or TokenCounter(args.tokenizer)
+    out = Path(args.out)
+    pairs, base_manifest = g41_set(args.base_set)
+    books = json.loads(Path(args.heldout_books).read_text())["books"]
+    keep = [(x, m) for x, m in pairs if not (m["kind"] == "book" and book_key(m["id"]) in books)]
+    if len(pairs) - len(keep) != sum(books.values()):
+        raise SystemExit(f"{len(pairs) - len(keep)} book pairs left out, the held-out books have {sum(books.values())}")
+    report = {"arm": ARM2, "seed": SEED2, "prompt": PROMPT, "epochs": args.epochs, "replay_share": args.replay_share,
+              "base_set": {"manifest": base_manifest, "examples": len(pairs)},
+              "heldout_books": books, "heldout_book_pairs": sum(books.values())}
+    evalsets_rows = read_rows(args.evalsets)
+    blind = read_jsonl(args.blind)
+    if sha256_file(args.blind) != blind_sha256():
+        raise SystemExit(f"{args.blind}: not the blind passages of the TG protocol (§4.2.4)")
+    blocked = blocked_grams(evalsets_rows, blind)
+    candidates = replay_pool(args.replay, args.replay_model, args.flan_eval, blocked, counter, report)
+    n_replay = replay_count(len(keep), args.replay_share)
+    if n_replay > len(candidates):
+        raise SystemExit(f"{n_replay} replay examples wanted, {len(candidates)} candidates")
+    replay = random.Random(f"{SEED}/replay").sample(candidates, n_replay)
+    report["replay"]["drawn"] = n_replay
+    one = keep + [example(r, "replay") for r in replay]
+    rows = []
+    for e in range(1, args.epochs + 1):
+        order = list(one)
+        random.Random(f"{SEED2}/shuffle/{e}").shuffle(order)
+        rows += [(x, {**m, "epoch": e}) for x, m in order]
+    d = out / ARM2
+    meta_schema = pa.schema([(n, getattr(pa, t)()) for n, t in META_SCHEMA_FIELDS + (("epoch", "int64"),)])
+    write_parquet([x for x, _ in rows], d / "train.parquet")
+    write_parquet([{n: m.get(n) for n in meta_schema.names} for _, m in rows], d / "train-meta.parquet", meta_schema)
+    (d / "template.jinja").write_text(g4lora.TEMPLATE, encoding="utf-8")
+    metas = [m for _, m in one]
+    tokens = sum(m["tokens_prompt"] + m["tokens_target"] for m in metas)
+    report["set"] = set_stats(metas, [])
+    report["estimate"] = {"tokens_per_epoch": tokens, "tokens": tokens * args.epochs,
+                          "steps": round(tokens * args.epochs / (16 * 2048 * PACK_FILL)), "pack_fill": PACK_FILL}
+    inputs = {"base_set": {f: sha256_file(Path(args.base_set) / f) for f in ("train.parquet", "train-meta.parquet")},
+              "heldout_books": sha256_file(args.heldout_books), "evalsets": sha256_file(args.evalsets),
+              "blind": sha256_file(args.blind),
+              "replay": {"path": str(args.replay), "sha256": sha256_file(args.replay), "model": args.replay_model}}
+    report["inputs"] = inputs
+    manifest = {"set": ARM2, "examples": len(rows), "examples_per_epoch": len(one), "epochs": args.epochs,
+                "kinds": dict(collections.Counter(m["kind"] for m in metas)), "tokens": tokens * args.epochs,
+                "prompt": PROMPT, "template": "g4lora.TEMPLATE (Gemma 4, thinking off)", "seed": SEED2,
+                "replay_share": args.replay_share, "inputs": inputs}
+    (d / "manifest.json").write_text(json.dumps(manifest, indent=1) + "\n")
+    (out / "report.json").write_text(json.dumps(report, indent=1, ensure_ascii=False, default=str) + "\n")
+    (out / "report.md").write_text(report2_md(report), encoding="utf-8")
+    print(f"BUILD2 {json.dumps({'examples': len(rows), 'per_epoch': len(one), 'kinds': manifest['kinds'], 'tokens': tokens * args.epochs, 'steps_est': report['estimate']['steps']})}",
+          flush=True)
+
+
+def report2_md(r):
+    s, e = r["set"], r["estimate"]
+    L = [f"# Trainingsset {r['arm']} (protocol-g4.md §9, amendement G4-2)", "",
+         f"Gemaakt door `g4arm.py build2`. De voorbeelden van G4-1 ({_n(r['base_set']['examples'])}) zonder de "
+         f"held-out boeken ({_n(r['heldout_book_pairs'])} paren: {json.dumps(r['heldout_books'])}), plus "
+         f"FLAN-replay {r['replay_share']:.0%} van de voorbeelden, {r['epochs']} doorgangen, elk apart geschud "
+         f"(seed `{r['seed']}/shuffle/<k>`); prompt `{r['prompt']}`.", "",
+         "## FLAN-replay", "", json.dumps(r["replay"], ensure_ascii=False), "",
+         "## Eén doorgang", "", "| soort | voorbeelden | tokens | doeltokens | max tokens | woorden NL / EN p10 / p50 / p90 | bronnen |",
+         "|---|---:|---:|---:|---:|---|---|"]
+    for kind, k in s["kinds"].items():
+        q = k["word_ratio"]
+        src = k["by_source"] if kind != "replay" else {"flan-taken": len(k["by_source"])}
+        L.append(f"| {kind} | {_n(k['examples'])} | {_n(k['tokens'])} | {_n(k['target_tokens'])} | {_n(k['max_tokens'])} | "
+                 f"{q.get('p10')} / {q.get('p50')} / {q.get('p90')} | {json.dumps(src)} |")
+    L += ["", f"Samen {_n(s['examples'])} voorbeelden per doorgang, {_n(e['tokens_per_epoch'])} tokens; "
+          f"{r['epochs']} doorgangen: {_n(e['tokens'])} tokens, ~{_n(e['steps'])} stappen [schatting, vulling "
+          f"{e['pack_fill']} zoals RL].", ""]
+    return "\n".join(L) + "\n"
+
+
+def smoke2_verdict(summary, adapter):
+    """amendment G4-2.4: the smoke test of G4-2, every criterion with its value and whether it holds"""
+    checks = {}
+    loss = summary.get("loss") or []
+    checks["steps"] = {"value": summary.get("steps_done"), "holds": summary.get("steps_done") == 8}
+    checks["loss_finite"] = {"value": [v for _, v in loss],
+                             "holds": len(loss) == 8 and all(math.isfinite(v) for _, v in loss)}
+    checks["peak_gib"] = {"value": summary.get("peak_gib_max"),
+                          "holds": summary.get("peak_gib_max") is not None and summary["peak_gib_max"] <= MEM_MAX_GIB}
+    checks["adapter"] = {"value": {k: adapter.get(k) for k in ("rank", "alpha", "scale")},
+                         "holds": (adapter.get("rank"), adapter.get("alpha"), adapter.get("scale")) == (32, 16.0, 0.5)}
+    lrs = list((summary.get("lr_at") or {}).values())
+    checks["lr_peak"] = {"value": max(lrs) if lrs else None,
+                         "holds": bool(lrs) and abs(max(lrs) - LR2) <= 1e-9}
+    evals = summary.get("eval") or []
+    for name in EVAL_SETS2:
+        rows = [e for e in evals if e["set"] == name]
+        checks[f"eval_{name}"] = {
+            "value": [(e["step"], round(e["loss"], 4), e["tokens"]) for e in rows],
+            "holds": [e["step"] for e in rows] == SMOKE2_EVAL_STEPS
+            and all(math.isfinite(e["loss"]) and e["tokens"] >= 1 for e in rows)}
+    own0 = next((e["loss"] for e in evals if e["set"] == "own" and e["step"] == 0), None)
+    checks["own_loss_step0"] = {"value": own0, "holds": own0 is not None and own0 <= OWN_MAX_LOSS + TOLERANCE}
+    return {"checks": checks, "passed": all(c["holds"] for c in checks.values())}
+
+
+def smoke2(args):
+    summary = json.loads(Path(args.summary).read_text())
+    adapter = json.loads(Path(args.adapter).read_text())
+    result = smoke2_verdict(summary, adapter)
+    result.update({k: summary.get(k) for k in ("loss", "eval", "eval_plan", "lr_at", "throughput", "times", "epoch")})
+    Path(args.out).with_suffix(".json").write_text(json.dumps(result, indent=1, default=str) + "\n")
+    L = ["# Smoke-test G4-2 (protocol-g4.md §9, amendement G4-2.4)", "",
+         f"**{'Geslaagd' if result['passed'] else 'Niet geslaagd'}.**", "", "| controle | waarde | gehaald |", "|---|---|---|"]
+    for k, c in result["checks"].items():
+        L.append(f"| {k} | `{json.dumps(c['value'], default=str)[:200]}` | {'ja' if c['holds'] else 'nee'} |")
+    L += ["", "Verlies per held-out set (stap, verlies, doeltokens): " + "; ".join(
+        f"{e['set']} {e['step']} {e['loss']:.4f} {e['tokens']}" for e in summary.get("eval") or []), "",
+          f"Training: {json.dumps({k: summary.get(k) for k in ('throughput', 'times')}, default=str)}", ""]
+    Path(args.out).write_text("\n".join(L), encoding="utf-8")
+    print(f"SMOKE2 {'PASSED' if result['passed'] else 'FAILED'} {json.dumps({k: c['holds'] for k, c in result['checks'].items()})} "
+          f"own0 {result['checks']['own_loss_step0']['value']}", flush=True)
+    if not result["passed"]:
+        raise SystemExit(1)
+
+
+def heldout_measure(heldout_rows, arm_pairs, base_pairs, evals, arm, base):
+    """amendment G4-2.6: chrF of both models against the original Dutch and the loss at step 0 against the last, per
+    held-out set (BT also per source), and the reading fixed beforehand"""
+    import armeval
+
+    meta = {r["id"]: json.loads(r["meta"]) for r in heldout_rows}
+    groups = collections.defaultdict(list)
+    for r in heldout_rows:
+        groups[r["set"]].append(r["id"])
+        if r["set"] == "btval":
+            groups[f"btval:{meta[r['id']]['source']}"].append(r["id"])
+    out = {"sets": {}}
+    for name, ids in sorted(groups.items()):
+        entry = {}
+        for model, pairs in ((arm, arm_pairs), (base, base_pairs)):
+            missing = [i for i in ids if i not in pairs]
+            if missing:
+                raise SystemExit(f"{model}: no held-out translation of {missing[:3]}")
+            rows = [pairs[i] for i in ids]
+            hyps = [r["hypothesis"] for r in rows]
+            refs = [r["reference"] for r in rows]
+            entry[model] = {"n": len(rows), "chrf_corpus": armeval.corpus_chrf(hyps, refs),
+                            "chrf_mean": mean(armeval.chrf(h, x) for h, x in zip(hyps, refs)),
+                            "not_ended": sum(not r["ended"] for r in rows),
+                            "decode_loop": sum(bool(r["decode_loop"]) for r in rows),
+                            "empty": sum(bool(r["empty"]) for r in rows),
+                            "chars_out_per_ref": sum(len(h) for h in hyps) / max(1, sum(len(x) for x in refs))}
+        out["sets"][name] = entry
+    losses = collections.defaultdict(dict)
+    for e in evals or []:
+        losses[e["set"]][e["step"]] = e["loss"]
+    out["loss"] = {k: dict(sorted(v.items())) for k, v in losses.items()}
+    reading = {}
+    for name in ("books", "btval"):
+        curve = out["loss"].get(name, {})
+        steps = sorted(curve)
+        loss_down = len(steps) >= 2 and steps[0] == 0 and curve[steps[-1]] < curve[0]
+        chrf_up = out["sets"][name][arm]["chrf_corpus"] > out["sets"][name][base]["chrf_corpus"]
+        reading[name] = {"loss_step0": curve.get(0), "loss_last": curve[steps[-1]] if steps else None,
+                         "last_step": steps[-1] if steps else None, "loss_down": loss_down, "chrf_up": chrf_up}
+    flags = [v["loss_down"] for v in reading.values()] + [v["chrf_up"] for v in reading.values()]
+    out["reading"] = reading
+    out["verdict"] = ("dichter bij het originele Nederlands" if all(flags) else
+                      "niet dichter" if not any(flags) else "gemengd")
+    return out
+
+
 # ---------------------------------------------------------------------------------------------------- main
 
 def main(argv=None):
@@ -941,6 +1477,7 @@ def main(argv=None):
     sub = parser.add_subparsers(dest="command", required=True)
     p = sub.add_parser("fetch")
     p.add_argument("--out", required=True)
+    p.add_argument("--split", default="train", choices=("train", "validation"))
     p = sub.add_parser("build")
     p.add_argument("--bt", required=True, help="fetch's directory (<source>/data/train-*.parquet, revisions.json)")
     p.add_argument("--books", required=True, help="RL's set ($S/data/rl-b5/RL: train.parquet, train-meta.parquet)")
@@ -978,6 +1515,10 @@ def main(argv=None):
     p.add_argument("--lora-line", action="append", default=[])
     p.add_argument("--train-summary", default=None)
     p.add_argument("--tally", default=None, help="tally's json after the blind review")
+    p.add_argument("--arm-name", default=ARM, help="the arm's name (G4-1, G4-2)")
+    p.add_argument("--heldout", default=None, help="G4-2: the held-out evalsets.parquet (the direct measure)")
+    p.add_argument("--heldout-arm", default=None, help="glob of the arm's held-out pairs-w*.parquet")
+    p.add_argument("--heldout-base", default=None, help="glob of G4-0's held-out pairs-w*.parquet")
     p.add_argument("--out", required=True)
     p = sub.add_parser("tally")
     p.add_argument("--judgments", required=True)
@@ -988,9 +1529,43 @@ def main(argv=None):
     for name in ("summary", "adapter", "translate-log", "arm-pairs", "arm-metricx", "base-pairs", "base-metricx", "out"):
         p.add_argument(f"--{name}", required=True)
     p.add_argument("--checkpoint-ok", action="store_true")
+    p = sub.add_parser("heldout")
+    p.add_argument("--g41", required=True, help="G4-1's set ($G/data/G4-1)")
+    p.add_argument("--btval", required=True, help="fetch --split validation's directory (revisions.json)")
+    p.add_argument("--data-report", required=True, help="G4-1's data report.json (the length bounds)")
+    p.add_argument("--evalsets", required=True)
+    p.add_argument("--blind", required=True)
+    p.add_argument("--tokenizer", required=True)
+    p.add_argument("--workers", type=int, default=4)
+    p.add_argument("--out", required=True)
+    p = sub.add_parser("own")
+    p.add_argument("--heldout", required=True, help="heldout's evalsets.parquet")
+    p.add_argument("--pairs", required=True, help="glob of G4-0's held-out pairs-w*.parquet")
+    p.add_argument("--tokenizer", required=True)
+    p.add_argument("--out", required=True)
+    p = sub.add_parser("replay")
+    for name in ("plan", "shards", "measures", "nl", "setup", "out"):
+        p.add_argument(f"--{name}", required=True)
+    p.add_argument("--uri", action="append", default=[], help="KEY=gs://... where each input came from")
+    p = sub.add_parser("build2")
+    p.add_argument("--base-set", required=True, help="G4-1's set ($G/data/G4-1)")
+    p.add_argument("--heldout-books", required=True, help="heldout's books.json")
+    p.add_argument("--replay", required=True, help="replay's parquet")
+    p.add_argument("--replay-model", default=REPLAY_MODEL2)
+    p.add_argument("--replay-share", type=float, default=REPLAY_SHARE2)
+    p.add_argument("--epochs", type=int, default=EPOCHS2)
+    p.add_argument("--flan-eval", required=True)
+    p.add_argument("--evalsets", required=True)
+    p.add_argument("--blind", required=True)
+    p.add_argument("--tokenizer", required=True)
+    p.add_argument("--out", required=True)
+    p = sub.add_parser("smoke2")
+    for name in ("summary", "adapter", "out"):
+        p.add_argument(f"--{name}", required=True)
     args = parser.parse_args(argv)
     {"fetch": fetch, "build": build, "check": check, "evaldata": evaldata, "texts": texts, "report": report,
-     "tally": tally, "smoke": smoke}[args.command](args)
+     "tally": tally, "smoke": smoke, "heldout": heldout, "own": own, "replay": replay_candidates, "build2": build2,
+     "smoke2": smoke2}[args.command](args)
 
 
 if __name__ == "__main__":

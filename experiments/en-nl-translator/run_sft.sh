@@ -2,7 +2,8 @@
 # On a worker of mbert-corpus: sft_lora.py (MaxText train_sft with LoRA) detached from ssh, either as a TPU of the
 # worker's own 4 chips (default) or, with MULTIHOST=1 started on all four workers at once, as one job over the 16 chips.
 #   NAME=sft12b_N MODEL=12b [STEPS=auto] DATA=/dev/shm/translator/smoke-lora/data/train-N.parquet [ROOT=gs://...]
-#     [TEMPLATE=<chat template>] [LORA_MODULES=<regex>] bash run_sft.sh [key=value ...]
+#     [TEMPLATE=<chat template>] [LORA_MODULES=<regex>] [SFT_ARGS="--eval NAME=FILE ... --eval-every N"]
+#     bash run_sft.sh [key=value ...]
 # MODEL: 12b or 27b (TranslateGemma), or gemma4-26b / gemma4-31b (Gemma 4 26B-A4B-it and 31B-it, converted by
 # run_g4lora.sh convert; their tokenizers from run_g4lora.sh setup).
 # The key=value arguments are MaxText overrides after this script's own (later ones win). Log: ~/logs/$NAME.log, a fresh
@@ -91,7 +92,7 @@ $ENV
 $NODUMP
 $PRE
 echo "\$(date +%H:%M:%S) $(hostname): $NAME, $MODEL, $DATA"
-$PY -u $CODE/sft_lora.py --out $OUT --steps $STEPS $FLAGS -- $(printf '%q ' "${ARGS[@]}")
+$PY -u $CODE/sft_lora.py --out $OUT --steps $STEPS $FLAGS ${SFT_ARGS:-} -- $(printf '%q ' "${ARGS[@]}")
 EOS
 COPY="gsutil -q cp ~/logs/$NAME.log $ROOT/runs/$NAME/$NAME-w$WORKER.log"
 # sft_lora.py writes its files on the job's process 0: this worker alone, or worker 0 of a multi-host job

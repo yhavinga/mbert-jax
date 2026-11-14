@@ -28,16 +28,40 @@
 #   MODEL=G4-1|G4-0 bash run_g4arm.sh smoke-translate   w0: the 50 smoke segments, class small, to $G/smoke/$TAG/$MODEL/
 #   MODEL=G4-1|G4-0 bash run_g4arm.sh smoke-score       w0: collect and MetricX-24 of those 50
 #   bash run_g4arm.sh smoke-report                      w0 (CPU): g4arm.py smoke, to $G/smoke/$TAG/
+# Arm G4-2 (protocol-g4.md §9, amendment G4-2), with ARM=G4-2 (default ARM=G4-1, every stage as before):
+#   bash run_g4arm.sh fetchval    w3: the five datasets' validation split at the pinned revisions, to $G/input/bt-val/
+#   bash run_g4arm.sh heldout     w3: g4arm.py heldout (held-out books of G4-1's set, BT validation), to $G/data/heldout/
+#   MODEL=G4-0|G4-2 SET=heldout bash run_g4arm.sh translate|score    the held-out segments (score: collect only), to
+#                                 $G/heldout/$MODEL/
+#   bash run_g4arm.sh own         w0 (CPU): g4arm.py own (G4-0's held-out outputs as an eval file), to $G/data/heldout/
+#   ARM=G4-2 RUN=g4arm_G4-2_s8 STEPS=8 bash run_g4arm.sh train, then ARM=G4-2 bash run_g4arm.sh smoke2-report (w0):
+#                                 the smoke test with the held-out evals on G4-1's set, verdict to $G/smoke2/$TAG/
+#   bash run_g4arm.sh replay      w3: g4arm.py replay from the Gemma 4 FLAN-nl after its post step, to $G/data/replay/
+#   bash run_g4arm.sh build2      w3: g4arm.py build2, to $G/data/G4-2/; ARM=G4-2 check: $G/data/check-G4-2.txt
+#   ARM=G4-2 RUN=g4arm_G4-2 bash run_g4arm.sh train (LR 1e-4, warmup 3%, constant, linear decay over the last 10% to
+#                                 1e-5; three passes; held-out evals every 150 steps), adapter, translate, score,
+#                                 texts, classify, blind, report as for G4-1 with G4-2's places
 # The code is beside this script (a copy of $G/scripts/). TAG names the jobs of one chain.
 set -euo pipefail
-STAGE=${1:?a stage: fetchbt, build, check, evaldata, setup, train, adapter, translate, score, texts, classify, blind, report, smoke-translate, smoke-score, smoke-report}
+STAGE=${1:?a stage: fetchbt, build, check, evaldata, setup, train, adapter, translate, score, texts, classify, blind, report, smoke-translate, smoke-score, smoke-report, fetchval, heldout, own, smoke2-report, replay, build2}
 R=gs://t5-dutch-english-usc2/mbert/translator
 S=$R/sft
 E=$R/eval
 G=$S/g4arm
-ARM=G4-1
-SMOKE_RUN=g4arm_G4-1_s8
-FULL_RUN=g4arm_G4-1
+ARM=${ARM:-G4-1}
+case $ARM in G4-1|G4-2) ;; *) echo "ARM is G4-1 or G4-2, not $ARM"; exit 1 ;; esac
+SMOKE_RUN=g4arm_${ARM}_s8
+FULL_RUN=g4arm_$ARM
+SET=${SET:-eval}
+case $SET in eval|heldout) ;; *) echo "SET is eval or heldout, not $SET"; exit 1 ;; esac
+# G4-2's places (amendment G4-2.9)
+H=$G/data/heldout
+NAT=$G/naturalness
+REP=$G/report
+CHECK_TXT=$G/data/check.txt
+if [ "$ARM" = G4-2 ]; then NAT=$G/naturalness-G4-2; REP=$G/report-G4-2; CHECK_TXT=$G/data/check-G4-2.txt; fi
+# The Gemma 4 FLAN-nl after its post step (flan_g4_full_run.sh), the replay's only source (amendment G4-2.3)
+FNL=gs://t5-dutch-english-usc2/mbert/flan-nl
 TRAIN_CKPT=$R/gemma4-ckpt/gemma-4-31b-it                       # run_sft.sh's gemma4-31b (MaxText 0.2.5 conversion)
 DECODE_CKPT=$R/judge/gemma-4-31b-it-maxtext/0/items            # the same conversion's twin, as every Gemma 4 decode
 G4_REPO=google/gemma-4-31B-it
@@ -138,6 +162,7 @@ EOF
   ;;
 build)
   only 3
+  [ "$ARM" = G4-1 ] || { echo "build makes G4-1's set; G4-2's is build2"; exit 1; }
   ! gsutil -q stat "$G/data/$ARM/manifest.json" || { echo "$G/data/$ARM has a manifest.json: the set stays as it is"; exit 1; }
   [ -s "$TOK_SFT/tokenizer.json" ] || { echo "w$W: no tokenizer in $TOK_SFT (setup)"; exit 1; }
   IN=$G_SHM/in-$TAG
@@ -169,7 +194,7 @@ export OMP_NUM_THREADS=8 TOKENIZERS_PARALLELISM=true HF_HUB_OFFLINE=1 HF_DATASET
 mkdir -p $D
 gsutil -m -q cp $G/data/$ARM/train.parquet $G/data/$ARM/train-meta.parquet $G/data/$ARM/template.jinja $D/
 $SFT_PY -u $CODE/g4arm.py check --data $D --tokenizer $TOK_SFT | tee $D/check.txt
-gsutil -q cp $D/check.txt $G/data/check.txt
+gsutil -q cp $D/check.txt $CHECK_TXT
 EOF
   detach "g4a_check_$TAG" nice -n 19 ionice -c3 bash ~/job_body_g4a_check_$TAG.sh
   ;;
@@ -231,15 +256,35 @@ train)
   STEPS=${STEPS:-auto}
   case "$RUN/$STEPS" in "$SMOKE_RUN/8"|"$FULL_RUN/auto") ;; *) echo "RUN/STEPS is $SMOKE_RUN/8 or $FULL_RUN/auto, not $RUN/$STEPS"; exit 1 ;; esac
   tpu_free
-  gsutil -q stat "$G/data/check.txt" || { echo "no $G/data/check.txt: the set is not checked"; exit 1; }
-  D=$G_SHM/data
-  mkdir -p "$D"
-  gsutil -m -q cp "$G/data/$ARM/train.parquet" "$G/data/$ARM/template.jinja" "$G/data/$ARM/manifest.json" "$D/"
-  # protocol-g4.md §3: one job over the 16 chips, sequences of 2,048, one per chip, LoRA rank 32 / alpha 16 on
-  # run_sft.sh's modules (attention + MLP), LR 1e-5 cosine with 10% warmup, one epoch (STEPS=auto) or 8 steps
-  MULTIHOST=1 NAME=$RUN MODEL=gemma4-31b DATA=$D/train.parquet TEMPLATE=$D/template.jinja ROOT=$G STEPS=$STEPS \
-    bash "$CODE/run_sft.sh" per_device_batch_size=1 max_target_length=2048 lora.lora_rank=32 lora.lora_alpha=16.0 \
-    learning_rate=1e-5
+  if [ "$ARM" = G4-1 ]; then
+    gsutil -q stat "$G/data/check.txt" || { echo "no $G/data/check.txt: the set is not checked"; exit 1; }
+    D=$G_SHM/data
+    mkdir -p "$D"
+    gsutil -m -q cp "$G/data/$ARM/train.parquet" "$G/data/$ARM/template.jinja" "$G/data/$ARM/manifest.json" "$D/"
+    # protocol-g4.md §3: one job over the 16 chips, sequences of 2,048, one per chip, LoRA rank 32 / alpha 16 on
+    # run_sft.sh's modules (attention + MLP), LR 1e-5 cosine with 10% warmup, one epoch (STEPS=auto) or 8 steps
+    MULTIHOST=1 NAME=$RUN MODEL=gemma4-31b DATA=$D/train.parquet TEMPLATE=$D/template.jinja ROOT=$G STEPS=$STEPS \
+      bash "$CODE/run_sft.sh" per_device_batch_size=1 max_target_length=2048 lora.lora_rank=32 lora.lora_alpha=16.0 \
+      learning_rate=1e-5
+  else
+    # amendment G4-2.4: the smoke test on G4-1's (checked) set, the full run on G4-2's; both with the held-out evals
+    if [ "$RUN" = "$SMOKE_RUN" ]; then SETDIR=$G/data/G4-1; CK=$G/data/check.txt; EVERY=4; else SETDIR=$G/data/G4-2; CK=$CHECK_TXT; EVERY=150; fi
+    gsutil -q stat "$CK" || { echo "no $CK: the set is not checked"; exit 1; }
+    for f in eval-books.parquet eval-btval.parquet eval-own.parquet; do
+      gsutil -q stat "$H/$f" || { echo "no $H/$f (heldout, own)"; exit 1; }
+    done
+    D=$G_SHM/data-$RUN
+    mkdir -p "$D"
+    gsutil -m -q cp "$SETDIR/train.parquet" "$SETDIR/template.jinja" "$SETDIR/manifest.json" "$H/eval-books.parquet" \
+      "$H/eval-btval.parquet" "$H/eval-own.parquet" "$D/"
+    # amendment G4-2.4: LR 1e-4, warmup 3%, constant, the last 10% linear to 1e-5 (MaxText's wsd); the epochs are the
+    # set's three passes (STEPS=auto counts them)
+    SFT_ARGS="--eval books=$D/eval-books.parquet --eval btval=$D/eval-btval.parquet --eval own=$D/eval-own.parquet --eval-every $EVERY" \
+      MULTIHOST=1 NAME=$RUN MODEL=gemma4-31b DATA=$D/train.parquet TEMPLATE=$D/template.jinja ROOT=$G STEPS=$STEPS \
+      bash "$CODE/run_sft.sh" per_device_batch_size=1 max_target_length=2048 lora.lora_rank=32 lora.lora_alpha=16.0 \
+      learning_rate=1e-4 lr_schedule_type=wsd warmup_steps_fraction=0.03 wsd_decay_steps_fraction=0.1 \
+      wsd_decay_style=linear learning_rate_final_fraction=0.1
+  fi
   ;;
 adapter)
   RUN_DIR=$G/runs/$FULL_RUN
@@ -254,10 +299,18 @@ adapter)
   echo "ADAPTER $ARM: $G/$ARM/ $(tr -d '\n ' < "$G_SHM/adapter-$TAG.json" | cut -c1-300)"
   ;;
 translate|smoke-translate)
-  MODEL=${MODEL:?G4-1 or G4-0}
-  case $MODEL in G4-1|G4-0) ;; *) echo "MODEL is G4-1 or G4-0, not $MODEL"; exit 1 ;; esac
+  MODEL=${MODEL:?G4-1, G4-2 or G4-0}
+  case $MODEL in G4-1|G4-2|G4-0) ;; *) echo "MODEL is G4-1, G4-2 or G4-0, not $MODEL"; exit 1 ;; esac
   tpu_free
-  if [ "$STAGE" = smoke-translate ]; then
+  EVALDIR=$G/data/eval
+  if [ "$SET" = heldout ]; then
+    OUT=$G/heldout/$MODEL/translations/w$W
+    ADAPTER_DIR=$G/$MODEL
+    SEG=segments-w$W.parquet
+    EVALDIR=$H
+    CLASSES=$(gsutil cat "$H/classes-w$W.txt")
+    NAME=g4a_htranslate_${MODEL}_$TAG
+  elif [ "$STAGE" = smoke-translate ]; then
     only 0
     OUT=$G/smoke/$TAG/$MODEL/translations
     ADAPTER_DIR=$G/runs/$SMOKE_RUN
@@ -266,14 +319,21 @@ translate|smoke-translate)
     NAME=g4a_smoke_translate_${MODEL}_$TAG
   else
     OUT=$G/eval/$MODEL/translations/w$W
-    ADAPTER_DIR=$G/$ARM
+    ADAPTER_DIR=$G/$MODEL
     SEG=segments-w$W.parquet
     CLASSES=$(gsutil cat "$G/data/eval/classes-w$W.txt")
     NAME=g4a_translate_${MODEL}_$TAG
   fi
-  [ -n "$CLASSES" ] || { echo "w$W: no classes"; exit 1; }
+  CLASSES=$(echo $CLASSES)
+  if [ -z "$CLASSES" ]; then
+    # the held-out segments fill fewer classes than there are workers
+    [ "$SET" = heldout ] || { echo "w$W: no classes"; exit 1; }
+    printf 'echo "TRANSLATED w%s %s: no class on this worker"\n' "$W" "$MODEL" > ~/job_body_$NAME.sh
+    detach "$NAME" bash ~/job_body_$NAME.sh
+    exit 0
+  fi
   EXTRA=
-  if [ "$MODEL" = G4-1 ]; then
+  if [ "$MODEL" != G4-0 ]; then
     adapter_local "$ADAPTER_DIR" "$G_SHM/adapter-$NAME"
     EXTRA="--lora $G_SHM/adapter-$NAME"
   fi
@@ -283,19 +343,41 @@ translate|smoke-translate)
     echo "$ONE_HOST"
     echo "export JAX_COMPILATION_CACHE_DIR=$G_SHM/jax_cache"
     echo "mkdir -p $G_SHM/seg-$TAG $G_SHM/work"
-    echo "gsutil -q cp $G/data/eval/$SEG $G_SHM/seg-$TAG/$SEG || exit 1"
+    echo "mkdir -p $G_SHM/seg-$TAG/$SET"
+    echo "gsutil -q cp $EVALDIR/$SEG $G_SHM/seg-$TAG/$SET/$SEG || exit 1"
     echo "$PREFLIGHT"
     echo "$TRANSLATE_CLASS"
     for cls in $CLASSES; do
-      echo "translate_class $G_SHM/seg-$TAG/$SEG $cls $OUT/$cls ~/logs/${NAME}_$cls.log $EXTRA || exit 1"
+      echo "translate_class $G_SHM/seg-$TAG/$SET/$SEG $cls $OUT/$cls ~/logs/${NAME}_$cls.log $EXTRA || exit 1"
     done
     echo "echo \"TRANSLATED w$W $MODEL: $CLASSES\""
   } > ~/job_body_$NAME.sh
   detach "$NAME" bash ~/job_body_$NAME.sh
   ;;
 score|smoke-score)
-  MODEL=${MODEL:?G4-1 or G4-0}
-  case $MODEL in G4-1|G4-0) ;; *) echo "MODEL is G4-1 or G4-0, not $MODEL"; exit 1 ;; esac
+  MODEL=${MODEL:?G4-1, G4-2 or G4-0}
+  case $MODEL in G4-1|G4-2|G4-0) ;; *) echo "MODEL is G4-1, G4-2 or G4-0, not $MODEL"; exit 1 ;; esac
+  if [ "$SET" = heldout ]; then
+    # the held-out segments: collect only (the direct measure's chrF is the report's), on the CPU
+    O=$G/heldout/$MODEL
+    NAME=g4a_hscore_${MODEL}_$TAG
+    L=$G_SHM/score-$NAME
+    if [ -z "$(gsutil cat "$H/classes-w$W.txt" | tr -d ' \n')" ]; then
+      printf 'echo "SCORED w%s %s: no class on this worker"\n' "$W" "$MODEL" > ~/job_body_$NAME.sh
+    else
+      cat > ~/job_body_$NAME.sh <<EOF
+set -euo pipefail
+mkdir -p $L/data $L/translations $L/out
+gsutil -q cp $H/evalsets.parquet $H/segments-w$W.parquet $L/data/
+gsutil -m -q rsync -r $O/translations/w$W $L/translations
+$FPY -I $CODE/evalsets.py collect --data $L/data --worker $W --shards $L/translations --out $L/out/pairs-w$W.parquet
+gsutil -q cp $L/out/pairs-w$W.parquet $O/pairs/pairs-w$W.parquet
+echo "SCORED w$W $MODEL: $O/pairs/"
+EOF
+    fi
+    detach "$NAME" bash ~/job_body_$NAME.sh
+    exit 0
+  fi
   tpu_free
   if [ "$STAGE" = smoke-score ]; then
     only 0
@@ -348,24 +430,26 @@ EOF
 texts)
   only 0
   T=$G_SHM/texts-$TAG
-  cat > ~/job_body_g4a_texts_$TAG.sh <<EOF
-set -euo pipefail
-mkdir -p $T/G4-1 $T/G4-0
-gsutil -m -q cp '$G/eval/G4-1/pairs/pairs-w*.parquet' $T/G4-1/
-gsutil -m -q cp '$G/eval/G4-0/pairs/pairs-w*.parquet' $T/G4-0/
-gsutil -q cp $G/data/eval/evalsets.parquet $S/re/classify/g4-base-texts.parquet $T/
-$FPY -I -u $CODE/g4arm.py texts --evalsets $T/evalsets.parquet --pairs 'G4-1=$T/G4-1/pairs-w*.parquet' \
-  --pairs 'G4-0=$T/G4-0/pairs-w*.parquet' --control $T/g4-base-texts.parquet --out $T/texts.parquet
-gsutil -q cp $T/texts.parquet $G/naturalness/texts.parquet
-echo "TEXTS: $G/naturalness/texts.parquet"
-EOF
+  # G4-2: G4-2, G4-0 and (to report) G4-1 in one classify run (amendment G4-2.7)
+  MODELS="G4-1 G4-0"
+  [ "$ARM" = G4-2 ] && MODELS="G4-2 G4-0 G4-1"
+  PAIRS=""
+  for m in $MODELS; do PAIRS="$PAIRS --pairs '$m=$T/$m/pairs-w*.parquet'"; done
+  {
+    echo "set -euo pipefail"
+    for m in $MODELS; do echo "mkdir -p $T/$m && gsutil -m -q cp '$G/eval/$m/pairs/pairs-w*.parquet' $T/$m/"; done
+    echo "gsutil -q cp $G/data/eval/evalsets.parquet $S/re/classify/g4-base-texts.parquet $T/"
+    echo "$FPY -I -u $CODE/g4arm.py texts --evalsets $T/evalsets.parquet $PAIRS --control $T/g4-base-texts.parquet --out $T/texts.parquet"
+    echo "gsutil -q cp $T/texts.parquet $NAT/texts.parquet"
+    echo "echo \"TEXTS: $NAT/texts.parquet\""
+  } > ~/job_body_g4a_texts_$TAG.sh
   detach "g4a_texts_$TAG" bash ~/job_body_g4a_texts_$TAG.sh
   ;;
 classify)
   only 0
   # run_arms.sh's stage, unchanged: the classifier of 10 Nov ($S/arms/naturalness/classifier/) on $NAT/texts.parquet,
   # to $NAT/predictions.parquet; its job is arms_classify_$TAG
-  NAT=$G/naturalness TAG=$TAG bash "$CODE/run_arms.sh" classify
+  NAT=$NAT TAG=$TAG bash "$CODE/run_arms.sh" classify
   ;;
 blind)
   only 0
@@ -375,45 +459,53 @@ blind)
   X=$G_SHM/blind-$TAG
   cat > ~/job_body_g4a_blind_$TAG.sh <<EOF
 set -euo pipefail
-mkdir -p $X/G4-1 $X/G4-0 $X/tg $X/out
+mkdir -p $X/$ARM $X/G4-0 $X/tg $X/out
 gsutil -q cp $S/blind/fixed-2026-11-10/blind100.jsonl $X/
-gsutil -m -q cp '$G/eval/G4-1/pairs/pairs-w*.parquet' $X/G4-1/
+gsutil -m -q cp '$G/eval/$ARM/pairs/pairs-w*.parquet' $X/$ARM/
 gsutil -m -q cp '$G/eval/G4-0/pairs/pairs-w*.parquet' $X/G4-0/
 gsutil -m -q cp '$S/arms/eval/base-x/pairs/pairs-w*.parquet' $X/tg/
-# G4-1 against its starting point G4-0 (rules (a2), (c)); against TranslateGemma 27B (reported); seeds
+# the arm against its starting point G4-0 (rules (a2), (c)); against TranslateGemma 27B (reported); seeds
 # en-nl-sft/blind/ab/<package>/<blind_id> (armeval.base_is_a), key apart
-$FPY -I -u $CODE/armeval.py blind --blind $X/blind100.jsonl --base '$X/G4-0/pairs-w*.parquet' --arm 'G4-1=$X/G4-1/pairs-w*.parquet' --out $X/out
-$FPY -I -u $CODE/armeval.py blind --blind $X/blind100.jsonl --base '$X/tg/pairs-w*.parquet' --arm 'G4-1-tg=$X/G4-1/pairs-w*.parquet' --out $X/out
-gsutil -m -q cp $X/out/G4-1/* $S/blind/G4-1/
-gsutil -m -q cp $X/out/G4-1-tg/* $S/blind/G4-1-tg/
-echo "BLIND: $S/blind/G4-1/ $S/blind/G4-1-tg/"
+$FPY -I -u $CODE/armeval.py blind --blind $X/blind100.jsonl --base '$X/G4-0/pairs-w*.parquet' --arm '$ARM=$X/$ARM/pairs-w*.parquet' --out $X/out
+$FPY -I -u $CODE/armeval.py blind --blind $X/blind100.jsonl --base '$X/tg/pairs-w*.parquet' --arm '$ARM-tg=$X/$ARM/pairs-w*.parquet' --out $X/out
+gsutil -m -q cp $X/out/$ARM/* $S/blind/$ARM/
+gsutil -m -q cp $X/out/$ARM-tg/* $S/blind/$ARM-tg/
+echo "BLIND: $S/blind/$ARM/ $S/blind/$ARM-tg/"
 EOF
   detach "g4a_blind_$TAG" bash ~/job_body_g4a_blind_$TAG.sh
   ;;
 report)
   only 0
   X=$G_SHM/report-$TAG
+  # G4-2: the direct measure from the held-out pairs of G4-2 and G4-0 and the training's evals (amendment G4-2.6)
+  HELD=""
+  [ "$ARM" = G4-2 ] && HELD="--heldout $X/heldout/evalsets.parquet --heldout-arm '$X/heldout/G4-2/pairs-w*.parquet' --heldout-base '$X/heldout/G4-0/pairs-w*.parquet'"
   cat > ~/job_body_g4a_report_$TAG.sh <<EOF
 set -euo pipefail
-mkdir -p $X/G4-1 $X/G4-0 $X/logs
-gsutil -m -q rsync -r -x 'translations/.*' $G/eval/G4-1 $X/G4-1
+mkdir -p $X/$ARM $X/G4-0 $X/logs $X/heldout/G4-2 $X/heldout/G4-0
+gsutil -m -q rsync -r -x 'translations/.*' $G/eval/$ARM $X/$ARM
 gsutil -m -q rsync -r -x 'translations/.*' $G/eval/G4-0 $X/G4-0
-gsutil -q cp $G/data/eval/evalsets.parquet $E/baseline-tg27b/scores.parquet $G/naturalness/predictions.parquet $X/
+gsutil -q cp $G/data/eval/evalsets.parquet $E/baseline-tg27b/scores.parquet $NAT/predictions.parquet $X/
 gsutil -q cp $S/arms/naturalness/classifier/results.json $X/classifier-results.json
 gsutil -q cp $G/$ARM/summary.json $X/train-summary.json
-gsutil -m -q cp '$G/logs/g4a_translate_G4-1_*' $X/logs/
+gsutil -m -q cp '$G/logs/g4a_translate_${ARM}_*' $X/logs/
+if [ "$ARM" = G4-2 ]; then
+  gsutil -q cp $H/evalsets.parquet $X/heldout/
+  gsutil -m -q cp '$G/heldout/G4-2/pairs/pairs-w*.parquet' $X/heldout/G4-2/
+  gsutil -m -q cp '$G/heldout/G4-0/pairs/pairs-w*.parquet' $X/heldout/G4-0/
+fi
 lora=""
 for f in $X/logs/*.log; do
   line=\$(grep -m1 '^LORA ' \$f | cut -c6- || true)
   [ -n "\$line" ] && { echo "\$line" > \$f.lora.json; lora="\$lora --lora-line \$f.lora.json"; }
 done
 TALLY=""
-if gsutil -q stat $G/report/tally.json; then gsutil -q cp $G/report/tally.json $X/; TALLY="--tally $X/tally.json"; fi
-$FPY -I -u $CODE/g4arm.py report --evalsets $X/evalsets.parquet --arm $X/G4-1 --base $X/G4-0 --tg-scores $X/scores.parquet \
+if gsutil -q stat $REP/tally.json; then gsutil -q cp $REP/tally.json $X/; TALLY="--tally $X/tally.json"; fi
+$FPY -I -u $CODE/g4arm.py report --arm-name $ARM --evalsets $X/evalsets.parquet --arm $X/$ARM --base $X/G4-0 --tg-scores $X/scores.parquet \
   --predictions $X/predictions.parquet --classifier-results $X/classifier-results.json --train-summary $X/train-summary.json \
-  \$lora \$TALLY --out $X/report.md
-gsutil -m -q cp $X/report.md $X/report.json $G/report/
-echo "REPORT_DONE $G/report/report.md"
+  \$lora \$TALLY $HELD --out $X/report.md
+gsutil -m -q cp $X/report.md $X/report.json $REP/
+echo "REPORT_DONE $REP/report.md"
 EOF
   detach "g4a_report_$TAG" bash ~/job_body_g4a_report_$TAG.sh
   ;;
@@ -439,6 +531,117 @@ gsutil -m -q cp $X/g4arm-smoke.md $X/g4arm-smoke.json $O/
 exit \$code
 EOF
   detach "g4a_smoke_report_$TAG" bash ~/job_body_g4a_smoke_report_$TAG.sh
+  ;;
+fetchval)
+  only 3
+  B=$G_SHM/btval-$TAG
+  cat > ~/job_body_g4a_fetchval_$TAG.sh <<EOF
+set -euo pipefail
+export HF_HUB_DISABLE_PROGRESS_BARS=1 HF_XET_CACHE=$SHM/xet-cache
+if gsutil -q stat $G/input/bt-val/revisions.json; then
+  echo "the BT validation is in $G/input/bt-val/ before"
+else
+  [ -s ~/.cache/huggingface/token ] || { echo "w$W: no ~/.cache/huggingface/token"; exit 1; }
+  $SFT_PY -u $CODE/g4arm.py fetch --split validation --out $B
+  rm -rf $B/*/.cache
+  gsutil -m -q rsync -r $B $G/input/bt-val
+fi
+echo "FETCHED: \$(gsutil cat $G/input/bt-val/revisions.json | tr -d '\n ' | cut -c1-400)"
+EOF
+  detach "g4a_fetchval_$TAG" nice -n 19 ionice -c3 bash ~/job_body_g4a_fetchval_$TAG.sh
+  ;;
+heldout)
+  only 3
+  ! gsutil -q stat "$H/manifest.json" || { echo "$H has a manifest.json: the held-out data stay as they are"; exit 1; }
+  [ -s "$TOK_SFT/tokenizer.json" ] || { echo "w$W: no tokenizer in $TOK_SFT (setup)"; exit 1; }
+  IN=$G_SHM/hin-$TAG
+  OUT=$G_SHM/heldout-$TAG
+  cat > ~/job_body_g4a_heldout_$TAG.sh <<EOF
+set -euo pipefail
+export OMP_NUM_THREADS=8 TOKENIZERS_PARALLELISM=true HF_HUB_OFFLINE=1 JAX_PLATFORMS=cpu
+mkdir -p $IN/g41 $IN/btval
+gsutil -m -q cp $G/data/G4-1/* $IN/g41/
+gsutil -m -q rsync -r $G/input/bt-val $IN/btval
+gsutil -q cp $G/data/report.json $IN/data-report.json
+gsutil -q cp $E/data/evalsets.parquet $S/blind/fixed-2026-11-10/blind100.jsonl $IN/
+$SFT_PY -u $CODE/g4arm.py heldout --g41 $IN/g41 --btval $IN/btval --data-report $IN/data-report.json \
+  --evalsets $IN/evalsets.parquet --blind $IN/blind100.jsonl --tokenizer $TOK_SFT --out $OUT
+gsutil -m -q cp $OUT/* $H/
+echo "HELDOUT_DONE: $H/"
+EOF
+  detach "g4a_heldout_$TAG" nice -n 19 ionice -c3 bash ~/job_body_g4a_heldout_$TAG.sh
+  ;;
+own)
+  only 0
+  ! gsutil -q stat "$H/eval-own.parquet" || { echo "$H has an eval-own.parquet: it stays as it is"; exit 1; }
+  X=$G_SHM/own-$TAG
+  cat > ~/job_body_g4a_own_$TAG.sh <<EOF
+set -euo pipefail
+export TOKENIZERS_PARALLELISM=true HF_HUB_OFFLINE=1 JAX_PLATFORMS=cpu
+mkdir -p $X/pairs
+gsutil -q cp $H/evalsets.parquet $X/
+gsutil -m -q cp '$G/heldout/G4-0/pairs/pairs-w*.parquet' $X/pairs/
+$SFT_PY -u $CODE/g4arm.py own --heldout $X/evalsets.parquet --pairs '$X/pairs/pairs-w*.parquet' --tokenizer $TOK_SFT --out $X/eval-own.parquet
+gsutil -q cp $X/eval-own.parquet $X/eval-own.json $H/
+echo "OWN_DONE: $H/eval-own.parquet"
+EOF
+  detach "g4a_own_$TAG" nice -n 19 ionice -c3 bash ~/job_body_g4a_own_$TAG.sh
+  ;;
+smoke2-report)
+  only 0
+  [ "$ARM" = G4-2 ] || { echo "smoke2-report is G4-2's"; exit 1; }
+  X=$G_SHM/smoke2-$TAG
+  O=$G/smoke2/$TAG
+  cat > ~/job_body_g4a_smoke2_report_$TAG.sh <<EOF
+set -euo pipefail
+mkdir -p $X
+gsutil -q cp $G/runs/$SMOKE_RUN/summary.json $G/runs/$SMOKE_RUN/adapter.json $X/
+$FPY -I -u $CODE/g4arm.py smoke2 --summary $X/summary.json --adapter $X/adapter.json --out $X/g4arm2-smoke.md && code=0 || code=\$?
+gsutil -m -q cp $X/g4arm2-smoke.md $X/g4arm2-smoke.json $O/
+exit \$code
+EOF
+  detach "g4a_smoke2_report_$TAG" bash ~/job_body_g4a_smoke2_report_$TAG.sh
+  ;;
+replay)
+  only 3
+  ! gsutil -q stat "$G/data/replay/replay.parquet" || { echo "$G/data/replay has a replay.parquet: it stays as it is"; exit 1; }
+  X=$G_SHM/replay-$TAG
+  cat > ~/job_body_g4a_replay_$TAG.sh <<EOF
+set -euo pipefail
+mkdir -p $X/plan2 $X/shards $X/nl $X/report
+gsutil -m -q cp $FNL/plan2/examples.parquet $FNL/plan2/plan.json '$FNL/plan2/segments-w*.parquet' $X/plan2/
+gsutil -m -q rsync -r $FNL/translations/g4 $X/shards
+gsutil -m -q cp '$FNL/nl-g4/w*.parquet' $X/nl/
+gsutil -q cp $FNL/g4-full/report/measures.parquet $FNL/g4-full/report/setup.json $X/report/
+$SFT_PY -u $CODE/g4arm.py replay --plan $X/plan2 --shards $X/shards --measures $X/report/measures.parquet --nl $X/nl \
+  --setup $X/report/setup.json --out $X/replay.parquet --uri plan=$FNL/plan2 --uri shards=$FNL/translations/g4 \
+  --uri measures=$FNL/g4-full/report/measures.parquet --uri nl=$FNL/nl-g4 --uri setup=$FNL/g4-full/report/setup.json
+gsutil -m -q cp $X/replay.parquet $X/replay.json $G/data/replay/
+echo "REPLAY_DONE: $G/data/replay/"
+EOF
+  detach "g4a_replay_$TAG" nice -n 19 ionice -c3 bash ~/job_body_g4a_replay_$TAG.sh
+  ;;
+build2)
+  only 3
+  ! gsutil -q stat "$G/data/G4-2/manifest.json" || { echo "$G/data/G4-2 has a manifest.json: the set stays as it is"; exit 1; }
+  [ -s "$TOK_SFT/tokenizer.json" ] || { echo "w$W: no tokenizer in $TOK_SFT (setup)"; exit 1; }
+  IN=$G_SHM/in2-$TAG
+  OUT=$G_SHM/data2-$TAG
+  cat > ~/job_body_g4a_build2_$TAG.sh <<EOF
+set -euo pipefail
+export OMP_NUM_THREADS=8 TOKENIZERS_PARALLELISM=true HF_HUB_OFFLINE=1 JAX_PLATFORMS=cpu
+mkdir -p $IN/g41
+gsutil -m -q cp $G/data/G4-1/* $IN/g41/
+gsutil -q cp $H/books.json $G/data/replay/replay.parquet $IN/
+gsutil -q cp $E/data/evalsets.parquet $S/blind/fixed-2026-11-10/blind100.jsonl $R/mainset/flan-eval/eval-rows.parquet $IN/
+$SFT_PY -u $CODE/g4arm.py build2 --base-set $IN/g41 --heldout-books $IN/books.json --replay $IN/replay.parquet \
+  --flan-eval $IN/eval-rows.parquet --evalsets $IN/evalsets.parquet --blind $IN/blind100.jsonl --tokenizer $TOK_SFT --out $OUT
+gsutil -m -q cp $OUT/G4-2/* $G/data/G4-2/
+gsutil -q cp $OUT/report.json $G/data/report-G4-2.json
+gsutil -q cp $OUT/report.md $G/data/report-G4-2.md
+echo "BUILT2: $G/data/G4-2/"
+EOF
+  detach "g4a_build2_$TAG" nice -n 19 ionice -c3 bash ~/job_body_g4a_build2_$TAG.sh
   ;;
 *)
   echo "unknown stage $STAGE"

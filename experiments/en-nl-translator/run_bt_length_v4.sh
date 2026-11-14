@@ -29,7 +29,7 @@
 # The code is beside this script (a copy of $O/scripts/, stage.sh). TAG names the jobs of one chain.
 set -euo pipefail
 STAGE=${1:?a stage: setup, mxdl, data, smoke, translate, collect, metricx, report}
-SHM=/dev/shm/translate-generic
+SHM=${SHM:-/dev/shm/translate-generic}   # another root only for a dry run on a CPU host
 C=$(cd "$(dirname "$0")" && pwd)
 D=${D:-$SHM/bt-length}
 FORK_COMMIT=${FORK_COMMIT:-}

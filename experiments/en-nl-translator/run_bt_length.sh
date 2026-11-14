@@ -20,7 +20,10 @@
 set -euo pipefail
 # systemd-logind (RemoveIPC=yes) deletes a user's files in /dev/shm when the user's last session ends (9 Nov)
 sudo -n loginctl enable-linger "$(id -un)"
-SHM=/dev/shm/translate-generic
+# SHM, VFIO and IOMMU: other roots only for a dry run on a CPU host (fake chips and buckets)
+SHM=${SHM:-/dev/shm/translate-generic}
+VFIO=${VFIO:-/dev/vfio}
+IOMMU=${IOMMU:-/sys/kernel/iommu_groups}
 C=$SHM/code-len
 D=${D:-$SHM/bt-length}
 # FORK_COMMIT: another commit of the fork in venv-fork-<first 9> (setup_generic.sh); unset: venv-fork as before
@@ -49,7 +52,7 @@ mkdir -p ~/logs "$D"
 
 half() {  # as run_bt_natural.sh: the 4 chips behind the first (0) or second (1) PCI root as a TPU of their own
   local chips port
-  chips=$(for g in /dev/vfio/[0-9]*; do n=${g##*/}; dev=$(ls "/sys/kernel/iommu_groups/$n/devices"); echo "${dev%:*} $n"; done \
+  chips=$(for g in "$VFIO"/[0-9]*; do n=${g##*/}; dev=$(ls "$IOMMU/$n/devices"); echo "${dev%:*} $n"; done \
     | LC_ALL=C sort -k1,1 -k2,2n | awk -v h="$1" '$1 != root {k++; root = $1} k == h + 1 {printf "%s%s", sep, $2; sep = ","}')
   [ "$(echo "$chips" | tr , '\n' | grep -c .)" = 4 ] || { echo "half $1: vfio groups '$chips', not 4 behind one PCI root"; exit 2; }
   echo "half $1: TPU_VISIBLE_CHIPS=$chips"

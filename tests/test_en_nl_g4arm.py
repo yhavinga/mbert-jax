@@ -366,3 +366,32 @@ def test_report_reads_the_chains_outputs_and_decides_a1_and_b(tmp_path, monkeypa
     args.tally = str(tmp_path / "tally.json")
     g4arm.report(args)
     assert json.loads(out.with_suffix(".json").read_text())["verdict"] == "helpt niet"
+
+
+def test_texts_takes_wmt_960_and_flan_of_both_models_and_renames_the_controls(tmp_path, monkeypatch):
+    monkeypatch.setattr(g4arm, "N_WMT_GOOD", 2)
+    monkeypatch.setattr(g4arm, "N_FLAN", 1)
+    evalsets = [{"id": "w0", "set": "wmt24pp", "meta": "{}"}, {"id": "w1", "set": "wmt24pp", "meta": "{}"},
+                {"id": "wbad", "set": "wmt24pp", "meta": json.dumps({"is_bad_source": True})},
+                {"id": "f0", "set": "flan", "meta": "{}"}, {"id": "b0", "set": "blind", "meta": "{}"}]
+    write(evalsets, tmp_path / "evalsets.parquet")
+    for name in ("G4-1", "G4-0"):
+        write([{"id": r["id"], "set": r["set"], "hypothesis": f"{name} {r['id']}"} for r in evalsets],
+              tmp_path / name / "pairs-w0.parquet")
+    control = [{"model": m, "set": s, "id": i, "text": "t"} for m in ("base", "G4")
+               for s, i in (("wmt24pp", "w0"), ("wmt24pp", "w1"), ("flan", "f0"))]
+    write(control, tmp_path / "control.parquet")
+    args = type("Args", (), {"evalsets": str(tmp_path / "evalsets.parquet"), "control": str(tmp_path / "control.parquet"),
+                             "pairs": [f"G4-1={tmp_path}/G4-1/pairs-w*.parquet", f"G4-0={tmp_path}/G4-0/pairs-w*.parquet"],
+                             "out": str(tmp_path / "texts.parquet")})()
+    g4arm.texts(args)
+    rows = pq.read_table(tmp_path / "texts.parquet").to_pylist()
+    by = {}
+    for r in rows:
+        by.setdefault(r["model"], []).append((r["set"], r["id"]))
+    assert sorted(by) == ["G4-0", "G4-1", "G4-v6e", "TG"]
+    assert sorted(by["G4-1"]) == [("flan", "f0"), ("wmt24pp", "w0"), ("wmt24pp", "w1")]
+    assert {r["text"] for r in rows if r["model"] == "G4-1"} == {"G4-1 w0", "G4-1 w1", "G4-1 f0"}
+    write(control[:-1], tmp_path / "control.parquet")
+    with pytest.raises(SystemExit, match="control texts"):
+        g4arm.texts(args)

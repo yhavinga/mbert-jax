@@ -118,12 +118,12 @@ def sha256_file(path):
     return h.hexdigest()
 
 
-def write_parquet(rows, path, schema=None):
+def write_parquet(rows, path, schema=None, row_group_size=None):
     import pyarrow as pa
     import pyarrow.parquet as pq
 
     Path(path).parent.mkdir(parents=True, exist_ok=True)
-    pq.write_table(pa.Table.from_pylist(rows, schema=schema), path, compression="zstd")
+    pq.write_table(pa.Table.from_pylist(rows, schema=schema), path, compression="zstd", row_group_size=row_group_size)
 
 
 def read_rows(path, columns=None):
@@ -2123,6 +2123,11 @@ B1_COLUMNS = ["id", "book", "nl_book_id", "en_book_id", "group", "author", "en",
 # (lower case) are equal on the English or on the Dutch side, at least SAME_WORK_MIN_SHARED between the two books
 SAME_WORK_CHARS = 80
 SAME_WORK_MIN_SHARED = 10
+# rows per parquet row group of G4-4's files: pyarrow's default (1,048,576) put more than 2 GiB of nested text in one
+# row group of train.parquet, which pyarrow 25 cannot read as one batch ("Nested data conversions not implemented for
+# chunked array outputs"; check of 15 Nov); datasets 4.8.5 reads a parquet file in batches of its first row group and
+# counts a file as one shard whatever its row groups, so the order every process reads is unchanged
+ROW_GROUP4 = 100_000
 
 
 def read_b1(path):
@@ -2442,8 +2447,9 @@ def build4(args, counter=None):
     rows_out = [(x, {**m, "epoch": e}) for e, one in enumerate(passes, 1) for x, m in one]
     d = out / ARM4
     meta_schema = pa.schema([(n, getattr(pa, "bool_" if t == "bool" else t)()) for n, t in META_SCHEMA3_FIELDS])
-    write_parquet([x for x, _ in rows_out], d / "train.parquet")
-    write_parquet([{n: m.get(n) for n in meta_schema.names} for _, m in rows_out], d / "train-meta.parquet", meta_schema)
+    write_parquet([x for x, _ in rows_out], d / "train.parquet", row_group_size=ROW_GROUP4)
+    write_parquet([{n: m.get(n) for n in meta_schema.names} for _, m in rows_out], d / "train-meta.parquet", meta_schema,
+                  row_group_size=ROW_GROUP4)
     (d / "template.jinja").write_text(g4lora.TEMPLATE, encoding="utf-8")
     lengths = [m["tokens_prompt"] + m["tokens_target"] for _, m in rows_out]
     if max(lengths) > SEQ3:
@@ -2483,9 +2489,9 @@ def build4(args, counter=None):
     smoke_rows = [(x, {**m, "epoch": 1}) for x, m in longest +
                   random.Random(f"{SEED4}/smoke").sample(others, min(SMOKE3_RANDOM, len(others)))]
     ds = out / f"{ARM4}-smoke"
-    write_parquet([x for x, _ in smoke_rows], ds / "train.parquet")
+    write_parquet([x for x, _ in smoke_rows], ds / "train.parquet", row_group_size=ROW_GROUP4)
     write_parquet([{n: m.get(n) for n in meta_schema.names} for _, m in smoke_rows], ds / "train-meta.parquet",
-                  meta_schema)
+                  meta_schema, row_group_size=ROW_GROUP4)
     (ds / "template.jinja").write_text(g4lora.TEMPLATE, encoding="utf-8")
     smoke_lengths = [m["tokens_prompt"] + m["tokens_target"] for _, m in smoke_rows]
     smoke_batches = pack_batches(smoke_lengths)

@@ -155,6 +155,22 @@ def test_build4_is_g4_3_per_pass_plus_novels_apart_and_10_percent_replay(world4)
     assert "# Trainingsset G4-4" in text_md and "Verschillende romanparen over de drie doorgangen: 207" in text_md
 
 
+def test_build4_writes_row_groups_of_at_most_row_group4_rows(world4, monkeypatch):
+    monkeypatch.setattr(g4arm, "ROW_GROUP4", 700)
+    out = run_build4(world4)
+    for name in ("train.parquet", "train-meta.parquet"):
+        f = pq.ParquetFile(out / "G4-4" / name)
+        sizes = [f.metadata.row_group(k).num_rows for k in range(f.metadata.num_row_groups)]
+        assert len(sizes) > 1 and max(sizes) <= 700 and sum(sizes) == f.metadata.num_rows
+    # the rows in the file's order, as datasets reads them batch by batch
+    import pyarrow.dataset as pads
+
+    with open(out / "G4-4" / "train.parquet", "rb") as f:
+        frag = pads.ParquetFileFormat().make_fragment(f)
+        batched = [r for b in frag.to_batches(batch_size=frag.row_groups[0].num_rows) for r in b.to_pylist()]
+    assert batched == pq.read_table(out / "G4-4" / "train.parquet").to_pylist()
+
+
 def test_build4_is_the_same_twice(world4):
     a = run_build4(world4)
     first = sha(a / "G4-4" / "train.parquet"), sha(a / "G4-4" / "train-meta.parquet")

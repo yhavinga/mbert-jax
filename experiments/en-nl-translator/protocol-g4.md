@@ -555,3 +555,102 @@ is het bestand van G4-2. De classifier draait opnieuw in één run over G4-3, G4
 `$G/heldout/G4-3/`, lange rijen `$G/long/{G4-3,G4-0}/`, classifier `$G/naturalness-G4-3/`, blind `$S/blind/G4-3/` en
 `$S/blind/G4-3-tg/`, verslag `$G/report-G4-3/report.md` (kopie `mbert-ops/translator-sft/g4-3-report.md`), stappen in
 `$G/stages/g4-3/`. Keten `mbert-ops/scripts/g4arm3_run.sh` op mbert-corpus.
+
+**Amendement 15 nov 2026 (tijdstip: de commit van deze sectie op branch `en-nl-g4arm4`): arm G4-4** [besluit van Yeb
+15 nov ~13:45; uitwerking door een subagent, labels als in de kop]. Vastgelegd vóór de bouw van de set van G4-4, vóór
+de eerste trainingsstap en vóór elke uitslag van G4-4; ook vóór de uitslag van G4-3 (die traint nog). Waar deze sectie
+niets zegt, gelden §1–§8 en de amendementen G4-2 en G4-3 voor G4-4 met "G4-4" in plaats van "G4-3".
+
+*G4-4.1 Aanleiding.* Yeb besliste een arm G4-4: precies de mix van G4-3 plus Engelse originelen met hun menselijke
+Nederlandse vertaling (populaire fictie, de groep "Engels origineel → menselijk Nederlands" van het `-b1-`-deel van
+`yhavinga/nedd_x_dataset`), elke doorgang andere romanparen; de keten start direct na G4-3 [besluit]. Bij TranslateGemma
+tilde zo'n romandeel arm RE over de grens van (b) (R2 plus 29.394 romanparen: "origineel" 31,7%, +0,126 tegen het
+basismodel; `mbert-ops/translator-sft/re-report.md`) [gemeten, daar].
+
+*G4-4.2 Bron.*
+- **De set van G4-3** (`$G/data/G4-3/`, amendement G4-3.3) zoals hij is, met zijn verslag `$G/data/report-G4-3.json`
+  en zijn replaypool `$G/data/replay-G4-3/replay.parquet`. `build4` legt de sha256 van `train.parquet` en
+  `train-meta.parquet` vast en eist: de manifest van G4-3 (set, sequentielengte, seed, drie doorgangen), per doorgang
+  de voorbeelden en tokens per soort van `report-G4-3.json`, de doorgangen op volgorde, elk voorbeeld buiten de replay
+  in elke doorgang hetzelfde, geen replayrij in twee doorgangen, en dezelfde evaluatie-, blinde en replaybestanden
+  (sha256 uit de manifest van G4-3).
+- **De romans**: `$S/data/books-b1/b1-selected.parquet` (inventaris van 12 nov, `mbert-ops/translator-sft/books-b1-inventory.md`;
+  `yhavinga/nedd_x_dataset` @ `708f34de8ec1ff4172f22b30e5890a5ee01d2ca7`), groep `en_orig` (1.628.217 rijen, 3.046
+  Engelse boeken) [besluit: deze groep]. `build4` legt de sha256 vast. De data zijn romans onder auteursrecht; de set
+  blijft privé.
+
+*G4-4.3 Data per doorgang* [besluit Yeb; uitwerking `g4arm.py build4`, set `$G/data/G4-4/`].
+1. **De delen van G4-3 blijven gelijk** [besluit]: doorgang k van G4-4 bevat alle rijen van doorgang k van G4-3 (BT
+   ≤ 512 en BT lang, elke doorgang dezelfde; de 11.760 boekparen; de replayrijen van G4-3 in die doorgang), byte voor
+   byte dezelfde voorbeelden.
+2. **Romanparen** [besluit: "dezelfde controles, zonder QE, zoals RL"]: de rijcontroles van arm RE (mbert-jax
+   `en-nl-sft-re` @ `97c44b6`, `sft_build.py`: `b1_fails`), letterlijk overgenomen: `passes` van de inventaris
+   (`real_fails`, zijn lengtegrens en uitlijncontrole, geen herhaald id of Engels), geen herhaald Nederlands, geen
+   Markdown-spoor, niet aan één kant schoongemaakt; geen QE-grens. **Eén editie per boek** [besluit]: van een Engels boek
+   met meer Nederlandse edities de editie met de meeste rijen die de controles halen, bij gelijkstand het laagste
+   Nederlandse id (RE's `b1_editions`). Daarbij twee keuzes voor hetzelfde boek onder een ander id [keuze]:
+   (i) **één Engels id per werk**: twee Engelse boek-id's met ten minste 10 gelijke passagebegins (de eerste 80 letters
+   en cijfers, kleine letters, van het Engels of van het Nederlands, over alle `en_orig`-rijen zonder herhaald id) zijn
+   één werk; het id met de meeste rijen na de controles blijft, bij gelijkstand het laagste. Gemeten op 15 nov (deze
+   bron, vóór de bouw): 19 paren id's met ≥ 10 gelijke Engelse begins, bv. Larry Niven `92870`/`127882` met 525, Ken
+   Follett `101895`/`128985` met 393; daaronder 1–9 (voorpublicaties en bundels) [gemeten, verkenning op mbert-corpus
+   w1]. (ii) **Bijna-dubbele passages**: een rij waarvan het Engelse of Nederlandse begin (zelfde sleutel) al bij een
+   eerdere rij hoort (boeken op id, rijen op id; ander boek of hetzelfde) gaat eruit; de inventaris haalde alleen
+   exacte herhalingen weg. Verder, zoals G4-3.3 punt 1: geen 13-gram met een evaluatieset of blinde passage; en de
+   tokengrens van RE: prompt plus antwoord ≤ 2.048 tokens (natural-v1 in Gemma 4's template).
+3. **Per doorgang hoogstens 20 paren per boek, over drie doorgangen verschillende paren, tot 60 per boek** [besluit].
+   Per Engels boek de rijen op id, geschud met seed `en-nl-g4arm/0/G4-4/novels/<Engels boek-id>`; daarvan de eerste 60
+   die de 13-gram- en tokengrens halen; het r-de (vanaf 0) gaat naar doorgang ⌊r / 20⌋ + 1. Een boek met minder paren
+   levert wat het heeft, aan de eerste doorgangen eerst [besluit: "levert wat het heeft"; de volgorde is een keuze].
+   Gemeten vóór de 13-gram-, token- en bijna-dubbelgrens: 2.953 boeken, 58.646 / 57.882 / 56.899 paren per doorgang
+   (doorgang 1 is RE's trekking met K = 20 in aantal) [gemeten, verkenning].
+4. **FLAN-replay: 10% van elke doorgang, berekend over het totaal zoals G4-3** [besluit; uitwerking keuze]: replay_k =
+   round(n_k / 9), met n_k = BT + boeken + romanparen van doorgang k (de regel `replay_count` van G4-3.3 punt 3, per
+   doorgang, omdat de romanparen per doorgang verschillen). De 28.831 replayrijen van G4-3 in doorgang k blijven; wat
+   erbij moet, komt uit G4-3's pool in G4-3's volgorde (seed `en-nl-g4arm/0/G4-3/replay`): de rijen na de 3 × 28.831
+   van G4-3, achter elkaar, eerst voor doorgang 1, dan 2, dan 3. `build4` maakt G4-3's trekking opnieuw en eist dat
+   die precies G4-3's replayrijen per doorgang geeft. Geen replayrij in twee doorgangen; is de pool te klein, dan
+   stopt `build4` (geen herhaling) [keuze].
+5. **Drie doorgangen, elk opnieuw geschud** (seeds `en-nl-g4arm/0/G4-4/shuffle/<1|2|3>`), achter elkaar in
+   `train.parquet` [besluit: "elk apart geschud"].
+6. **Sequentielengte 4.096** zoals G4-3.3 punt 5; packing, `per_device_batch_size=1`, 16 sequenties per stap, de
+   batches per proces nagerekend zoals MaxText 0.2.5 ze maakt, en daaruit de stappen. De romanparen blijven onder 2.048
+   tokens; het langste voorbeeld is dat van G4-3 (3.972 tokens) [gevolgtrekking uit punt 2].
+7. `check --arm G4-4` = G4-3.3 punt 6 (MaxText's eigen SFT-stappen op elk voorbeeld, één keer per id).
+
+*G4-4.4 Training.* Als G4-3.4: rank 32 / alpha 16 op de 410 modules, AdamW, clipping 1,0, `num_vocab_tiling=8`,
+MaxText 0.2.5, één multi-host-job over de 16 chips van mbert-corpus; **LR 1e-5, WSD** (warmup 3%, constant, de laatste
+10% lineair naar 1e-6); `max_target_length` 4.096; evaluatie op stap 0, elke 750 stappen en na de laatste, op `books`,
+`btval`, `own` en `btlong` [besluit: "LR 1e-5 met WSD zoals G4-3, LoRA zoals G4-3"]. **Drie doorgangen** [besluit].
+Run `g4arm_G4-4`. [schatting vóór de bouw: ~590 M tokens, ~9.400 stappen, ~29 uur.]
+
+*G4-4.5 Smoke-test en schatting* (op mbert-corpus, binnen `final_run.lock`, vóór de volle training). Als G4-3.5 op de
+smoke-set van G4-4 (de 256 langste voorbeelden van doorgang 1, dan 512 andere, seed `en-nl-g4arm/0/G4-4/smoke`), run
+`g4arm_G4-4_s8`, met dezelfde controles (o.a. piek ≤ 29,5 GiB per chip, elke stap 16 van de langste voorbeelden, de
+batches per proces van de pipeline gelijk aan de naberekening, de vier held-out sets, het verlies op `own` op stap 0
+≤ 1,0). Faalt een controle, dan stopt de keten vóór de training. Schatting van drie doorgangen zoals G4-3.5. **Is die
+schatting boven 120 uur, dan stopt de keten vóór de training** en beslist de hoofdsessie [keuze: de regel "dan twee
+doorgangen" was Yebs regel voor G4-3; voor G4-4 besliste hij drie doorgangen].
+
+*G4-4.6 De lange validation-rijen*: als G4-3.6 (rapporteren, beslist niet). G4-4 vertaalt ze; G4-0's vertalingen zijn
+die uit de keten van G4-3 (`$G/long/G4-0/`).
+
+*G4-4.7 Evaluatie en beslisregel* (§4, §5): ongewijzigd, als G4-3.7, met G4-4 als arm en **G4-0 als uitgangspunt**:
+(a1) QE ≤ de mens (2,3917784375 / 1,4938481225 / 1,8419510766), (a2) fouten(G4-4) ≤ fouten(G4-0), (b) "origineel"(G4-4)
+− "origineel"(G4-0) ≥ 0,10 op WMT24++ (960) + FLAN (1.000), (c) ≥ 60% van de niet-gelijke oordelen; de blinde
+beoordeling alleen als (a1) en (b) gelden, door de hoofdsessie (een verse Claude-subagent); pakket G4-4 tegen G4-0 in
+`$S/blind/G4-4/` (seed `en-nl-sft/blind/ab/G4-4/<blind_id>`) en tegen TG in `$S/blind/G4-4-tg/`. G4-0 = de vertalingen
+en scores van G4-3.7. De classifier draait opnieuw in één run over G4-4, G4-0 en G4-3.
+**Daarnaast G4-3, op dezelfde maten, alleen rapporteren** [besluit]: MetricX-QE per set (de getallen van (a1)),
+MetricX-ref, COMET-22, de lengte en niet af / lus / Engels over / leeg per set, het aandeel "origineel" uit dezelfde
+classify-run en het verschil G4-4 − G4-3, chrF op de held-out sets en de lange validation-rijen, het verlies op de
+held-out sets na de laatste stap van beide trainingen, en de blinde uitslag van G4-3 tegen G4-0 als die er is. Dit
+beslist niets. De uitvoer van G4-3 komt uit zijn keten (`$G/eval/G4-3/`, `$G/heldout/G4-3/`, `$G/long/G4-3/`,
+`$G/G4-3/summary.json`); daarom start de keten van G4-4 pas als die van G4-3 op `DONE` eindigde.
+
+*G4-4.8 Uitvoer.* Set `$G/data/G4-4/`, smoke-set `$G/data/G4-4-smoke/`, verslag `$G/data/report-G4-4.md`, check
+`$G/data/check-G4-4.txt`; smoke `$G/smoke4/<tag>/`; run `$G/runs/g4arm_G4-4/`, adapter `$G/G4-4/`, vertalingen en
+scores `$G/eval/G4-4/`, held-out `$G/heldout/G4-4/`, lange rijen `$G/long/G4-4/`, classifier `$G/naturalness-G4-4/`,
+blind `$S/blind/G4-4/` en `$S/blind/G4-4-tg/`, verslag `$G/report-G4-4/report.md` (kopie
+`mbert-ops/translator-sft/g4-4-report.md`), stappen in `$G/stages/g4-4/`. Keten `mbert-ops/scripts/g4arm4_run.sh` op
+mbert-corpus, na de keten van G4-3 (`final_run.lock`).

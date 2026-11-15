@@ -288,6 +288,34 @@ models:
     # xxlong (merge with en-nl-translator, never run for Gemma 4): 20 x 2048 slot-tokens, as many as xlong's 28 x 1472
     slots: {tiny: 192, small: 80, medium: 52, long: 36, xlong: 28, xxlong: 20}
 
+  # Arm G4-3's long validation rows (experiments/en-nl-translator/protocol-g4.md §9, amendment G4-3.6): passages of
+  # more than 512 Dutch tokens, each translated whole from English into Dutch with natural-v1, on the fork @ f4d8615
+  # (decode limits above 1,024 need its fix of the shared decode-cache index). A class takes the English up to
+  # max_source, the prefill 128 above it (natural-v1 adds 89 tokens around the English); the decode limit holds 1.25 x
+  # the most original Dutch tokens a row of the class may have (g4arm.heldout3 leaves out a row whose Dutch is longer
+  # than 0.8 x the limit). Slots: at most ~34k slot-tokens, fewer than the length trial's d1k (16 x 2,432 = 38,912,
+  # 28.75 GiB per v4 chip on 13 Nov).
+  gemma4-31b-long:
+    maxtext_model: gemma4-31b
+    hf_repo: google/gemma-4-31B-it
+    checkpoints:
+      europe-west4: gs://t5-dutch-english/mbert/translator/judge/gemma-4-31b-it-maxtext/0/items
+      us-east1: gs://t5-dutch-english-use1/mbert/translator/judge/gemma-4-31b-it-maxtext/0/items
+      us-central2: gs://t5-dutch-english-usc2/mbert/translator/judge/gemma-4-31b-it-maxtext/0/items
+    chips: 4
+    eos_ids: [1, 106, 50]
+    prompt: natural-v1
+    context_prompt: chat-v1
+    turn: {prefix: "<bos><|turn>user\n", suffix: "<turn|>\n<|turn>model\n<|channel>thought\n<channel|>", check: true}
+    length_classes:
+      e512: {max_source: 512, prefill_lengths: [640], max_decode: 1024}
+      e768: {max_source: 768, prefill_lengths: [896], max_decode: 1536}
+      e1k: {max_source: 1024, prefill_lengths: [1152], max_decode: 2048}
+      e1280: {max_source: 1280, prefill_lengths: [1408], max_decode: 2560}
+      e1536: {max_source: 1536, prefill_lengths: [1664], max_decode: 2560}
+      e2k: {max_source: 2048, prefill_lengths: [2176], max_decode: 2560}
+    slots: {e512: 20, e768: 14, e1k: 10, e1280: 8, e1536: 8, e2k: 6}
+
   # The smaller Gemma 4 instruction models (Yeb, 13 Nov: "the same trial for the smaller Gemma 4 models"), with the
   # 31B's prompt, classes and stop tokens; run_g4_sizes.sh, converted per region by g4_sizes.py convert from the pinned
   # revision. Tensor parallelism cannot exceed a layer's KV heads (MaxText refuses it), so one process takes as many

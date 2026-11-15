@@ -26,6 +26,15 @@ Arm G4-2 (protocol-g4.md §9, amendment G4-2):
   replay    the replay candidates from the Gemma 4 FLAN-nl after its post step (segments of kept examples, measures)
   build2    G4-2's set: G4-1's examples without the held-out books, the FLAN replay, three shuffled passes
   smoke2    the verdict of G4-2's smoke test (8 steps with the held-out evals; the own-output loss at step 0)
+Arm G4-3 (protocol-g4.md §9, amendment G4-3):
+  fetch --arm G4-3 [--split validation]   the five datasets at their revisions with the long rows (BT_REPOS3)
+  heldout3  the long validation rows (more than 512 Dutch tokens) as evaluation segments of gemma4-31b-long and as an
+            eval file; G4-2's held-out BT validation checked against the new revisions
+  replay --pool N --pool-seed S   a larger replay pool, so that every pass gets replay rows of its own
+  build3    G4-3's set: every BT train row without hard_fails (up to 2,048 Dutch tokens), the books of G4-2, 10% FLAN
+            replay apart per pass, three shuffled passes; the batches of MaxText's packing per process, the smoke set
+  check --arm G4-3   MaxText's own SFT steps on every distinct example, in processes
+  smoke3    the verdict of G4-3's smoke test and the estimate of the full training's time (bound: 3 days)
 """
 
 import argparse
@@ -129,12 +138,14 @@ def quantiles(values, qs=(5, 10, 25, 50, 75, 90, 95)):
 # ---------------------------------------------------------------------------------------------------- fetch
 
 def fetch(args):
-    from huggingface_hub import snapshot_download
+    from huggingface_hub import HfApi, snapshot_download
 
     out = Path(args.out)
     split = getattr(args, "split", "train")
+    arm = getattr(args, "arm", None) or ARM
+    repos = BT_REPOS3 if arm == ARM3 else BT_REPOS
     info = {}
-    for source, (repo, revision) in BT_REPOS.items():
+    for source, (repo, revision) in repos.items():
         d = out / source
         snapshot_download(repo, repo_type="dataset", revision=revision, local_dir=str(d),
                           allow_patterns=[f"data/{split}-*.parquet", "README.md"])
@@ -143,6 +154,14 @@ def fetch(args):
             raise SystemExit(f"{repo}@{revision}: no data/{split}-*.parquet")
         info[source] = {"repo": repo, "revision": revision,
                         "files": {f.name: sha256_file(f) for f in files}}
+        if arm == ARM3:
+            # every file as the Hub's LFS record of that revision has it, and no file of the split left out
+            lfs = {Path(x.rfilename).name: x.lfs.sha256 for x in HfApi().dataset_info(
+                repo, revision=revision, files_metadata=True).siblings
+                   if x.rfilename.startswith(f"data/{split}-") and x.lfs}
+            if lfs != info[source]["files"]:
+                raise SystemExit(f"{repo}@{revision}: the files of {split} differ from the Hub's LFS sha256: "
+                                 f"{sorted(lfs)} against {sorted(info[source]['files'])}")
         print(f"FETCH {source} {repo}@{revision[:9]}: {len(files)} files", flush=True)
     (out / "revisions.json").write_text(json.dumps(info, indent=1) + "\n")
 
@@ -160,9 +179,9 @@ def crawl_key(value):
     return int(m.group(1)), int(m.group(2))
 
 
-def read_bt(directory, revisions, split="train"):
-    """The rows of a split of the five datasets as {pid, source, nl, en, hard_fails, chrf, model, dump}; every file's
-    sha256 must be the one fetch recorded"""
+def read_bt(directory, revisions, split="train", extra=()):
+    """The rows of a split of the five datasets as {pid, source, nl, en, hard_fails, chrf, model, dump} and the extra
+    columns; every file's sha256 must be the one fetch recorded"""
     import pyarrow.parquet as pq
 
     rows = []
@@ -176,14 +195,14 @@ def read_bt(directory, revisions, split="train"):
             if sha256_file(f) != want[f.name]:
                 raise SystemExit(f"{f}: sha256 differs from revisions.json")
             names = pq.read_schema(f).names
-            columns = BT_COLUMNS + (["dump"] if source == "fineweb" else [])
+            columns = BT_COLUMNS + (["dump"] if source == "fineweb" else []) + list(extra)
             missing = [c for c in columns if c not in names]
             if missing:
                 raise SystemExit(f"{f}: no column(s) {missing}")
             for r in pq.read_table(f, columns=columns).to_pylist():
                 rows.append({"pid": r["id"], "source": source, "nl": r["nl"], "en": r["en"],
                              "hard_fails": list(r["hard_fails"] or []), "chrf": r["chrf"], "model": r["model"],
-                             "dump": r.get("dump")})
+                             "dump": r.get("dump"), **{c: r[c] for c in extra}})
     ids = [r["pid"] for r in rows]
     if len(set(ids)) != len(ids):
         raise SystemExit("duplicate ids among the back-translation rows")
@@ -526,6 +545,8 @@ def report_md(r):
 
 
 def check(args):
+    if getattr(args, "arm", None) == ARM3:
+        return check3(args)
     d = Path(args.data)
     msgs = [x["messages"] for x in read_rows(d / "train.parquet")]
     metas = read_rows(d / "train-meta.parquet", ["id", "en", "tokens_prompt", "tokens_target"])
@@ -796,14 +817,24 @@ def report(args):
     if getattr(args, "heldout", None):
         t = json.loads(Path(args.train_summary).read_text()) if args.train_summary else {}
 
-        def pairs_of(pattern):
+        def many(value):
+            return [value] if isinstance(value, str) else list(value)
+
+        def pairs_of(patterns):
             rows = {}
-            for f in sorted(glob.glob(pattern)):
-                rows.update((r["id"], r) for r in read_rows(f))
+            for pattern in many(patterns):
+                files = sorted(glob.glob(pattern))
+                if not files:
+                    raise SystemExit(f"no held-out pairs in {pattern}")
+                for f in files:
+                    rows.update((r["id"], r) for r in read_rows(f))
             return rows
 
-        result["heldout"] = heldout_measure(read_rows(args.heldout), pairs_of(args.heldout_arm),
-                                            pairs_of(args.heldout_base), t.get("eval"), arm, BASE)
+        held = [r for path in many(args.heldout) for r in read_rows(path)]
+        if len({r["id"] for r in held}) != len(held):
+            raise SystemExit("an id twice among the held-out files")
+        result["heldout"] = heldout_measure(held, pairs_of(args.heldout_arm), pairs_of(args.heldout_base),
+                                            t.get("eval"), arm, BASE)
     if args.tally:
         result["blind"] = json.loads(Path(args.tally).read_text())
         result["a2"] = result["blind"]["a2"]
@@ -891,12 +922,15 @@ def report_text(r):
 def heldout_text(h, arm, base):
     """The direct measure (amendment G4-2.6) as Markdown: reported, it decides nothing"""
     L = ["", "## De directe maat: dichter bij het originele Nederlands? (amendement G4-2.6, rapporteren, beslist niet)", "",
+         *(["De lange validation-rijen (`btlong`, meer dan 512 Nederlandse tokens, elk heel vertaald; amendement "
+            "G4-3.6) staan erbij en tellen niet mee in de lezing.", ""] if h.get("reported") else []),
          f"**Lezing (vooraf vastgelegd): {h['verdict']}.**", "",
          "| set | verlies stap 0 (G4-0) | verlies laatste stap | lager | chrF " + arm + " | chrF " + base + " | hoger |",
          "|---|---:|---:|---|---:|---:|---|"]
-    for name, v in h["reading"].items():
+    for name, v in list(h["reading"].items()) + list((h.get("reported") or {}).items()):
         sets = h["sets"][name]
-        L.append(f"| {name} | {f3(v['loss_step0'])} | {f3(v['loss_last'])} (stap {v['last_step']}) | "
+        label = name if name in h["reading"] else f"{name} (rapporteren, buiten de lezing)"
+        L.append(f"| {label} | {f3(v['loss_step0'])} | {f3(v['loss_last'])} (stap {v['last_step']}) | "
                  f"{'ja' if v['loss_down'] else 'nee'} | {f2(sets[arm]['chrf_corpus'])} | {f2(sets[base]['chrf_corpus'])} | "
                  f"{'ja' if v['chrf_up'] else 'nee'} |")
     L += ["", "| set | model | n | chrF (corpus) | chrF (gem.) | uitvoer / origineel (tekens) | niet af | lus | leeg |",
@@ -1268,11 +1302,20 @@ def replay_candidates(args):
     if funnel["measured"] != len(task):
         raise SystemExit(f"{args.measures}: {funnel['measured']} of the {len(task)} segments of kept examples measured")
     passing.sort()
-    pool = sorted(random.Random(f"{SEED2}/replay-pool").sample(passing, min(REPLAY_POOL2, len(passing))))
+    g43 = getattr(args, "arm", None) == ARM3
+    size = getattr(args, "pool", None) or (REPLAY_POOL3 if g43 else REPLAY_POOL2)
+    seed = getattr(args, "pool_seed", None) or (f"{SEED3}/replay-pool" if g43 else f"{SEED2}/replay-pool")
+    pool = sorted(random.Random(seed).sample(passing, min(size, len(passing))))
+    report["pool_seed"] = seed
     want = set(pool)
     report["funnel"] = dict(funnel)
     report["candidates"] = len(passing)
     report["pool"] = len(pool)
+    # the inputs as read (the Gemma 4 FLAN-nl's places can change later)
+    report["sha256"] = {**{f"nl/{f.name}": sha256_file(f) for f in sorted(Path(args.nl).glob("w*.parquet"))},
+                        "measures": sha256_file(args.measures), "setup": sha256_file(args.setup),
+                        "plan/examples.parquet": sha256_file(Path(args.plan) / "examples.parquet"),
+                        "plan/plan.json": sha256_file(Path(args.plan) / "plan.json")}
     en, nl = {}, {}
     for path in sorted(Path(args.plan).glob("segments-w*.parquet")):
         t = pq.read_table(path, columns=["id", "text"]).to_pydict()
@@ -1432,8 +1475,8 @@ def heldout_measure(heldout_rows, arm_pairs, base_pairs, evals, arm, base):
     groups = collections.defaultdict(list)
     for r in heldout_rows:
         groups[r["set"]].append(r["id"])
-        if r["set"] == "btval":
-            groups[f"btval:{meta[r['id']]['source']}"].append(r["id"])
+        if r["set"] in ("btval", "btlong"):
+            groups[f"{r['set']}:{meta[r['id']]['source']}"].append(r["id"])
     out = {"sets": {}}
     for name, ids in sorted(groups.items()):
         entry = {}
@@ -1455,19 +1498,548 @@ def heldout_measure(heldout_rows, arm_pairs, base_pairs, evals, arm, base):
     for e in evals or []:
         losses[e["set"]][e["step"]] = e["loss"]
     out["loss"] = {k: dict(sorted(v.items())) for k, v in losses.items()}
-    reading = {}
-    for name in ("books", "btval"):
+    def read(name):
         curve = out["loss"].get(name, {})
         steps = sorted(curve)
         loss_down = len(steps) >= 2 and steps[0] == 0 and curve[steps[-1]] < curve[0]
         chrf_up = out["sets"][name][arm]["chrf_corpus"] > out["sets"][name][base]["chrf_corpus"]
-        reading[name] = {"loss_step0": curve.get(0), "loss_last": curve[steps[-1]] if steps else None,
-                         "last_step": steps[-1] if steps else None, "loss_down": loss_down, "chrf_up": chrf_up}
+        return {"loss_step0": curve.get(0), "loss_last": curve[steps[-1]] if steps else None,
+                "last_step": steps[-1] if steps else None, "loss_down": loss_down, "chrf_up": chrf_up}
+
+    reading = {name: read(name) for name in ("books", "btval")}
     flags = [v["loss_down"] for v in reading.values()] + [v["chrf_up"] for v in reading.values()]
     out["reading"] = reading
+    # amendment G4-3: the long validation rows, reported beside the reading fixed for G4-2, not part of it
+    out["reported"] = {name: read(name) for name in ("btlong",) if name in out["sets"]}
     out["verdict"] = ("dichter bij het originele Nederlands" if all(flags) else
                       "niet dichter" if not any(flags) else "gemengd")
     return out
+
+
+# ---------------------------------------------------------------------------------------------------- G4-3
+
+ARM3 = "G4-3"
+SEED3 = f"{SEED}/G4-3"
+EPOCHS3 = 3
+REPLAY_SHARE3 = 0.10                 # amendment G4-3.3 (Yeb, 15 Nov): 10% of the examples
+REPLAY_POOL3 = 120000                # every pass its own replay rows: 3 x ~28,800 out of this pool
+LR3 = 1e-5                           # amendment G4-3.4 (Yeb, 15 Nov)
+SEQ3 = 4096                          # max_target_length: the longest example (3,972 tokens, measured 15 Nov) fits
+LONG_TOKENS = 512                    # tokens_nl > 512 marks the long rows (the datasets' cards)
+EVAL_SETS3 = ("books", "btval", "own", "btlong")
+EVAL_EVERY3 = 750
+SMOKE3_EVAL_STEPS = [0, 4, 8]
+SMOKE3_LONGEST = 256                 # the smoke set: the longest examples first (every step of the 8 is one of them)
+SMOKE3_RANDOM = 512                  # then others, so that the pipeline's count can be checked against pack_batches
+HOSTS, ROWS_PER_HOST = 4, 4          # a v4-32: 4 processes of 4 chips, per_device_batch_size 1
+LONG_MODEL = "gemma4-31b-long"       # translate_models.yml: the classes of the long validation rows (en->nl)
+MAX_HOURS3 = 120                     # Yeb (15 Nov ~08:05): up to ~5 days three passes; above, the first two only
+# sft_lora.py counts the training data before the first step; G4-2: python_to_setup_s 212.5 s for 12.1 M tokens (its
+# smoke test, G4-1's set) and 404.2 s for 41.2 M (the full run), so ~6.6 s per million tokens beyond the fixed part
+COUNT_S_PER_MTOKEN = 6.6
+# amendment G4-3.2: the five datasets after the publication of the long rows (15 Nov ~07:40 CET, one commit each; the
+# columns region, vm and time dropped; Handelingen's card changed once more at 08:05, its data files byte for byte
+# those of the publication); the train split holds the rows of up to 512 and of 513-2,048 Dutch tokens
+BT_REPOS3 = {
+    "handelingen": ("yhavinga/handelingen-tweede-kamer-nl-en-gemma4", "e4010d9534789927f14f364d3ee6aa3850dd66b8"),
+    "raad": ("yhavinga/openraadsinformatie-nl-en-gemma4", "926d94adc3c67a0aec59d13f7bcc78dd94d4601a"),
+    "dpc": ("yhavinga/rijksoverheid-websites-nl-en-gemma4", "958b56a33b65c2a21d081ae5e4ef503b2c8913eb"),
+    "rechtspraak": ("yhavinga/rechtspraak-nl-en-gemma4", "09a8f8c811c99ab34b311d3d03147eb638d6e28c"),
+    "fineweb": ("yhavinga/fineweb-2-nl-en-gemma4", "15dc526d3359af2fa8f94b17320c91420b66f1fa"),
+}
+META_SCHEMA3_FIELDS = META_SCHEMA_FIELDS + (("long", "bool"), ("epoch", "int64"))
+
+
+def revisions3(directory):
+    """fetch --arm G4-3's revisions.json, checked against BT_REPOS3"""
+    revisions = json.loads((Path(directory) / "revisions.json").read_text())
+    for source, (repo, revision) in BT_REPOS3.items():
+        got = revisions.get(source, {})
+        if (got.get("repo"), got.get("revision")) != (repo, revision):
+            raise SystemExit(f"{directory}/revisions.json: {source} is {got.get('repo')}@{got.get('revision')}, "
+                             f"amendment G4-3 pins {repo}@{revision}")
+    return revisions
+
+
+def checked_blocked(evalsets_path, blind_path):
+    blind = read_jsonl(blind_path)
+    if sha256_file(blind_path) != blind_sha256():
+        raise SystemExit(f"{blind_path}: not the blind passages of the TG protocol (§4.2.4)")
+    return blocked_grams(read_rows(evalsets_path), blind)
+
+
+def pack_batches(lengths, hosts=HOSTS, rows=ROWS_PER_HOST, seq=SEQ3):
+    """The batches per process of MaxText 0.2.5's SFT pipeline on one parquet file: process k reads examples k,
+    k + hosts, ... (HFDataSource: split_dataset_by_node over hosts on a file of one shard) and packs them with grain's
+    PackAndBatchOperation (max_segments_per_seq -1): an example goes to the first of the batch's rows it fits; one that
+    fits none closes the batch and opens the next; the last batch counts."""
+    out = []
+    for h in range(hosts):
+        n, free = 0, None
+        for length in lengths[h::hosts]:
+            if length > seq:
+                raise SystemExit(f"an example of {length} tokens, more than the sequence length {seq}")
+            if free is None:
+                free, n = [seq] * rows, n + 1
+            for i in range(rows):
+                if free[i] >= length:
+                    free[i] -= length
+                    break
+            else:
+                free, n = [seq] * rows, n + 1
+                free[0] -= length
+        out.append(n)
+    return out
+
+
+def steps_of(batches):
+    """sft_lora.py's step count of a multi-host job (STEPS=auto): step_limit of the batches per process"""
+    import sft_lora
+
+    return sft_lora.step_limit(batches)
+
+
+def long_class(src_tokens, nl_tokens):
+    """The class of gemma4-31b-long for a long validation row: the first whose max_source holds the English, if the
+    Dutch fits DECODE_FIT of its decode limit (else None, as decode_class)"""
+    import translate
+
+    for name, c in translate.MODELS[LONG_MODEL]["length_classes"].items():
+        if src_tokens <= c["max_source"]:
+            return name if nl_tokens <= DECODE_FIT * c["max_decode"] else None
+    return None
+
+
+def assign_long_workers(rows, workers):
+    """{worker: [rows]}: whole classes of gemma4-31b-long, the largest estimated time first, each to the least loaded
+    worker (evalsets.assign_workers with this model's classes)"""
+    import evalsets
+    import translate
+
+    order = list(translate.MODELS[LONG_MODEL]["length_classes"])
+    by_class = collections.defaultdict(list)
+    for r in rows:
+        by_class[r["length_class"]].append(r)
+    load = {k: 0.0 for k in range(workers)}
+    out = {k: [] for k in range(workers)}
+    for name in sorted(by_class, key=lambda c: (-evalsets.class_seconds(by_class[c]), order.index(c))):
+        k = min(load, key=lambda w: (load[w], w))
+        load[k] += evalsets.class_seconds(by_class[name])
+        out[k] += by_class[name]
+    return {k: sorted(v, key=lambda r: (r["tokens"], r["id"])) for k, v in out.items()}
+
+
+def heldout3(args, counter=None):
+    """amendment G4-3.6: the long validation rows (tokens_nl > 512) of the five datasets at BT_REPOS3, without
+    hard_fails and 13-grams of the evaluation sets, as evaluation segments of gemma4-31b-long (whole classes per worker)
+    and as an eval file of the training; G4-2's 800 held-out BT validation rows must be the same rows there"""
+    counter = counter or TokenCounter(args.tokenizer)
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    revisions = revisions3(args.btval)
+    rows = read_bt(args.btval, revisions, split="validation", extra=("tokens_nl",))
+    by_pid = {r["pid"]: r for r in rows}
+    old = [r for r in read_rows(args.heldout) if r["set"] == "btval"]
+    if len(old) != HELDOUT_BTVAL:
+        raise SystemExit(f"{args.heldout}: {len(old)} BT validation rows, G4-2 held out {HELDOUT_BTVAL}")
+    for r in old:
+        pid = json.loads(r["meta"])["pid"]
+        new = by_pid.get(pid)
+        if new is None or (new["en"], new["nl"]) != (r["source"], r["reference"]):
+            raise SystemExit(f"{pid}: G4-2's held-out BT validation row differs in the revisions of amendment G4-3")
+    blocked = checked_blocked(args.evalsets, args.blind)
+    funnel = collections.defaultdict(collections.Counter)
+    pool = []
+    for r in rows:
+        if r["tokens_nl"] <= LONG_TOKENS:
+            continue
+        funnel[r["source"]]["long_rows"] += 1
+        if r["hard_fails"]:
+            funnel[r["source"]]["hard_fails"] += 1
+        elif shares_gram(r, blocked):
+            funnel[r["source"]]["eval_13gram"] += 1
+        else:
+            pool.append(r)
+    prompts, targets = counter.examples(pool)
+    src = counter.lengths(r["en"] for r in pool)
+    nl = counter.lengths(r["nl"] for r in pool)
+    keep = []
+    for r, a, b, n_src, n_nl in zip(pool, prompts, targets, src, nl):
+        cls = long_class(n_src, n_nl)
+        if a + b > SEQ3:
+            funnel[r["source"]]["too_long"] += 1
+        elif cls is None:
+            funnel[r["source"]]["not_fitting_the_classes"] += 1
+        else:
+            keep.append({**r, "tokens": n_src, "tokens_nl_counted": n_nl, "length_class": cls})
+            funnel[r["source"]]["eligible"] += 1
+    if not keep:
+        raise SystemExit("no long validation row passes the bounds")
+    keep.sort(key=lambda r: r["pid"])
+    eval_rows = [{"id": f"heldout:btlong:{r['pid']}", "set": "btlong", "source": r["en"], "reference": r["nl"],
+                  "tokens": r["tokens"], "over_512": r["tokens"] > 512, "length_class": r["length_class"],
+                  "meta": json.dumps({"source": r["source"], "pid": r["pid"], "tokens_nl": r["tokens_nl_counted"]})}
+                 for r in keep]
+    write_parquet(eval_rows, out / "evalsets.parquet", schema(EVAL_SCHEMA))
+    write_parquet([messages_row(r["en"], r["nl"]) for r in keep], out / "eval-btlong.parquet")
+    assignment = assign_long_workers(eval_rows, args.workers)
+    import translate
+
+    order = list(translate.MODELS[LONG_MODEL]["length_classes"])
+    for k, part in assignment.items():
+        write_parquet([{"id": r["id"], "text": r["source"], "tokens": r["tokens"]} for r in part],
+                      out / f"segments-w{k}.parquet", schema(SEGMENT_SCHEMA))
+        (out / f"classes-w{k}.txt").write_text(
+            " ".join(c for c in order if any(r["length_class"] == c for r in part)) + "\n")
+    manifest = {"set": "btlong", "rows": len(eval_rows), "model": LONG_MODEL,
+                "funnel": {s: dict(c) for s, c in sorted(funnel.items())},
+                "by_source": dict(sorted(collections.Counter(r["source"] for r in keep).items())),
+                "classes": dict(collections.Counter(r["length_class"] for r in eval_rows)),
+                "workers": {f"w{k}": {"segments": len(p), "classes": sorted({r["length_class"] for r in p},
+                                                                             key=order.index)}
+                            for k, p in assignment.items()},
+                "btval_checked": len(old), "seq": SEQ3, "max_example_tokens": max(a + b for a, b in zip(prompts, targets)),
+                "inputs": {"btval": revisions, "g4_2_heldout": sha256_file(args.heldout),
+                           "evalsets": sha256_file(args.evalsets), "blind": sha256_file(args.blind)}}
+    (out / "manifest.json").write_text(json.dumps(manifest, indent=1) + "\n")
+    print(f"HELDOUT3 {json.dumps({k: manifest[k] for k in ('rows', 'funnel', 'by_source', 'classes', 'workers', 'btval_checked')})}",
+          flush=True)
+
+
+def held_pids(paths):
+    """The dataset ids (meta pid) of the held-out BT rows of evalsets files (G4-2's btval, G4-3's btlong)"""
+    pids = set()
+    for path in paths:
+        for r in read_rows(path, ["set", "meta"]):
+            if r["set"] in ("btval", "btlong"):
+                pids.add(json.loads(r["meta"])["pid"])
+    return pids
+
+
+def build3(args, counter=None):
+    """amendment G4-3.3: every BT train row of BT_REPOS3 without hard_fails and without a 13-gram of the evaluation
+    sets, the books of G4-2 (G4-1's book pairs without the held-out books), FLAN replay as 10% of the examples with rows
+    of its own in every pass where the pool allows, three passes shuffled apart; the batches of MaxText's packing at
+    SEQ3 and the steps; the smoke test's set"""
+    import pyarrow as pa
+
+    counter = counter or TokenCounter(args.tokenizer)
+    out = Path(args.out)
+    revisions = revisions3(args.bt)
+    pairs, base_manifest = g41_set(args.base_set)
+    books = json.loads(Path(args.heldout_books).read_text())["books"]
+    book_pairs = [(x, m) for x, m in pairs if m["kind"] == "book"]
+    kept_books = [(x, {**m, "long": False}) for x, m in book_pairs if book_key(m["id"]) not in books]
+    if len(book_pairs) - len(kept_books) != sum(books.values()):
+        raise SystemExit(f"{len(book_pairs) - len(kept_books)} book pairs left out, the held-out books have "
+                         f"{sum(books.values())}")
+    blocked = checked_blocked(args.evalsets, args.blind)
+    print("PROGRESS reading the back-translations", flush=True)
+    rows = read_bt(args.bt, revisions, split="train", extra=("tokens_nl",))
+    held = held_pids(args.heldout)
+    overlap = sorted(held & {r["pid"] for r in rows})
+    if overlap:
+        raise SystemExit(f"{len(overlap)} held-out validation rows are train rows, e.g. {overlap[:3]}")
+    funnel = collections.defaultdict(collections.Counter)
+    for r in rows:
+        funnel[r["source"]]["rows"] += 1
+        funnel[r["source"]]["long_rows"] += r["tokens_nl"] > LONG_TOKENS
+    passed = []
+    for r in rows:
+        if r["hard_fails"]:
+            funnel[r["source"]]["hard_fails"] += 1
+        else:
+            passed.append(r)
+    # R2's length bound is not applied (amendment G4-3.3); what it would take is reported
+    bounds = sft_build.length_bounds(passed, LEN_FACTOR)
+    pool = []
+    for r in passed:
+        funnel[r["source"]]["outside_r2_length_bound_kept"] += sft_build.length_fails(r, bounds)
+        if shares_gram(r, blocked):
+            funnel[r["source"]]["eval_13gram"] += 1
+        else:
+            pool.append(r)
+    print(f"PROGRESS {len(pool):,} back-translations, counting tokens", flush=True)
+    prompts, targets = counter.examples(pool)
+    too_long = [r["pid"] for r, a, b in zip(pool, prompts, targets) if a + b > SEQ3]
+    if too_long:
+        raise SystemExit(f"{len(too_long)} back-translations above {SEQ3} tokens, e.g. {too_long[:3]}: the sequence "
+                         f"length of amendment G4-3 does not hold them")
+    bt = []
+    for r, a, b in zip(pool, prompts, targets):
+        x, m = example({**r, "tokens_prompt": a, "tokens_target": b}, "bt")
+        bt.append((x, {**m, "long": r["tokens_nl"] > LONG_TOKENS}))
+        funnel[r["source"]]["eligible"] += 1
+        funnel[r["source"]]["eligible_long"] += r["tokens_nl"] > LONG_TOKENS
+    report = {"arm": ARM3, "seed": SEED3, "prompt": PROMPT, "epochs": args.epochs, "replay_share": args.replay_share,
+              "seq": SEQ3, "bt": {"funnel": {s: dict(c) for s, c in sorted(funnel.items())},
+                                  "r2_length_bounds_not_applied": bounds},
+              "base_set": {"manifest": base_manifest, "examples": len(pairs)}, "heldout_books": books,
+              "heldout_book_pairs": sum(books.values()), "books": len(kept_books)}
+    candidates = replay_pool(args.replay, args.replay_model, args.flan_eval, blocked, counter, report)
+    n_replay = replay_count(len(bt) + len(kept_books), args.replay_share)
+    order = random.Random(f"{SEED3}/replay").sample(candidates, len(candidates))
+    if not order:
+        raise SystemExit("no replay candidate")
+    distinct = min(len(order), args.epochs * n_replay)
+    report["replay"].update({"per_pass": n_replay, "distinct": distinct,
+                             "apart_in_every_pass": distinct == args.epochs * n_replay})
+    passes = []
+    for e in range(1, args.epochs + 1):
+        replay = [order[k % len(order)] for k in range((e - 1) * n_replay, e * n_replay)]
+        one = bt + kept_books + [(x, {**m, "long": False}) for x, m in (example(r, "replay") for r in replay)]
+        random.Random(f"{SEED3}/shuffle/{e}").shuffle(one)
+        passes.append(one)
+    rows_out = [(x, {**m, "epoch": e}) for e, one in enumerate(passes, 1) for x, m in one]
+    d = out / ARM3
+    meta_schema = pa.schema([(n, getattr(pa, "bool_" if t == "bool" else t)()) for n, t in META_SCHEMA3_FIELDS])
+    write_parquet([x for x, _ in rows_out], d / "train.parquet")
+    write_parquet([{n: m.get(n) for n in meta_schema.names} for _, m in rows_out], d / "train-meta.parquet", meta_schema)
+    (d / "template.jinja").write_text(g4lora.TEMPLATE, encoding="utf-8")
+    lengths = [m["tokens_prompt"] + m["tokens_target"] for _, m in rows_out]
+    batches = pack_batches(lengths)
+    steps = steps_of(batches)
+    # amendment G4-3.5: above MAX_HOURS3 the training takes the first two passes (the first rows of train.parquet)
+    two = sum(len(one) for one in passes[:2])
+    batches2 = pack_batches(lengths[:two])
+    per_pass = []
+    for e, one in enumerate(passes, 1):
+        kinds = collections.defaultdict(lambda: {"examples": 0, "tokens": 0, "target_tokens": 0})
+        for _, m in one:
+            k = "bt_long" if m["kind"] == "bt" and m["long"] else m["kind"]
+            kinds[k]["examples"] += 1
+            kinds[k]["tokens"] += m["tokens_prompt"] + m["tokens_target"]
+            kinds[k]["target_tokens"] += m["tokens_target"]
+        per_pass.append({"pass": e, "examples": len(one), "tokens": sum(v["tokens"] for v in kinds.values()),
+                         "kinds": dict(sorted(kinds.items()))})
+    report["set"] = set_stats([m for _, m in passes[0]], [])
+    report["passes"] = per_pass
+    report["estimate"] = {"tokens": sum(lengths), "examples": len(lengths), "seq": SEQ3,
+                          "batches_per_process": batches, "steps": steps,
+                          "fill": round(sum(lengths) / (sum(batches) * ROWS_PER_HOST * SEQ3), 4),
+                          "max_tokens": max(lengths),
+                          "two_passes": {"examples": two, "tokens": sum(lengths[:two]), "batches_per_process": batches2,
+                                         "steps": steps_of(batches2)}}
+    inputs = {"bt": revisions, "base_set": {f: sha256_file(Path(args.base_set) / f) for f in ("train.parquet",
+                                                                                            "train-meta.parquet")},
+              "heldout_books": sha256_file(args.heldout_books), "heldout": {p: sha256_file(p) for p in args.heldout},
+              "evalsets": sha256_file(args.evalsets), "blind": sha256_file(args.blind),
+              "replay": {"path": str(args.replay), "sha256": sha256_file(args.replay), "model": args.replay_model}}
+    report["inputs"] = inputs
+    manifest = {"set": ARM3, "examples": len(rows_out), "examples_per_epoch": [p["examples"] for p in per_pass],
+                "epochs": args.epochs, "tokens": sum(lengths), "seq": SEQ3, "steps": steps, "prompt": PROMPT,
+                "template": "g4lora.TEMPLATE (Gemma 4, thinking off)", "seed": SEED3,
+                "replay_share": args.replay_share, "inputs": inputs}
+    (d / "manifest.json").write_text(json.dumps(manifest, indent=1) + "\n")
+    # the smoke set (amendment G4-3.5): pass 1's longest examples first, then a seeded sample of the others
+    first = list(passes[0])
+    longest = sorted(first, key=lambda p: (-(p[1]["tokens_prompt"] + p[1]["tokens_target"]), p[1]["id"]))
+    longest = longest[:SMOKE3_LONGEST]
+    taken = {m["id"] for _, m in longest}
+    others = sorted((p for p in first if p[1]["id"] not in taken), key=lambda p: p[1]["id"])
+    smoke_rows = [(x, {**m, "epoch": 1}) for x, m in longest +
+                  random.Random(f"{SEED3}/smoke").sample(others, min(SMOKE3_RANDOM, len(others)))]
+    ds = out / f"{ARM3}-smoke"
+    write_parquet([x for x, _ in smoke_rows], ds / "train.parquet")
+    write_parquet([{n: m.get(n) for n in meta_schema.names} for _, m in smoke_rows], ds / "train-meta.parquet",
+                  meta_schema)
+    (ds / "template.jinja").write_text(g4lora.TEMPLATE, encoding="utf-8")
+    smoke_lengths = [m["tokens_prompt"] + m["tokens_target"] for _, m in smoke_rows]
+    smoke_batches = pack_batches(smoke_lengths)
+    (ds / "manifest.json").write_text(json.dumps({
+        "set": f"{ARM3}-smoke", "examples": len(smoke_rows), "longest": len(longest), "tokens": sum(smoke_lengths),
+        "max_tokens": max(smoke_lengths), "min_of_longest": min(smoke_lengths[:len(longest)]),
+        "batches_per_process": smoke_batches, "steps_limit": steps_of(smoke_batches), "seq": SEQ3}, indent=1) + "\n")
+    (out / "report.json").write_text(json.dumps(report, indent=1, ensure_ascii=False, default=str) + "\n")
+    (out / "report.md").write_text(report3_md(report), encoding="utf-8")
+    print(f"BUILD3 {json.dumps({'examples': len(rows_out), 'per_pass': [p['examples'] for p in per_pass], 'tokens': sum(lengths), 'steps': steps, 'fill': report['estimate']['fill'], 'replay': report['replay']['per_pass'], 'smoke_batches': smoke_batches})}",
+          flush=True)
+
+
+def report3_md(r):
+    e = r["estimate"]
+    L = [f"# Trainingsset {r['arm']} (protocol-g4.md §9, amendement G4-3)", "",
+         f"Gemaakt door `g4arm.py build3`. Alle BT-train-rijen van de vijf datasets op de revisies van amendement G4-3 "
+         f"zonder `hard_fails` en zonder 13-gram van een evaluatieset of blinde passage (geen hersampling, geen "
+         f"chrF-filter, geen lengtegrens van R2), de boeken van G4-2 ({_n(r['books'])} paren; de boeken van G4-1 zonder "
+         f"de held-out boeken {json.dumps(r['heldout_books'])}), FLAN-replay {r['replay_share']:.0%} van de voorbeelden, "
+         f"{r['epochs']} doorgangen, elk apart geschud (seed `{r['seed']}/shuffle/<k>`); prompt `{r['prompt']}`, "
+         f"sequentielengte {_n(r['seq'])}.", "",
+         "## Terugvertalingen (train-split)", "",
+         "| bron | rijen | waarvan lang | hard_fails | 13-gram | in de set | waarvan lang | buiten R2's lengtegrens (niet toegepast) |",
+         "|---|---:|---:|---:|---:|---:|---:|---:|"]
+    for s, c in r["bt"]["funnel"].items():
+        L.append(f"| {s} | {_n(c.get('rows', 0))} | {_n(c.get('long_rows', 0))} | {_n(c.get('hard_fails', 0))} | "
+                 f"{_n(c.get('eval_13gram', 0))} | {_n(c.get('eligible', 0))} | {_n(c.get('eligible_long', 0))} | "
+                 f"{_n(c.get('outside_r2_length_bound_kept', 0))} |")
+    rep = r["replay"]
+    L += ["", "## FLAN-replay", "", f"Per doorgang {_n(rep['per_pass'])}; verschillende rijen over de doorgangen "
+          f"{_n(rep['distinct'])} ({'elke doorgang eigen rijen' if rep['apart_in_every_pass'] else 'de pool is te klein: rijen komen terug'}); "
+          f"kandidaten {_n(rep['candidates'])} uit een pool van {_n(rep['rows'])} (weg: {json.dumps(rep['dropped'])}).", "",
+          "## Per doorgang", "", "| doorgang | soort | voorbeelden | tokens | doeltokens |", "|---:|---|---:|---:|---:|"]
+    for p in r["passes"]:
+        for kind, k in p["kinds"].items():
+            L.append(f"| {p['pass']} | {kind} | {_n(k['examples'])} | {_n(k['tokens'])} | {_n(k['target_tokens'])} |")
+        L.append(f"| {p['pass']} | samen | {_n(p['examples'])} | {_n(p['tokens'])} | |")
+    L += ["", f"Samen {_n(e['examples'])} rijen, {_n(e['tokens'])} tokens, langste voorbeeld {_n(e['max_tokens'])} tokens. "
+          f"Packing zoals MaxText 0.2.5 (elk proces elk vierde voorbeeld, first-fit in 4 rijen van {_n(e['seq'])}): "
+          f"batches per proces {e['batches_per_process']}, dus {_n(e['steps'])} stappen (`sft_lora.step_limit`), "
+          f"vulling {e['fill']}. Alleen de eerste twee doorgangen (amendement G4-3.5, boven {MAX_HOURS3} uur): "
+          f"{_n(e['two_passes']['examples'])} rijen, {_n(e['two_passes']['tokens'])} tokens, "
+          f"{_n(e['two_passes']['steps'])} stappen.", ""]
+    return "\n".join(L) + "\n"
+
+
+def _check_chunk(job):
+    """One task of check --arm G4-3: MaxText's own SFT steps on a chunk of distinct examples"""
+    messages, ens, ids, tokenizer = job
+    return g4lora.check_examples(messages, ens, tokenizer, MODEL, ids)
+
+
+def check3(args):
+    """amendment G4-3.3: MaxText's own SFT steps on every distinct example of G4-3's set (an example of the three
+    passes once; the same id must be the same example in every pass), in processes; every row's length must be the
+    build's count, and none above SEQ3"""
+    import multiprocessing
+
+    d = Path(args.data)
+    msgs = [x["messages"] for x in read_rows(d / "train.parquet")]
+    metas = read_rows(d / "train-meta.parquet", ["id", "en", "tokens_prompt", "tokens_target", "epoch"])
+    if len(msgs) != len(metas):
+        raise SystemExit(f"{d}: {len(msgs)} examples, {len(metas)} meta rows")
+    if (d / "template.jinja").read_text(encoding="utf-8") != g4lora.TEMPLATE:
+        raise SystemExit(f"{d}/template.jinja is not g4lora.TEMPLATE")
+    distinct = {}
+    for x, m in zip(msgs, metas):
+        seen = distinct.setdefault(m["id"], (x, m))
+        if seen[0] != x or (seen[1]["en"], seen[1]["tokens_prompt"], seen[1]["tokens_target"]) != (
+                m["en"], m["tokens_prompt"], m["tokens_target"]):
+            raise SystemExit(f"{m['id']}: not the same example in pass {seen[1]['epoch']} and pass {m['epoch']}")
+    ids = sorted(distinct)
+    chunks = [ids[k:k + args.chunk] for k in range(0, len(ids), args.chunk)]
+    jobs = [([distinct[i][0] for i in c], [distinct[i][1]["en"] for i in c], c, args.tokenizer) for c in chunks]
+    if args.processes > 1:
+        with multiprocessing.get_context("spawn").Pool(args.processes) as pool:
+            results = pool.map(_check_chunk, jobs, chunksize=1)
+    else:
+        results = [_check_chunk(j) for j in jobs]
+    lengths, loss_tokens, pads = {}, 0, set()
+    for c, (ls, lt, pad) in zip(chunks, results):
+        lengths.update(zip(c, ls))
+        loss_tokens += lt
+        pads.add(pad)
+    differ = [i for i in ids if lengths[i] != distinct[i][1]["tokens_prompt"] + distinct[i][1]["tokens_target"]]
+    if differ:
+        raise SystemExit(f"{len(differ)} examples whose MaxText length differs from the build's count: {differ[:3]}")
+    if max(lengths.values()) > SEQ3:
+        raise SystemExit(f"an example of {max(lengths.values())} tokens, more than {SEQ3}")
+    if len(pads) != 1:
+        raise SystemExit(f"the chunks saw different pad ids: {pads}")
+    print(f"CHECK {json.dumps({'examples': len(metas), 'distinct': len(ids), 'tokens': sum(lengths[m['id']] for m in metas), 'loss_tokens_distinct': loss_tokens, 'max': max(lengths.values()), 'pad_id': pads.pop(), 'seq': SEQ3})}",
+          flush=True)
+
+
+def training_time(summary, steps, tokens, smoke_tokens):
+    """The full training's time [estimate] from the smoke test: the count of the data before the first step, loading
+    and compiling, the steps at the smoke test's median step, the evals at its longest round after step 0"""
+    t = summary.get("times") or {}
+    step_s = (summary.get("throughput") or {}).get("step_s_median")
+    rounds = collections.defaultdict(float)
+    for e in summary.get("eval") or []:
+        rounds[e["step"]] += e["seconds"]
+    later = [v for k, v in rounds.items() if k != 0]
+    round_s = max(later) if later else rounds.get(0)
+    if step_s is None or round_s is None:
+        return None
+    n_evals = steps // EVAL_EVERY3 + 1 + (1 if steps % EVAL_EVERY3 else 0)
+    count_s = (t.get("python_to_setup_s") or 0) + COUNT_S_PER_MTOKEN * (tokens - smoke_tokens) / 1e6
+    load_s = (t.get("setup_s") or 0) + (t.get("compile_s_est") or 0)
+    seconds = count_s + load_s + steps * step_s + n_evals * round_s
+    return {"steps": steps, "tokens": tokens, "step_s": step_s, "evals": n_evals, "eval_round_s": round(round_s, 1),
+            "count_s": round(count_s), "load_s": round(load_s), "train_s": round(steps * step_s),
+            "seconds": round(seconds), "hours": round(seconds / 3600, 2)}
+
+
+def smoke3_estimate(summary, data_report, smoke_manifest):
+    """amendment G4-3.5 (Yeb, 15 Nov ~08:05): three passes if their estimate stays within MAX_HOURS3 (~5 days), else
+    the first two"""
+    est = data_report["estimate"]
+    three = training_time(summary, est["steps"], est["tokens"], smoke_manifest["tokens"])
+    two = training_time(summary, est["two_passes"]["steps"], est["two_passes"]["tokens"], smoke_manifest["tokens"])
+    if three is None:
+        return {"passes": None, "hours": None, "three": None, "two": None, "max_hours": MAX_HOURS3}
+    passes = 3 if three["hours"] <= MAX_HOURS3 else 2
+    chosen = three if passes == 3 else two
+    return {"passes": passes, "hours": chosen["hours"], "steps": chosen["steps"], "max_hours": MAX_HOURS3,
+            "fill": est["fill"], "three": three, "two": two}
+
+
+def smoke3_verdict(summary, adapter, smoke_manifest):
+    """amendment G4-3.5: the smoke test of G4-3, every criterion with its value and whether it holds"""
+    checks = {}
+    loss = summary.get("loss") or []
+    checks["steps"] = {"value": summary.get("steps_done"), "holds": summary.get("steps_done") == 8}
+    checks["loss_finite"] = {"value": [v for _, v in loss],
+                             "holds": len(loss) == 8 and all(math.isfinite(v) for _, v in loss)}
+    checks["peak_gib"] = {"value": summary.get("peak_gib_max"),
+                          "holds": summary.get("peak_gib_max") is not None and summary["peak_gib_max"] <= MEM_MAX_GIB}
+    checks["adapter"] = {"value": {k: adapter.get(k) for k in ("rank", "alpha", "scale")},
+                         "holds": (adapter.get("rank"), adapter.get("alpha"), adapter.get("scale")) == (32, 16.0, 0.5)}
+    seq = (summary.get("config") or {}).get("max_target_length")
+    checks["seq"] = {"value": seq, "holds": seq == SEQ3}
+    lrs = list((summary.get("lr_at") or {}).values())
+    checks["lr_peak"] = {"value": max(lrs) if lrs else None, "holds": bool(lrs) and abs(max(lrs) - LR3) <= 1e-12}
+    got = (summary.get("epoch") or {}).get("batches_per_process")
+    checks["batches_as_build3"] = {"value": {"pipeline": got, "build3": smoke_manifest.get("batches_per_process")},
+                                   "holds": got is not None and got == smoke_manifest.get("batches_per_process")}
+    per_step = (summary.get("tokens") or {}).get("per_step") or []
+    longest = smoke_manifest.get("min_of_longest") or 0
+    # every step of the 8 holds 16 of the longest examples: each a row of its own
+    checks["longest_rows"] = {"value": per_step,
+                              "holds": len(per_step) == 8 and all(n >= 16 * longest for n in per_step)}
+    evals = summary.get("eval") or []
+    for name in EVAL_SETS3:
+        rows = [e for e in evals if e["set"] == name]
+        checks[f"eval_{name}"] = {
+            "value": [(e["step"], round(e["loss"], 4), e["tokens"]) for e in rows],
+            "holds": [e["step"] for e in rows] == SMOKE3_EVAL_STEPS
+            and all(math.isfinite(e["loss"]) and e["tokens"] >= 1 for e in rows)}
+    own0 = next((e["loss"] for e in evals if e["set"] == "own" and e["step"] == 0), None)
+    checks["own_loss_step0"] = {"value": own0, "holds": own0 is not None and own0 <= OWN_MAX_LOSS + TOLERANCE}
+    return {"checks": checks, "passed": all(c["holds"] for c in checks.values())}
+
+
+def smoke3(args):
+    """The smoke test's verdict, the estimate and the passes of the full training (PASSES); exit 1 if a check fails
+    (the chain stops before the full training)"""
+    summary = json.loads(Path(args.summary).read_text())
+    adapter = json.loads(Path(args.adapter).read_text())
+    smoke_manifest = json.loads(Path(args.smoke_manifest).read_text())
+    data_report = json.loads(Path(args.data_report).read_text())
+    result = smoke3_verdict(summary, adapter, smoke_manifest)
+    result["estimate"] = smoke3_estimate(summary, data_report, smoke_manifest)
+    result.update({k: summary.get(k) for k in ("loss", "eval", "eval_plan", "lr_at", "throughput", "times", "epoch",
+                                               "memory", "peak_gib_max")})
+    result["smoke_set"] = smoke_manifest
+    Path(args.out).with_suffix(".json").write_text(json.dumps(result, indent=1, default=str) + "\n")
+    x = result["estimate"]
+    L = ["# Smoke-test G4-3 (protocol-g4.md §9, amendement G4-3.5)", "",
+         f"**{'Geslaagd' if result['passed'] else 'Niet geslaagd'}.** Schatting van de volle training met drie "
+         f"doorgangen: {(x.get('three') or {}).get('hours')} uur (grens {MAX_HOURS3} uur); de training neemt "
+         f"**{x.get('passes')} doorgangen** ({x.get('hours')} uur, {x.get('steps')} stappen).", "",
+         "| controle | waarde | gehaald |", "|---|---|---|"]
+    for k, c in result["checks"].items():
+        L.append(f"| {k} | `{json.dumps(c['value'], default=str)[:240]}` | {'ja' if c['holds'] else 'nee'} |")
+    L += ["", f"Schatting [schatting, uit de smoke-test en build3]: {json.dumps(x)}", "",
+          "Verlies per held-out set (stap, verlies, doeltokens, seconden): " + "; ".join(
+              f"{e['set']} {e['step']} {e['loss']:.4f} {e['tokens']} {e['seconds']}" for e in summary.get("eval") or []),
+          "", f"Training: {json.dumps({k: summary.get(k) for k in ('throughput', 'times', 'peak_gib_max')}, default=str)}",
+          ""]
+    Path(args.out).write_text("\n".join(L), encoding="utf-8")
+    print(f"SMOKE3 {'PASSED' if result['passed'] else 'FAILED'} {json.dumps({k: c['holds'] for k, c in result['checks'].items()})} "
+          f"PASSES {x.get('passes')} HOURS {x.get('hours')} estimate {json.dumps(x)}", flush=True)
+    if not result["passed"] or x.get("passes") not in (2, 3):
+        raise SystemExit(1)
 
 
 # ---------------------------------------------------------------------------------------------------- main
@@ -1478,6 +2050,7 @@ def main(argv=None):
     p = sub.add_parser("fetch")
     p.add_argument("--out", required=True)
     p.add_argument("--split", default="train", choices=("train", "validation"))
+    p.add_argument("--arm", default=ARM, choices=(ARM, ARM2, ARM3), help="G4-3: the revisions with the long rows")
     p = sub.add_parser("build")
     p.add_argument("--bt", required=True, help="fetch's directory (<source>/data/train-*.parquet, revisions.json)")
     p.add_argument("--books", required=True, help="RL's set ($S/data/rl-b5/RL: train.parquet, train-meta.parquet)")
@@ -1494,6 +2067,9 @@ def main(argv=None):
     p = sub.add_parser("check")
     p.add_argument("--data", required=True)
     p.add_argument("--tokenizer", required=True)
+    p.add_argument("--arm", default=None, choices=(ARM, ARM2, ARM3))
+    p.add_argument("--processes", type=int, default=8, help="G4-3: processes of the check")
+    p.add_argument("--chunk", type=int, default=5000, help="G4-3: distinct examples per task")
     p = sub.add_parser("evaldata")
     p.add_argument("--four", required=True, help="$E/data/evalsets.parquet")
     p.add_argument("--x", required=True, help="$S/arms/data/x/data/evalsets.parquet (FLAN, blind)")
@@ -1516,9 +2092,10 @@ def main(argv=None):
     p.add_argument("--train-summary", default=None)
     p.add_argument("--tally", default=None, help="tally's json after the blind review")
     p.add_argument("--arm-name", default=ARM, help="the arm's name (G4-1, G4-2)")
-    p.add_argument("--heldout", default=None, help="G4-2: the held-out evalsets.parquet (the direct measure)")
-    p.add_argument("--heldout-arm", default=None, help="glob of the arm's held-out pairs-w*.parquet")
-    p.add_argument("--heldout-base", default=None, help="glob of G4-0's held-out pairs-w*.parquet")
+    p.add_argument("--heldout", action="append", default=None,
+                   help="G4-2, G4-3: a held-out evalsets.parquet (the direct measure; G4-3 also heldout3's)")
+    p.add_argument("--heldout-arm", action="append", default=None, help="glob of the arm's held-out pairs-w*.parquet")
+    p.add_argument("--heldout-base", action="append", default=None, help="glob of G4-0's held-out pairs-w*.parquet")
     p.add_argument("--out", required=True)
     p = sub.add_parser("tally")
     p.add_argument("--judgments", required=True)
@@ -1547,6 +2124,10 @@ def main(argv=None):
     for name in ("plan", "shards", "measures", "nl", "setup", "out"):
         p.add_argument(f"--{name}", required=True)
     p.add_argument("--uri", action="append", default=[], help="KEY=gs://... where each input came from")
+    p.add_argument("--arm", default=None, choices=(ARM2, ARM3),
+                   help="G4-3: a pool of REPLAY_POOL3 with G4-3's seed (default: G4-2's 30,000)")
+    p.add_argument("--pool", type=int, default=None, help="the pool's size instead of the arm's")
+    p.add_argument("--pool-seed", default=None, help="the pool's seed instead of the arm's")
     p = sub.add_parser("build2")
     p.add_argument("--base-set", required=True, help="G4-1's set ($G/data/G4-1)")
     p.add_argument("--heldout-books", required=True, help="heldout's books.json")
@@ -1562,10 +2143,36 @@ def main(argv=None):
     p = sub.add_parser("smoke2")
     for name in ("summary", "adapter", "out"):
         p.add_argument(f"--{name}", required=True)
+    p = sub.add_parser("heldout3")
+    p.add_argument("--btval", required=True, help="fetch --arm G4-3 --split validation's directory")
+    p.add_argument("--heldout", required=True, help="G4-2's held-out evalsets.parquet ($G/data/heldout/)")
+    p.add_argument("--evalsets", required=True)
+    p.add_argument("--blind", required=True)
+    p.add_argument("--tokenizer", required=True)
+    p.add_argument("--workers", type=int, default=4)
+    p.add_argument("--out", required=True)
+    p = sub.add_parser("build3")
+    p.add_argument("--bt", required=True, help="fetch --arm G4-3's directory (train split)")
+    p.add_argument("--base-set", required=True, help="G4-1's set ($G/data/G4-1): the books")
+    p.add_argument("--heldout-books", required=True, help="heldout's books.json")
+    p.add_argument("--heldout", action="append", required=True,
+                   help="the held-out evalsets.parquet of heldout and heldout3 (no training row among them)")
+    p.add_argument("--replay", required=True, help="replay's parquet (the pool of G4-3)")
+    p.add_argument("--replay-model", default=REPLAY_MODEL2)
+    p.add_argument("--replay-share", type=float, default=REPLAY_SHARE3)
+    p.add_argument("--epochs", type=int, default=EPOCHS3)
+    p.add_argument("--flan-eval", required=True)
+    p.add_argument("--evalsets", required=True)
+    p.add_argument("--blind", required=True)
+    p.add_argument("--tokenizer", required=True)
+    p.add_argument("--out", required=True)
+    p = sub.add_parser("smoke3")
+    for name in ("summary", "adapter", "smoke-manifest", "data-report", "out"):
+        p.add_argument(f"--{name}", required=True)
     args = parser.parse_args(argv)
     {"fetch": fetch, "build": build, "check": check, "evaldata": evaldata, "texts": texts, "report": report,
      "tally": tally, "smoke": smoke, "heldout": heldout, "own": own, "replay": replay_candidates, "build2": build2,
-     "smoke2": smoke2}[args.command](args)
+     "smoke2": smoke2, "heldout3": heldout3, "build3": build3, "smoke3": smoke3}[args.command](args)
 
 
 if __name__ == "__main__":

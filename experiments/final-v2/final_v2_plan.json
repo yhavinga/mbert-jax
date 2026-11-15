@@ -1,0 +1,52 @@
+{
+ "run": "v2-fw2optout-230m",
+ "name_on_release": "yhavinga/dmbert-230m-fineweb2-optout",
+ "protocol": "experiments/final-v2/protocol.md",
+ "recipe_of": "T2 (final-culturax-230m, epoch2 at 1,306,000; experiments/final/protocol.md, start_final.sh at 1c8f2c7)",
+ "seed": 42,
+ "seeds": {"init": 42, "masking": "42 + process index", "data": "42 + pass"},
+ "hosts": 4,
+ "steps": 1306000,
+ "legs": [
+  {"leg": "main", "from": 0, "to": 1306000, "note": "one run; resumed only after a preemption or reboot, or by the float32 rule"}
+ ],
+ "schedule": {
+  "lr_schedule": "wsd",
+  "warmup_steps": 1250,
+  "peak_learning_rate": 4.8e-4,
+  "decay_steps": 266000,
+  "decay_start": 1040000,
+  "decay_shape": "1-sqrt",
+  "min_lr": 1e-6,
+  "note": "warmup as optax.warmup_cosine_decay_schedule, then 4.8e-4 to step 1,040,000, then 4.8e-4 - (4.8e-4 - 1e-6) * sqrt(f) over the last 266,000 steps; per step the schedule of T2"
+ },
+ "batch": {"per_device": 8, "devices": 16, "rows": 128, "max_length": 1024, "positions_per_step": 131072, "packing": true,
+           "long_documents": "split into pieces of 1,024"},
+ "masking": "uniform15 (15% single tokens, 80/10/10)",
+ "model": {"hidden_size": 1024, "num_layers": 22, "num_heads": 16, "intermediate_size": 1536, "global_attn_every_n_layers": 3,
+           "parameters": 230110592, "tokenizer": "yhavinga/dutch-llama-tokenizer", "vocab_size": 32128},
+ "optimizer": {"name": "adamw", "weight_decay": 0.01, "layer_norm_lr_factor": 1.0, "gradient_clipping": 1.0,
+               "skip_nonfinite_updates": true, "max_consecutive_nonfinite": 50},
+ "precision": {"compute_dtype": "bfloat16", "param_dtype": "float32",
+               "rule": "after a self-stop (50 non-finite steps in a row): resume from the last checkpoint in float32 to the next multiple of 10,000 after the stop, then bf16; at most 5 times (protocol.md)"},
+ "data": {
+  "source": "gs://t5-dutch-english-usc2/mbert/data/fineweb2-nl-optout/kept/train/",
+  "version": "the one of gs://t5-dutch-english-usc2/mbert/data/fineweb2-nl-optout/work/final-fwo1115a.done",
+  "fineweb2": {"repo": "HuggingFaceFW/fineweb-2", "revision": "af9c13333eb981300149d5ca60a8e9d659b276b9", "config": "nld_Latn",
+               "crawl_last": "CC-MAIN-2023-23"},
+  "min_tokens": 40000000000,
+  "shares": "stage_optout.py plan from manifest.json: the kept/train files in name order, every file split over the 4 hosts in segments of 1,000 rows taken in rounds (scripts/stage_share.py); the plan, with the sha256 of the manifest, to gs://t5-dutch-english-usc2/mbert/final-v2/plan/",
+  "staged_columns": ["text", "url"],
+  "files_list": "~/fw2optout_files.txt (the plan's order, files without rows for the host left out)",
+  "url_blocklist": ["hebban.nl"],
+  "dataset_num_rows": "kept/train documents less those of hebban.nl (blocklist_scan.py), in ~/fw2optout_files.rows",
+  "steps_per_pass_formula": "tokens x 1.0033 / (131,072 x 0.9512)",
+  "heldout": "kept/test less every document also in kept/train (same id or same sha256 of the text): ~/fw2optout_heldout.parquet, its md5 in ~/fw2optout_heldout.parquet.md5"
+ },
+ "checkpoints": {"every": 10000, "trainer_keeps": 3,
+                 "keep": [100000, 200000, 300000, 400000, 500000, 600000, 700000, 800000, 900000, 1000000, 1040000, 1100000,
+                          1200000, 1300000, 1306000]},
+ "eval": {"file": "~/fw2optout_heldout.parquet", "every": 25000, "batches": 50},
+ "vm": {"name": "mbert-mix", "type": "v4-32", "zone": "us-central2-b", "lock": "mbert-ops/final_eval_mix.lock on co1"},
+ "expected": {"seconds_per_step": 0.24, "hours": "87-92"}
+}

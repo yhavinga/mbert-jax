@@ -1,0 +1,8 @@
+kept/train/train-000_00000-r00000.parquet
+kept/train/train-000_00004-r02500.parquet
+kept/train/train-001_00000-r00900.parquet
+kept/train/train-001_00004-r03700.parquet
+kept/train/train-002_00000-r02500.parquet
+kept/train/train-002_00005-r02200.parquet
+kept/train/train-003_00001-r02100.parquet
+kept/train/train-003_00006-r02800.parquet

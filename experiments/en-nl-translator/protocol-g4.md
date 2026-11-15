@@ -449,3 +449,109 @@ verliezen en de eis "eigen ≤ 1,0" van G4-2.4 zien.
 `$G/heldout/{G4-2,G4-0}/`, classifier `$G/naturalness-G4-2/`, blind `$S/blind/G4-2/` en `$S/blind/G4-2-tg/`, verslag
 `$G/report-G4-2/report.md` (kopie `mbert-ops/translator-sft/g4-2-report.md`), stappen in `$G/stages/g4-2/`. Keten
 `mbert-ops/scripts/g4arm2_run.sh` op mbert-mix.
+
+**Amendement 15 nov 2026 (tijdstip: de commit van deze sectie op branch `en-nl-g4arm3`): arm G4-3** [besluiten van Yeb
+15 nov ~08:00 (`mbert-ops/translator-sft/g4-3-spec.md`) en ~08:05 (looptijd); uitwerking door een subagent, labels als
+in de kop]. Vastgelegd vóór de bouw van de set van G4-3, vóór de eerste trainingsstap en vóór elke uitslag van G4-3.
+Waar deze sectie niets zegt, gelden §1–§8 en amendement G4-2 voor G4-3 met "G4-3" in plaats van "G4-2".
+
+*G4-3.1 Aanleiding.* G4-2 (LR 1e-4) haalde (a1) en (b) niet ((b) +1,0 pp tegen G4-0,
+`mbert-ops/translator-sft/g4-2-report.md`). Yeb besliste daarna toch een arm G4-3: alle BT-rijen, ook de lange
+(513–2.048 tokens), LR 1e-5, 10% FLAN-replay, drie epochs [besluit 15 nov ~08:00]. Engels vakjargon in de uitvoer is
+volgens Yeb geen reden voor een filter [besluit].
+
+*G4-3.2 Bron.* De vijf datasets van §2.1 op de revisies na de publicatie van de lange rijen (15 nov; per dataset één
+commit; de kolommen `region`, `vm` en `time` zijn eruit; `mbert-ops/bt-long/publish-report.md`), vastgelegd in
+`g4arm.BT_REPOS3`:
+`yhavinga/handelingen-tweede-kamer-nl-en-gemma4` @ `e4010d9534789927f14f364d3ee6aa3850dd66b8`,
+`yhavinga/openraadsinformatie-nl-en-gemma4` @ `926d94adc3c67a0aec59d13f7bcc78dd94d4601a`,
+`yhavinga/rijksoverheid-websites-nl-en-gemma4` @ `958b56a33b65c2a21d081ae5e4ef503b2c8913eb`,
+`yhavinga/rechtspraak-nl-en-gemma4` @ `09a8f8c811c99ab34b311d3d03147eb638d6e28c`,
+`yhavinga/fineweb-2-nl-en-gemma4` @ `15dc526d3359af2fa8f94b17320c91420b66f1fa`.
+Handelingen kreeg om ~08:05 nog een commit die alleen `README.md` veranderde, en een squash; de datafiles zijn byte
+voor byte die van de publicatie (`d61e32a`) [gemeten: LFS-sha256 van alle `data/`-bestanden gelijk]. `g4arm.py fetch
+--arm G4-3` eist dat elk gedownload bestand de LFS-sha256 van die revisie op de Hub heeft en dat er geen bestand van de
+split ontbreekt.
+
+*G4-3.3 Data per doorgang* [besluit Yeb; uitwerking `g4arm.py build3`, set `$G/data/G4-3/`].
+1. **Alle BT-train-rijen** van G4-3.2, korte (≤ 512 tokens Nederlands) en lange (513–2.048), zonder hersampling naar
+   lengte en zonder chrF-filter [besluit Yeb]. Eruit blijven: rijen met een niet-lege `hard_fails` (zoals G4-1/G4-2)
+   [technisch, besluit hoofdsessie], en rijen met een 13-gram van een evaluatieset of blinde passage (§2.1 regel 3)
+   [keuze: die regel beschermt de evaluatie, geen kwaliteitsfilter; bij G4-1 kostte hij 1 rij]. Niet toegepast: de
+   lengtegrens van R2 (§2.1, bij G4-1 108 rijen; het verslag telt wat hij zou weghalen) en een crawlgrens. Gemeten op
+   15 nov (alle rijen, Gemma 4-tokenizer, prompt + antwoord zoals de training): 250.840 train-rijen, 3.118 met
+   `hard_fails`, dus 247.722, waarvan 20.180 lang; 144,2 M tokens per doorgang, waarvan 42,9 M in de lange rijen.
+2. **Alle boeken**: de boekparen van G4-1 zonder de held-out boeken van G4-2.5 (11.760 paren), letterlijk uit
+   `$G/data/G4-1/`, zoals G4-2.
+3. **FLAN-replay: 10% van de voorbeelden** (replay = round(n / 9), n = de voorbeelden van 1 en 2) [besluit Yeb], uit
+   de Gemma 4-FLAN-nl zoals G4-2.3 punt 3–5 (de plaatsen in de bucket, met `nl-g4/w*.parquet` van 14 nov; dezelfde
+   eisen en het venster van 48–384 tokens Nederlands). Elke doorgang krijgt andere replayrijen [besluit hoofdsessie,
+   "waar de pool dat toelaat"]: `g4arm.py replay --arm G4-3` trekt uit de kandidaten (G4-2: 534.456) uniform een pool
+   van 120.000 (seed `en-nl-g4arm/0/G4-3/replay-pool`); build3 schudt die (seed `en-nl-g4arm/0/G4-3/replay`) en geeft
+   doorgang k de rijen (k−1)·r tot k·r; is de pool kleiner dan 3·r, dan komen rijen terug (het verslag zegt het). De
+   69 voorbeelden die FLAN-69 op 15 nov vertaalt, zitten niet in `nl-g4` van 14 nov [gevolgtrekking: hun lange
+   segmenten vielen buiten het venster; het effect op 1,03 M voorbeelden is verwaarloosbaar]. De sha256 van de
+   gelezen invoer staat in `replay.json`.
+4. **Drie doorgangen**, elk apart geschud (seeds `en-nl-g4arm/0/G4-3/shuffle/<1|2|3>`), achter elkaar in
+   `train.parquet` (zoals G4-2.3 punt 6).
+5. **Sequentielengte 4.096** (`max_target_length`) [keuze]. Gemeten: het langste voorbeeld is 3.972 tokens
+   (FineWeb-2: prompt met 1.929 tokens Engels, Nederlands 2.048 tokens en `<turn|>\n`); de prompt rond het Engels
+   kost 89 tokens. 4.096 is het kleinste veelvoud van 512 dat elk voorbeeld houdt; MaxText's `SFTPromptMasking`
+   kapt zonder melding af wat langer is, dus build3 en check stoppen bij een voorbeeld boven 4.096. Packing,
+   `per_device_batch_size=1` en 16 sequenties per stap als G4-2; build3 rekent de batches per proces na zoals MaxText
+   0.2.5 ze maakt (elk proces elk vierde voorbeeld, grain's first-fit over de 4 rijen van een batch) en daaruit de
+   stappen (`sft_lora.step_limit`).
+6. `check --arm G4-3`: MaxText's eigen SFT-stappen op elk voorbeeld dat in de set staat, één keer per id (een id moet
+   in elke doorgang hetzelfde voorbeeld zijn), en elke rij zijn lengte van de build.
+
+*G4-3.4 Training.* Als G4-2.2/G4-2.4 (rank 32 / alpha 16 op de 410 modules, AdamW, clipping 1,0,
+`num_vocab_tiling=8`, MaxText 0.2.5, één multi-host-job over de 16 chips van mbert-corpus), behalve:
+- **LR 1e-5** [besluit Yeb], WSD als G4-2: warmup 3%, constant, de laatste 10% lineair naar 1e-6 (LR/10).
+- **`max_target_length` 4.096** (G4-3.3 punt 5). Gemeten op 13 nov (`translator-sft/gemma4-moe-lora-test.md`, variant
+  v4): Gemma 4 31B, rank 32, 4.096, 16 chips: piek 25,04 GiB per chip, 10,60 s per stap.
+- **Evaluatie tijdens de training**: stap 0, elke 750 stappen [keuze: ~10 rondes bij de ~8.000 stappen van de
+  schatting] en na de laatste, op vier held-out sets: `books`, `btval` en `own` (de bestanden van G4-2.5) en `btlong`
+  (G4-3.6).
+
+*G4-3.5 Smoke-test en schatting* (op mbert-corpus, binnen `final_run.lock`, vóór de volle training). 8 stappen met de
+instellingen van G4-3.4 op een smoke-set uit doorgang 1: eerst de 256 langste voorbeelden, dan 512 andere (seed
+`en-nl-g4arm/0/G4-3/smoke`), evaluatie op stap 0, 4 en 8; run `g4arm_G4-3_s8`. Geslaagd als: alle 4 workers `EXIT 0`,
+8 eindige verliezen, piek ≤ 29,5 GiB per chip, adapter rank 32 / alpha 16 / schaal 0,5, `max_target_length` 4.096,
+LR-piek 1e-5, elke stap bevat 16 van de langste voorbeelden (tokens per stap ≥ 16 × het kortste daarvan; geheugen en
+stapduur gelden dus voor de langste rijen), de batches per proces van de pipeline zijn die van de naberekening van
+build3 op de smoke-set, van elke held-out set drie eindige verliezen met ≥ 1 token, en het verlies van het basismodel
+op zijn eigen greedy vertalingen (stap 0) ≤ 1,0 (G4-2.4). Faalt een controle, dan stopt de keten vóór de training.
+**Schatting** [schatting]: het tellen van de data vóór de eerste stap (de tijd van de smoke-test plus 6,6 s per miljoen
+tokens extra, uit G4-2: 212,5 s voor 12,1 M en 404,2 s voor 41,2 M), laden en compileren (uit de smoke-test), de
+stappen van build3 × de mediane stapduur van de smoke-test, en de evaluatierondes × de langste ronde na stap 0.
+**Regel** [besluit Yeb 15 nov ~08:05]: is de schatting voor drie doorgangen ≤ 120 uur (~5 dagen), dan traint G4-3 drie
+doorgangen; daarboven de eerste twee doorgangen van `train.parquet` (de keten stopt niet om het voor te leggen).
+
+*G4-3.6 De lange validation-rijen: rapporteren, beslist niet* [besluit Yeb: chrF op de lange validation-rijen tegen
+G4-0, rapporteren]. Code `g4arm.py heldout3`, `$G/data/heldout3/`. De rijen van de split `validation` van G4-3.2 met
+`tokens_nl` > 512, zonder `hard_fails`, zonder 13-gram van een evaluatieset of blinde passage, als voorbeeld
+≤ 4.096 tokens, en passend in de klassen van `gemma4-31b-long` (`translate_models.yml`: klassen e512–e2k op het aantal
+tokens Engels, het Nederlands ≤ 0,8 × de decodeerlimiet van de klasse, zoals G4-2.5). Alle zulke rijen, zonder
+steekproef. Elke rij wordt **heel** vertaald (documentniveau), door G4-3 en door G4-0, met `natural-v1` op de fork
+@ `f4d8615` (decodeerlimieten boven 1.024 vragen die fix). Maten: chrF2 tegen het originele Nederlands (corpus en
+gemiddeld per rij), totaal en per bron; niet af, lus, leeg en de lengte tegen het origineel; het verlies op
+`eval-btlong` op stap 0 tegen de laatste stap. Ze staan in het verslag naast de directe maat van G4-2.6 en tellen niet
+mee in de vooraf vastgelegde lezing (die blijft over `books` en `btval`). G4-0's vertalingen van deze rijen maakt
+de keten van G4-3 (ze bestonden nog niet). heldout3 controleert ook dat de 800 rijen van de BT-validatie van G4-2.5
+in de revisies van G4-3.2 dezelfde rijen zijn (Engels en Nederlands gelijk), en build3 dat geen held-out rij een
+train-rij is.
+
+*G4-3.7 Evaluatie en beslisregel* (§4, §5): ongewijzigd, met G4-3 als arm en G4-0 als uitgangspunt: (a1) QE ≤ de mens
+(2,3917784375 / 1,4938481225 / 1,8419510766), (a2) fouten(G4-3) ≤ fouten(G4-0), (b) "origineel"(G4-3) −
+"origineel"(G4-0) ≥ 0,10 op WMT24++ (960) + FLAN (1.000), (c) ≥ 60% van de niet-gelijke oordelen; blind alleen als (a1)
+en (b) gelden, door een verse Claude-subagent; pakket G4-3 tegen G4-0 in `$S/blind/G4-3/` (seed
+`en-nl-sft/blind/ab/G4-3/<blind_id>`) en tegen TG in `$S/blind/G4-3-tg/`. G4-0 = de vertalingen en scores uit de run
+van G4-1 (`$G/eval/G4-0/`) en de held-out vertalingen uit de run van G4-2 (`$G/heldout/G4-0/`), zoals G4-2.7; `own`
+is het bestand van G4-2. De classifier draait opnieuw in één run over G4-3, G4-0 en (ter informatie) G4-2.
+
+*G4-3.8 Uitvoer.* Invoer `$G/input/bt3/`, `$G/input/bt3-val/`, `$G/data/replay-G4-3/`; lange validation-rijen
+`$G/data/heldout3/`; set `$G/data/G4-3/`, smoke-set `$G/data/G4-3-smoke/`, verslag `$G/data/report-G4-3.md`; smoke
+`$G/smoke3/<tag>/`; run `$G/runs/g4arm_G4-3/`, adapter `$G/G4-3/`, vertalingen en scores `$G/eval/G4-3/`, held-out
+`$G/heldout/G4-3/`, lange rijen `$G/long/{G4-3,G4-0}/`, classifier `$G/naturalness-G4-3/`, blind `$S/blind/G4-3/` en
+`$S/blind/G4-3-tg/`, verslag `$G/report-G4-3/report.md` (kopie `mbert-ops/translator-sft/g4-3-report.md`), stappen in
+`$G/stages/g4-3/`. Keten `mbert-ops/scripts/g4arm3_run.sh` op mbert-corpus.

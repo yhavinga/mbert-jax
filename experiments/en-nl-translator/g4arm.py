@@ -35,6 +35,14 @@ Arm G4-3 (protocol-g4.md §9, amendment G4-3):
             replay apart per pass, three shuffled passes; the batches of MaxText's packing per process, the smoke set
   check --arm G4-3   MaxText's own SFT steps on every distinct example, in processes
   smoke3    the verdict of G4-3's smoke test and the estimate of the full training's time (bound: 3 days)
+Arm G4-4 (protocol-g4.md §9, amendment G4-4):
+  build4    G4-4's set: G4-3's set pass by pass as it is, plus at most 20 pairs per English novel per pass (-b1-, group
+            en_orig, arm RE's checks, one Dutch edition per book and one English id per work, near-duplicate
+            passages out, no 13-gram of the evaluation sets) apart in every pass, and the replay that keeps 10% of
+            every pass (the next rows of G4-3's replay order); three passes shuffled anew; packing, steps, smoke set
+  check --arm G4-4   as G4-3's
+  smoke4    the verdict of G4-4's smoke test (G4-3's checks) and the estimate of three passes (above 120 h: exit 1)
+  report --other G4-3=DIR   beside G4-0 the arm against G4-3 on the same measures (reported, deciding nothing)
 """
 
 import argparse
@@ -545,7 +553,7 @@ def report_md(r):
 
 
 def check(args):
-    if getattr(args, "arm", None) == ARM3:
+    if getattr(args, "arm", None) in (ARM3, ARM4):
         return check3(args)
     d = Path(args.data)
     msgs = [x["messages"] for x in read_rows(d / "train.parquet")]
@@ -771,6 +779,10 @@ def report(args):
     arm = getattr(args, "arm_name", None) or ARM
     evalsets = {r["id"]: r for r in read_rows(args.evalsets)}
     models = {arm: scored_dir(args.arm), BASE: scored_dir(args.base)}
+    other = None
+    if getattr(args, "other", None):
+        other, other_dir = args.other.split("=", 1)
+        models[other] = scored_dir(other_dir)
     for name, rows in models.items():
         if set(rows) != set(evalsets):
             raise SystemExit(f"{name}: scores for {len(rows)} of {len(evalsets)} segments")
@@ -786,7 +798,7 @@ def report(args):
             tg_sets["wmt24pp"].append(r)
     predictions = read_rows(args.predictions)
     shares = armeval.classifier_shares(predictions)
-    for name in (arm, BASE):
+    for name in models:
         if shares.get(name, {}).get("n") != N_WMT_GOOD + N_FLAN:
             raise SystemExit(f"{args.predictions}: {name} has {shares.get(name, {}).get('n')} texts")
     accuracy = json.loads(Path(args.classifier_results).read_text())["test_accuracy"] if args.classifier_results else None
@@ -796,7 +808,7 @@ def report(args):
               "shares": shares, "classifier_accuracy": accuracy, "sets": {}}
     for s in ("wmt24pp", "wmt24pp_all", "flores", "ntrex", "europarl", "flan", "blind"):
         entry = {}
-        for name in (arm, BASE):
+        for name in models:
             rows = sets[name].get(s, [])
             entry[name] = {**armeval.counts(rows), "metricx_qe": mean(r["metricx_qe"] for r in rows),
                            "metricx_ref": mean(r["metricx_ref"] for r in rows),
@@ -835,6 +847,21 @@ def report(args):
             raise SystemExit("an id twice among the held-out files")
         result["heldout"] = heldout_measure(held, pairs_of(args.heldout_arm), pairs_of(args.heldout_base),
                                             t.get("eval"), arm, BASE)
+        if other and getattr(args, "heldout_other", None):
+            result["other_heldout"] = heldout_measure(held, pairs_of(args.heldout_arm), pairs_of(args.heldout_other),
+                                                      t.get("eval"), arm, other)
+    if other:
+        # amendment G4-4.7: the arm beside another arm on the same measures, reported, deciding nothing
+        o = {"name": other, "a1": rule_a1(sets[other]), "b": rule_b(shares, arm, other)}
+        if getattr(args, "other_summary", None):
+            evals = json.loads(Path(args.other_summary).read_text()).get("eval") or []
+            curve = collections.defaultdict(dict)
+            for e in evals:
+                curve[e["set"]][e["step"]] = e["loss"]
+            o["loss"] = {k: dict(sorted(v.items())) for k, v in sorted(curve.items())}
+        if getattr(args, "other_tally", None):
+            o["blind_vs_base"] = json.loads(Path(args.other_tally).read_text())
+        result["other"] = o
     if args.tally:
         result["blind"] = json.loads(Path(args.tally).read_text())
         result["a2"] = result["blind"]["a2"]
@@ -910,6 +937,8 @@ def report_text(r):
                      f"{v.get('empty', '–')} |")
     if r.get("heldout"):
         L += heldout_text(r["heldout"], r["arm"], r["base"])
+    if r.get("other"):
+        L += other_text(r)
     if r.get("lora_merge"):
         L += ["", "LoRA-samenvoeging (`translate.py`, regel LORA): " + "; ".join(json.dumps(x) for x in r["lora_merge"][:4])]
     if r.get("training"):
@@ -947,6 +976,39 @@ def heldout_text(h, arm, base):
 
 def f2(x):
     return "–" if x is None else f"{x:.2f}".replace(".", ",")
+
+
+def other_text(r):
+    """amendment G4-4.7: the arm against another arm (G4-3) on the same measures, reported, deciding nothing"""
+    o, arm = r["other"], r["arm"]
+    name = o["name"]
+    L = ["", f"## Vergelijking met {name} (rapporteren, beslist niet)", "",
+         f"| set | n | {arm} QE | {name} QE | verschil | mens |", "|---|---:|---:|---:|---:|---:|"]
+    for s, v in r["a1"]["sets"].items():
+        w = o["a1"]["sets"][s]
+        diff = None if v["model"] is None or w["model"] is None else v["model"] - w["model"]
+        L.append(f"| {s} | {v['n']} | {f3(v['model'])} | {f3(w['model'])} | {f3(diff, True)} | {f3(v['human'])} |")
+    L += ["", f"(a1) voor {name}: {'gehaald' if o['a1']['holds'] else 'niet gehaald'}. (b) in dezelfde classify-run: "
+          f"{arm} {pct(o['b']['arm'])}, {name} {pct(o['b']['base'])}, verschil {f3(o['b']['delta'], True)}."]
+    h = r.get("other_heldout")
+    if h:
+        L += ["", f"| set | chrF {arm} | chrF {name} | {arm} hoger | verlies laatste stap {arm} | verlies laatste stap {name} |",
+              "|---|---:|---:|---|---:|---:|"]
+        own_loss = (r.get("heldout") or {}).get("loss") or {}
+        for set_name, entry in h["sets"].items():
+            mine, theirs = entry[arm], entry[name]
+            base_set = set_name.split(":")[0]
+            a = own_loss.get(base_set) or {}
+            b = (o.get("loss") or {}).get(base_set) or {}
+            last_a = a[max(a)] if a and ":" not in set_name else None
+            last_b = b[max(b)] if b and ":" not in set_name else None
+            L.append(f"| {set_name} | {f2(mine['chrf_corpus'])} | {f2(theirs['chrf_corpus'])} | "
+                     f"{'ja' if mine['chrf_corpus'] > theirs['chrf_corpus'] else 'nee'} | {f3(last_a)} | {f3(last_b)} |")
+    if o.get("blind_vs_base"):
+        x = o["blind_vs_base"]
+        L += ["", f"Blinde beoordeling van {name} tegen {r['base']} (zijn eigen pakket): {name} beter {x['arm_better']}, "
+              f"{r['base']} beter {x['base_better']}, gelijk {x['equal']}; fouten {x['errors_arm']} tegen {x['errors_base']}."]
+    return L
 
 
 # ---------------------------------------------------------------------------------------------------- smoke
@@ -2042,6 +2104,503 @@ def smoke3(args):
         raise SystemExit(1)
 
 
+# ---------------------------------------------------------------------------------------------------- G4-4
+
+ARM4 = "G4-4"
+SEED4 = f"{SEED}/G4-4"
+EPOCHS4 = 3
+REPLAY_SHARE4 = 0.10                 # amendment G4-4.3: 10% of every pass's examples, G4-3's round(n / 9) per pass
+NOVELS_PER_PASS = 20                 # amendment G4-4.3 (Yeb, 15 Nov ~13:45): at most 20 pairs of a book in a pass
+NOVEL_SOURCE = "books_en"            # arm RE's source name of the -b1- English novels with their Dutch translation
+NOVEL_MAX_TOKENS = MAX_TOKENS        # arm RE's bound on a novel pair (2,048), here in Gemma 4's prompt
+# arm RE's checks of a -b1- row (mbert-jax en-nl-sft-re @ 97c44b6, sft_build.py), copied unchanged: the inventory's
+# passes (real_fails, its length bound and alignment check, no repeated id or English), no repeated Dutch, no Markdown
+# trace, not cleaned on one side only; one Dutch edition per English book
+B1_MARKDOWN = re.compile(r"(^|\s)_[^_\s][^_]*_($|[\s.,;:!?])|\*\*")
+B1_COLUMNS = ["id", "book", "nl_book_id", "en_book_id", "group", "author", "en", "nl", "en_raw", "nl_raw", "passes",
+              "dup_id", "dup_nl"]
+# one book under two English ids (another English edition): passages whose first SAME_WORK_CHARS letters and digits
+# (lower case) are equal on the English or on the Dutch side, at least SAME_WORK_MIN_SHARED between the two books
+SAME_WORK_CHARS = 80
+SAME_WORK_MIN_SHARED = 10
+
+
+def read_b1(path):
+    """(the rows of group en_orig, with B1_COLUMNS; {group: rows} of the whole file): b1-selected.parquet of the -b1-
+    inventory (arm RE's read_b1)"""
+    import pyarrow.compute as pc
+    import pyarrow.parquet as pq
+
+    t = pq.read_table(path, columns=B1_COLUMNS)
+    groups = {g["values"]: g["counts"] for g in pc.value_counts(t["group"]).to_pylist()}
+    return t.filter(pc.equal(t["group"], "en_orig")).to_pylist(), groups
+
+
+def b1_fails(r):
+    """The first of arm RE's row checks a -b1- row fails, or None (arm RE's b1_fails)"""
+    if r["group"] != "en_orig":
+        return "group"
+    if r["dup_id"]:
+        return "dup_id"
+    if not r["passes"]:
+        return "passes"
+    if r["dup_nl"]:
+        return "dup_nl"
+    if B1_MARKDOWN.search(r["en"]) or B1_MARKDOWN.search(r["nl"]):
+        return "markdown"
+    # the loader's clean_line changed the text on one side only: a leading mark taken off there and not here
+    if (r["en_raw"] is None) != (r["nl_raw"] is None):
+        return "cleaned_one_side"
+    return None
+
+
+def _id(x):
+    return int(str(x))
+
+
+def b1_editions(rows):
+    """({English book id: the rows of its chosen Dutch edition}, info): the rows without b1_fails; of an English book
+    with several Dutch editions the one with the most such rows, a tie to the lowest Dutch id (arm RE's b1_editions)"""
+    first, alone = collections.Counter(), collections.Counter()
+    by = collections.defaultdict(lambda: collections.defaultdict(list))
+    english = set()
+    for r in rows:
+        english.add(r["en_book_id"])
+        f = b1_fails(r)
+        if f is None:
+            by[r["en_book_id"]][r["book"]].append(r)
+        else:
+            first[f] += 1
+        if r["group"] == "en_orig" and not r["dup_id"] and r["passes"]:
+            alone["dup_nl"] += bool(r["dup_nl"])
+            alone["markdown"] += bool(B1_MARKDOWN.search(r["en"]) or B1_MARKDOWN.search(r["nl"]))
+            alone["cleaned_one_side"] += (r["en_raw"] is None) != (r["nl_raw"] is None)
+    chosen, editions = {}, collections.Counter()
+    for en, eds in by.items():
+        book = min(eds, key=lambda b: (-len(eds[b]), _id(eds[b][0]["nl_book_id"])))
+        chosen[en] = eds[book]
+        editions[len(eds)] += 1
+        first["other_edition"] += sum(len(v) for b, v in eds.items() if b != book)
+    counts = sorted(len(v) for v in chosen.values())
+    info = {"rows": len(rows), "first_failed": dict(sorted(first.items())),
+            "alone_after_passes": dict(sorted(alone.items())), "english_books": len(english),
+            "english_books_with_rows": len(chosen), "editions": dict(sorted(editions.items())),
+            "rows_kept": sum(counts),
+            "rows_per_book": {f"p{q}": quantile(counts, q / 100) for q in (0, 10, 50, 90, 100)} if counts else None}
+    return chosen, info
+
+
+def quantile(values, q):
+    return sft_build.quantile(values, q)
+
+
+def work_key(text):
+    k = re.sub(r"[^a-z0-9]", "", text.lower())
+    return k[:SAME_WORK_CHARS] if len(k) >= SAME_WORK_CHARS else None
+
+
+def same_works(rows, chosen):
+    """({English book id: rows}, info): of English books that are one work under several ids (at least
+    SAME_WORK_MIN_SHARED passage keys in common on the English or on the Dutch side, over every en_orig row without a
+    repeated id) the one with the most rows in chosen stays, a tie to the lowest id; the others go"""
+    shared = {}
+    for side in ("en", "nl"):
+        books = collections.defaultdict(set)
+        for r in rows:
+            if r["group"] == "en_orig" and not r["dup_id"]:
+                k = work_key(r[side])
+                if k is not None:
+                    books[k].add(r["en_book_id"])
+        pair = collections.Counter()
+        for ids in books.values():
+            ids = sorted(ids, key=_id)
+            for i in range(len(ids)):
+                for j in range(i + 1, len(ids)):
+                    pair[(ids[i], ids[j])] += 1
+        shared[side] = pair
+    edges = sorted({p for side in shared.values() for p, n in side.items() if n >= SAME_WORK_MIN_SHARED},
+                   key=lambda p: (_id(p[0]), _id(p[1])))
+    parent = {}
+
+    def root(x):
+        while parent.get(x, x) != x:
+            x = parent[x]
+        return x
+
+    for a, b in edges:
+        ra, rb = root(a), root(b)
+        if ra != rb:
+            parent[max(ra, rb, key=_id)] = min(ra, rb, key=_id)
+    works = collections.defaultdict(list)
+    for x in {x for e in edges for x in e}:
+        works[root(x)].append(x)
+    out = dict(chosen)
+    dropped = []
+    for members in works.values():
+        keep = min(members, key=lambda x: (-len(chosen.get(x, [])), _id(x)))
+        for x in sorted(members, key=_id):
+            if x != keep and x in out:
+                dropped.append({"en_book_id": str(x), "rows": len(out.pop(x)), "kept_instead": str(keep)})
+    near = {side: sum(1 for n in pair.values() if 0 < n < SAME_WORK_MIN_SHARED) for side, pair in shared.items()}
+    info = {"key_chars": SAME_WORK_CHARS, "min_shared": SAME_WORK_MIN_SHARED, "pairs_linked": len(edges),
+            "works": len(works), "books_in_works": sum(len(m) for m in works.values()),
+            "books_dropped": len(dropped), "rows_dropped": sum(d["rows"] for d in dropped), "dropped": dropped,
+            "pairs_below_bound": near,
+            "most_shared": {side: [[str(a), str(b), n] for (a, b), n in pair.most_common(12)]
+                            for side, pair in shared.items()}}
+    return out, info
+
+
+def near_duplicates(chosen):
+    """({English book id: rows}, info): a row whose English or Dutch passage key (work_key) is that of an earlier row
+    (books by id, rows by id) goes, beyond the inventory's exact repeats: the same passage in another English book (a
+    preview chapter, an omnibus) or twice in one book"""
+    seen, out, dropped = {}, {}, collections.Counter()
+    for en in sorted(chosen, key=_id):
+        keep = []
+        for r in sorted(chosen[en], key=lambda r: r["id"]):
+            keys = [(side, k) for side in ("en", "nl") if (k := work_key(r[side])) is not None]
+            hit = [seen[k] for k in keys if k in seen]
+            if hit:
+                dropped["same_book" if en in hit else "other_book"] += 1
+            else:
+                keep.append(r)
+            for k in keys:
+                seen.setdefault(k, en)
+        if keep:
+            out[en] = keep
+    info = {"rows_dropped": sum(dropped.values()), **dict(sorted(dropped.items())),
+            "books_left": len(out), "rows_left": sum(len(v) for v in out.values())}
+    return out, info
+
+
+def novel_draw(by_book, blocked, counter, seed, per_pass, passes):
+    """({pass: rows}, info): per English book its rows (by id) in an order drawn with the seed, and of them the first
+    per_pass x passes that share no 13-gram with blocked and fit NOVEL_MAX_TOKENS; the r-th of a book goes to pass
+    r // per_pass + 1, so a pair is in one pass only, a pass has at most per_pass of a book, and a book with fewer
+    pairs gives what it has to the first passes"""
+    want = per_pass * passes
+    out = {e: [] for e in range(1, passes + 1)}
+    stats, kept_of = collections.Counter(), {}
+    for en in sorted(by_book, key=_id):
+        rows = sorted(by_book[en], key=lambda r: r["id"])
+        random.Random(f"{seed}/novels/{en}").shuffle(rows)
+        kept, i = 0, 0
+        while kept < want and i < len(rows):
+            part = rows[i:i + want - kept + 8]
+            i += len(part)
+            prompts, targets = counter.examples(part)
+            for r, a, b in zip(part, prompts, targets):
+                if kept == want:
+                    break
+                stats["looked_at"] += 1
+                if shares_gram(r, blocked):
+                    stats["eval_13gram"] += 1
+                elif a + b > NOVEL_MAX_TOKENS:
+                    stats["too_long"] += 1
+                else:
+                    out[kept // per_pass + 1].append({"pid": r["id"], "source": NOVEL_SOURCE, "en": r["en"],
+                                                       "nl": r["nl"], "book": r["book"], "en_book_id": str(en),
+                                                       "rank": kept, "tokens_prompt": a, "tokens_target": b})
+                    kept += 1
+        kept_of[str(en)] = kept
+    counts = sorted(kept_of.values())
+    info = {"per_pass": per_pass, "passes": passes, "books": len(by_book), **dict(sorted(stats.items())),
+            "drawn": sum(counts), "per_pass_rows": {e: len(v) for e, v in out.items()},
+            "per_pass_books": {e: len({r["en_book_id"] for r in v}) for e, v in out.items()},
+            "books_below": {n: sum(c < n for c in counts) for n in range(per_pass, want + 1, per_pass)},
+            "kept_per_book": {f"p{q}": quantile(counts, q / 100) for q in (0, 10, 50, 90, 100)} if counts else None}
+    return out, info
+
+
+def g43_set(directory, report_path):
+    """G4-3's set as {pass: [(messages row, meta row)]}, checked: the manifest, report-G4-3.json's examples and tokens
+    per pass and kind, the passes in order, every example outside the replay the same in each pass, the replay apart"""
+    d = Path(directory)
+    manifest = json.loads((d / "manifest.json").read_text())
+    if (manifest.get("set"), manifest.get("seq"), manifest.get("seed"), manifest.get("epochs")) != (ARM3, SEQ3, SEED3,
+                                                                                                    EPOCHS3):
+        raise SystemExit(f"{d}: not G4-3's set ({manifest.get('set')}, seq {manifest.get('seq')})")
+    msgs = read_rows(d / "train.parquet")
+    metas = read_rows(d / "train-meta.parquet")
+    if len(msgs) != len(metas) or len(metas) != manifest["examples"]:
+        raise SystemExit(f"{d}: {len(msgs)} examples, {len(metas)} meta rows, manifest {manifest['examples']}")
+    if (d / "template.jinja").read_text(encoding="utf-8") != g4lora.TEMPLATE:
+        raise SystemExit(f"{d}/template.jinja is not g4lora.TEMPLATE")
+    epochs = [m["epoch"] for m in metas]
+    if epochs != sorted(epochs) or sorted(set(epochs)) != list(range(1, EPOCHS3 + 1)):
+        raise SystemExit(f"{d}: the passes are not 1 ... {EPOCHS3} in order")
+    passes = collections.defaultdict(list)
+    for x, m in zip(msgs, metas):
+        passes[m["epoch"]].append((x, m))
+    report = json.loads(Path(report_path).read_text())
+    for p in report["passes"]:
+        got = pass_kinds(passes[p["pass"]])
+        if (p["examples"], p["tokens"], p["kinds"]) != (len(passes[p["pass"]]), sum(v["tokens"] for v in got.values()),
+                                                        got):
+            raise SystemExit(f"{d}: pass {p['pass']} is not the pass of {report_path}")
+    seen, replay = {}, []
+    for e, one in passes.items():
+        for x, m in one:
+            if m["kind"] == "replay":
+                continue
+            s = seen.setdefault(m["id"], (x, m))
+            if s[0] != x or {k: v for k, v in s[1].items() if k != "epoch"} != {k: v for k, v in m.items() if k != "epoch"}:
+                raise SystemExit(f"{m['id']}: not the same example in pass {s[1]['epoch']} and pass {e}")
+        replay.append({m["id"] for _, m in one if m["kind"] == "replay"})
+    rest = [sorted(m["id"] for _, m in one if m["kind"] != "replay") for one in passes.values()]
+    if any(r != rest[0] for r in rest):
+        raise SystemExit(f"{d}: the examples outside the replay differ between the passes")
+    if sum(map(len, replay)) != len(set().union(*replay)):
+        raise SystemExit(f"{d}: a replay row in two passes")
+    return dict(passes), manifest, report
+
+
+def pass_kinds(one):
+    kinds = collections.defaultdict(lambda: {"examples": 0, "tokens": 0, "target_tokens": 0})
+    for _, m in one:
+        k = "bt_long" if m["kind"] == "bt" and m["long"] else m["kind"]
+        kinds[k]["examples"] += 1
+        kinds[k]["tokens"] += m["tokens_prompt"] + m["tokens_target"]
+        kinds[k]["target_tokens"] += m["tokens_target"]
+    return dict(sorted(kinds.items()))
+
+
+def build4(args, counter=None):
+    """amendment G4-4.3: G4-3's set, pass by pass, as it is (its BT, its books, its replay rows of the pass), plus per
+    pass at most NOVELS_PER_PASS pairs of every English novel (-b1-, group en_orig, arm RE's checks, one Dutch edition
+    per book and one English id per work, no 13-gram of the evaluation sets or blind passages, apart in every pass) and
+    the replay that keeps 10% of the pass (the next rows of G4-3's replay order, so every pass its own rows), every
+    pass shuffled anew; MaxText's packing per process at SEQ3, the steps; the smoke test's set"""
+    import pyarrow as pa
+
+    counter = counter or TokenCounter(args.tokenizer)
+    out = Path(args.out)
+    print("PROGRESS reading G4-3's set", flush=True)
+    g43, g43_manifest, g43_report = g43_set(args.g43, args.g43_report)
+    inputs3 = g43_manifest["inputs"]
+    for name, path, want in (("evalsets", args.evalsets, inputs3["evalsets"]), ("blind", args.blind, inputs3["blind"]),
+                             ("replay", args.replay, inputs3["replay"]["sha256"])):
+        if sha256_file(path) != want:
+            raise SystemExit(f"{path}: not the {name} file G4-3's set was built from")
+    if args.replay_model != inputs3["replay"]["model"]:
+        raise SystemExit(f"--replay-model {args.replay_model!r}: G4-3's replay is {inputs3['replay']['model']!r}")
+    blocked = checked_blocked(args.evalsets, args.blind)
+    report = {"arm": ARM4, "seed": SEED4, "prompt": PROMPT, "epochs": args.epochs, "replay_share": args.replay_share,
+              "seq": SEQ3, "novels_per_pass": NOVELS_PER_PASS, "novel_max_tokens": NOVEL_MAX_TOKENS,
+              "g4_3": {"manifest": {k: g43_manifest[k] for k in ("set", "examples", "examples_per_epoch", "tokens",
+                                                                 "steps", "seed")},
+                       "files": {f: sha256_file(Path(args.g43) / f) for f in ("train.parquet", "train-meta.parquet")},
+                       "report": sha256_file(args.g43_report)}}
+    # G4-3's replay draw again (build3: the pool, its order with G4-3's seed, pass k the rows (k-1)r ... kr - 1): it
+    # must give G4-3's replay rows of every pass; G4-4's added replay rows are the next ones in that order
+    print("PROGRESS the replay order of G4-3", flush=True)
+    candidates = replay_pool(args.replay, args.replay_model, args.flan_eval, blocked, counter, report)
+    order = random.Random(f"{SEED3}/replay").sample(candidates, len(candidates))
+    r3 = g43_report["replay"]["per_pass"]
+    for e in range(1, EPOCHS3 + 1):
+        theirs = {m["id"]: (x, m["tokens_prompt"], m["tokens_target"]) for x, m in g43[e] if m["kind"] == "replay"}
+        again = {m["id"]: (x, m["tokens_prompt"], m["tokens_target"])
+                 for x, m in (example(r, "replay") for r in order[(e - 1) * r3:e * r3])}
+        if again != theirs:
+            raise SystemExit(f"pass {e}: G4-3's replay draw is not reproduced "
+                             f"({len(set(again) ^ set(theirs))} of {len(theirs)} ids differ)")
+    print("PROGRESS reading the novels", flush=True)
+    rows, groups = read_b1(args.novels)
+    chosen, editions = b1_editions(rows)
+    chosen, works = same_works(rows, chosen)
+    del rows
+    chosen, near = near_duplicates(chosen)
+    drawn, draw = novel_draw(chosen, blocked, counter, SEED4, NOVELS_PER_PASS, args.epochs)
+    report["novels"] = {"source": str(args.novels), "sha256": sha256_file(args.novels), "groups": groups,
+                        "editions": editions, "same_works": works, "near_duplicates": near, "draw": draw}
+    used = EPOCHS3 * r3
+    passes, added = [], []
+    for e in range(1, args.epochs + 1):
+        base = [(x, {k: v for k, v in m.items() if k != "epoch"}) for x, m in g43[e]]
+        n_rest = sum(m["kind"] != "replay" for _, m in base)
+        novels = [(x, {**m, "long": False}) for x, m in (example(r, "novel") for r in drawn[e])]
+        n_replay = replay_count(n_rest + len(novels), args.replay_share)
+        extra = n_replay - r3
+        if extra < 0 or used + extra > len(order):
+            raise SystemExit(f"pass {e}: {n_replay} replay rows wanted, G4-3 gives {r3} and the pool has "
+                             f"{len(order) - used} left: no replay apart in every pass")
+        more = [(x, {**m, "long": False}) for x, m in (example(r, "replay") for r in order[used:used + extra])]
+        used += extra
+        added.append({"pass": e, "novels": len(novels), "replay_g4_3": r3, "replay_added": extra,
+                      "replay": n_replay, "rest": n_rest})
+        one = base + novels + more
+        random.Random(f"{SEED4}/shuffle/{e}").shuffle(one)
+        passes.append(one)
+    novel_ids = [m["id"] for one in passes for _, m in one if m["kind"] == "novel"]
+    replay_ids = [m["id"] for one in passes for _, m in one if m["kind"] == "replay"]
+    if len(novel_ids) != len(set(novel_ids)) or len(replay_ids) != len(set(replay_ids)):
+        raise SystemExit("a novel pair or a replay row in two passes")
+    report["added"] = added
+    report["replay"].update({"per_pass": [a["replay"] for a in added], "g4_3_per_pass": r3,
+                             "distinct": len(replay_ids), "apart_in_every_pass": True, "order_used": used})
+    rows_out = [(x, {**m, "epoch": e}) for e, one in enumerate(passes, 1) for x, m in one]
+    d = out / ARM4
+    meta_schema = pa.schema([(n, getattr(pa, "bool_" if t == "bool" else t)()) for n, t in META_SCHEMA3_FIELDS])
+    write_parquet([x for x, _ in rows_out], d / "train.parquet")
+    write_parquet([{n: m.get(n) for n in meta_schema.names} for _, m in rows_out], d / "train-meta.parquet", meta_schema)
+    (d / "template.jinja").write_text(g4lora.TEMPLATE, encoding="utf-8")
+    lengths = [m["tokens_prompt"] + m["tokens_target"] for _, m in rows_out]
+    if max(lengths) > SEQ3:
+        raise SystemExit(f"an example of {max(lengths)} tokens, more than {SEQ3}")
+    batches = pack_batches(lengths)
+    steps = steps_of(batches)
+    per_pass = []
+    for e, one in enumerate(passes, 1):
+        kinds = pass_kinds(one)
+        tokens = sum(v["tokens"] for v in kinds.values())
+        per_pass.append({"pass": e, "examples": len(one), "tokens": tokens, "kinds": kinds,
+                         "novel_share_examples": kinds["novel"]["examples"] / len(one),
+                         "novel_share_tokens": kinds["novel"]["tokens"] / tokens,
+                         "replay_share_examples": kinds["replay"]["examples"] / len(one)})
+    report["set"] = set_stats([m for _, m in passes[0]], [])
+    report["passes"] = per_pass
+    report["novels"]["distinct_pairs"] = len(novel_ids)
+    report["estimate"] = {"tokens": sum(lengths), "examples": len(lengths), "seq": SEQ3,
+                          "batches_per_process": batches, "steps": steps,
+                          "fill": round(sum(lengths) / (sum(batches) * ROWS_PER_HOST * SEQ3), 4),
+                          "max_tokens": max(lengths)}
+    inputs = {"g4_3": report["g4_3"], "evalsets": sha256_file(args.evalsets), "blind": sha256_file(args.blind),
+              "replay": {"path": str(args.replay), "sha256": sha256_file(args.replay), "model": args.replay_model},
+              "novels": {"path": str(args.novels), "sha256": report["novels"]["sha256"]}}
+    report["inputs"] = inputs
+    manifest = {"set": ARM4, "examples": len(rows_out), "examples_per_epoch": [p["examples"] for p in per_pass],
+                "epochs": args.epochs, "tokens": sum(lengths), "seq": SEQ3, "steps": steps, "prompt": PROMPT,
+                "template": "g4lora.TEMPLATE (Gemma 4, thinking off)", "seed": SEED4,
+                "replay_share": args.replay_share, "novels_per_pass": NOVELS_PER_PASS, "inputs": inputs}
+    (d / "manifest.json").write_text(json.dumps(manifest, indent=1) + "\n")
+    # the smoke test's set (amendment G4-4.5, as G4-3.5): pass 1's longest examples first, then a seeded sample
+    first = list(passes[0])
+    longest = sorted(first, key=lambda p: (-(p[1]["tokens_prompt"] + p[1]["tokens_target"]), p[1]["id"]))
+    longest = longest[:SMOKE3_LONGEST]
+    taken = {m["id"] for _, m in longest}
+    others = sorted((p for p in first if p[1]["id"] not in taken), key=lambda p: p[1]["id"])
+    smoke_rows = [(x, {**m, "epoch": 1}) for x, m in longest +
+                  random.Random(f"{SEED4}/smoke").sample(others, min(SMOKE3_RANDOM, len(others)))]
+    ds = out / f"{ARM4}-smoke"
+    write_parquet([x for x, _ in smoke_rows], ds / "train.parquet")
+    write_parquet([{n: m.get(n) for n in meta_schema.names} for _, m in smoke_rows], ds / "train-meta.parquet",
+                  meta_schema)
+    (ds / "template.jinja").write_text(g4lora.TEMPLATE, encoding="utf-8")
+    smoke_lengths = [m["tokens_prompt"] + m["tokens_target"] for _, m in smoke_rows]
+    smoke_batches = pack_batches(smoke_lengths)
+    (ds / "manifest.json").write_text(json.dumps({
+        "set": f"{ARM4}-smoke", "examples": len(smoke_rows), "longest": len(longest), "tokens": sum(smoke_lengths),
+        "max_tokens": max(smoke_lengths), "min_of_longest": min(smoke_lengths[:len(longest)]),
+        "kinds": dict(collections.Counter(m["kind"] for _, m in smoke_rows)),
+        "batches_per_process": smoke_batches, "steps_limit": steps_of(smoke_batches), "seq": SEQ3}, indent=1) + "\n")
+    (out / "report.json").write_text(json.dumps(report, indent=1, ensure_ascii=False, default=str) + "\n")
+    (out / "report.md").write_text(report4_md(report), encoding="utf-8")
+    print(f"BUILD4 {json.dumps({'examples': len(rows_out), 'per_pass': [p['examples'] for p in per_pass], 'tokens': sum(lengths), 'steps': steps, 'fill': report['estimate']['fill'], 'novels': [a['novels'] for a in added], 'replay': [a['replay'] for a in added], 'smoke_batches': smoke_batches})}",
+          flush=True)
+
+
+KIND_NAMES4 = {"bt": "BT ≤ 512 tokens", "bt_long": "BT lang (513–2.048)", "book": "Nederlandse boeken",
+               "novel": "romans (Engels origineel, menselijk Nederlands)", "replay": "FLAN-replay"}
+
+
+def report4_md(r):
+    e, n, x = r["estimate"], r["novels"], r["novels"]["draw"]
+    w = n["same_works"]
+    L = [f"# Trainingsset {r['arm']} (protocol-g4.md §9, amendement G4-4)", "",
+         f"Gemaakt door `g4arm.py build4`. Per doorgang de set van G4-3 zoals hij is (BT ≤ 512 en lang, de boeken van "
+         f"G4-2, de replayrijen van die doorgang; bestanden met sha256 {json.dumps(r['g4_3']['files'])}), plus "
+         f"hoogstens {r['novels_per_pass']} romanparen per boek (`-b1-`, groep `en_orig`, de controles van arm RE "
+         f"zonder QE, één Nederlandse editie per boek en één Engels id per werk, geen 13-gram van een evaluatieset of "
+         f"blinde passage, ≤ {_n(r['novel_max_tokens'])} tokens; elke doorgang andere paren), plus de replay die de "
+         f"doorgang op {r['replay_share']:.0%} houdt (de volgende rijen van G4-3's replayvolgorde); elke doorgang "
+         f"opnieuw geschud (seed `{r['seed']}/shuffle/<k>`); prompt `{r['prompt']}`, sequentielengte {_n(r['seq'])}.", "",
+         "## Per doorgang", "", "| doorgang | deel | voorbeelden | tokens | doeltokens |", "|---:|---|---:|---:|---:|"]
+    for p in r["passes"]:
+        for kind, k in p["kinds"].items():
+            L.append(f"| {p['pass']} | {KIND_NAMES4.get(kind, kind)} | {_n(k['examples'])} | {_n(k['tokens'])} | "
+                     f"{_n(k['target_tokens'])} |")
+        L.append(f"| {p['pass']} | **samen** | **{_n(p['examples'])}** | **{_n(p['tokens'])}** | |")
+    L += ["", "| doorgang | romans (voorbeelden) | romans (tokens) | replay (voorbeelden) | replay van G4-3 | replay erbij |",
+          "|---:|---:|---:|---:|---:|---:|"]
+    for p, a in zip(r["passes"], r["added"]):
+        L.append(f"| {p['pass']} | {p['novel_share_examples']:.1%} | {p['novel_share_tokens']:.1%} | "
+                 f"{p['replay_share_examples']:.2%} | {_n(a['replay_g4_3'])} | {_n(a['replay_added'])} |")
+    L += ["", f"Samen {_n(e['examples'])} rijen, {_n(e['tokens'])} tokens, langste voorbeeld {_n(e['max_tokens'])} tokens. "
+          f"Packing zoals MaxText 0.2.5 (elk proces elk vierde voorbeeld, first-fit in 4 rijen van {_n(e['seq'])}): "
+          f"batches per proces {e['batches_per_process']}, dus **{_n(e['steps'])} stappen** (`sft_lora.step_limit`), "
+          f"vulling {e['fill']}.", "",
+          "## Romans", "",
+          f"Bron `{n['source']}` (sha256 `{n['sha256']}`), groepen {json.dumps(n['groups'])}.", "",
+          f"- Controles van arm RE (eerste die faalt): {json.dumps(n['editions']['first_failed'])}; Engelse boeken "
+          f"{_n(n['editions']['english_books'])}, met rijen {_n(n['editions']['english_books_with_rows'])}; edities per "
+          f"boek {json.dumps(n['editions']['editions'])}; rijen over {_n(n['editions']['rows_kept'])}.",
+          f"- Eén werk onder meer Engelse id's (≥ {w['min_shared']} gedeelde passagebegins van {w['key_chars']} tekens): "
+          f"{w['works']} werken met {w['books_in_works']} id's; weg {w['books_dropped']} id's met {_n(w['rows_dropped'])} "
+          f"rijen; paren met 1–{w['min_shared'] - 1} gedeelde begins (niet samengevoegd): {json.dumps(w['pairs_below_bound'])}.",
+          f"- Bijna-dubbele passages (zelfde begin van {w['key_chars']} tekens als een eerdere rij, Engels of "
+          f"Nederlands): weg {json.dumps({k: v for k, v in n['near_duplicates'].items() if k not in ('books_left', 'rows_left')})}; "
+          f"over {_n(n['near_duplicates']['rows_left'])} rijen in {_n(n['near_duplicates']['books_left'])} boeken.",
+          f"- Trekking (seed `{r['seed']}/novels/<boek>`): {_n(x['books'])} boeken, bekeken {_n(x.get('looked_at', 0))}, "
+          f"13-gram {_n(x.get('eval_13gram', 0))}, te lang {_n(x.get('too_long', 0))}; getrokken {_n(x['drawn'])}; per "
+          f"doorgang {json.dumps(x['per_pass_rows'])} paren uit {json.dumps(x['per_pass_books'])} boeken; boeken met "
+          f"minder dan 20 / 40 / 60 paren: {json.dumps(x['books_below'])}; per boek {json.dumps(x['kept_per_book'])}.",
+          f"- **Verschillende romanparen over de drie doorgangen: {_n(n['distinct_pairs'])}** (geen paar in twee "
+          f"doorgangen).", "",
+          "## FLAN-replay", "",
+          f"Kandidaten {_n(r['replay']['candidates'])} uit een pool van {_n(r['replay']['rows'])} (weg: "
+          f"{json.dumps(r['replay']['dropped'])}); G4-3's trekking opnieuw gemaakt en gelijk aan zijn replayrijen; per "
+          f"doorgang {json.dumps(r['replay']['per_pass'])}; verschillende rijen {_n(r['replay']['distinct'])} (elke "
+          f"doorgang eigen rijen; gebruikt {_n(r['replay']['order_used'])} van de volgorde).", ""]
+    return "\n".join(L) + "\n"
+
+
+def smoke4_estimate(summary, data_report, smoke_manifest):
+    """amendment G4-4.5: the three passes' time; above MAX_HOURS3 the chain stops before the training (the main
+    session decides)"""
+    est = data_report["estimate"]
+    three = training_time(summary, est["steps"], est["tokens"], smoke_manifest["tokens"])
+    if three is None:
+        return {"passes": None, "hours": None, "three": None, "max_hours": MAX_HOURS3}
+    return {"passes": 3 if three["hours"] <= MAX_HOURS3 else None, "hours": three["hours"], "steps": three["steps"],
+            "max_hours": MAX_HOURS3, "fill": est["fill"], "three": three}
+
+
+def smoke4(args):
+    """The smoke test's verdict of G4-4 (G4-3.5's checks on G4-4's smoke set) and the estimate; exit 1 if a check
+    fails or the estimate is above MAX_HOURS3 (the chain stops before the full training)"""
+    summary = json.loads(Path(args.summary).read_text())
+    adapter = json.loads(Path(args.adapter).read_text())
+    smoke_manifest = json.loads(Path(args.smoke_manifest).read_text())
+    data_report = json.loads(Path(args.data_report).read_text())
+    if data_report.get("arm") != ARM4:
+        raise SystemExit(f"{args.data_report}: not G4-4's data report")
+    result = smoke3_verdict(summary, adapter, smoke_manifest)
+    result["estimate"] = smoke4_estimate(summary, data_report, smoke_manifest)
+    result.update({k: summary.get(k) for k in ("loss", "eval", "eval_plan", "lr_at", "throughput", "times", "epoch",
+                                               "memory", "peak_gib_max")})
+    result["smoke_set"] = smoke_manifest
+    Path(args.out).with_suffix(".json").write_text(json.dumps(result, indent=1, default=str) + "\n")
+    x = result["estimate"]
+    L = ["# Smoke-test G4-4 (protocol-g4.md §9, amendement G4-4.5)", "",
+         f"**{'Geslaagd' if result['passed'] else 'Niet geslaagd'}.** Schatting van de volle training (drie "
+         f"doorgangen): {x.get('hours')} uur, {x.get('steps')} stappen (grens {MAX_HOURS3} uur; daarboven stopt de "
+         f"keten vóór de training).", "", "| controle | waarde | gehaald |", "|---|---|---|"]
+    for k, c in result["checks"].items():
+        L.append(f"| {k} | `{json.dumps(c['value'], default=str)[:240]}` | {'ja' if c['holds'] else 'nee'} |")
+    L += ["", f"Schatting [schatting, uit de smoke-test en build4]: {json.dumps(x)}", "",
+          "Verlies per held-out set (stap, verlies, doeltokens, seconden): " + "; ".join(
+              f"{e['set']} {e['step']} {e['loss']:.4f} {e['tokens']} {e['seconds']}" for e in summary.get("eval") or []),
+          "", f"Smoke-set: {json.dumps(smoke_manifest)}", "",
+          f"Training: {json.dumps({k: summary.get(k) for k in ('throughput', 'times', 'peak_gib_max')}, default=str)}",
+          ""]
+    Path(args.out).write_text("\n".join(L), encoding="utf-8")
+    print(f"SMOKE4 {'PASSED' if result['passed'] else 'FAILED'} {json.dumps({k: c['holds'] for k, c in result['checks'].items()})} "
+          f"PASSES {x.get('passes')} HOURS {x.get('hours')} estimate {json.dumps(x)}", flush=True)
+    if not result["passed"] or x.get("passes") != 3:
+        raise SystemExit(1)
+
+
 # ---------------------------------------------------------------------------------------------------- main
 
 def main(argv=None):
@@ -2067,8 +2626,8 @@ def main(argv=None):
     p = sub.add_parser("check")
     p.add_argument("--data", required=True)
     p.add_argument("--tokenizer", required=True)
-    p.add_argument("--arm", default=None, choices=(ARM, ARM2, ARM3))
-    p.add_argument("--processes", type=int, default=8, help="G4-3: processes of the check")
+    p.add_argument("--arm", default=None, choices=(ARM, ARM2, ARM3, ARM4))
+    p.add_argument("--processes", type=int, default=8, help="G4-3, G4-4: processes of the check")
     p.add_argument("--chunk", type=int, default=5000, help="G4-3: distinct examples per task")
     p = sub.add_parser("evaldata")
     p.add_argument("--four", required=True, help="$E/data/evalsets.parquet")
@@ -2096,6 +2655,10 @@ def main(argv=None):
                    help="G4-2, G4-3: a held-out evalsets.parquet (the direct measure; G4-3 also heldout3's)")
     p.add_argument("--heldout-arm", action="append", default=None, help="glob of the arm's held-out pairs-w*.parquet")
     p.add_argument("--heldout-base", action="append", default=None, help="glob of G4-0's held-out pairs-w*.parquet")
+    p.add_argument("--other", default=None, help="G4-4: NAME=DIR of another arm's output (pairs/, scores/), reported")
+    p.add_argument("--heldout-other", action="append", default=None, help="glob of the other arm's held-out pairs")
+    p.add_argument("--other-summary", default=None, help="the other arm's training summary.json (its eval losses)")
+    p.add_argument("--other-tally", default=None, help="the other arm's tally.json against G4-0, if there is one")
     p.add_argument("--out", required=True)
     p = sub.add_parser("tally")
     p.add_argument("--judgments", required=True)
@@ -2169,10 +2732,27 @@ def main(argv=None):
     p = sub.add_parser("smoke3")
     for name in ("summary", "adapter", "smoke-manifest", "data-report", "out"):
         p.add_argument(f"--{name}", required=True)
+    p = sub.add_parser("build4")
+    p.add_argument("--g43", required=True, help="G4-3's set ($G/data/G4-3)")
+    p.add_argument("--g43-report", required=True, help="G4-3's data report ($G/data/report-G4-3.json)")
+    p.add_argument("--novels", required=True, help="b1-selected.parquet of the -b1- inventory")
+    p.add_argument("--replay", required=True, help="G4-3's replay pool ($G/data/replay-G4-3/replay.parquet)")
+    p.add_argument("--replay-model", default=REPLAY_MODEL2)
+    p.add_argument("--replay-share", type=float, default=REPLAY_SHARE4)
+    p.add_argument("--epochs", type=int, default=EPOCHS4)
+    p.add_argument("--flan-eval", required=True)
+    p.add_argument("--evalsets", required=True)
+    p.add_argument("--blind", required=True)
+    p.add_argument("--tokenizer", required=True)
+    p.add_argument("--out", required=True)
+    p = sub.add_parser("smoke4")
+    for name in ("summary", "adapter", "smoke-manifest", "data-report", "out"):
+        p.add_argument(f"--{name}", required=True)
     args = parser.parse_args(argv)
     {"fetch": fetch, "build": build, "check": check, "evaldata": evaldata, "texts": texts, "report": report,
      "tally": tally, "smoke": smoke, "heldout": heldout, "own": own, "replay": replay_candidates, "build2": build2,
-     "smoke2": smoke2, "heldout3": heldout3, "build3": build3, "smoke3": smoke3}[args.command](args)
+     "smoke2": smoke2, "heldout3": heldout3, "build3": build3, "smoke3": smoke3, "build4": build4,
+     "smoke4": smoke4}[args.command](args)
 
 
 if __name__ == "__main__":

@@ -654,3 +654,58 @@ scores `$G/eval/G4-4/`, held-out `$G/heldout/G4-4/`, lange rijen `$G/long/G4-4/`
 blind `$S/blind/G4-4/` en `$S/blind/G4-4-tg/`, verslag `$G/report-G4-4/report.md` (kopie
 `mbert-ops/translator-sft/g4-4-report.md`), stappen in `$G/stages/g4-4/`. Keten `mbert-ops/scripts/g4arm4_run.sh` op
 mbert-corpus, na de keten van G4-3 (`final_run.lock`).
+
+**Amendement 16 nov 2026 (tijdstip: de commit van deze sectie op branch `en-nl-g4arm4`): romanpassages als vijfde
+eval-set van G4-4** [besluit van Yeb 16 nov ~07:25 en ~07:35; uitwerking door een subagent, labels als in de kop].
+Vastgelegd vóór de bouw van deze set, vóór de eerste trainingsstap van G4-4 (ook vóór zijn smoke-test) en vóór elke
+uitslag van G4-4 en G4-3. De trainingsset van G4-4 (`$G/data/G4-4/`, G4-4.3) verandert niet.
+
+*G4-4.9 Aanleiding.* Yeb wilde een held-out set van Engelse originele romans met hun menselijke Nederlandse vertaling.
+Hele romans buiten de training zijn er niet: alle 2.931 werken van `en_orig` die de controles van G4-4.3 halen, zitten
+in de training van G4-4 (elk met 1–60 paren); de overige 115 boeken van de groep zijn 79 andere Nederlandse edities van
+een Engels boek, 22 boeken onder een tweede Engels id van een werk dat al meedoet, en de boeken van 14 Engelse id's
+waarvan geen rij de controles haalt [gemeten: `data-g4-4-report.json`, `books.tsv`, `books-groups.tsv`]. Yeb koos
+daarom **nieuwe passages uit romans die al in de training zitten** [besluit]. De set heet in protocol en verslag
+**"unseen passages of seen novels"**: geen held-out romans. De boeken, personages, namen en vertalers zijn in de training
+gezien; het verlies op deze set is daardoor optimistischer dan het op onbekende boeken zou zijn [gevolgtrekking].
+
+*G4-4.10 De set `novels`* [besluit: ~10 boeken × ~50 paren, dezelfde controles en 13-gram-filter als build4, geen
+overlap of bijna-dubbel met de training, boeken verspreid over auteurs met een vaste seed; uitwerking `g4arm.py
+novels4`, `$G/data/heldout4/`].
+1. **Kandidaten**: dezelfde bron (`b1-selected.parquet`, sha256 vastgelegd en gelijk aan die van de set van G4-4) door
+   dezelfde stappen als G4-4.3 punt 2 (RE's rijcontroles, één editie per boek, één Engels id per werk, bijna-dubbele
+   passages eruit); `novels4` eist dat dat de getallen van `report-G4-4.json` geeft (2.931 boeken, 1.239.634 rijen).
+   Daarvan de rijen die **geen romanpaar van G4-4** zijn (de 172.168 ids `novel:<pid>` van `train-meta.parquet`).
+2. **Per rij, zoals build4**: geen 13-gram met een evaluatieset of blinde passage, prompt plus antwoord ≤ 2.048 tokens.
+   **Daarbovenop** [besluit]: geen rij waarvan het Engelse of Nederlandse begin (de sleutel van G4-4.3 punt 2 (ii): de
+   eerste 80 letters en cijfers, kleine letters) gelijk is aan dat van een trainingsvoorbeeld van G4-4 (alle
+   1.056.235 rijen: het Engels uit `train-meta.parquet`, het Nederlands uit de assistent-beurt van `train.parquet`),
+   en geen rij waarvan het voorbeeld (`messages_row`) in `train.parquet` staat; `novels4` telt beide en eist 0 in de
+   uitvoer.
+3. **Boeken** [keuze]: de auteur genormaliseerd (kleine letters, alleen letters, de naamdelen gesorteerd, zodat
+   "Rand, Ayn" en "Ayn Rand" één auteur zijn); een boek telt mee als het ten minste 100 kandidaatrijen heeft en een
+   auteursnaam. Uit de gesorteerde auteurs worden er 10 getrokken (seed `en-nl-g4arm/0/G4-4/novels-eval/authors`), per
+   auteur één boek (seed `en-nl-g4arm/0/G4-4/novels-eval/book/<auteur>`): 10 boeken van 10 verschillende auteurs.
+4. **Paren**: per boek de kandidaatrijen op id, geschud met seed `en-nl-g4arm/0/G4-4/novels-eval/rows/<Engels
+   boek-id>`; de eerste 50 die punt 2 halen. Samen 500 paren, in één volgorde geschud (seed
+   `en-nl-g4arm/0/G4-4/novels-eval/order`), als `eval-novels.parquet` in het formaat van de andere eval-bestanden
+   (`messages_row`: natural-v1 in Gemma 4's template, het Nederlands als antwoord), met `eval-novels-meta.parquet`
+   (pid, boek-id's, auteur, tokens) en `manifest.json` (boeken, aantallen, seeds, sha256 van elke invoer).
+
+*G4-4.11 Gebruik.*
+1. **G4-4**: `novels` als vijfde eval-set naast `books`, `btval`, `own` en `btlong` (G4-4.4): verlies op stap 0 (= G4-0
+   in de trainingsstack), elke 750 stappen en na de laatste; in de smoke-test (G4-4.5) op stap 0, 4 en 8, met dezelfde
+   controle als de andere sets (evaluaties op die stappen, eindig verlies, ten minste één doeltoken). Zoals alle
+   eval-sets draait elk proces evenveel batches (het kleinste aantal, zonder padding-batches; `sft_lora.py` @ `a3c9e62`).
+2. **Het eindmodel van G4-3** op dezelfde set, alleen het verlies [besluit]: run `g4arm_G4-3_novels` in de keten van
+   G4-4, binnen `final_run.lock`, na `setup-tpu` en vóór de smoke-test: G4-3's adapter (`$G/G4-3/adapter.npz`, rank 32 /
+   alpha 16) wordt vóór de eerste stap in de LoRA-parameters geladen (`sft_lora.py --init-adapter`), dezelfde
+   `max_target_length` (4.096) en dezelfde eval-batches als G4-4; de evaluatie op stap 0 is G4-3's verlies. Om de
+   trainingsstack te gebruiken zoals hij is, doet de run één trainingsstap op de smoke-set van G4-4; die stap en de
+   evaluatie erna worden niet gebruikt [keuze].
+3. **Verslag**: een sectie "Romanpassages (unseen passages of seen novels)" met het verlies van G4-0 (stap 0), van G4-4
+   (per eval-stap en na de laatste) en van G4-3 (eindmodel), en de waarschuwing van G4-4.9. **Rapporteren, beslist
+   niets**: de set telt niet mee in (a1), (a2), (b), (c), de directe maat (G4-2.6) of de smoke-test-schatting, en is
+   geen reden om de training te stoppen of te verlengen.
+4. Uitvoer: `$G/data/heldout4/`, run `$G/runs/g4arm_G4-3_novels/`, stappen `novels4` en `g43novels` in
+   `$G/stages/g4-4/`.

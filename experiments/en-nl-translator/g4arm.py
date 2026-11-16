@@ -41,8 +41,12 @@ Arm G4-4 (protocol-g4.md §9, amendment G4-4):
             passages out, no 13-gram of the evaluation sets) apart in every pass, and the replay that keeps 10% of
             every pass (the next rows of G4-3's replay order); three passes shuffled anew; packing, steps, smoke set
   check --arm G4-4   as G4-3's
-  smoke4    the verdict of G4-4's smoke test (G4-3's checks) and the estimate of three passes (above 120 h: exit 1)
+  smoke4    the verdict of G4-4's smoke test (G4-3's checks, five eval sets) and the estimate of three passes (above
+            120 h: exit 1)
   report --other G4-3=DIR   beside G4-0 the arm against G4-3 on the same measures (reported, deciding nothing)
+  novels4   amendment of 16 Nov: eval-novels.parquet, unseen passages of seen novels (10 books of 10 authors x 50
+            pairs that G4-4 does not train on, build4's checks; no key or example of G4-4's training set)
+  report --novels-other SUMMARY   the novels' losses of G4-0, G4-4 and G4-3's final model (reported, deciding nothing)
 """
 
 import argparse
@@ -862,6 +866,13 @@ def report(args):
         if getattr(args, "other_tally", None):
             o["blind_vs_base"] = json.loads(Path(args.other_tally).read_text())
         result["other"] = o
+    if getattr(args, "novels_other", None) or (other and args.train_summary):
+        # amendment G4-4.11: the novels (unseen passages of seen novels), reported only
+        t = json.loads(Path(args.train_summary).read_text()) if args.train_summary else {}
+        o = json.loads(Path(args.novels_other).read_text()) if getattr(args, "novels_other", None) else None
+        n = novels_measure(t, o, arm, BASE, other or ARM3)
+        if n["loss"] or "other_loss" in n:
+            result["novels"] = n
     if args.tally:
         result["blind"] = json.loads(Path(args.tally).read_text())
         result["a2"] = result["blind"]["a2"]
@@ -939,6 +950,8 @@ def report_text(r):
         L += heldout_text(r["heldout"], r["arm"], r["base"])
     if r.get("other"):
         L += other_text(r)
+    if r.get("novels"):
+        L += novels_text(r["novels"])
     if r.get("lora_merge"):
         L += ["", "LoRA-samenvoeging (`translate.py`, regel LORA): " + "; ".join(json.dumps(x) for x in r["lora_merge"][:4])]
     if r.get("training"):
@@ -976,6 +989,49 @@ def heldout_text(h, arm, base):
 
 def f2(x):
     return "–" if x is None else f"{x:.2f}".replace(".", ",")
+
+
+def novels_measure(train_summary, other_summary, arm, base, other):
+    """amendment G4-4.11: the novels' loss of the base (the arm's step 0), the arm per eval step and after its last, and
+    the other arm's final model (step 0 of its run with --init-adapter); the same batches when the target tokens agree"""
+    def curve(summary):
+        return {e["step"]: e for e in (summary or {}).get("eval") or [] if e["set"] == "novels"}
+
+    mine, theirs = curve(train_summary), curve(other_summary)
+    out = {"name": "unseen passages of seen novels", "arm": arm, "base": base, "other": other,
+           "loss": {k: v["loss"] for k, v in sorted(mine.items())}}
+    if mine:
+        last = max(mine)
+        out.update({"base_loss": mine[0]["loss"] if 0 in mine else None, "arm_loss": mine[last]["loss"],
+                    "arm_step": last, "tokens": mine[last]["tokens"]})
+    if theirs:
+        if 0 not in theirs:
+            raise SystemExit(f"{other}'s novels run has no eval at step 0")
+        out.update({"other_loss": theirs[0]["loss"], "other_tokens": theirs[0]["tokens"],
+                    "other_adapter": (other_summary or {}).get("init_adapter")})
+    if mine and theirs:
+        out["same_batches"] = mine[min(mine)]["tokens"] == theirs[0]["tokens"]
+    return out
+
+
+def novels_text(n):
+    """amendment G4-4.11 as Markdown: reported, it decides nothing"""
+    arm, base, other = n["arm"], n["base"], n["other"]
+    L = ["", "## Romanpassages: unseen passages of seen novels (amendement G4-4.9–G4-4.11, rapporteren, beslist niet)", "",
+         "500 nieuwe passages uit 10 romans (10 auteurs) die in de training van G4-4 zitten (elk boek met ten hoogste 60 "
+         "andere paren). Dit zijn geen held-out romans: boeken, personages en vertalers zijn gezien, dus het verlies is "
+         "optimistischer dan op onbekende boeken. De set telt niet mee in (a1), (a2), (b), (c) of de directe maat.", "",
+         "| model | verlies (token-gewogen) | stap | doeltokens |", "|---|---:|---|---:|",
+         f"| {base} | {f3(n.get('base_loss'))} | stap 0 van {arm} | {n.get('tokens', '–')} |",
+         f"| {arm} | {f3(n.get('arm_loss'))} | {n.get('arm_step', '–')} (laatste) | {n.get('tokens', '–')} |",
+         f"| {other} | {f3(n.get('other_loss'))} | eindmodel (run `g4arm_{other}_novels`, stap 0) | "
+         f"{n.get('other_tokens', '–')} |"]
+    if "same_batches" in n:
+        L += ["", f"Dezelfde eval-batches voor {arm} en {other} (gelijk aantal doeltokens): "
+              f"{'ja' if n['same_batches'] else 'nee'}."]
+    if n.get("loss"):
+        L += ["", f"Verlies van {arm} per stap: " + ", ".join(f"{k}: {f3(x)}" for k, x in n["loss"].items()) + "."]
+    return L
 
 
 def other_text(r):
@@ -2036,8 +2092,9 @@ def smoke3_estimate(summary, data_report, smoke_manifest):
             "fill": est["fill"], "three": three, "two": two}
 
 
-def smoke3_verdict(summary, adapter, smoke_manifest):
-    """amendment G4-3.5: the smoke test of G4-3, every criterion with its value and whether it holds"""
+def smoke3_verdict(summary, adapter, smoke_manifest, eval_sets=EVAL_SETS3):
+    """amendment G4-3.5: the smoke test of G4-3, every criterion with its value and whether it holds (G4-4: its five
+    eval sets, amendment G4-4.11)"""
     checks = {}
     loss = summary.get("loss") or []
     checks["steps"] = {"value": summary.get("steps_done"), "holds": summary.get("steps_done") == 8}
@@ -2060,7 +2117,7 @@ def smoke3_verdict(summary, adapter, smoke_manifest):
     checks["longest_rows"] = {"value": per_step,
                               "holds": len(per_step) == 8 and all(n >= 16 * longest for n in per_step)}
     evals = summary.get("eval") or []
-    for name in EVAL_SETS3:
+    for name in eval_sets:
         rows = [e for e in evals if e["set"] == name]
         checks[f"eval_{name}"] = {
             "value": [(e["step"], round(e["loss"], 4), e["tokens"]) for e in rows],
@@ -2128,6 +2185,8 @@ SAME_WORK_MIN_SHARED = 10
 # chunked array outputs"; check of 15 Nov); datasets 4.8.5 reads a parquet file in batches of its first row group and
 # counts a file as one shard whatever its row groups, so the order every process reads is unchanged
 ROW_GROUP4 = 100_000
+# G4-4's eval sets: G4-3's and the novels (amendment G4-4.11)
+EVAL_SETS4 = EVAL_SETS3 + ("novels",)
 
 
 def read_b1(path):
@@ -2581,7 +2640,7 @@ def smoke4(args):
     data_report = json.loads(Path(args.data_report).read_text())
     if data_report.get("arm") != ARM4:
         raise SystemExit(f"{args.data_report}: not G4-4's data report")
-    result = smoke3_verdict(summary, adapter, smoke_manifest)
+    result = smoke3_verdict(summary, adapter, smoke_manifest, EVAL_SETS4)
     result["estimate"] = smoke4_estimate(summary, data_report, smoke_manifest)
     result.update({k: summary.get(k) for k in ("loss", "eval", "eval_plan", "lr_at", "throughput", "times", "epoch",
                                                "memory", "peak_gib_max")})
@@ -2605,6 +2664,195 @@ def smoke4(args):
           f"PASSES {x.get('passes')} HOURS {x.get('hours')} estimate {json.dumps(x)}", flush=True)
     if not result["passed"] or x.get("passes") != 3:
         raise SystemExit(1)
+
+
+# ---------------------------------------------------------------------------------------------------- G4-4: novels
+# amendment of 16 Nov (G4-4.9-G4-4.11): a fifth eval set, unseen passages of seen novels (no en_orig work that passes
+# the checks is outside G4-4's training), reported only
+NOVELS_EVAL_SEED = f"{SEED4}/novels-eval"
+NOVELS_EVAL_BOOKS = 10
+NOVELS_EVAL_PAIRS = 50
+NOVELS_EVAL_MIN_ROWS = 100           # candidate rows a book needs: room for 50 after the filters
+
+
+def author_key(name):
+    """An author as a key: lower case letters only, the name's parts sorted ("Rand, Ayn" and "Ayn Rand" are one)"""
+    return " ".join(sorted(re.findall(r"[^\W\d_]+", (name or "").lower())))
+
+
+def example_digest(user, assistant):
+    return hashlib.sha256(f"{user}\x00{assistant}".encode()).digest()
+
+
+def g44_trained(train_path, meta_path):
+    """(novel pids of G4-4's set, the 80-character keys of every training example's English and Dutch, the digests of
+    every training example's user and assistant turns)"""
+    import pyarrow.parquet as pq
+
+    pids, keys, digests = set(), set(), set()
+    meta = pq.ParquetFile(meta_path)
+    for batch in meta.iter_batches(columns=["id", "kind", "en"], batch_size=100_000):
+        for i, kind, en in zip(*(batch.column(c).to_pylist() for c in ("id", "kind", "en"))):
+            if kind == "novel":
+                if not i.startswith("novel:"):
+                    raise SystemExit(f"{meta_path}: a novel example with id {i}")
+                pids.add(i[len("novel:"):])
+            if (k := work_key(en or "")) is not None:
+                keys.add(k)
+    n = 0
+    for batch in pq.ParquetFile(train_path).iter_batches(columns=["messages"], batch_size=100_000):
+        for turns in batch.column("messages").to_pylist():
+            if [t["role"] for t in turns] != ["user", "assistant"]:
+                raise SystemExit(f"{train_path}: an example without one user and one assistant turn")
+            digests.add(example_digest(turns[0]["content"], turns[1]["content"]))
+            if (k := work_key(turns[1]["content"])) is not None:
+                keys.add(k)
+            n += 1
+    if n != meta.metadata.num_rows:
+        raise SystemExit(f"{train_path}: {n} examples, {meta_path} {meta.metadata.num_rows}")
+    return pids, keys, digests, n
+
+
+def novels_eval_draw(by_book, trained_pids, train_keys, train_digests, blocked, counter, seed=NOVELS_EVAL_SEED,
+                     books=NOVELS_EVAL_BOOKS, pairs=NOVELS_EVAL_PAIRS, min_rows=NOVELS_EVAL_MIN_ROWS):
+    """(rows, info), amendment G4-4.10: of every English book its rows that are no novel pair of G4-4; books with at
+    least min_rows of them and an author; `books` authors drawn, one book each; per book its rows in a seeded order and
+    the first `pairs` without a 13-gram of blocked, within NOVEL_MAX_TOKENS, without an 80-character key of a training
+    example and not a training example"""
+    candidates = {en: [r for r in rows if str(r["id"]) not in trained_pids] for en, rows in by_book.items()}
+    by_author = collections.defaultdict(list)
+    for en, rows in candidates.items():
+        first = min(by_book[en], key=lambda r: r["id"])
+        a = author_key(first["author"])
+        if len(rows) >= min_rows and a:
+            by_author[a].append(en)
+    authors = sorted(by_author)
+    if len(authors) < books:
+        raise SystemExit(f"{len(authors)} authors with a book of >= {min_rows} candidate rows, {books} wanted")
+    chosen_authors = random.Random(f"{seed}/authors").sample(authors, books)
+    out, info_books, stats = [], [], collections.Counter()
+    for a in chosen_authors:
+        en = random.Random(f"{seed}/book/{a}").choice(sorted(by_author[a], key=_id))
+        rows = sorted(candidates[en], key=lambda r: r["id"])
+        random.Random(f"{seed}/rows/{en}").shuffle(rows)
+        kept, i, seen = [], 0, collections.Counter()
+        while len(kept) < pairs and i < len(rows):
+            part = rows[i:i + pairs - len(kept) + 8]
+            i += len(part)
+            prompts, targets = counter.examples(part)
+            for r, p, t in zip(part, prompts, targets):
+                if len(kept) == pairs:
+                    break
+                seen["looked_at"] += 1
+                x = messages_row(r["en"], r["nl"])
+                if shares_gram(r, blocked):
+                    seen["eval_13gram"] += 1
+                elif p + t > NOVEL_MAX_TOKENS:
+                    seen["too_long"] += 1
+                elif any(k in train_keys for k in (work_key(r["en"]), work_key(r["nl"])) if k is not None):
+                    seen["train_key"] += 1
+                elif example_digest(x["messages"][0]["content"], x["messages"][1]["content"]) in train_digests:
+                    seen["train_example"] += 1
+                else:
+                    kept.append({"pid": str(r["id"]), "en_book_id": str(en), "book": r["book"], "author": r["author"],
+                                 "author_key": a, "en": r["en"], "nl": r["nl"], "tokens_prompt": p, "tokens_target": t})
+        if len(kept) < pairs:
+            raise SystemExit(f"book {en} ({a}): {len(kept)} pairs, {pairs} wanted")
+        stats.update(seen)
+        info_books.append({"en_book_id": str(en), "book": kept[0]["book"], "author": kept[0]["author"],
+                           "author_key": a, "books_of_author": len(by_author[a]), "candidate_rows": len(rows),
+                           "trained_pairs": len(by_book[en]) - len(rows), "pairs": len(kept), **dict(seen)})
+        out += kept
+    out = random.Random(f"{seed}/order").sample(out, len(out))
+    info = {"seed": seed, "books_wanted": books, "pairs_per_book": pairs, "min_candidate_rows": min_rows,
+            "books_with_rows": len(by_book), "candidate_rows": sum(map(len, candidates.values())),
+            "eligible_books": sum(map(len, by_author.values())), "eligible_authors": len(authors),
+            "authors": chosen_authors, "books": info_books, **dict(sorted(stats.items())), "pairs": len(out)}
+    return out, info
+
+
+def novels4(args, counter=None):
+    """amendment G4-4.10: eval-novels.parquet, unseen passages of seen novels: the -b1- rows through build4's steps
+    (checked against G4-4's data report), the rows G4-4 does not train on, NOVELS_EVAL_BOOKS books of as many authors,
+    NOVELS_EVAL_PAIRS pairs each; no pair, 80-character key or example of G4-4's training set among them"""
+    counter = counter or TokenCounter(args.tokenizer)
+    out = Path(args.out)
+    report4 = json.loads(Path(args.data_report).read_text())
+    if report4.get("arm") != ARM4:
+        raise SystemExit(f"{args.data_report}: not G4-4's data report")
+    manifest4 = json.loads((Path(args.g44) / "manifest.json").read_text())
+    train, meta = Path(args.g44) / "train.parquet", Path(args.g44) / "train-meta.parquet"
+    inputs = {"novels": sha256_file(args.novels), "train": sha256_file(train), "train_meta": sha256_file(meta),
+              "evalsets": sha256_file(args.evalsets), "blind": sha256_file(args.blind),
+              "data_report": sha256_file(args.data_report), "manifest": sha256_file(Path(args.g44) / "manifest.json")}
+    if inputs["novels"] != report4["novels"]["sha256"] or inputs["novels"] != manifest4["inputs"]["novels"]["sha256"]:
+        raise SystemExit(f"{args.novels}: not the -b1- file of G4-4's set")
+    if inputs["evalsets"] != manifest4["inputs"]["evalsets"] or inputs["blind"] != manifest4["inputs"]["blind"]:
+        raise SystemExit("not the evaluation or blind files of G4-4's set")
+    blocked = checked_blocked(args.evalsets, args.blind)
+    print("PROGRESS reading G4-4's training set", flush=True)
+    trained_pids, train_keys, train_digests, n_train = g44_trained(train, meta)
+    if n_train != manifest4["examples"] or len(trained_pids) != report4["novels"]["distinct_pairs"]:
+        raise SystemExit(f"G4-4's set: {n_train} examples, {len(trained_pids)} novel pairs; the manifest says "
+                         f"{manifest4['examples']}, the report {report4['novels']['distinct_pairs']}")
+    print("PROGRESS the novels through build4's steps", flush=True)
+    rows, groups = read_b1(args.novels)
+    chosen, editions = b1_editions(rows)
+    chosen, works = same_works(rows, chosen)
+    del rows
+    chosen, near = near_duplicates(chosen)
+    if (near["books_left"], near["rows_left"]) != (report4["novels"]["near_duplicates"]["books_left"],
+                                                   report4["novels"]["near_duplicates"]["rows_left"]):
+        raise SystemExit(f"build4's steps give {near['books_left']} books, {near['rows_left']} rows; G4-4's report "
+                         f"{report4['novels']['near_duplicates']}")
+    found = sum(str(r["id"]) in trained_pids for v in chosen.values() for r in v)
+    if found != len(trained_pids):
+        raise SystemExit(f"{found} of G4-4's {len(trained_pids)} novel pairs among the rows of build4's steps")
+    drawn, info = novels_eval_draw(chosen, trained_pids, train_keys, train_digests, blocked, counter,
+                                   books=NOVELS_EVAL_BOOKS, pairs=NOVELS_EVAL_PAIRS, min_rows=NOVELS_EVAL_MIN_ROWS)
+    # the checks again on the output: no pair of the training, no key, no example, no 13-gram, the token bound
+    msgs = [messages_row(r["en"], r["nl"]) for r in drawn]
+    again = {"trained_pid": sum(r["pid"] in trained_pids for r in drawn),
+             "train_key": sum(any(k in train_keys for k in (work_key(r["en"]), work_key(r["nl"])) if k is not None)
+                              for r in drawn),
+             "train_example": sum(example_digest(x["messages"][0]["content"], x["messages"][1]["content"])
+                                  in train_digests for x in msgs),
+             "eval_13gram": sum(shares_gram(r, blocked) for r in drawn),
+             "too_long": sum(r["tokens_prompt"] + r["tokens_target"] > NOVEL_MAX_TOKENS for r in drawn),
+             "pids_twice": len(drawn) - len({r["pid"] for r in drawn})}
+    if any(again.values()):
+        raise SystemExit(f"the drawn pairs fail a check: {again}")
+    write_parquet(msgs, out / "eval-novels.parquet")
+    meta_rows = [{k: r[k] for k in ("pid", "en_book_id", "book", "author", "tokens_prompt", "tokens_target")}
+                 for r in drawn]
+    write_parquet(meta_rows, out / "eval-novels-meta.parquet")
+    lengths = [r["tokens_prompt"] + r["tokens_target"] for r in drawn]
+    # the eval batches per process as MaxText packs the file at SEQ3 on the v4-32; sft_lora.py runs the smallest count
+    # on every process (a3c9e62), which must be at least one
+    eval_batches = pack_batches(lengths)
+    if min(eval_batches) < 1:
+        raise SystemExit(f"a process gets no eval batch of the novels: {eval_batches}")
+    manifest = {"set": "novels", "name": "unseen passages of seen novels", "arm": ARM4,
+                "eval_batches_per_process": eval_batches, "eval_batches_run": min(eval_batches),
+                "note": "the books are in G4-4's training (up to 60 pairs each): the loss is more optimistic than on "
+                        "unseen books (amendment G4-4.9)",
+                "prompt": PROMPT, "format": "messages_row (natural-v1, Gemma 4's template; the Dutch as the answer)",
+                "pairs": len(drawn), "tokens": sum(lengths), "target_tokens": sum(r["tokens_target"] for r in drawn),
+                "max_tokens": max(lengths), "tokens_q": quantiles(lengths), "draw": info, "checks_on_output": again,
+                "build4_steps": {"editions": {k: editions[k] for k in ("english_books", "english_books_with_rows",
+                                                                       "rows_kept")},
+                                 "same_works_dropped": works["books_dropped"], "near_duplicates": near,
+                                 "groups": groups},
+                "g4_4": {"examples": n_train, "novel_pairs": len(trained_pids), "keys": len(train_keys),
+                         "distinct_examples": len(train_digests)},
+                "inputs": {"paths": {"novels": str(args.novels), "g44": str(args.g44), "evalsets": str(args.evalsets),
+                                     "blind": str(args.blind), "data_report": str(args.data_report)},
+                           "sha256": inputs},
+                "files": {"eval-novels.parquet": sha256_file(out / "eval-novels.parquet"),
+                          "eval-novels-meta.parquet": sha256_file(out / "eval-novels-meta.parquet")}}
+    (out / "manifest.json").write_text(json.dumps(manifest, indent=1, ensure_ascii=False) + "\n")
+    print(f"NOVELS4 {json.dumps({'pairs': len(drawn), 'tokens': sum(lengths), 'max_tokens': max(lengths), 'books': [(b['en_book_id'], b['author'], b['pairs'], b['candidate_rows']) for b in info['books']], 'checks': again}, ensure_ascii=False)}",
+          flush=True)
 
 
 # ---------------------------------------------------------------------------------------------------- main
@@ -2665,6 +2913,8 @@ def main(argv=None):
     p.add_argument("--heldout-other", action="append", default=None, help="glob of the other arm's held-out pairs")
     p.add_argument("--other-summary", default=None, help="the other arm's training summary.json (its eval losses)")
     p.add_argument("--other-tally", default=None, help="the other arm's tally.json against G4-0, if there is one")
+    p.add_argument("--novels-other", default=None,
+                   help="G4-4: summary.json of the other arm's novels run (g4arm_G4-3_novels), amendment G4-4.11")
     p.add_argument("--out", required=True)
     p = sub.add_parser("tally")
     p.add_argument("--judgments", required=True)
@@ -2754,11 +3004,19 @@ def main(argv=None):
     p = sub.add_parser("smoke4")
     for name in ("summary", "adapter", "smoke-manifest", "data-report", "out"):
         p.add_argument(f"--{name}", required=True)
+    p = sub.add_parser("novels4")
+    p.add_argument("--g44", required=True, help="G4-4's set ($G/data/G4-4: train.parquet, train-meta.parquet, manifest)")
+    p.add_argument("--data-report", required=True, help="G4-4's data report ($G/data/report-G4-4.json)")
+    p.add_argument("--novels", required=True, help="b1-selected.parquet of the -b1- inventory")
+    p.add_argument("--evalsets", required=True)
+    p.add_argument("--blind", required=True)
+    p.add_argument("--tokenizer", required=True)
+    p.add_argument("--out", required=True)
     args = parser.parse_args(argv)
     {"fetch": fetch, "build": build, "check": check, "evaldata": evaldata, "texts": texts, "report": report,
      "tally": tally, "smoke": smoke, "heldout": heldout, "own": own, "replay": replay_candidates, "build2": build2,
      "smoke2": smoke2, "heldout3": heldout3, "build3": build3, "smoke3": smoke3, "build4": build4,
-     "smoke4": smoke4}[args.command](args)
+     "smoke4": smoke4, "novels4": novels4}[args.command](args)
 
 
 if __name__ == "__main__":

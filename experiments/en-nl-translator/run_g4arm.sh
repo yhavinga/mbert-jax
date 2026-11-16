@@ -67,9 +67,14 @@
 #                                 the estimate is above g4arm.MAX_HOURS3)
 #   RUN=g4arm_G4-4 bash run_g4arm.sh train (as G4-3, three passes), adapter, translate and score (SET=eval|heldout|long),
 #                                 texts (G4-4, G4-0, G4-3), classify, blind, report with G4-3 beside G4-0 (reported)
+#   Amendment of 16 Nov (G4-4.9-G4-4.11): the fifth eval set novels (unseen passages of seen novels), reported only:
+#   bash run_g4arm.sh novels4     w1: g4arm.py novels4, to $G/data/heldout4/ (eval-novels.parquet, its meta, manifest)
+#   RUN=g4arm_G4-3_novels STEPS=1 bash run_g4arm.sh train   G4-3's final adapter ($G/G4-3/) loaded before the first
+#                                 step, one step on G4-4's smoke set, the novels evaluated at step 0 (G4-3's loss)
+#                                 and after the step; G4-4's smoke test and training evaluate the novels too
 # The code is beside this script (a copy of $G/scripts/). TAG names the jobs of one chain.
 set -euo pipefail
-STAGE=${1:?a stage: fetchbt, build, check, evaldata, setup, train, adapter, translate, score, texts, classify, blind, report, smoke-translate, smoke-score, smoke-report, fetchval, heldout, own, smoke2-report, replay, build2, heldout3, build3, smoke3-report, build4, smoke4-report}
+STAGE=${1:?a stage: fetchbt, build, check, evaldata, setup, train, adapter, translate, score, texts, classify, blind, report, smoke-translate, smoke-score, smoke-report, fetchval, heldout, own, smoke2-report, replay, build2, heldout3, build3, smoke3-report, build4, smoke4-report, novels4}
 R=gs://t5-dutch-english-usc2/mbert/translator
 S=$R/sft
 E=$R/eval
@@ -95,8 +100,11 @@ if [ "$ARM" = G4-3 ]; then
   NAT=$G/naturalness-G4-3; REP=$G/report-G4-3; CHECK_TXT=$G/data/check-G4-3.txt
   BT_IN=$G/input/bt3; BTVAL_IN=$G/input/bt3-val; REPLAY_DIR=$G/data/replay-G4-3
 fi
-# G4-4's places (amendment G4-4.8): its set on G4-3's (with G4-3's replay pool), the novels of the -b1- inventory
+# G4-4's places (amendment G4-4.8): its set on G4-3's (with G4-3's replay pool), the novels of the -b1- inventory;
+# the novels' eval set (amendment G4-4.11)
 B1=$S/data/books-b1
+H4=$G/data/heldout4
+NOVELS_RUN=g4arm_G4-3_novels
 if [ "$ARM" = G4-4 ]; then
   NAT=$G/naturalness-G4-4; REP=$G/report-G4-4; CHECK_TXT=$G/data/check-G4-4.txt
   BT_IN=$G/input/bt3; BTVAL_IN=$G/input/bt3-val; REPLAY_DIR=$G/data/replay-G4-3
@@ -303,7 +311,7 @@ EOF
 train)
   RUN=${RUN:?$SMOKE_RUN (with STEPS=8) or $FULL_RUN}
   STEPS=${STEPS:-auto}
-  case "$RUN/$STEPS" in "$SMOKE_RUN/8"|"$FULL_RUN/auto") ;; *) echo "RUN/STEPS is $SMOKE_RUN/8 or $FULL_RUN/auto, not $RUN/$STEPS"; exit 1 ;; esac
+  case "$ARM/$RUN/$STEPS" in "$ARM/$SMOKE_RUN/8"|"$ARM/$FULL_RUN/auto"|"G4-4/$NOVELS_RUN/1") ;; *) echo "RUN/STEPS is $SMOKE_RUN/8 or $FULL_RUN/auto (G4-4 also $NOVELS_RUN/1), not $RUN/$STEPS"; exit 1 ;; esac
   tpu_free
   if [ "$ARM" = G4-1 ]; then
     gsutil -q stat "$G/data/check.txt" || { echo "no $G/data/check.txt: the set is not checked"; exit 1; }
@@ -322,16 +330,28 @@ train)
     PASSES=${PASSES:-3}
     case $ARM/$PASSES in G4-3/2|G4-3/3|G4-4/3) ;; *) echo "PASSES is 2 or 3 (G4-4: 3), not $PASSES"; exit 1 ;; esac
     if [ "$RUN" = "$SMOKE_RUN" ]; then SETDIR=$G/data/$ARM-smoke; EVERY=4; else SETDIR=$G/data/$ARM; EVERY=$(g4a_const EVAL_EVERY3); fi
+    # amendment G4-4.11: G4-3's final model on the novels, one step on G4-4's smoke set (its step-0 eval is the measure)
+    if [ "$RUN" = "$NOVELS_RUN" ]; then SETDIR=$G/data/G4-4-smoke; EVERY=1; fi
     SEQ=$(g4a_const SEQ3)
     LR=$(g4a_const LR3)
     gsutil -q stat "$CHECK_TXT" || { echo "no $CHECK_TXT: the set is not checked"; exit 1; }
-    for f in $H/eval-books.parquet $H/eval-btval.parquet $H/eval-own.parquet $H3/eval-btlong.parquet; do
-      gsutil -q stat "$f" || { echo "no $f (heldout, own, heldout3)"; exit 1; }
+    EVAL_FILES="$H/eval-books.parquet $H/eval-btval.parquet $H/eval-own.parquet $H3/eval-btlong.parquet"
+    [ "$ARM" = G4-4 ] && EVAL_FILES="$EVAL_FILES $H4/eval-novels.parquet"
+    for f in $EVAL_FILES; do
+      gsutil -q stat "$f" || { echo "no $f (heldout, own, heldout3, heldout4)"; exit 1; }
     done
     D=$G_SHM/data-$RUN
     mkdir -p "$D"
     gsutil -m -q cp "$SETDIR/train.parquet" "$SETDIR/train-meta.parquet" "$SETDIR/template.jinja" "$SETDIR/manifest.json" \
-      "$H/eval-books.parquet" "$H/eval-btval.parquet" "$H/eval-own.parquet" "$H3/eval-btlong.parquet" "$D/"
+      $EVAL_FILES "$D/"
+    EVAL_ARGS="--eval books=$D/eval-books.parquet --eval btval=$D/eval-btval.parquet --eval own=$D/eval-own.parquet --eval btlong=$D/eval-btlong.parquet"
+    [ "$ARM" = G4-4 ] && EVAL_ARGS="$EVAL_ARGS --eval novels=$D/eval-novels.parquet"
+    if [ "$RUN" = "$NOVELS_RUN" ]; then
+      gsutil -q cp "$G/G4-3/adapter.npz" "$G/G4-3/adapter.json" "$D/"
+      python3 -c "import json, sys; a = json.load(open(sys.argv[1])); assert (a['rank'], a['alpha'], a['scale']) == (32, 16.0, 0.5), a" \
+        "$D/adapter.json" || { echo "G4-3's adapter is not rank 32, alpha 16"; exit 1; }
+      EVAL_ARGS="--init-adapter $D/adapter.npz --eval novels=$D/eval-novels.parquet"
+    fi
     if [ "$RUN" = "$FULL_RUN" ] && [ "$PASSES" = 2 ]; then
       # the passes follow each other in train.parquet: the first two are its first rows
       $SFT_PY -c "import pyarrow.parquet as pq, pyarrow.compute as pc, sys; d = sys.argv[1]; e = pq.read_table(d + '/train-meta.parquet', columns=['epoch']).column('epoch'); n = int(pc.sum(pc.less_equal(e, 2)).as_py()); assert e.slice(0, n).to_pylist() == sorted(e.slice(0, n).to_pylist()) and pc.min(e.slice(n)).as_py() == 3; pq.write_table(pq.read_table(d + '/train.parquet').slice(0, n), d + '/train-2p.parquet'); print('PASSES 2:', n, 'rows')" "$D"
@@ -339,7 +359,7 @@ train)
     else
       DATA_FILE=$D/train.parquet
     fi
-    SFT_ARGS="--eval books=$D/eval-books.parquet --eval btval=$D/eval-btval.parquet --eval own=$D/eval-own.parquet --eval btlong=$D/eval-btlong.parquet --eval-every $EVERY" \
+    SFT_ARGS="$EVAL_ARGS --eval-every $EVERY" \
       MULTIHOST=1 NAME=$RUN MODEL=gemma4-31b DATA=$DATA_FILE TEMPLATE=$D/template.jinja ROOT=$G STEPS=$STEPS \
       bash "$CODE/run_sft.sh" per_device_batch_size=1 max_target_length=$SEQ lora.lora_rank=32 lora.lora_alpha=16.0 \
       learning_rate=$LR lr_schedule_type=wsd warmup_steps_fraction=0.03 wsd_decay_steps_fraction=0.1 \
@@ -601,6 +621,9 @@ if [ "$ARM" = G4-4 ]; then
   gsutil -m -q cp '$G/long/G4-3/pairs/pairs-w*.parquet' $X/long/G4-3/
   gsutil -q cp $G/G4-3/summary.json $X/g4-3-summary.json
   if gsutil -q stat $G/report-G4-3/tally.json; then gsutil -q cp $G/report-G4-3/tally.json $X/g4-3-tally.json; OTHER_TALLY="--other-tally $X/g4-3-tally.json"; fi
+  # amendment G4-4.11: G4-3's final model on the novels
+  gsutil -q cp $G/runs/$NOVELS_RUN/summary.json $X/g4-3-novels-summary.json
+  OTHER_TALLY="\$OTHER_TALLY --novels-other $X/g4-3-novels-summary.json"
 fi
 lora=""
 for f in $X/logs/*.log; do
@@ -845,6 +868,29 @@ gsutil -q cp $OUT/report.md $G/data/report-G4-4.md
 echo "BUILT4: $G/data/G4-4/ $G/data/G4-4-smoke/"
 EOF
   detach "g4a_build4_$TAG" nice -n 19 ionice -c3 bash ~/job_body_g4a_build4_$TAG.sh
+  ;;
+novels4)
+  only 1
+  [ "$ARM" = G4-4 ] || { echo "novels4 is G4-4's"; exit 1; }
+  ! gsutil -q stat "$H4/manifest.json" || { echo "$H4 has a manifest.json: the set stays as it is"; exit 1; }
+  [ -s "$TOK_SFT/tokenizer.json" ] || { echo "w$W: no tokenizer in $TOK_SFT (setup)"; exit 1; }
+  IN=$G_SHM/in-novels4-$TAG
+  OUT=$G_SHM/novels4-$TAG
+  # few threads: the CPUs serve a TPU training at the same time; the manifest goes last (it marks the set complete)
+  cat > ~/job_body_g4a_novels4_$TAG.sh <<EOF
+set -euo pipefail
+export OMP_NUM_THREADS=4 RAYON_NUM_THREADS=4 TOKENIZERS_PARALLELISM=true HF_HUB_OFFLINE=1 JAX_PLATFORMS=cpu
+mkdir -p $IN/g44
+gsutil -m -q cp $G/data/G4-4/train.parquet $G/data/G4-4/train-meta.parquet $G/data/G4-4/manifest.json $IN/g44/
+gsutil -q cp $G/data/report-G4-4.json $B1/b1-selected.parquet $E/data/evalsets.parquet $S/blind/fixed-2026-11-10/blind100.jsonl $IN/
+$SFT_PY -u $CODE/g4arm.py novels4 --g44 $IN/g44 --data-report $IN/report-G4-4.json --novels $IN/b1-selected.parquet \
+  --evalsets $IN/evalsets.parquet --blind $IN/blind100.jsonl --tokenizer $TOK_SFT --out $OUT
+gsutil -m -q cp $OUT/eval-novels.parquet $OUT/eval-novels-meta.parquet $H4/
+gsutil -q cp $OUT/manifest.json $H4/
+rm -f $IN/g44/train.parquet $IN/g44/train-meta.parquet $IN/b1-selected.parquet
+echo "NOVELS4_DONE: $H4/"
+EOF
+  detach "g4a_novels4_$TAG" nice -n 19 ionice -c3 bash ~/job_body_g4a_novels4_$TAG.sh
   ;;
 smoke4-report)
   only 0

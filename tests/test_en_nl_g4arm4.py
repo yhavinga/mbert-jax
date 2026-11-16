@@ -234,14 +234,21 @@ def test_check_of_g4_4_is_g4_3s_check_of_distinct_examples(world4, monkeypatch):
     assert sum(calls) == len(want) < len(metas)
 
 
+def smoke4_summary(**kw):
+    """G4-3's smoke summary with the fifth eval set of G4-4 (amendment G4-4.11) at the same steps"""
+    s = smoke3_summary(**kw)
+    s["eval"] += [{**e, "set": "novels", "loss": 2.5 + 0.01 * e["step"]} for e in s["eval"] if e["set"] == "books"]
+    return s
+
+
 def test_the_smoke4_estimate_is_three_passes_and_stops_above_five_days(tmp_path):
     report = {"arm": "G4-4", "estimate": {"steps": 9500, "tokens": 590_000_000, "fill": 0.95}}
-    x = g4arm.smoke4_estimate(smoke3_summary(), report, SMOKE_MANIFEST)
+    x = g4arm.smoke4_estimate(smoke4_summary(), report, SMOKE_MANIFEST)
     assert x["passes"] == 3 and x["steps"] == 9500 and x["hours"] == x["three"]["hours"] < 40
-    slow = g4arm.smoke4_estimate(smoke3_summary(step_s=50.0), report, SMOKE_MANIFEST)
+    slow = g4arm.smoke4_estimate(smoke4_summary(step_s=50.0), report, SMOKE_MANIFEST)
     assert slow["hours"] > 120 and slow["passes"] is None
     files = {}
-    for name, value in (("summary", smoke3_summary(step_s=50.0)), ("adapter", ADAPTER),
+    for name, value in (("summary", smoke4_summary(step_s=50.0)), ("adapter", ADAPTER),
                         ("smoke-manifest", SMOKE_MANIFEST), ("data-report", report)):
         files[name] = tmp_path / f"{name}.json"
         files[name].write_text(json.dumps(value))
@@ -250,9 +257,19 @@ def test_the_smoke4_estimate_is_three_passes_and_stops_above_five_days(tmp_path)
     with pytest.raises(SystemExit):
         g4arm.smoke4(args)
     assert json.loads((tmp_path / "g4arm4-smoke.json").read_text())["passed"]
-    files["summary"].write_text(json.dumps(smoke3_summary()))
+    files["summary"].write_text(json.dumps(smoke4_summary()))
     g4arm.smoke4(args)
     assert "Smoke-test G4-4" in (tmp_path / "g4arm4-smoke.md").read_text()
+    # amendment G4-4.11: G4-3's smoke summary (four sets) does not pass G4-4's smoke test, nor novels without step 4
+    files["summary"].write_text(json.dumps(smoke3_summary()))
+    with pytest.raises(SystemExit):
+        g4arm.smoke4(args)
+    checks = json.loads((tmp_path / "g4arm4-smoke.json").read_text())["checks"]
+    assert not checks["eval_novels"]["holds"] and checks["eval_btlong"]["holds"]
+    s = smoke4_summary()
+    s["eval"] = [e for e in s["eval"] if not (e["set"] == "novels" and e["step"] == 4)]
+    assert not g4arm.smoke3_verdict(s, ADAPTER, SMOKE_MANIFEST, g4arm.EVAL_SETS4)["checks"]["eval_novels"]["holds"]
+    assert g4arm.smoke3_verdict(s, ADAPTER, SMOKE_MANIFEST)["passed"]
 
 
 def test_report_of_g4_4_puts_g4_3_beside_on_the_same_measures(tmp_path, monkeypatch):
@@ -296,7 +313,14 @@ def test_report_of_g4_4_puts_g4_3_beside_on_the_same_measures(tmp_path, monkeypa
         (tmp_path / f"{name}.json").write_text(json.dumps({
             "steps": 300, "steps_done": 300, "loss": [[1, 2.3], [300, 0.8]], "lr_at": {"0": 0.0},
             "eval": [{"step": st, "set": s, "loss": x, "tokens": 9} for st, x in ((0, 2.2), (300, last))
-                     for s in ("books", "btval", "own", "btlong")]}))
+                     for s in ("books", "btval", "own", "btlong")]
+            + ([{"step": st, "set": "novels", "loss": x, "tokens": 77} for st, x in ((0, 2.6), (150, 2.1), (300, 1.9))]
+               if name == "summary" else [])}))
+    # amendment G4-4.11: G4-3's final model on the novels (step 0 of its run with --init-adapter)
+    (tmp_path / "novels3.json").write_text(json.dumps({
+        "init_adapter": {"path": "adapter.npz", "sha256": "ab", "nonzero_b": 7},
+        "eval": [{"step": 0, "set": "novels", "loss": 2.0, "tokens": 77}, {"step": 1, "set": "novels", "loss": 1.95,
+                                                                            "tokens": 77}]}))
     out = tmp_path / "report.md"
     args = ns(evalsets=str(tmp_path / "evalsets.parquet"), arm=str(tmp_path / "G4-4"), base=str(tmp_path / "G4-0"),
               tg_scores=str(tmp_path / "tg.parquet"), predictions=str(tmp_path / "pred.parquet"), classifier_results=None,
@@ -304,7 +328,8 @@ def test_report_of_g4_4_puts_g4_3_beside_on_the_same_measures(tmp_path, monkeypa
               heldout=[str(tmp_path / "held.parquet")], heldout_arm=[str(tmp_path / "h" / "G4-4" / "pairs-w*.parquet")],
               heldout_base=[str(tmp_path / "h" / "G4-0" / "pairs-w*.parquet")], other=f"G4-3={tmp_path / 'G4-3'}",
               heldout_other=[str(tmp_path / "h" / "G4-3" / "pairs-w*.parquet")],
-              other_summary=str(tmp_path / "summary3.json"), other_tally=None, out=str(out))
+              other_summary=str(tmp_path / "summary3.json"), other_tally=None,
+              novels_other=str(tmp_path / "novels3.json"), out=str(out))
     g4arm.report(args)
     r = json.loads(out.with_suffix(".json").read_text())
     # the decision stays against G4-0
@@ -316,3 +341,105 @@ def test_report_of_g4_4_puts_g4_3_beside_on_the_same_measures(tmp_path, monkeypa
     assert r["other_heldout"]["sets"]["books"]["G4-3"]["chrf_corpus"] == 10.0
     md = out.read_text()
     assert "## Vergelijking met G4-3 (rapporteren, beslist niet)" in md and "| books | 50,00 | 10,00 | ja | 1,400 | 1,500 |" in md
+    n = r["novels"]
+    assert (n["base_loss"], n["arm_loss"], n["arm_step"], n["other_loss"], n["same_batches"]) == (2.6, 1.9, 300, 2.0, True)
+    assert n["name"] == "unseen passages of seen novels" and n["other"] == "G4-3"
+    assert "## Romanpassages: unseen passages of seen novels" in md and "geen held-out romans" in md
+    assert "| G4-0 | 2,600 | stap 0 van G4-4 | 77 |" in md and "| G4-3 | 2,000 | eindmodel" in md
+    assert "novels" not in r["heldout"]["sets"] and "novels" not in r["heldout"]["reading"]
+
+
+# ---------------------------------------------------------------------------------------------------- novels (16 Nov)
+
+def test_author_key_joins_name_orders():
+    assert g4arm.author_key("Rand, Ayn") == g4arm.author_key("Ayn Rand") == "ayn rand"
+    assert g4arm.author_key("Foster,Lori") == "foster lori" and g4arm.author_key(None) == "" == g4arm.author_key("42")
+    assert g4arm.author_key("Sigurdardóttir, Yrsa") == "sigurdardóttir yrsa"
+
+
+def draw_book(en_book, author, n, rng):
+    return [{"id": f"{en_book}-{k:03d}", "book": f"9{en_book}-{en_book}", "author": author,
+             "en": text(rng, EN_WORDS, 30), "nl": text(rng, WORDS, 32)} for k in range(n)]
+
+
+def test_novels_eval_draw_leaves_out_trained_pairs_keys_examples_13grams_and_long_rows():
+    rng = random.Random(5)
+    a = draw_book("1", "Rand, Ayn", 9, rng)
+    b = draw_book("2", "Ayn Rand", 4, rng)        # the same author, too few candidates
+    c = draw_book("3", "Clavell, James", 8, rng)
+    d = draw_book("4", "", 9, rng)                # no author
+    a[0]["en"] = LONG_EN                          # too long
+    a[1]["nl"] = "en toen " + EVAL_REF            # an evaluation 13-gram
+    trained = {a[2]["id"], a[3]["id"], c[0]["id"]}
+    keys = {g4arm.work_key(a[4]["en"]), g4arm.work_key(c[1]["nl"])}
+    x = g4arm.messages_row(a[5]["en"], a[5]["nl"])
+    digests = {g4arm.example_digest(x["messages"][0]["content"], x["messages"][1]["content"])}
+    blocked = g4arm.sp.ngrams(EVAL_REF)
+    by_book = {"1": a, "2": b, "3": c, "4": d}
+    args = dict(by_book=by_book, trained_pids=trained, train_keys=keys, train_digests=digests, blocked=blocked,
+                counter=FakeCounter(), books=2, pairs=3, min_rows=5)
+    out, info = g4arm.novels_eval_draw(**args)
+    assert sorted(info["authors"]) == ["ayn rand", "clavell james"] and info["eligible_books"] == 2
+    got = {r["pid"] for r in out}
+    assert {r["pid"] for r in out if r["en_book_id"] == "1"} == {a[k]["id"] for k in (6, 7, 8)}
+    assert len(got) == 6 and not got & ({r["id"] for r in a[:6]} | trained | {c[1]["id"]})
+    assert out == g4arm.novels_eval_draw(**args)[0]
+    with pytest.raises(SystemExit, match="book 1"):
+        g4arm.novels_eval_draw(**{**args, "pairs": 4})
+    with pytest.raises(SystemExit, match="authors"):
+        g4arm.novels_eval_draw(**{**args, "books": 3})
+
+
+def novels_world_file(path):
+    """novels_file plus three books of 75 rows (two authors' names in two orders), so that after build4's 60 a book
+    there are candidates"""
+    rows = novels_file(path)
+    rng = random.Random(12)
+    for en_book, nl_book, author in (("107", "208", "Rand, Ayn"), ("108", "209", "Ayn Rand"), ("109", "210", "Clavell, James")):
+        rows += [novel_row(rng, en_book, nl_book, k, author=author) for k in range(75)]
+    write(rows, path)
+    return rows
+
+
+def test_novels4_draws_unseen_pairs_of_seen_books_and_checks_them_against_g4_4s_set(world4, monkeypatch):
+    rows = novels_world_file(world4["tmp"] / "b1-selected.parquet")
+    set4 = run_build4(world4)
+    monkeypatch.setattr(g4arm, "NOVELS_EVAL_BOOKS", 3)
+    monkeypatch.setattr(g4arm, "NOVELS_EVAL_PAIRS", 4)
+    monkeypatch.setattr(g4arm, "NOVELS_EVAL_MIN_ROWS", 5)
+
+    def run(out, **kw):
+        args = dict(g44=str(set4 / "G4-4"), data_report=str(set4 / "report.json"),
+                    novels=str(world4["tmp"] / "b1-selected.parquet"), evalsets=str(world4["tmp"] / "evalsets.parquet"),
+                    blind=str(world4["blind"]), tokenizer="unused", out=str(out))
+        args.update(kw)
+        g4arm.novels4(ns(**args), counter=FakeCounter())
+        return out
+
+    out = run(world4["tmp"] / "novels")
+    manifest = json.loads((out / "manifest.json").read_text())
+    meta = pq.read_table(out / "eval-novels-meta.parquet").to_pylist()
+    msgs = pq.read_table(out / "eval-novels.parquet").to_pylist()
+    assert manifest["pairs"] == len(meta) == len(msgs) == 12 and manifest["name"] == "unseen passages of seen novels"
+    assert not any(manifest["checks_on_output"].values())
+    assert sorted(manifest["draw"]["authors"]) == ["author", "ayn rand", "clavell james"]
+    assert len({m["en_book_id"] for m in meta}) == 3 and {m["en_book_id"] for m in meta} <= {"101", "107", "108", "109"}
+    trained = {m["id"][len("novel:"):] for m in pq.read_table(set4 / "G4-4" / "train-meta.parquet").to_pylist()
+               if m["kind"] == "novel"}
+    assert trained and not trained & {m["pid"] for m in meta}
+    train = pq.read_table(set4 / "G4-4" / "train.parquet").column("messages").to_pylist()
+    assert not [x for x in msgs if x["messages"] in train]
+    by_id = {r["id"]: r for r in rows}
+    assert [x for x in msgs] == [g4arm.messages_row(by_id[m["pid"]]["en"], by_id[m["pid"]]["nl"]) for m in meta]
+    assert all(m["author"] in ("Rand, Ayn", "Ayn Rand", "Clavell, James", "author 101") for m in meta)
+    # the same set twice; another data report or -b1- file is refused
+    again = run(world4["tmp"] / "novels2")
+    assert sha(again / "eval-novels.parquet") == sha(out / "eval-novels.parquet")
+    report = json.loads((set4 / "report.json").read_text())
+    report["novels"]["near_duplicates"]["rows_left"] += 1
+    (world4["tmp"] / "report-bad.json").write_text(json.dumps(report))
+    with pytest.raises(SystemExit):
+        run(world4["tmp"] / "novels3", data_report=str(world4["tmp"] / "report-bad.json"))
+    write(rows[:-1], world4["tmp"] / "b1-other.parquet")
+    with pytest.raises(SystemExit, match="not the -b1- file"):
+        run(world4["tmp"] / "novels4", novels=str(world4["tmp"] / "b1-other.parquet"))

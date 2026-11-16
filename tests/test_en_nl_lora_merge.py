@@ -87,3 +87,36 @@ def test_merged_kernels_reproduce_qwix_lora():
     nnx.replace_by_pure_dict(state, tree)
     nnx.update(merged, state)
     np.testing.assert_allclose(np.asarray(merged(x)), np.asarray(lora_out), rtol=1e-4, atol=1e-4)
+
+
+def test_init_adapter_puts_an_exported_adapter_back_into_a_fresh_model(tmp_path):
+    """sft_lora.py --init-adapter (protocol-g4.md amendment G4-4.11): an adapter exported after training, loaded into a
+    model whose lora_b is zero, gives the trained model's output; a missing key or another shape stops the load"""
+    x = jax.random.normal(jax.random.key(1), (2, 3, 8))
+    provider = qwix.LoraProvider(module_path=r"layers_[0-9]+/.*(self_attention/(query|out)|mlp/(wi_0|wo))",
+                                 rank=RANK, alpha=ALPHA)
+    trained = qwix.apply_lora_to_model(Decoder(nnx.Rngs(0)), provider, x, rngs=nnx.Rngs(3))
+    key = jax.random.key(2)
+    for _, variable in nnx.iter_graph(trained):
+        if isinstance(variable, nnx.LoRAParam):
+            key, sub = jax.random.split(key)
+            variable.set_value(0.3 * jax.random.normal(sub, variable.get_value().shape))
+    adapter, _ = sft_lora.adapter_arrays(nnx.to_pure_dict(nnx.state(trained, nnx.LoRAParam)))
+    np.savez(tmp_path / "adapter.npz", **adapter)
+    fresh = qwix.apply_lora_to_model(Decoder(nnx.Rngs(0)), provider, x, rngs=nnx.Rngs(4))
+    assert float(np.max(np.abs(np.asarray(fresh(x) - trained(x))))) > 0.1
+    info = sft_lora.load_adapter(fresh, tmp_path / "adapter.npz")
+    assert info["keys"] == 8 and info["nonzero_b"] == 4 and info["params"] == sum(a.size for a in adapter.values())
+    np.testing.assert_allclose(np.asarray(fresh(x)), np.asarray(trained(x)), rtol=1e-6, atol=1e-6)
+    np.savez(tmp_path / "missing.npz", **{k: v for k, v in adapter.items() if not k.endswith("wo/kernel_lora_b")})
+    with pytest.raises(SystemExit, match="no layers_0/mlp/wo/kernel_lora_b"):
+        sft_lora.load_adapter(qwix.apply_lora_to_model(Decoder(nnx.Rngs(0)), provider, x, rngs=nnx.Rngs(4)),
+                              tmp_path / "missing.npz")
+    np.savez(tmp_path / "shape.npz", **{**adapter, "layers_0/mlp/wo/kernel_lora_a": np.zeros((12, RANK + 1), np.float32)})
+    with pytest.raises(SystemExit, match="is \\(12, 4\\)"):
+        sft_lora.load_adapter(qwix.apply_lora_to_model(Decoder(nnx.Rngs(0)), provider, x, rngs=nnx.Rngs(4)),
+                              tmp_path / "shape.npz")
+    np.savez(tmp_path / "extra.npz", **{**adapter, "layers_9/mlp/wo/kernel_lora_a": np.zeros((12, RANK), np.float32)})
+    with pytest.raises(SystemExit, match="no LoRA parameter for"):
+        sft_lora.load_adapter(qwix.apply_lora_to_model(Decoder(nnx.Rngs(0)), provider, x, rngs=nnx.Rngs(4)),
+                              tmp_path / "extra.npz")

@@ -19,6 +19,9 @@ after the last: each file (see below for the batches), token-weighted (MaxText's
 iterator (MaxText's HF source cannot restart), and every process runs the same number of batches, the smallest count
 of any process (counted before training), without padding batches; the last batches of the larger shares are left out,
 the same ones at every eval. Each eval prints an EVAL line; summary.json keeps them under "eval".
+With --init-adapter FILE (an adapter.npz of this script) the LoRA parameters are that adapter's before the first step,
+each in the model's own dtype and sharding, every key and shape checked both ways and read back: the eval at step 0 is
+then that adapter's model (protocol-g4.md amendment G4-4.11: G4-3's final model on G4-4's novels).
 Writes to DIR (process 0): summary.json (configuration, times, throughput, memory per chip, loss per step), adapter.npz
 (the LoRA parameters in float32, keys as decoder/layers_0/self_attention/query/kernel_lora_a), adapter.json (rank,
 alpha, module regex, model, checkpoint, original dtype); MaxText's output (metrics file, tensorboard, Tunix's checkpoint
@@ -50,6 +53,45 @@ def path_key(path):
 
 LORA_SUFFIXES = ("_lora_a", "_lora_b")
 LAYER_INDEX = re.compile(r"(?<=layers_)[0-9]+")
+
+
+def load_adapter(model, path):
+    """Puts adapter.npz (adapter_arrays' keys, float32) into the model's LoRA parameters, each cast to the parameter's
+    dtype and placed with its sharding; every parameter needs a key of its shape and every key a parameter. Read back
+    through adapter_arrays and compared, so that a load that did not reach the model stops the run."""
+    import hashlib
+
+    import jax
+    import numpy as np
+    from flax import nnx
+
+    state = nnx.state(model, nnx.LoRAParam)
+    leaves, treedef = jax.tree_util.tree_flatten_with_path(nnx.to_pure_dict(state))
+    with np.load(path) as z:
+        arrays = {k: z[k] for k in z.files}
+    new, want = [], {}
+    for p, leaf in leaves:
+        key = path_key(p)
+        if key not in arrays:
+            raise SystemExit(f"--init-adapter {path}: no {key}")
+        if tuple(arrays[key].shape) != tuple(leaf.shape):
+            raise SystemExit(f"--init-adapter {path}: {key} is {arrays[key].shape}, the model's {leaf.shape}")
+        a = arrays[key].astype(leaf.dtype)
+        want[key] = np.asarray(a).astype(np.float32)
+        new.append(jax.make_array_from_callback(leaf.shape, leaf.sharding, lambda index, a=a: a[index]))
+    extra = sorted(set(arrays) - set(want))
+    if extra:
+        raise SystemExit(f"--init-adapter {path}: {len(extra)} keys the model has no LoRA parameter for, e.g. {extra[:3]}")
+    nnx.replace_by_pure_dict(state, jax.tree_util.tree_unflatten(treedef, new))
+    nnx.update(model, state)
+    back, dtypes = adapter_arrays(nnx.to_pure_dict(nnx.state(model, nnx.LoRAParam)))
+    differ = [k for k in want if not np.array_equal(back[k], want[k])]
+    if set(back) != set(want) or differ:
+        raise SystemExit(f"--init-adapter {path}: read back, {len(differ)} parameters differ, e.g. {differ[:3]}")
+    with open(path, "rb") as f:
+        digest = hashlib.sha256(f.read()).hexdigest()
+    return {"path": str(path), "sha256": digest, "keys": len(want), "params": int(sum(a.size for a in want.values())),
+            "dtype": sorted(dtypes), "nonzero_b": sum(bool(np.any(want[k])) for k in want if k.endswith("_lora_b"))}
 
 
 def module_type(module_path):
@@ -302,6 +344,9 @@ def main(argv=None):
                         help="NAME=FILE: a held-out file in the training data's format, its loss at step 0, every "
                              "--eval-every steps and after the last (repeatable)")
     parser.add_argument("--eval-every", type=int, default=0)
+    parser.add_argument("--init-adapter", default=None,
+                        help="an adapter.npz of this script: the LoRA parameters before the first step (its eval at "
+                             "step 0 is that adapter's model)")
     args = parser.parse_args(own)
     evals_wanted = parse_evals(args.eval)
     overrides = overrides + eval_overrides(evals_wanted, args.eval_every)
@@ -410,6 +455,9 @@ def main(argv=None):
                     if path and isinstance(value, nnx.Module)]
     lora_seen = lora_report(lora_utils._get_lora_module_path(config), lora_sizes, module_paths)  # noqa: SLF001
     print(f"LORA_MODULES {json.dumps(lora_seen)}", flush=True)
+    init_adapter = load_adapter(trainer.model, args.init_adapter) if args.init_adapter else None
+    if init_adapter:
+        print(f"INIT_ADAPTER {json.dumps(init_adapter)}", flush=True)
 
     hooks = trainer.training_hooks
     records, batch_counts = [], []
@@ -545,6 +593,7 @@ def main(argv=None):
         "eval_plan": {k: {x: v[x] for x in ("path", "batches", "batches_per_process", "end")}
                       for k, v in eval_plan.items()},
         "lr_at": lr_at,
+        "init_adapter": init_adapter,
     }
     if summary["throughput"]:
         summary["throughput"]["tokens_per_s_per_chip"] = round(summary["throughput"]["tokens_per_s"] / jax.device_count(), 1)

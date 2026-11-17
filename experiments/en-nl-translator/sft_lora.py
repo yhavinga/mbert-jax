@@ -22,6 +22,17 @@ the same ones at every eval. Each eval prints an EVAL line; summary.json keeps t
 With --init-adapter FILE (an adapter.npz of this script) the LoRA parameters are that adapter's before the first step,
 each in the model's own dtype and sharding, every key and shape checked both ways and read back: the eval at step 0 is
 then that adapter's model (protocol-g4.md amendment G4-4.11: G4-3's final model on G4-4's novels).
+Arm G4-5 (draft amendment G4-5): with --resume-step N the run continues the training state that Tunix restores from
+its own checkpoint directory (MaxText's checkpoint_dir, where the chain copied the warmup's checkpoint of step N): the
+LoRA parameters and the optimizer state (AdamW's moments and step count); this script checks that Tunix restored step
+N, that the LoRA parameters equal --resume-adapter (the warmup's adapter.npz) and that the optimizer's step counters
+are N. --steps then counts this run's own steps (its data from the first batch: MaxText's data hooks skip nothing);
+MaxText's `steps` and the schedule run over N + own steps, so the learning rate continues at step N. With
+--warmup-steps W and --decay-fraction F the WSD schedule has exactly W warmup steps and int(F x own) decay steps at
+the end (the fractions of MaxText's schedule computed for N + own). With --combine SPEC (g4mix.py spec) the first
+eval runs, after its usual round, the search over the weights of a shared warmup and its branches (KernelMerger: the
+model's base kernels replaced by W0 + the stacked update, one point at a time, forward only), the top K on every eval
+file, and puts the base kernels back; summary.json keeps it under "combine".
 Writes to DIR (process 0): summary.json (configuration, times, throughput, memory per chip, loss per step), adapter.npz
 (the LoRA parameters in float32, keys as decoder/layers_0/self_attention/query/kernel_lora_a), adapter.json (rank,
 alpha, module regex, model, checkpoint, original dtype); MaxText's output (metrics file, tensorboard, Tunix's checkpoint
@@ -254,20 +265,224 @@ def needs_final_eval(evals, steps):
     return bool(evals) and evals[-1]["step"] != steps
 
 
-def lr_points(steps, warmup_fraction, decay_fraction):
-    """The steps whose learning rate summary.json records: start, end of warmup, middle, start of the decay, last"""
+def lr_points(steps, warmup_fraction, decay_fraction, extra=()):
+    """The steps whose learning rate summary.json records: start, end of warmup, middle, start of the decay, last (and
+    `extra`, e.g. a resumed run's first steps)"""
     warmup = int(steps * warmup_fraction)
     decay = int(steps * decay_fraction)
-    return sorted({0, 1, warmup, warmup + 1, steps // 2, max(0, steps - decay), steps - 1} & set(range(steps)))
+    points = {0, 1, warmup, warmup + 1, steps // 2, max(0, steps - decay), steps - 1}
+    return sorted((points | set(extra)) & set(range(steps)))
 
 
-def learning_rates(config, steps):
+def learning_rates(config, steps, extra=()):
     """{step: the learning rate of MaxText's schedule} at lr_points (optax counts updates from 0)"""
     from maxtext.utils import maxtext_utils
 
     schedule = maxtext_utils.create_learning_rate_schedule(config)
     decay = config.wsd_decay_steps_fraction if str(config.lr_schedule_type).lower().endswith("wsd") else 0.0
-    return {str(k): float(schedule(k)) for k in lr_points(steps, config.warmup_steps_fraction, decay)}
+    return {str(k): float(schedule(k)) for k in lr_points(steps, config.warmup_steps_fraction, decay, extra)}
+
+
+def schedule_overrides(total, warmup, decay):
+    """MaxText's WSD fractions that give exactly `warmup` linear warmup steps and `decay` decay steps in a schedule of
+    `total` steps (MaxText takes int(total * fraction)); the schedule's length is `steps`"""
+    if not (0 <= warmup and 0 <= decay and warmup + decay <= total):
+        raise SystemExit(f"warmup {warmup} and decay {decay} steps do not fit a schedule of {total}")
+    fw = (warmup + 0.5) / total
+    fd = (decay + 0.5) / total if decay else 0.0
+    if int(total * fw) != warmup or int(total * fd) != decay or fw + fd > 1.0:
+        raise SystemExit(f"no fractions for {warmup} / {decay} of {total} steps ({fw!r}, {fd!r})")
+    return [f"warmup_steps_fraction={fw!r}", f"wsd_decay_steps_fraction={fd!r}", "learning_rate_schedule_steps=-1"]
+
+
+def resumed_counters(opt_pure):
+    """{key: value} of the optimizer state's step counters (leaves named step or count) of a pure dict"""
+    import jax
+    import numpy as np
+
+    out = {}
+    for path, leaf in jax.tree_util.tree_flatten_with_path(opt_pure)[0]:
+        key = path_key(path)
+        if key.rpartition("/")[2] in ("step", "count"):
+            value = leaf.addressable_data(0) if hasattr(leaf, "addressable_data") else leaf
+            out[key] = int(np.asarray(value))
+    return out
+
+
+def check_resume(trainer, step, adapter_path):
+    """--resume-step: Tunix restored step `step` from the run's checkpoint directory, the LoRA parameters are those of
+    adapter_path (the warmup's adapter.npz), and every step counter of the optimizer state is `step`"""
+    import numpy as np
+    from flax import nnx
+
+    if trainer.train_steps != step:
+        where = getattr(getattr(trainer, "config", None), "checkpoint_root_directory", "the run's checkpoint directory")
+        raise SystemExit(f"--resume-step {step}: Tunix starts at step {trainer.train_steps} (no checkpoint of step "
+                         f"{step} in {where}?)")
+    flat, _ = adapter_arrays(nnx.to_pure_dict(nnx.state(trainer.model, nnx.LoRAParam)))
+    with np.load(adapter_path) as z:
+        want = {k: z[k] for k in z.files}
+    differ = sorted(k for k in want if k not in flat or not np.array_equal(flat[k], want[k]))
+    if set(flat) != set(want) or differ:
+        raise SystemExit(f"--resume-adapter {adapter_path}: the restored LoRA parameters differ ({len(differ)} keys, "
+                         f"e.g. {differ[:3]}; keys only in one: {sorted(set(flat) ^ set(want))[:3]})")
+    opt = nnx.to_pure_dict(nnx.state(trainer.optimizer, nnx.optimizer.OptState))
+    counters = resumed_counters(opt)
+    if not counters or any(v != step for v in counters.values()):
+        raise SystemExit(f"--resume-step {step}: the optimizer's step counters are {counters or 'not found'}")
+    return {"step": step, "adapter": str(adapter_path), "lora_keys": len(want), "counters": counters}
+
+
+class KernelMerger:
+    """sft_lora.py --combine: the base kernels of the adapters' modules replaced by W0 + scale * sum_k c_k A_k B_k
+    (g4mix.stack_module, translate.lora_delta in float32, then the kernel's own dtype and sharding), one module at a
+    time; W0 from a host copy of this process's own shards, so that every point starts from the base exactly and
+    restore() puts it back. The kernels keep their shapes, dtypes and shardings: the jitted eval step is not compiled
+    again. The model casts a kernel to its compute dtype (bf16) at use, so a point is the model translate.py --lora
+    decodes with the stacked adapter."""
+
+    def __init__(self, model, mesh, components, scale):
+        import g4mix
+        import jax
+        import numpy as np
+        from flax import nnx
+
+        self.jax, self.np, self.scale, self.mesh = jax, np, float(scale), mesh
+        self.factors = g4mix.module_factors(components)
+        self.modules = sorted(self.factors[0])
+        found = {}
+        for path, value in nnx.iter_graph(model):
+            if isinstance(value, nnx.Param) and not isinstance(value, nnx.LoRAParam) and path and path[-1] == "kernel":
+                found.setdefault(from_decoder("/".join(str(p) for p in path[:-1])), []).append(value)
+        missing = [m for m in self.modules if len(found.get(from_decoder(m), [])) != 1]
+        if missing:
+            raise SystemExit(f"--combine: {len(missing)} adapter modules without exactly one base kernel, e.g. "
+                             f"{[(m, len(found.get(from_decoder(m), []))) for m in missing[:3]]}")
+        self.vars = {m: found[from_decoder(m)][0] for m in self.modules}
+        self.host, self.fns = {}, {}
+        for m, var in self.vars.items():
+            w = self.get(var)
+            self.host[m] = {self.index_key(s.index): np.asarray(s.data) for s in w.addressable_shards}
+        self.replicated = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+
+    @staticmethod
+    def get(var):
+        return var.get_value() if hasattr(var, "get_value") else var.value
+
+    @staticmethod
+    def put(var, value):
+        if hasattr(var, "set_value"):
+            var.set_value(value)
+        else:
+            var.value = value
+
+    @staticmethod
+    def index_key(index):
+        return tuple((s.start, s.stop, s.step) for s in index)
+
+    def base(self, module):
+        w = self.get(self.vars[module])
+        shards = self.host[module]
+
+        def shard(index):
+            key = self.index_key(index)
+            if key not in shards:
+                raise SystemExit(f"--combine: {module} has no host copy of the shard {key}")
+            return shards[key]
+
+        return self.jax.make_array_from_callback(w.shape, w.sharding, shard)
+
+    def merge_fn(self, w):
+        import jax.numpy as jnp
+        import translate
+
+        key = (tuple(w.shape), str(w.dtype), str(w.sharding))
+        if key not in self.fns:
+            scale = self.scale
+            self.fns[key] = self.jax.jit(
+                lambda w0, a, b: (w0.astype(jnp.float32) + translate.lora_delta(a, b, w0.shape, scale, jnp)).astype(
+                    w0.dtype), out_shardings=w.sharding)
+        return self.fns[key]
+
+    def apply(self, coefs):
+        """Every module's kernel = W0 + its stacked update with these coefficients (all zero: W0 itself)"""
+        import g4mix
+
+        np = self.np
+        for m in self.modules:
+            w0 = self.base(m)
+            if not any(coefs):
+                self.put(self.vars[m], w0)
+                continue
+            a, b = g4mix.stack_module([f[m] for f in self.factors], coefs)
+            put = [self.jax.make_array_from_callback(x.shape, self.replicated, lambda i, x=x: x[i])
+                   for x in (np.ascontiguousarray(a), np.ascontiguousarray(b))]
+            self.put(self.vars[m], self.merge_fn(w0)(w0, *put))
+
+    def restore(self):
+        self.apply([0.0] * len(self.factors))
+
+
+def broadcast_float(value):
+    """Process 0's float on every process, so that the search's choices are the same everywhere"""
+    import jax
+
+    if jax.process_count() == 1:
+        return float(value)
+    import numpy as np
+    from jax.experimental import multihost_utils
+
+    return float(np.asarray(multihost_utils.broadcast_one_to_all(np.array(value, np.float64))))
+
+
+def run_combine(spec, model, mesh, run_files, names):
+    """--combine: the anchors, the coordinate search on the objective's eval files, the top K on every eval file, the
+    first anchor once more (the same loss: the base came back), the base kernels restored"""
+    import g4mix
+    import numpy as np
+
+    t0 = time.perf_counter()
+    components = []
+    for c in spec["components"]:
+        with np.load(c["adapter"]) as z:
+            components.append({k: z[k] for k in z.files})
+    merger = KernelMerger(model, mesh, components, spec["scale"])
+    objective_sets = list(spec["objective"])
+    records = []
+
+    def evaluate(w, tag, sets):
+        coefs = g4mix.coefficients(w, spec["shared_coef"])
+        t = time.perf_counter()
+        merger.apply(coefs)
+        merge_s = time.perf_counter() - t
+        rows = run_files(sets, tag)
+        losses = {r["set"]: r["loss"] for r in rows}
+        records.append({"tag": tag, "w": list(w), "coefs": coefs, "losses": losses,
+                        "tokens": {r["set"]: r["tokens"] for r in rows}, "merge_s": round(merge_s, 1),
+                        "seconds": round(time.perf_counter() - t, 1)})
+        return losses
+
+    def objective(w):
+        losses = evaluate(w, f"search/{len(records)}", objective_sets)
+        return broadcast_float(g4mix.objective_value(losses, spec["objective"]))
+
+    search = g4mix.run_search(objective, spec)
+    for p in search["points"]:
+        r = records[p["order"]]
+        if r["tag"] != f"search/{p['order']}" or g4mix.key_of(r["w"]) != g4mix.key_of(p["w"]):
+            raise SystemExit(f"--combine: point {p['order']} is not the evaluation {r['tag']}")
+        p["losses"] = r["losses"]
+    for k, p in enumerate(search["top"], 1):
+        p["losses"] = evaluate(p["w"], f"top/{k}", names)
+    first = search["points"][0]
+    again = g4mix.objective_value(evaluate(first["w"], "repeat", objective_sets), spec["objective"])
+    merger.restore()
+    out = {"spec": spec, "search": search, "evals": records,
+           "repeat": {"w": first["w"], "first": first["value"], "again": again, "equal": again == first["value"]},
+           "seconds": round(time.perf_counter() - t0, 1)}
+    print(f"COMBINE {json.dumps({k: out[k] for k in ('repeat', 'seconds')} | {'best': search['best'], 'top': [(p['w'], p['value']) for p in search['top']], 'evaluations': search['evaluations'], 'stopped': search['stopped']})}",
+          flush=True)
+    return out
 
 
 def scalar(x):
@@ -347,8 +562,34 @@ def main(argv=None):
     parser.add_argument("--init-adapter", default=None,
                         help="an adapter.npz of this script: the LoRA parameters before the first step (its eval at "
                              "step 0 is that adapter's model)")
+    parser.add_argument("--resume-step", type=int, default=0,
+                        help="continue the training state of this step, which Tunix restores from the run's own "
+                             "checkpoint directory (copied there before); --steps counts this run's own steps")
+    parser.add_argument("--resume-adapter", default=None,
+                        help="with --resume-step: the adapter.npz of the restored step (checked against the restore)")
+    parser.add_argument("--warmup-steps", type=int, default=None,
+                        help="WSD with exactly this many warmup steps (with --decay-fraction)")
+    parser.add_argument("--decay-fraction", type=float, default=None,
+                        help="WSD decay over int(this x the run's own steps) steps at its end (0: none)")
+    parser.add_argument("--combine", default=None,
+                        help="g4mix.py spec: the search over the weights of a warmup and its branches at the first eval")
     args = parser.parse_args(own)
+    if args.resume_step < 0 or bool(args.resume_step) != bool(args.resume_adapter):
+        raise SystemExit("--resume-step N (> 0) and --resume-adapter go together")
+    if (args.warmup_steps is None) != (args.decay_fraction is None):
+        raise SystemExit("--warmup-steps and --decay-fraction go together")
+    if args.decay_fraction is not None and not 0 <= args.decay_fraction < 1:
+        raise SystemExit(f"--decay-fraction {args.decay_fraction}: in [0, 1)")
+    combine_spec = None
+    if args.combine:
+        if args.steps != "1" or args.resume_step or args.init_adapter:
+            raise SystemExit("--combine is a measurement: --steps 1, no --resume-step, no --init-adapter")
+        combine_spec = json.loads(Path(args.combine).read_text())
     evals_wanted = parse_evals(args.eval)
+    if combine_spec:
+        unknown = [s for s in combine_spec["objective"] if s not in evals_wanted]
+        if unknown or not evals_wanted:
+            raise SystemExit(f"--combine: the objective's sets {unknown} are no --eval")
     overrides = overrides + eval_overrides(evals_wanted, args.eval_every)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -410,11 +651,17 @@ def main(argv=None):
             batches_per_process = [int(x) for x in np.asarray(counts).reshape(-1)]
             count["batches_per_process"] = batches_per_process
             count["step_limit"] = step_limit(batches_per_process)
-    steps = choose_steps(args.steps, batches_per_process)
-    print(f"EPOCH {json.dumps(count | {'requested': args.steps, 'steps': steps})}", flush=True)
+    own_steps = choose_steps(args.steps, batches_per_process)
+    # --resume-step: MaxText's steps (Tunix's max_steps) and the schedule count from the restored step
+    steps = args.resume_step + own_steps
+    print(f"EPOCH {json.dumps(count | {'requested': args.steps, 'steps': steps, 'own_steps': own_steps, 'resume_step': args.resume_step})}",
+          flush=True)
+    if args.warmup_steps is not None:
+        decay = int(args.decay_fraction * own_steps)
+        base = base + schedule_overrides(steps, args.warmup_steps, decay)
     config = pyconfig.initialize_pydantic(base + [f"steps={steps}"])
     # before the training, so that a schedule this cannot read stops the run before it costs anything
-    lr_at = learning_rates(config, steps)
+    lr_at = learning_rates(config, steps, extra=(args.resume_step, args.resume_step + 1) if args.resume_step else ())
     print(f"LR {json.dumps({'type': str(config.lr_schedule_type), 'at': lr_at})}", flush=True)
 
     # The held-out files: per file a config of its own; the batches every process runs, the largest count of any
@@ -458,6 +705,9 @@ def main(argv=None):
     init_adapter = load_adapter(trainer.model, args.init_adapter) if args.init_adapter else None
     if init_adapter:
         print(f"INIT_ADAPTER {json.dumps(init_adapter)}", flush=True)
+    resumed = check_resume(trainer, args.resume_step, args.resume_adapter) if args.resume_step else None
+    if resumed:
+        print(f"RESUMED {json.dumps(resumed)}", flush=True)
 
     hooks = trainer.training_hooks
     records, batch_counts = [], []
@@ -480,7 +730,7 @@ def main(argv=None):
 
     hooks.on_train_start, hooks.on_train_step_start, hooks.on_train_step_end = train_start, step_start, step_end
 
-    evals = []
+    evals, combined = [], {}
     if eval_plan:
         # Tunix's eval loop, file by file: our batches (data_hooks.load_next_eval_batch), the planned number of them
         # from a fresh iterator; the jitted eval step wrapped to keep each batch's xent_sum and total_weights
@@ -514,9 +764,11 @@ def main(argv=None):
         trainer.jit_train_and_eval_step = jit_recorded
         run_eval_tunix = trainer._run_eval  # noqa: SLF001 - wrapped, not replaced
 
-        def run_eval(eval_ds, eval_step_fn):
+        def run_files(names, eval_ds, eval_step_fn, tag=None):
             step = trainer.train_steps
-            for name, plan in eval_plan.items():
+            out = []
+            for name in names:
+                plan = eval_plan[name]
                 feed["iter"] = eval_iterator(plan["config"], mesh)
                 feed["left"], feed["parts"] = plan["batches"], []
                 t0 = time.perf_counter()
@@ -526,8 +778,18 @@ def main(argv=None):
                     raise SystemExit(f"eval {name} at step {step}: {feed['left']} planned batches not run")
                 record = eval_loss(name, step, [(scalar(x), scalar(w)) for x, w in feed["parts"]], plan["batches"],
                                    time.perf_counter() - t0)
-                evals.append(record)
-                print(f"EVAL {json.dumps(record)}", flush=True)
+                if tag is not None:
+                    record["combo"] = tag
+                out.append(record)
+                print(f"{'COMBO_EVAL' if tag is not None else 'EVAL'} {json.dumps(record)}", flush=True)
+            return out
+
+        def run_eval(eval_ds, eval_step_fn):
+            evals.extend(run_files(list(eval_plan), eval_ds, eval_step_fn))
+            if combine_spec and "result" not in combined:
+                combined["result"] = run_combine(
+                    combine_spec, trainer.model, mesh,
+                    lambda names, tag: run_files(names, eval_ds, eval_step_fn, tag), list(eval_plan))
 
         trainer._run_eval = run_eval  # noqa: SLF001
         on_end = hooks.on_train_end
@@ -543,9 +805,12 @@ def main(argv=None):
     t_train = time.time()
     train_sft.train_model(config, trainer, mesh)
     train_s = time.time() - t_train
-    if trainer.train_steps != steps or len(records) != steps:
+    if trainer.train_steps != steps or len(records) != own_steps:
         # the loop ended early (the data ran out) or a step went unlogged: not the run that was set up
-        raise SystemExit(f"trained {trainer.train_steps} steps ({len(records)} logged), not the {steps} set")
+        raise SystemExit(f"trained up to step {trainer.train_steps} ({len(records)} logged), not {steps} "
+                         f"({own_steps} own steps)")
+    if combine_spec and "result" not in combined:
+        raise SystemExit("--combine: the search did not run (no eval before the first step?)")
 
     tokens = [int(a) for a, _ in batch_counts]
     loss_tokens = [int(b) for _, b in batch_counts]
@@ -580,7 +845,8 @@ def main(argv=None):
             "adam_b2", "adam_weight_decay", "gradient_clipping_threshold", "weight_dtype",
             "dtype", "remat_policy", "attention", "scan_layers", "ici_fsdp_parallelism", "ici_tensor_parallelism",
             "dcn_data_parallelism", "dcn_fsdp_parallelism", "sft_train_on_completion_only", "enable_data_shuffling")},
-        "epoch": count, "steps": steps, "steps_done": len(records),
+        "epoch": count, "steps": steps, "steps_done": len(records), "own_steps": own_steps,
+        "resume": resumed, "schedule": {"warmup_steps": args.warmup_steps, "decay_fraction": args.decay_fraction},
         "times": {"python_to_setup_s": round(t_setup - started, 1), "setup_s": round(setup_s, 1),
                   "train_s": round(train_s, 1),
                   "first_step_s": round(first_compile, 1) if first_compile is not None else None,
@@ -594,6 +860,7 @@ def main(argv=None):
                       for k, v in eval_plan.items()},
         "lr_at": lr_at,
         "init_adapter": init_adapter,
+        "combine": combined.get("result"),
     }
     if summary["throughput"]:
         summary["throughput"]["tokens_per_s_per_chip"] = round(summary["throughput"]["tokens_per_s"] / jax.device_count(), 1)

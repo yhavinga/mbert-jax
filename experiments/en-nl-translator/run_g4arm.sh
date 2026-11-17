@@ -72,15 +72,31 @@
 #   RUN=g4arm_G4-3_novels STEPS=1 bash run_g4arm.sh train   G4-3's final adapter ($G/G4-3/) loaded before the first
 #                                 step, one step on G4-4's smoke set, the novels evaluated at step 0 (G4-3's loss)
 #                                 and after the step; G4-4's smoke test and training evaluate the novels too
+# Arm G4-5 (draft amendment G4-5, Yeb 17 Nov: one LoRA per source, branched from a shared warmup with its optimizer
+# state, combined by weights searched on the search part of the rules' sets), with ARM=G4-5:
+#   bash run_g4arm.sh build5      w1: g4arm.py build5 (from G4-4's set: the warmup's set, one set per branch, flanval, the
+#                                 smoke sets), to $G/data/G4-5/
+#   bash run_g4arm.sh split5      w0: g4arm.py split5 (search and decision parts, the search part's reference files), to
+#                                 $G/data/G4-5-split/
+#   bash run_g4arm.sh refqe5      w0 (its TPU): MetricX-24-QE of the human references of WMT24++, FLORES, NTREX (the
+#                                 human side of (a1) per part), to $G/data/G4-5-split/refqe.parquet
+#   The smoke test: RUN=g4arm_G4-5_s8 train (the warmup's smoke set, 8 steps); RUN=g4arm_G4-5_b8 resume5 (w0: the s8
+#     checkpoint into b8's checkpoint directory), RUN=g4arm_G4-5_b8 train (the branch's smoke set from step 8, 8 steps
+#     with a cooldown); RUN=g4arm_G4-5_c8 train (the search on s8, b8 and G4-3's final adapter); MODEL=G4-5c1
+#     SEARCH_RUN=g4arm_G4-5_c8 smoke-translate and smoke-score (w0: the stacked adapter decodes); smoke5-report (w0)
+#   RUN=g4arm_G4-5_warmup train; for every branch B: RUN=g4arm_G4-5_B resume5, then RUN=g4arm_G4-5_B train
+#   RUN=g4arm_G4-5_search train (STEPS=1: the search at step 0; SEARCH_BUDGET, SEARCH_TOP_K, SEARCH_STEP, ... override)
+#   MODEL=G4-5c<k> translate and score (the k-th of the search's top, stacked on every worker from the runs' adapters);
+#   CANDIDATES="G4-5c1 ..." [REFS=G4-4] texts, classify, report5 (w0); SELECTED=<report5's choice> blind
 # The code is beside this script (a copy of $G/scripts/). TAG names the jobs of one chain.
 set -euo pipefail
-STAGE=${1:?a stage: fetchbt, build, check, evaldata, setup, train, adapter, translate, score, texts, classify, blind, report, smoke-translate, smoke-score, smoke-report, fetchval, heldout, own, smoke2-report, replay, build2, heldout3, build3, smoke3-report, build4, smoke4-report, novels4}
+STAGE=${1:?a stage: fetchbt, build, check, evaldata, setup, train, adapter, translate, score, texts, classify, blind, report, smoke-translate, smoke-score, smoke-report, fetchval, heldout, own, smoke2-report, replay, build2, heldout3, build3, smoke3-report, build4, smoke4-report, novels4, build5, split5, refqe5, resume5, report5, smoke5-report}
 R=gs://t5-dutch-english-usc2/mbert/translator
 S=$R/sft
 E=$R/eval
 G=$S/g4arm
 ARM=${ARM:-G4-1}
-case $ARM in G4-1|G4-2|G4-3|G4-4) ;; *) echo "ARM is G4-1, G4-2, G4-3 or G4-4, not $ARM"; exit 1 ;; esac
+case $ARM in G4-1|G4-2|G4-3|G4-4|G4-5) ;; *) echo "ARM is G4-1, G4-2, G4-3, G4-4 or G4-5, not $ARM"; exit 1 ;; esac
 SMOKE_RUN=g4arm_${ARM}_s8
 FULL_RUN=g4arm_$ARM
 SET=${SET:-eval}
@@ -108,6 +124,15 @@ NOVELS_RUN=g4arm_G4-3_novels
 if [ "$ARM" = G4-4 ]; then
   NAT=$G/naturalness-G4-4; REP=$G/report-G4-4; CHECK_TXT=$G/data/check-G4-4.txt
   BT_IN=$G/input/bt3; BTVAL_IN=$G/input/bt3-val; REPLAY_DIR=$G/data/replay-G4-3
+fi
+# G4-5's places (draft amendment G4-5): its sets on G4-4's, the split of the rules' sets, its runs
+G5=$G/data/G4-5
+G5S=$G/data/G4-5-split
+G5_WARMUP=g4arm_G4-5_warmup
+G5_SEARCH=${SEARCH_RUN:-g4arm_G4-5_search}
+G5_BRANCHES="bt_handelingen bt_raad bt_fineweb bt_rechtspraak bt_dpc books novels flan"
+if [ "$ARM" = G4-5 ]; then
+  NAT=$G/naturalness-G4-5; REP=$G/report-G4-5
 fi
 # The Gemma 4 FLAN-nl after its post step (flan_g4_full_run.sh), the replay's only source (amendment G4-2.3)
 FNL=gs://t5-dutch-english-usc2/mbert/flan-nl
@@ -193,6 +218,107 @@ g4a_const() {  # g4a_const NAME: a constant of g4arm.py (SEQ3, LR3, EVAL_EVERY3)
 adapter_local() {  # adapter_local RUN_DIR LOCAL: the adapter of a run (or $G/G4-1) copied for translate.py --lora
   mkdir -p "$2"
   gsutil -q cp "$1/adapter.npz" "$1/adapter.json" "$2/"
+}
+
+json_key() {  # json_key FILE KEY: a top-level value of a json file
+  python3 -c "import json, sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])" "$1" "$2"
+}
+
+g45_component_dir() {  # g45_component_dir NAME: where a component of G4-5's search has its adapter
+  case $1 in
+    shared) if [ "$G5_SEARCH" = g4arm_G4-5_c8 ]; then echo "$G/runs/g4arm_G4-5_s8"; else echo "$G/runs/$G5_WARMUP"; fi ;;
+    g43) echo "$G/G4-3" ;;
+    b8) echo "$G/runs/g4arm_G4-5_b8" ;;
+    *) echo "$G/runs/g4arm_G4-5_$1" ;;
+  esac
+}
+
+g45_check_adapter() {  # g45_check_adapter adapter.json: rank 32, alpha 16 (every component of G4-5)
+  python3 -c "import json, sys; a = json.load(open(sys.argv[1])); assert (a['rank'], a['alpha'], a['scale']) == (32, 16.0, 0.5), a" \
+    "$1" || { echo "$1 is not rank 32, alpha 16"; exit 1; }
+}
+
+g45_stack() {  # g45_stack MODEL OUT: G4-5c<k>, the k-th of the search's top, stacked here from the components' adapters
+  local k=${1#G4-5c} out=$2 sum=$G_SHM/g45-summary-$G5_SEARCH.json comps="" n d l
+  gsutil -q cp "$G/runs/$G5_SEARCH/summary.json" "$sum"
+  for n in $(python3 -c "import json, sys; print(' '.join(c['name'] for c in json.load(open(sys.argv[1]))['combine']['spec']['components']))" "$sum"); do
+    d=$(g45_component_dir "$n")
+    l=$G_SHM/g45-components-$G5_SEARCH/$n
+    [ -s "$l/adapter.npz" ] || adapter_local "$d" "$l"
+    g45_check_adapter "$l/adapter.json"
+    comps="$comps --component $n=$l"
+  done
+  [ -s "$out/adapter.npz" ] || $FPY -I "$CODE/g4mix.py" stack $comps --from-summary "$sum" --candidate "$k" --out "$out"
+}
+
+g45_train() {  # the training runs of G4-5 (draft amendment G4-5): the warmup, the branches, the search, the smoke runs
+  RUN=${RUN:?g4arm_G4-5_warmup, g4arm_G4-5_<branch>, $G5_SEARCH or a smoke run (g4arm_G4-5_s8, _b8, _c8)}
+  tpu_free
+  local setdir steps every lrw decay from="" resume=0 combine="" b
+  every=$(g4a_const EVAL_EVERY5)
+  lrw=$(g4a_const LR_WARMUP_STEPS5)
+  decay=$(g4a_const DECAY_FRACTION5)
+  D=$G_SHM/data-$RUN
+  mkdir -p "$D"
+  case $RUN in
+    g4arm_G4-5_s8) setdir=$G5/G4-5-smoke-warmup; steps=8; every=4; lrw=$(g4a_const SMOKE5_LR_WARMUP); decay=0 ;;
+    g4arm_G4-5_b8) setdir=$G5/G4-5-smoke-branch; steps=8; every=4; lrw=$(g4a_const SMOKE5_LR_WARMUP)
+                   decay=$(g4a_const SMOKE5_DECAY); from=g4arm_G4-5_s8 ;;
+    g4arm_G4-5_c8|"$G5_SEARCH") setdir=$G5/G4-5-smoke-warmup; steps=1; every=1; lrw=0; decay=0; combine=1 ;;
+    "$G5_WARMUP") setdir=$G5/G4-5-warmup; decay=0 ;;
+    g4arm_G4-5_*) b=${RUN#g4arm_G4-5_}
+                  case " $G5_BRANCHES " in *" $b "*) ;; *) echo "RUN $RUN: $b is no branch of G4-5 ($G5_BRANCHES)"; exit 1 ;; esac
+                  setdir=$G5/G4-5-$b; from=$G5_WARMUP ;;
+    *) echo "RUN $RUN is no run of G4-5"; exit 1 ;;
+  esac
+  gsutil -q cp "$setdir/manifest.json" "$D/manifest.json"
+  [ -n "${steps:-}" ] || steps=$(json_key "$D/manifest.json" steps)
+  [ "${STEPS:-$steps}" = "$steps" ] || { echo "$RUN takes $steps steps (its set), not STEPS=$STEPS"; exit 1; }
+  local EVAL_FILES="$H/eval-books.parquet $H/eval-btval.parquet $H/eval-own.parquet $H3/eval-btlong.parquet $H4/eval-novels.parquet $G5/eval-flanval.parquet $G5S/eval-wmt24pp-s.parquet $G5S/eval-flores-s.parquet $G5S/eval-ntrex-s.parquet"
+  for f in $EVAL_FILES; do gsutil -q stat "$f" || { echo "no $f (heldout, heldout3, novels4, build5, split5)"; exit 1; }; done
+  gsutil -m -q cp "$setdir/train.parquet" "$setdir/train-meta.parquet" "$setdir/template.jinja" $EVAL_FILES "$D/"
+  local ARGS="--eval books=$D/eval-books.parquet --eval btval=$D/eval-btval.parquet --eval own=$D/eval-own.parquet"
+  ARGS="$ARGS --eval btlong=$D/eval-btlong.parquet --eval novels=$D/eval-novels.parquet --eval flanval=$D/eval-flanval.parquet"
+  ARGS="$ARGS --eval wmt24pp_s=$D/eval-wmt24pp-s.parquet --eval flores_s=$D/eval-flores-s.parquet --eval ntrex_s=$D/eval-ntrex-s.parquet"
+  ARGS="$ARGS --eval-every $every --warmup-steps $lrw --decay-fraction $decay"
+  if [ -n "$from" ]; then
+    # the restored state is the last step of the run it comes from; resume5 copied its checkpoint into this run's place
+    gsutil -q cp "$G/runs/$from/summary.json" "$D/from-summary.json"
+    gsutil -q cp "$G/runs/$from/adapter.npz" "$D/resume-adapter.npz"
+    gsutil -q cp "$G/runs/$from/adapter.json" "$D/resume-adapter.json"
+    g45_check_adapter "$D/resume-adapter.json"
+    resume=$(json_key "$D/from-summary.json" steps)
+    gsutil -q stat "$G/runs/$RUN/maxtext/$RUN/checkpoints/$resume/commit_success.txt" || \
+      { echo "no checkpoint of step $resume in $G/runs/$RUN/maxtext/$RUN/checkpoints/ (resume5 first)"; exit 1; }
+    ARGS="$ARGS --resume-step $resume --resume-adapter $D/resume-adapter.npz"
+  fi
+  if [ -n "$combine" ]; then
+    local comps="" n names objective
+    if [ "$RUN" = g4arm_G4-5_c8 ]; then
+      names="shared b8 g43"
+      objective="--objective books=1 --objective novels=1"
+      SEARCH_BUDGET=${SEARCH_BUDGET:-8}; SEARCH_TOP_K=${SEARCH_TOP_K:-2}; SEARCH_STEP=${SEARCH_STEP:-0.5}
+      SEARCH_MIN_STEP=${SEARCH_MIN_STEP:-0.5}
+    else
+      names="shared $G5_BRANCHES"
+      objective=$($SFT_PY -c "import sys; sys.path.insert(0, '$CODE'); import g4arm; print(' '.join(f'--objective {k}={v}' for k, v in g4arm.OBJECTIVE5.items()))")
+    fi
+    for n in $names; do
+      mkdir -p "$D/components/$n"
+      gsutil -q cp "$(g45_component_dir "$n")/adapter.npz" "$(g45_component_dir "$n")/adapter.json" "$D/components/$n/"
+      g45_check_adapter "$D/components/$n/adapter.json"
+      comps="$comps --component $n=$D/components/$n/adapter.npz"
+    done
+    $SFT_PY "$CODE/g4mix.py" spec $comps $objective --budget "${SEARCH_BUDGET:-$(g4a_const SEARCH_BUDGET5)}" \
+      --top-k "${SEARCH_TOP_K:-$(g4a_const SEARCH_TOP_K5)}" --step "${SEARCH_STEP:-0.25}" --min-step "${SEARCH_MIN_STEP:-0.0625}" \
+      --lower "${SEARCH_LOWER:-0.0}" --upper "${SEARCH_UPPER:-1.5}" --start "${SEARCH_START:-uniform}" \
+      --shared-coef "${SEARCH_SHARED:-1.0}" --scale 0.5 --out "$D/spec.json" > /dev/null
+    ARGS="$ARGS --combine $D/spec.json"
+  fi
+  SFT_ARGS="$ARGS" MULTIHOST=1 NAME=$RUN MODEL=gemma4-31b DATA=$D/train.parquet TEMPLATE=$D/template.jinja ROOT=$G \
+    STEPS=$steps bash "$CODE/run_sft.sh" per_device_batch_size=1 max_target_length="$(g4a_const SEQ3)" \
+    lora.lora_rank=32 lora.lora_alpha=16.0 learning_rate="$(g4a_const LR5)" lr_schedule_type=wsd \
+    wsd_decay_style=linear learning_rate_final_fraction=0.1
 }
 
 case $STAGE in
@@ -309,6 +435,10 @@ EOF
   detach "g4a_setup_$TAG" bash ~/job_body_g4a_setup_$TAG.sh
   ;;
 train)
+  if [ "$ARM" = G4-5 ]; then
+    g45_train
+    exit 0
+  fi
   RUN=${RUN:?$SMOKE_RUN (with STEPS=8) or $FULL_RUN}
   STEPS=${STEPS:-auto}
   case "$ARM/$RUN/$STEPS" in "$ARM/$SMOKE_RUN/8"|"$ARM/$FULL_RUN/auto"|"G4-4/$NOVELS_RUN/1") ;; *) echo "RUN/STEPS is $SMOKE_RUN/8 or $FULL_RUN/auto (G4-4 also $NOVELS_RUN/1), not $RUN/$STEPS"; exit 1 ;; esac
@@ -397,8 +527,9 @@ adapter)
   echo "ADAPTER $ARM: $G/$ARM/ $(tr -d '\n ' < "$G_SHM/adapter-$TAG.json" | cut -c1-300)"
   ;;
 translate|smoke-translate)
-  MODEL=${MODEL:?G4-1, G4-2, G4-3, G4-4 or G4-0}
-  case $MODEL in G4-1|G4-2|G4-3|G4-4|G4-0) ;; *) echo "MODEL is G4-1, G4-2, G4-3, G4-4 or G4-0, not $MODEL"; exit 1 ;; esac
+  MODEL=${MODEL:?G4-1, G4-2, G4-3, G4-4, G4-5c<k> or G4-0}
+  case $MODEL in G4-1|G4-2|G4-3|G4-4|G4-0|G4-5c[1-9]) ;; *) echo "MODEL is G4-1, G4-2, G4-3, G4-4, G4-5c<k> or G4-0, not $MODEL"; exit 1 ;; esac
+  case $MODEL in G4-5c*) [ "$SET" = eval ] || { echo "$MODEL: SET=eval only"; exit 1; } ;; esac
   tpu_free
   EVALDIR=$G/data/eval
   if [ "$SET" = long ]; then
@@ -438,7 +569,13 @@ translate|smoke-translate)
     exit 0
   fi
   EXTRA=
-  if [ "$MODEL" != G4-0 ]; then
+  if [[ $MODEL == G4-5c* ]]; then
+    # draft amendment G4-5: the k-th of the search's top, the components' adapters side by side (g4mix.py stack)
+    g45_stack "$MODEL" "$G_SHM/adapter-$NAME"
+    if [ "$STAGE" = smoke-translate ]; then META=$G/smoke/$TAG/$MODEL/adapter.json; else META=$G/eval/$MODEL/adapter.json; fi
+    gsutil -q cp "$G_SHM/adapter-$NAME/adapter.json" "$META"
+    EXTRA="--lora $G_SHM/adapter-$NAME"
+  elif [ "$MODEL" != G4-0 ]; then
     adapter_local "$ADAPTER_DIR" "$G_SHM/adapter-$NAME"
     EXTRA="--lora $G_SHM/adapter-$NAME"
   fi
@@ -460,8 +597,8 @@ translate|smoke-translate)
   detach "$NAME" bash ~/job_body_$NAME.sh
   ;;
 score|smoke-score)
-  MODEL=${MODEL:?G4-1, G4-2, G4-3, G4-4 or G4-0}
-  case $MODEL in G4-1|G4-2|G4-3|G4-4|G4-0) ;; *) echo "MODEL is G4-1, G4-2, G4-3, G4-4 or G4-0, not $MODEL"; exit 1 ;; esac
+  MODEL=${MODEL:?G4-1, G4-2, G4-3, G4-4, G4-5c<k> or G4-0}
+  case $MODEL in G4-1|G4-2|G4-3|G4-4|G4-0|G4-5c[1-9]) ;; *) echo "MODEL is G4-1, G4-2, G4-3, G4-4, G4-5c<k> or G4-0, not $MODEL"; exit 1 ;; esac
   if [ "$SET" != eval ]; then
     # the held-out and the long segments: collect only (the direct measure's chrF is the report's), on the CPU
     if [ "$SET" = long ]; then
@@ -543,6 +680,7 @@ texts)
   [ "$ARM" = G4-2 ] && MODELS="G4-2 G4-0 G4-1"
   [ "$ARM" = G4-3 ] && MODELS="G4-3 G4-0 G4-2"                 # amendment G4-3.7
   [ "$ARM" = G4-4 ] && MODELS="G4-4 G4-0 G4-3"                 # amendment G4-4.7
+  [ "$ARM" = G4-5 ] && MODELS="${CANDIDATES:?the candidates of the search, G4-5c1 ...} G4-0 ${REFS:-}"   # draft G4-5
   PAIRS=""
   for m in $MODELS; do PAIRS="$PAIRS --pairs '$m=$T/$m/pairs-w*.parquet'"; done
   {
@@ -563,23 +701,26 @@ classify)
   ;;
 blind)
   only 0
+  # G4-5: the candidate report5 selected, under its own name (the key's and the tally's arm)
+  BARM=$ARM
+  [ "$ARM" = G4-5 ] && BARM=${SELECTED:?the candidate report5 selected, G4-5c<k>}
   for d in "$S/blind/$ARM" "$S/blind/$ARM-tg"; do
     ! gsutil -q stat "$d/key.jsonl" || { echo "$d has a key.jsonl: the package stays as it is"; exit 1; }
   done
   X=$G_SHM/blind-$TAG
   cat > ~/job_body_g4a_blind_$TAG.sh <<EOF
 set -euo pipefail
-mkdir -p $X/$ARM $X/G4-0 $X/tg $X/out
+mkdir -p $X/$BARM $X/G4-0 $X/tg $X/out
 gsutil -q cp $S/blind/fixed-2026-11-10/blind100.jsonl $X/
-gsutil -m -q cp '$G/eval/$ARM/pairs/pairs-w*.parquet' $X/$ARM/
+gsutil -m -q cp '$G/eval/$BARM/pairs/pairs-w*.parquet' $X/$BARM/
 gsutil -m -q cp '$G/eval/G4-0/pairs/pairs-w*.parquet' $X/G4-0/
 gsutil -m -q cp '$S/arms/eval/base-x/pairs/pairs-w*.parquet' $X/tg/
 # the arm against its starting point G4-0 (rules (a2), (c)); against TranslateGemma 27B (reported); seeds
 # en-nl-sft/blind/ab/<package>/<blind_id> (armeval.base_is_a), key apart
-$FPY -I -u $CODE/armeval.py blind --blind $X/blind100.jsonl --base '$X/G4-0/pairs-w*.parquet' --arm '$ARM=$X/$ARM/pairs-w*.parquet' --out $X/out
-$FPY -I -u $CODE/armeval.py blind --blind $X/blind100.jsonl --base '$X/tg/pairs-w*.parquet' --arm '$ARM-tg=$X/$ARM/pairs-w*.parquet' --out $X/out
-gsutil -m -q cp $X/out/$ARM/* $S/blind/$ARM/
-gsutil -m -q cp $X/out/$ARM-tg/* $S/blind/$ARM-tg/
+$FPY -I -u $CODE/armeval.py blind --blind $X/blind100.jsonl --base '$X/G4-0/pairs-w*.parquet' --arm '$BARM=$X/$BARM/pairs-w*.parquet' --out $X/out
+$FPY -I -u $CODE/armeval.py blind --blind $X/blind100.jsonl --base '$X/tg/pairs-w*.parquet' --arm '$BARM-tg=$X/$BARM/pairs-w*.parquet' --out $X/out
+gsutil -m -q cp $X/out/$BARM/* $S/blind/$ARM/
+gsutil -m -q cp $X/out/$BARM-tg/* $S/blind/$ARM-tg/
 echo "BLIND: $S/blind/$ARM/ $S/blind/$ARM-tg/"
 EOF
   detach "g4a_blind_$TAG" bash ~/job_body_g4a_blind_$TAG.sh
@@ -910,6 +1051,148 @@ gsutil -m -q cp $X/g4arm4-smoke.md $X/g4arm4-smoke.json $O/ || exit 1
 exit \$code
 EOF
   detach "g4a_smoke4_report_$TAG" bash ~/job_body_g4a_smoke4_report_$TAG.sh
+  ;;
+build5)
+  only 1
+  [ "$ARM" = G4-5 ] || { echo "build5 is G4-5's"; exit 1; }
+  ! gsutil -q stat "$G5/report.json" || { echo "$G5 has a report.json: the sets stay as they are"; exit 1; }
+  IN=$G_SHM/in5-$TAG
+  OUT=$G_SHM/data5-$TAG
+  # BUILD5_EXTRA: other numbers of steps (--warmup-steps N, --branch-steps N, --steps BRANCH=N); report.json goes
+  # last (it marks the sets complete)
+  cat > ~/job_body_g4a_build5_$TAG.sh <<EOF
+set -euo pipefail
+export OMP_NUM_THREADS=4 JAX_PLATFORMS=cpu
+mkdir -p $IN/g44
+gsutil -m -q cp $G/data/G4-4/train.parquet $G/data/G4-4/train-meta.parquet $G/data/G4-4/manifest.json $G/data/G4-4/template.jinja $IN/g44/
+gsutil -q cp $G/data/report-G4-4.json $H4/eval-novels-meta.parquet $IN/
+$SFT_PY -u $CODE/g4arm.py build5 --g44 $IN/g44 --g44-report $IN/report-G4-4.json --novels-eval $IN/eval-novels-meta.parquet \
+  ${BUILD5_EXTRA:-} --out $OUT
+for d in $OUT/G4-5-*; do gsutil -m -q cp \$d/* $G5/\$(basename \$d)/; done
+gsutil -m -q cp $OUT/eval-flanval.parquet $OUT/eval-flanval-meta.parquet $OUT/report.md $G5/
+gsutil -q cp $OUT/report.json $G5/
+gsutil -q cp $OUT/report.json $G/data/report-G4-5.json
+gsutil -q cp $OUT/report.md $G/data/report-G4-5.md
+rm -f $IN/g44/train.parquet $IN/g44/train-meta.parquet
+echo "BUILT5: $G5/"
+EOF
+  detach "g4a_build5_$TAG" nice -n 19 ionice -c3 bash ~/job_body_g4a_build5_$TAG.sh
+  ;;
+split5)
+  only 0
+  [ "$ARM" = G4-5 ] || { echo "split5 is G4-5's"; exit 1; }
+  ! gsutil -q stat "$G5S/split.json" || { echo "$G5S has a split.json: the split stays as it is"; exit 1; }
+  [ -s "$TOK_SFT/tokenizer.json" ] || { echo "w$W: no tokenizer in $TOK_SFT (setup)"; exit 1; }
+  X=$G_SHM/split5-$TAG
+  cat > ~/job_body_g4a_split5_$TAG.sh <<EOF
+set -euo pipefail
+export TOKENIZERS_PARALLELISM=true HF_HUB_OFFLINE=1 JAX_PLATFORMS=cpu
+mkdir -p $X
+gsutil -q cp $G/data/eval/evalsets.parquet $X/
+$SFT_PY -u $CODE/g4arm.py split5 --evalsets $X/evalsets.parquet --tokenizer $TOK_SFT --out $X/out
+gsutil -m -q cp $X/out/eval-*.parquet $G5S/
+gsutil -q cp $X/out/split.json $G5S/
+echo "SPLIT5_DONE: $G5S/"
+EOF
+  detach "g4a_split5_$TAG" bash ~/job_body_g4a_split5_$TAG.sh
+  ;;
+refqe5)
+  only 0
+  [ "$ARM" = G4-5 ] || { echo "refqe5 is G4-5's"; exit 1; }
+  ! gsutil -q stat "$G5S/refqe.parquet" || { echo "$G5S has a refqe.parquet"; exit 1; }
+  tpu_free
+  X=$G_SHM/refqe5-$TAG
+  # draft amendment G4-5: the human side of (a1) per part: the references scored as an arm's translations (as
+  # bt_natural.py refqe did for the protocol's numbers), with this chain's MetricX
+  cat > ~/job_body_g4a_refqe5_$TAG.sh <<EOF
+set -euo pipefail
+$ONE_HOST
+export JAX_COMPILATION_CACHE_DIR=$G_SHM/jax_cache_metricx
+mkdir -p $X
+gsutil -q cp $G/data/eval/evalsets.parquet $X/
+$FPY -I -c "import pyarrow as pa, pyarrow.parquet as pq, pyarrow.compute as pc, sys; t = pq.read_table(sys.argv[1], columns=['id', 'set', 'source', 'reference']); t = t.filter(pc.is_in(t['set'], value_set=pa.array(['wmt24pp', 'flores', 'ntrex']))); pq.write_table(t, sys.argv[2]); print('REFS', t.num_rows)" $X/evalsets.parquet $X/refs.parquet
+timeout 600 $FPY -c "import jax; assert (jax.device_count(), jax.process_count()) == (4, 1), (jax.device_count(), jax.process_count())"
+$FPY -I -u $CODE/metricx_qe.py score --pairs $X/refs.parquet --pair source:reference --model xxl --root $MX_ROOT --empty-candidates --out $X/refqe.parquet
+gsutil -q cp $X/refqe.parquet $G5S/refqe.parquet
+echo "REFQE5_DONE: $G5S/refqe.parquet"
+EOF
+  detach "g4a_refqe5_$TAG" bash ~/job_body_g4a_refqe5_$TAG.sh
+  ;;
+resume5)
+  only 0
+  [ "$ARM" = G4-5 ] || { echo "resume5 is G4-5's"; exit 1; }
+  RUN=${RUN:?g4arm_G4-5_<branch> or g4arm_G4-5_b8}
+  case $RUN in
+    g4arm_G4-5_b8) FROM=g4arm_G4-5_s8 ;;
+    g4arm_G4-5_*) case " $G5_BRANCHES " in *" ${RUN#g4arm_G4-5_} "*) FROM=$G5_WARMUP ;; *) echo "$RUN is no branch"; exit 1 ;; esac ;;
+    *) echo "$RUN is no run of G4-5"; exit 1 ;;
+  esac
+  # the training state of FROM's last step (Tunix's checkpoint: the LoRA parameters and the optimizer state) into
+  # RUN's checkpoint directory, where Tunix restores it when RUN starts (sft_lora.py --resume-step checks it)
+  gsutil -q cp "$G/runs/$FROM/summary.json" "$G_SHM/resume5-$RUN.json"
+  step=$(json_key "$G_SHM/resume5-$RUN.json" steps)
+  SRC=$G/runs/$FROM/maxtext/$FROM/checkpoints/$step
+  DST=$G/runs/$RUN/maxtext/$RUN/checkpoints
+  gsutil -q stat "$SRC/commit_success.txt" || { echo "no $SRC/commit_success.txt"; exit 1; }
+  [ -z "$(gsutil ls "$G/runs/$RUN/" 2> /dev/null)" ] || { echo "$G/runs/$RUN/ exists: a new run takes a new name"; exit 1; }
+  gsutil -m -q cp -r "$SRC" "$DST/"
+  gsutil -q stat "$DST/$step/commit_success.txt" || { echo "the copy of $SRC is incomplete"; exit 1; }
+  echo "RESUME5 $RUN: $FROM step $step, $(gsutil du -s "$DST/$step" | awk '{print $1}') bytes"
+  ;;
+report5)
+  only 0
+  [ "$ARM" = G4-5 ] || { echo "report5 is G4-5's"; exit 1; }
+  X=$G_SHM/report5-$TAG
+  MODELS5="${CANDIDATES:?the candidates of the search, G4-5c1 ...} G4-0 ${REFS:-}"
+  ARGS5=""
+  for m in $CANDIDATES; do ARGS5="$ARGS5 --candidate $m=$X/$m"; done
+  for m in ${REFS:-}; do ARGS5="$ARGS5 --reference $m=$X/$m"; done
+  RUNS5="$G5_WARMUP"
+  ARGS5="$ARGS5 --run warmup=$X/runs/$G5_WARMUP.json"
+  for b in $G5_BRANCHES; do RUNS5="$RUNS5 g4arm_G4-5_$b"; ARGS5="$ARGS5 --run $b=$X/runs/g4arm_G4-5_$b.json"; done
+  cat > ~/job_body_g4a_report5_$TAG.sh <<EOF
+set -euo pipefail
+mkdir -p $X/runs
+for m in $MODELS5; do mkdir -p $X/\$m; gsutil -m -q rsync -r -x 'translations/.*' $G/eval/\$m $X/\$m; done
+gsutil -q cp $G/data/eval/evalsets.parquet $G5S/split.json $G5S/refqe.parquet $NAT/predictions.parquet $X/
+gsutil -q cp $G/runs/$G5_SEARCH/summary.json $X/search.json
+for r in $RUNS5; do gsutil -q cp $G/runs/\$r/summary.json $X/runs/\$r.json; done
+TALLY=""
+if gsutil -q stat $REP/tally.json; then gsutil -q cp $REP/tally.json $X/; TALLY="--tally $X/tally.json"; fi
+$FPY -I -u $CODE/g4arm.py report5 --evalsets $X/evalsets.parquet --split $X/split.json --refqe $X/refqe.parquet \
+  --base $X/G4-0 --predictions $X/predictions.parquet --search $X/search.json $ARGS5 \$TALLY --out $X/report.md
+gsutil -m -q cp $X/report.md $X/report.json $REP/
+echo "REPORT5_DONE $REP/report.md"
+EOF
+  detach "g4a_report5_$TAG" bash ~/job_body_g4a_report5_$TAG.sh
+  ;;
+smoke5-report)
+  only 0
+  [ "$ARM" = G4-5 ] || { echo "smoke5-report is G4-5's"; exit 1; }
+  X=$G_SHM/smoke5-$TAG
+  O=$G/smoke5/$TAG
+  cat > ~/job_body_g4a_smoke5_report_$TAG.sh <<EOF
+set -uo pipefail
+mkdir -p $X
+for r in g4arm_G4-5_s8 g4arm_G4-5_b8 g4arm_G4-5_c8; do
+  gsutil -q cp $G/runs/\$r/summary.json $X/\$r.json || exit 1
+done
+gsutil -q cp $G/runs/g4arm_G4-5_s8/adapter.json $X/s8-adapter.json || exit 1
+gsutil -q cp $G/runs/g4arm_G4-5_b8/adapter.json $X/b8-adapter.json || exit 1
+gsutil -q cp $G5/G4-5-smoke-warmup/manifest.json $X/warmup-manifest.json || exit 1
+gsutil -q cp $G5/G4-5-smoke-branch/manifest.json $X/branch-manifest.json || exit 1
+gsutil -q cp $G5/report.json $X/data-report.json || exit 1
+gsutil -q cp $G/G4-3/summary.json $X/g43-summary.json || exit 1
+gsutil -q cp $G/runs/$NOVELS_RUN/summary.json $X/g43-novels-summary.json || exit 1
+$FPY -I -u $CODE/g4arm.py smoke5 --warmup-summary $X/g4arm_G4-5_s8.json --warmup-adapter $X/s8-adapter.json \
+  --branch-summary $X/g4arm_G4-5_b8.json --branch-adapter $X/b8-adapter.json --combine-summary $X/g4arm_G4-5_c8.json \
+  --warmup-manifest $X/warmup-manifest.json --branch-manifest $X/branch-manifest.json --data-report $X/data-report.json \
+  --g43-summary $X/g43-summary.json --g43-novels-summary $X/g43-novels-summary.json --out $X/g4arm5-smoke.md
+code=\$?
+gsutil -m -q cp $X/g4arm5-smoke.md $X/g4arm5-smoke.json $O/ || exit 1
+exit \$code
+EOF
+  detach "g4a_smoke5_report_$TAG" bash ~/job_body_g4a_smoke5_report_$TAG.sh
   ;;
 *)
   echo "unknown stage $STAGE"

@@ -47,6 +47,15 @@ Arm G4-4 (protocol-g4.md §9, amendment G4-4):
   novels4   amendment of 16 Nov: eval-novels.parquet, unseen passages of seen novels (10 books of 10 authors x 50
             pairs that G4-4 does not train on, build4's checks; no key or example of G4-4's training set)
   report --novels-other SUMMARY   the novels' losses of G4-0, G4-4 and G4-3's final model (reported, deciding nothing)
+Arm G4-5 (draft amendment G4-5, Yeb 17 Nov: one LoRA per source, branched from a shared warmup, combined by weights):
+  build5    from G4-4's set: the shared warmup's set (pass 1 without the replay, as many as its steps take) and one set
+            per branch (BT per source, the Dutch books, the novels with G4-4's passes as epochs, FLAN without flanval),
+            every epoch freshly shuffled, as many rows as the branch's steps take; eval-flanval; the smoke sets
+  split5    the search and decision parts of WMT24++, FLORES, NTREX and FLAN (seeded, per domain; FLORES per article;
+            the blind passages' WMT24++ segments in the decision part), the search part's reference eval files
+  smoke5    the verdict of G4-5's smoke test (warmup, a resumed branch, the search on G4-3's adapter) and its estimate
+  report5   the training per branch, the search, the full evaluation of its top K on the search part, the selection by
+            the fixed rule, (a1) and (b) of the selected one against G4-0 on the decision part
 """
 
 import argparse
@@ -2057,7 +2066,7 @@ def check3(args):
           flush=True)
 
 
-def training_time(summary, steps, tokens, smoke_tokens):
+def training_time(summary, steps, tokens, smoke_tokens, every=EVAL_EVERY3):
     """The full training's time [estimate] from the smoke test: the count of the data before the first step, loading
     and compiling, the steps at the smoke test's median step, the evals at its longest round after step 0"""
     t = summary.get("times") or {}
@@ -2069,7 +2078,7 @@ def training_time(summary, steps, tokens, smoke_tokens):
     round_s = max(later) if later else rounds.get(0)
     if step_s is None or round_s is None:
         return None
-    n_evals = steps // EVAL_EVERY3 + 1 + (1 if steps % EVAL_EVERY3 else 0)
+    n_evals = steps // every + 1 + (1 if steps % every else 0)
     count_s = (t.get("python_to_setup_s") or 0) + COUNT_S_PER_MTOKEN * (tokens - smoke_tokens) / 1e6
     load_s = (t.get("setup_s") or 0) + (t.get("compile_s_est") or 0)
     seconds = count_s + load_s + steps * step_s + n_evals * round_s
@@ -2855,6 +2864,670 @@ def novels4(args, counter=None):
           flush=True)
 
 
+# ---------------------------------------------------------------------------------------------------- G4-5
+# draft amendment G4-5 (Yeb, 17 Nov): one LoRA per source of G4-4's mix, each branched from a shared warmup with its
+# whole training state (LoRA parameters and AdamW's state), combined as W0 + Delta_s + sum_i w_i (Delta_i - Delta_s)
+# with weights searched on the search part of the rules' evaluation sets; the rules decide on the decision part
+
+ARM5 = "G4-5"
+SEED5 = f"{SEED}/G4-5"
+BT_BRANCHES5 = {"bt_handelingen": "handelingen", "bt_raad": "raad", "bt_fineweb": "fineweb",
+                "bt_rechtspraak": "rechtspraak", "bt_dpc": "dpc"}
+BRANCHES5 = (*BT_BRANCHES5, "books", "novels", "flan")
+WARMUP5 = "warmup"
+WARMUP_STEPS5 = 1000                 # the shared warmup: past the jump of G4-4's curve (~96% of its drop by step 750)
+LR_WARMUP_STEPS5 = 279               # G4-4's linear LR warmup, int(0.03 x 9,316): the warmup follows G4-4's start
+BRANCH_STEPS5 = 1000                 # every branch: ~10 epochs of the smallest source (the Dutch books, ~103 steps)
+DECAY_FRACTION5 = 0.1                # every branch's cooldown: the last 10% of its own steps, linear to LR / 10
+LR5 = 1e-5                           # the warmup's constant LR, continued by the branches (Yeb, 17 Nov, point 4)
+RANK5, ALPHA5 = 32, 16.0             # with the warmup's state carried over, every branch has the warmup's rank
+EVAL_EVERY5 = 500
+FLANVAL5 = 500                       # G4-4's replay rows held out of the FLAN branch: the eval set flanval
+MAX_EPOCHS5 = 60
+SPLIT_SHARE5 = 0.5
+SPLIT_SETS5 = ("wmt24pp", "flores", "ntrex", "flan")
+SEARCH_LOSS_SETS5 = ("wmt24pp", "flores", "ntrex")   # the search part's sets with a human reference: their losses
+EVAL_SETS5 = EVAL_SETS4 + ("flanval", "wmt24pp_s", "flores_s", "ntrex_s")
+OBJECTIVE5 = {"wmt24pp_s": 1.0, "flores_s": 1.0, "ntrex_s": 1.0}
+REFQE_MAX_DIFF5 = 0.05               # the human references' QE again: its mean over a whole set within this of HUMAN_QE
+SEARCH_BUDGET5, SEARCH_TOP_K5 = 80, 4  # the search's points (anchors included) and the candidates of the full evaluation
+SMOKE5_STEPS = 8                     # the warmup's smoke run, then the branch's from its step 8: 8 steps each
+SMOKE5_LR_WARMUP = 2
+SMOKE5_DECAY = 0.5                   # the branch's smoke test: 4 of its 8 steps in the cooldown
+SMOKE5_EVAL_STEPS = [0, 4, 8]
+SMOKE5_BRANCH_EVAL_STEPS = [8, 12, 16]
+EQUAL5 = 1e-6                        # the same model on the same eval batches: the same loss
+MERGE_MAX_DIFF5 = 0.02               # a merged kernel (bf16 at use) against LoRA in the forward pass, same adapter
+
+
+def g44_set(directory, report_path):
+    """G4-4's set as {pass: [(messages row, meta row)]}, checked: the manifest, report-G4-4.json's examples and tokens
+    per pass and kind, the passes in order, the examples outside the novels and the replay the same ids in every pass"""
+    d = Path(directory)
+    manifest = json.loads((d / "manifest.json").read_text())
+    if (manifest.get("set"), manifest.get("seq"), manifest.get("seed"), manifest.get("epochs")) != (ARM4, SEQ3, SEED4,
+                                                                                                    EPOCHS4):
+        raise SystemExit(f"{d}: not G4-4's set ({manifest.get('set')}, seq {manifest.get('seq')})")
+    if (d / "template.jinja").read_text(encoding="utf-8") != g4lora.TEMPLATE:
+        raise SystemExit(f"{d}/template.jinja is not g4lora.TEMPLATE")
+    msgs = read_rows(d / "train.parquet")
+    metas = read_rows(d / "train-meta.parquet")
+    if len(msgs) != len(metas) or len(metas) != manifest["examples"]:
+        raise SystemExit(f"{d}: {len(msgs)} examples, {len(metas)} meta rows, manifest {manifest['examples']}")
+    epochs = [m["epoch"] for m in metas]
+    if epochs != sorted(epochs) or sorted(set(epochs)) != list(range(1, EPOCHS4 + 1)):
+        raise SystemExit(f"{d}: the passes are not 1 ... {EPOCHS4} in order")
+    passes = collections.defaultdict(list)
+    for x, m in zip(msgs, metas):
+        passes[m["epoch"]].append((x, m))
+    report = json.loads(Path(report_path).read_text())
+    if report.get("arm") != ARM4:
+        raise SystemExit(f"{report_path}: not G4-4's data report")
+    for p in report["passes"]:
+        got = pass_kinds(passes[p["pass"]])
+        if (p["examples"], p["tokens"], p["kinds"]) != (len(passes[p["pass"]]), sum(v["tokens"] for v in got.values()),
+                                                        got):
+            raise SystemExit(f"{d}: pass {p['pass']} is not the pass of {report_path}")
+    rest = [sorted(m["id"] for _, m in one if m["kind"] not in ("novel", "replay")) for one in passes.values()]
+    if any(r != rest[0] for r in rest):
+        raise SystemExit(f"{d}: the examples outside the novels and the replay differ between the passes")
+    return dict(passes), manifest, report
+
+
+def sources5(passes, report):
+    """{branch: [(x, meta)]} of G4-4's set (the BT per source, the books: pass 1; the FLAN replay: every pass's rows),
+    and the novels per pass {pass: [(x, meta)]}; checked against report-G4-4.json"""
+    out = {b: [] for b in BRANCHES5 if b != "novels"}
+    novels = {e: [] for e in passes}
+    by_source = {s: b for b, s in BT_BRANCHES5.items()}
+    replay_ids = set()
+    for e, one in sorted(passes.items()):
+        for x, m in one:
+            m = {k: v for k, v in m.items() if k != "epoch"}
+            if m["kind"] == "novel":
+                novels[e].append((x, m))
+            elif m["kind"] == "replay":
+                if m["id"] in replay_ids:
+                    raise SystemExit(f"{m['id']}: a replay row in two passes")
+                replay_ids.add(m["id"])
+                out["flan"].append((x, m))
+            elif e == 1 and m["kind"] == "bt":
+                if m["source"] not in by_source:
+                    raise SystemExit(f"{m['id']}: BT of an unknown source {m['source']}")
+                out[by_source[m["source"]]].append((x, m))
+            elif e == 1 and m["kind"] == "book":
+                out["books"].append((x, m))
+            elif m["kind"] not in ("bt", "book"):
+                raise SystemExit(f"{m['id']}: an example of kind {m['kind']}")
+    kinds = report["set"]["kinds"]
+    want = kinds["bt"]["by_source"]
+    got = {s: len(out[b]) for b, s in BT_BRANCHES5.items()}
+    if got != want or len(out["books"]) != kinds["book"]["examples"]:
+        raise SystemExit(f"BT per source {got} and books {len(out['books'])}: report-G4-4.json has {want} and "
+                         f"{kinds['book']['examples']}")
+    n_novels = [p["kinds"]["novel"]["examples"] for p in report["passes"]]
+    if [len(novels[e]) for e in sorted(novels)] != n_novels or report["novels"]["distinct_pairs"] != sum(n_novels):
+        raise SystemExit(f"novels per pass {[len(v) for v in novels.values()]}, report {n_novels}")
+    if len(out["flan"]) != report["replay"]["distinct"]:
+        raise SystemExit(f"{len(out['flan'])} replay rows, report-G4-4.json {report['replay']['distinct']}")
+    return out, novels
+
+
+def tokens_of(rows):
+    return [m["tokens_prompt"] + m["tokens_target"] for _, m in rows]
+
+
+def shortest_prefix(lengths, steps):
+    """The fewest first examples whose packing (pack_batches) gives MaxText at least `steps` steps (steps_of)"""
+    if steps_of(pack_batches(lengths)) < steps:
+        raise SystemExit(f"{len(lengths)} examples give {steps_of(pack_batches(lengths))} steps, {steps} wanted")
+    lo, hi = 1, len(lengths)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if steps_of(pack_batches(lengths[:mid])) >= steps:
+            hi = mid
+        else:
+            lo = mid + 1
+    return lo
+
+
+def epochs_rows(per_epoch, steps, seed):
+    """Epoch after epoch (epoch e: per_epoch(e) in a fresh order, seed <seed>/epoch/<e>) until MaxText's packing gives
+    `steps` steps; then the shortest prefix that does. Every row's meta carries its epoch."""
+    rows = []
+    for e in range(1, MAX_EPOCHS5 + 1):
+        one = sorted(per_epoch(e), key=lambda p: p[1]["id"])
+        if not one:
+            raise SystemExit(f"{seed}: epoch {e} has no example")
+        random.Random(f"{seed}/epoch/{e}").shuffle(one)
+        rows += [(x, {**m, "epoch": e}) for x, m in one]
+        if steps_of(pack_batches(tokens_of(rows))) >= steps:
+            return rows[:shortest_prefix(tokens_of(rows), steps)]
+    raise SystemExit(f"{seed}: {MAX_EPOCHS5} epochs give fewer than {steps} steps")
+
+
+def write_set5(d, rows, name, steps, extra):
+    """train.parquet, train-meta.parquet, template.jinja and manifest.json of one set of G4-5"""
+    import pyarrow as pa
+
+    meta_schema = pa.schema([(n, getattr(pa, "bool_" if t == "bool" else t)()) for n, t in META_SCHEMA3_FIELDS])
+    write_parquet([x for x, _ in rows], d / "train.parquet", row_group_size=ROW_GROUP4)
+    write_parquet([{n: m.get(n) for n in meta_schema.names} for _, m in rows], d / "train-meta.parquet", meta_schema,
+                  row_group_size=ROW_GROUP4)
+    (d / "template.jinja").write_text(g4lora.TEMPLATE, encoding="utf-8")
+    lengths = tokens_of(rows)
+    batches = pack_batches(lengths)
+    manifest = {"set": f"{ARM5}-{name}", "examples": len(rows), "tokens": sum(lengths), "max_tokens": max(lengths),
+                "steps": steps, "batches_per_process": batches, "step_limit": steps_of(batches), "seq": SEQ3,
+                "prompt": PROMPT, "template": "g4lora.TEMPLATE (Gemma 4, thinking off)",
+                "kinds": dict(collections.Counter(m["kind"] for _, m in rows)), **extra}
+    if manifest["step_limit"] < steps:
+        raise SystemExit(f"{name}: {manifest['step_limit']} steps in the set, {steps} wanted")
+    (d / "manifest.json").write_text(json.dumps(manifest, indent=1) + "\n")
+    return manifest
+
+
+def smoke_set5(rows, seed):
+    """As G4-3.5's smoke set: the SMOKE3_LONGEST longest examples first, then SMOKE3_RANDOM others (seeded)"""
+    longest = sorted(rows, key=lambda p: (-(p[1]["tokens_prompt"] + p[1]["tokens_target"]), p[1]["id"]))
+    longest = longest[:SMOKE3_LONGEST]
+    taken = {m["id"] for _, m in longest}
+    others = sorted({m["id"]: (x, m) for x, m in rows if m["id"] not in taken}.values(), key=lambda p: p[1]["id"])
+    out = [(x, {**m, "epoch": 1}) for x, m in longest + random.Random(seed).sample(others, min(SMOKE3_RANDOM,
+                                                                                               len(others)))]
+    return out, len(longest)
+
+
+def build5(args, counter=None):
+    """draft amendment G4-5: from G4-4's set (its examples byte for byte) the shared warmup's set (pass 1 without the
+    replay: BT, books, novels in G4-4's proportions, freshly shuffled, as many as WARMUP steps take) and one set per
+    branch (its source's examples epoch after epoch, each epoch freshly shuffled, as many as the branch's steps take;
+    the novels' epochs are G4-4's passes, so its pairs come before any repeat); FLAN without the FLANVAL5 rows of
+    its eval set; the smoke sets of the warmup and of the branch with the longest example"""
+    out = Path(args.out)
+    steps = {b: args.branch_steps for b in BRANCHES5}
+    for spec in args.steps or []:
+        name, _, n = spec.partition("=")
+        if name not in steps or not n.isdigit() or int(n) < 1:
+            raise SystemExit(f"--steps {spec!r}: BRANCH=N with a branch of {BRANCHES5}")
+        steps[name] = int(n)
+    print("PROGRESS reading G4-4's set", flush=True)
+    passes, manifest4, report4 = g44_set(args.g44, args.g44_report)
+    sources, novels = sources5(passes, report4)
+    held = {str(r["pid"]) for r in read_rows(args.novels_eval, ["pid"])}
+    trained = {m["id"][len("novel:"):] for one in novels.values() for _, m in one}
+    if held & trained:
+        raise SystemExit(f"{len(held & trained)} rows of the novels' eval set are novel pairs of G4-4")
+    flan = sorted(sources["flan"], key=lambda p: p[1]["id"])
+    flanval = random.Random(f"{SEED5}/flanval").sample(flan, args.flanval)
+    val_ids = {m["id"] for _, m in flanval}
+    sources["flan"] = [p for p in flan if p[1]["id"] not in val_ids]
+    report = {"arm": ARM5, "seed": SEED5, "seq": SEQ3, "prompt": PROMPT, "warmup_steps": args.warmup_steps,
+              "branch_steps": steps, "g4_4": {"manifest": {k: manifest4[k] for k in ("set", "examples", "tokens",
+                                                                                      "steps", "seed")},
+                                              "files": {f: sha256_file(Path(args.g44) / f)
+                                                        for f in ("train.parquet", "train-meta.parquet")},
+                                              "report": sha256_file(args.g44_report)},
+              "novels_eval": {"path": str(args.novels_eval), "sha256": sha256_file(args.novels_eval),
+                              "rows": len(held)}, "sets": {}}
+    # the shared warmup: pass 1 of G4-4 without the replay (FLAN not in the warmup: Yeb, 17 Nov), a fresh order
+    first = [(x, {k: v for k, v in m.items() if k != "epoch"}) for x, m in passes[1] if m["kind"] != "replay"]
+    first.sort(key=lambda p: p[1]["id"])
+    random.Random(f"{SEED5}/warmup").shuffle(first)
+    n = shortest_prefix(tokens_of(first), args.warmup_steps)
+    warm = [(x, {**m, "epoch": 1}) for x, m in first[:n]]
+    d = out / f"{ARM5}-{WARMUP5}"
+    report["sets"][WARMUP5] = write_set5(d, warm, WARMUP5, args.warmup_steps,
+                                         {"seed": f"{SEED5}/warmup", "pool": len(first),
+                                          "pool_kinds": dict(collections.Counter(m["kind"] for _, m in first))})
+    print(f"PROGRESS warmup {json.dumps(report['sets'][WARMUP5])}", flush=True)
+    longest_branch, longest = None, -1
+    branch_rows = {}
+    def per_epoch(branch):
+        if branch == "novels":
+            return lambda e: novels[(e - 1) % len(novels) + 1]
+        return lambda e: sources[branch]
+
+    for b in BRANCHES5:
+        unit = sum(len(v) for v in novels.values()) if b == "novels" else len(sources[b])
+        rows = epochs_rows(per_epoch(b), steps[b], f"{SEED5}/{b}")
+        branch_rows[b] = rows
+        if b == "novels":
+            epochs = len(rows) / unit
+            distinct = len({m["id"] for _, m in rows})
+        else:
+            epochs = len(rows) / unit
+            distinct = min(len(rows), unit)
+        report["sets"][b] = write_set5(out / f"{ARM5}-{b}", rows, b, steps[b],
+                                       {"seed": f"{SEED5}/{b}", "rows_per_epoch": unit if b != "novels" else
+                                        [len(v) for _, v in sorted(novels.items())], "epochs": round(epochs, 3),
+                                        "distinct": distinct, "source_tokens": sum(tokens_of(
+                                            [p for v in novels.values() for p in v] if b == "novels" else sources[b]))})
+        top = max(tokens_of(rows))
+        if top > longest:
+            longest_branch, longest = b, top
+        print(f"PROGRESS {b} {json.dumps(report['sets'][b])}", flush=True)
+    # the FLAN branch's eval set: G4-4's replay rows it does not train on
+    flan_ids = {m["id"] for _, m in branch_rows["flan"]}
+    if flan_ids & val_ids:
+        raise SystemExit("a flanval row in the FLAN branch")
+    write_parquet([x for x, _ in flanval], out / "eval-flanval.parquet")
+    write_parquet([{"id": m["id"], "source": m["source"], "tokens": m["tokens_prompt"] + m["tokens_target"]}
+                   for _, m in flanval], out / "eval-flanval-meta.parquet")
+    report["flanval"] = {"rows": len(flanval), "seed": f"{SEED5}/flanval", "tokens": sum(tokens_of(flanval)),
+                         "batches_per_process": pack_batches(tokens_of(flanval))}
+    # the smoke sets: the warmup's, and the branch's with the longest example (the memory of the longest rows)
+    smoke = {}
+    for name, rows in ((WARMUP5, warm), (longest_branch, branch_rows[longest_branch])):
+        srows, n_long = smoke_set5(rows, f"{SEED5}/smoke/{name}")
+        tag = "smoke-warmup" if name == WARMUP5 else "smoke-branch"
+        smoke[tag] = write_set5(out / f"{ARM5}-{tag}", srows, tag, SMOKE5_STEPS,
+                                {"from": name, "longest": n_long,
+                                 "min_of_longest": min(tokens_of(srows)[:n_long])})
+    report["smoke"] = smoke
+    total = args.warmup_steps + sum(steps.values())
+    report["estimate"] = {"steps": total, "tokens": sum(s["tokens"] for s in report["sets"].values())}
+    (out / "report.json").write_text(json.dumps(report, indent=1, ensure_ascii=False, default=str) + "\n")
+    (out / "report.md").write_text(report5_data_md(report), encoding="utf-8")
+    print(f"BUILD5 {json.dumps({k: (v['examples'], v['tokens'], v['steps'], v.get('epochs')) for k, v in report['sets'].items()})} "
+          f"smoke-branch {longest_branch}", flush=True)
+
+
+BRANCH_NAMES5 = {"warmup": "warmup (BT, boeken, romans; zonder FLAN)", "bt_handelingen": "BT Handelingen",
+                 "bt_raad": "BT Openraadsinformatie", "bt_fineweb": "BT FineWeb-2", "bt_rechtspraak": "BT Rechtspraak",
+                 "bt_dpc": "BT Rijksoverheid (DPC)", "books": "Nederlandse boeken",
+                 "novels": "romans (Engels origineel)", "flan": "FLAN-replay"}
+
+
+def report5_data_md(r):
+    L = [f"# Trainingssets {r['arm']} (concept-amendement G4-5)", "",
+         "Gemaakt door `g4arm.py build5` uit de set van G4-4 (voorbeelden byte voor byte; bestanden met sha256 "
+         f"{json.dumps(r['g4_4']['files'])}). Elke epoch van een tak is opnieuw geschud (seed `{r['seed']}/<tak>/epoch/<e>`); "
+         "de romantak neemt de doorgangen van G4-4 als epochs; FLAN zonder de rijen van `flanval`.", "",
+         "| set | voorbeelden | tokens | stappen | epochs | verschillende | rijen per epoch | batches per proces |",
+         "|---|---:|---:|---:|---:|---:|---|---|"]
+    for k, s in r["sets"].items():
+        L.append(f"| {BRANCH_NAMES5.get(k, k)} | {_n(s['examples'])} | {_n(s['tokens'])} | {_n(s['steps'])} | "
+                 f"{s.get('epochs', '–')} | {_n(s.get('distinct', s['examples']))} | {s.get('rows_per_epoch', s.get('pool'))} | "
+                 f"{s['batches_per_process']} |")
+    L += ["", f"Samen {_n(r['estimate']['steps'])} stappen, {_n(r['estimate']['tokens'])} tokens. `flanval`: "
+          f"{r['flanval']['rows']} rijen (seed `{r['flanval']['seed']}`). Smoke-sets: {json.dumps(r['smoke'])}", ""]
+    return "\n".join(L) + "\n"
+
+
+def split5(args, counter=None):
+    """draft amendment G4-5: the search and decision parts of the rules' sets (WMT24++, FLORES, NTREX, FLAN), fixed
+    before any result of G4-5: per set and stratum (WMT24++, FLORES: the domain) its units (FLORES: articles, else
+    segments) in a seeded order, half of the segments to the search part; the blind passages' WMT24++ segments to the
+    decision part. The search part's sets with a human reference as eval files (natural-v1, the reference as the
+    answer)."""
+    import g4mix
+
+    counter = counter or TokenCounter(args.tokenizer)
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    rows = read_rows(args.evalsets)
+    by = collections.defaultdict(list)
+    for r in rows:
+        by[r["set"]].append(r)
+    want = {**FOUR_SETS, "flan": N_FLAN, "blind": N_BLIND}
+    if {s: len(v) for s, v in by.items()} != want:
+        raise SystemExit(f"{args.evalsets}: {dict((s, len(v)) for s, v in by.items())}, expected {want}")
+    ids = {r["id"] for r in rows}
+    forced = {json.loads(r["meta"]).get("item") for r in by["blind"]} & ids
+    assign, sets = {}, {}
+    for s in SPLIT_SETS5:
+        part = g4mix.split_set(by[s], f"{SEED5}/split/{s}", args.share, forced)
+        assign.update(part)
+        units, strata = collections.defaultdict(set), collections.defaultdict(collections.Counter)
+        for r in by[s]:
+            units[part[r["id"]]].add(g4mix.unit_of(r))
+            strata[part[r["id"]]][g4mix.stratum_of(r)] += 1
+        sets[s] = {p: {"segments": sum(v == p for v in part.values()), "units": len(units[p]),
+                       "strata": dict(sorted(strata[p].items()))} for p in ("search", "decision")}
+        sets[s]["forced_decision"] = len(forced & {r["id"] for r in by[s]})
+        if s == "wmt24pp":
+            good = [r for r in by[s] if not bad_source(r["meta"])]
+            for p in ("search", "decision"):
+                sets[s][p]["good"] = sum(part[r["id"]] == p for r in good)
+    files = {}
+    for s in SEARCH_LOSS_SETS5:
+        keep = [r for r in sorted(by[s], key=lambda r: r["id"])
+                if assign[r["id"]] == "search" and not (s == "wmt24pp" and bad_source(r["meta"]))]
+        pairs = [{"en": r["source"], "nl": r["reference"]} for r in keep]
+        prompts, targets = counter.examples(pairs)
+        lengths = [a + b for a, b in zip(prompts, targets)]
+        if max(lengths) > SEQ3:
+            raise SystemExit(f"{s}: an example of {max(lengths)} tokens, more than {SEQ3}")
+        name = f"eval-{s}-s.parquet"
+        write_parquet([messages_row(p["en"], p["nl"]) for p in pairs], out / name)
+        write_parquet([{"id": r["id"], "tokens": n} for r, n in zip(keep, lengths)], out / f"eval-{s}-s-meta.parquet")
+        files[name] = {"rows": len(keep), "tokens": sum(lengths), "target_tokens": sum(targets),
+                       "batches_per_process": pack_batches(lengths), "sha256": sha256_file(out / name)}
+    split = {"arm": ARM5, "seed": f"{SEED5}/split/<set>/<stratum>", "share": args.share,
+             "unit": "per stratum (WMT24++ and FLORES: the domain): FLORES its article (URL), else the segment; the "
+                     "blind passages' WMT24++ segments in the decision part", "sets": sets,
+             "files": files, "inputs": {"evalsets": sha256_file(args.evalsets)}, "assign": dict(sorted(assign.items()))}
+    split["digest"] = g4mix.digest(split["assign"])
+    (out / "split.json").write_text(json.dumps(split, indent=1) + "\n")
+    print(f"SPLIT5 {json.dumps({'sets': sets, 'files': {k: (v['rows'], v['batches_per_process']) for k, v in files.items()}, 'digest': split['digest']})}",
+          flush=True)
+
+
+# ---------------------------------------------------------------------------------------------------- G4-5 smoke
+
+def eval_at(summary, step):
+    return {e["set"]: e["loss"] for e in summary.get("eval") or [] if e["step"] == step}
+
+
+def run_checks(summary, adapter, manifest, steps, eval_steps, prefix):
+    """The checks of G4-3.5 that hold for every training run of G4-5's smoke test"""
+    checks = {}
+    loss = summary.get("loss") or []
+    checks[f"{prefix}steps"] = {"value": summary.get("steps_done"), "holds": summary.get("steps_done") == steps}
+    checks[f"{prefix}loss_finite"] = {"value": [v for _, v in loss],
+                                      "holds": len(loss) == steps and all(math.isfinite(v) for _, v in loss)}
+    checks[f"{prefix}peak_gib"] = {"value": summary.get("peak_gib_max"),
+                                   "holds": summary.get("peak_gib_max") is not None
+                                   and summary["peak_gib_max"] <= MEM_MAX_GIB}
+    checks[f"{prefix}adapter"] = {"value": {k: adapter.get(k) for k in ("rank", "alpha", "scale")},
+                                  "holds": (adapter.get("rank"), adapter.get("alpha"), adapter.get("scale")) ==
+                                  (RANK5, ALPHA5, ALPHA5 / RANK5)}
+    seq = (summary.get("config") or {}).get("max_target_length")
+    checks[f"{prefix}seq"] = {"value": seq, "holds": seq == SEQ3}
+    got = (summary.get("epoch") or {}).get("batches_per_process")
+    checks[f"{prefix}batches_as_build5"] = {"value": {"pipeline": got, "build5": manifest.get("batches_per_process")},
+                                            "holds": got is not None and got == manifest.get("batches_per_process")}
+    evals = summary.get("eval") or []
+    for name in EVAL_SETS5:
+        rows = [e for e in evals if e["set"] == name]
+        checks[f"{prefix}eval_{name}"] = {
+            "value": [(e["step"], round(e["loss"], 4), e["tokens"]) for e in rows],
+            "holds": [e["step"] for e in rows] == eval_steps
+            and all(math.isfinite(e["loss"]) and e["tokens"] >= 1 for e in rows)}
+    return checks
+
+
+def lr_is(summary, step, value):
+    got = (summary.get("lr_at") or {}).get(str(step))
+    return {"value": {"step": step, "lr": got, "want": value}, "holds": got is not None and abs(got - value) <= 1e-12}
+
+
+def smoke5_verdict(w, wa, b, ba, c, wm, bm, g43, g43_novels):
+    """The smoke test of G4-5: the warmup (8 steps), a branch resumed at its step 8 (8 more, with a cooldown), the
+    search run on the warmup, that branch and G4-3's final adapter"""
+    checks = run_checks(w, wa, wm, 8, SMOKE5_EVAL_STEPS, "warmup_")
+    checks["warmup_lr_constant_at_end"] = lr_is(w, 7, LR5)
+    own0 = eval_at(w, 0).get("own")
+    checks["warmup_own_loss_step0"] = {"value": own0, "holds": own0 is not None and own0 <= OWN_MAX_LOSS + TOLERANCE}
+    checks.update(run_checks(b, ba, bm, 8, SMOKE5_BRANCH_EVAL_STEPS, "branch_"))
+    r = b.get("resume") or {}
+    checks["branch_resumed"] = {"value": r, "holds": r.get("step") == 8 and b.get("steps") == 16
+                                and b.get("own_steps") == 8 and bool(r.get("counters"))}
+    checks["branch_lr_continues"] = lr_is(b, 8, LR5)
+    checks["branch_lr_cooldown_end"] = lr_is(b, 15, LR5 * 0.1)
+    w8, b8 = eval_at(w, 8), eval_at(b, 8)
+    checks["branch_start_is_warmup_end"] = {
+        "value": {s: (w8.get(s), b8.get(s)) for s in EVAL_SETS5},
+        "holds": all(s in w8 and s in b8 and abs(w8[s] - b8[s]) <= EQUAL5 for s in EVAL_SETS5)}
+    x = c.get("combine") or {}
+    checks["search_ran"] = {"value": {k: (x.get("search") or {}).get(k) for k in ("evaluations", "stopped", "best")},
+                            "holds": bool(x) and (x.get("search") or {}).get("evaluations", 0) >= 4}
+    checks["search_repeat_equal"] = {"value": x.get("repeat"), "holds": bool((x.get("repeat") or {}).get("equal"))}
+    c0, w0 = eval_at(c, 0), eval_at(w, 0)
+    checks["search_base_is_base"] = {"value": {s: (w0.get(s), c0.get(s)) for s in EVAL_SETS5},
+                                     "holds": all(s in c0 and s in w0 and abs(c0[s] - w0[s]) <= EQUAL5
+                                                  for s in EVAL_SETS5)}
+    points = {p["phase"]: p for p in (x.get("search") or {}).get("points", [])}
+    names = [comp["name"] for comp in (x.get("spec") or {}).get("components", [])]
+    warm = (points.get("anchor/warmup") or {}).get("losses") or {}
+    checks["merge_warmup_is_lora"] = {"value": {s: (warm.get(s), w8.get(s)) for s in warm},
+                                      "holds": bool(warm) and all(abs(v - w8[s]) <= MERGE_MAX_DIFF5
+                                                                  for s, v in warm.items())}
+    g = (points.get(f"anchor/alone/{names.index('g43') - 1}") if "g43" in names else None) or {}
+    want = {"books": [e["loss"] for e in g43.get("eval") or [] if e["set"] == "books"][-1:],
+            "novels": [e["loss"] for e in g43_novels.get("eval") or [] if e["set"] == "novels" and e["step"] == 0]}
+    got = g.get("losses") or {}
+    checks["merge_g43_is_g43"] = {"value": {s: (got.get(s), (want[s] or [None])[0]) for s in want},
+                                  "holds": all(s in got and want[s] and abs(got[s] - want[s][0]) <= MERGE_MAX_DIFF5
+                                               for s in want)}
+    checks["search_peak_gib"] = {"value": c.get("peak_gib_max"),
+                                 "holds": c.get("peak_gib_max") is not None and c["peak_gib_max"] <= MEM_MAX_GIB}
+    return {"checks": checks, "passed": all(v["holds"] for v in checks.values())}
+
+
+def smoke5_estimate(w, b, c, data_report, wm, bm):
+    """[estimate] the warmup and every branch at the smoke test's step and eval times (G4-3.5's method, evals every
+    EVAL_EVERY5), the search at the smoke search's seconds per point, from build5's report"""
+    sets = data_report["sets"]
+    out = {"runs": {}}
+    out["runs"][WARMUP5] = training_time(w, sets[WARMUP5]["steps"], sets[WARMUP5]["tokens"], wm["tokens"],
+                                         EVAL_EVERY5)
+    for name in BRANCHES5:
+        out["runs"][name] = training_time(b, sets[name]["steps"], sets[name]["tokens"], bm["tokens"], EVAL_EVERY5)
+    x = c.get("combine") or {}
+    per_point = [e["seconds"] for e in x.get("evals") or [] if e["tag"].startswith("search/")]
+    top = [e["seconds"] for e in x.get("evals") or [] if e["tag"].startswith("top/")]
+    if per_point and all(v is not None for v in out["runs"].values()):
+        t = c.get("times") or {}
+        points = SEARCH_BUDGET5
+        seconds = ((t.get("python_to_setup_s") or 0) + (t.get("setup_s") or 0) + (t.get("compile_s_est") or 0)
+                   + points * statistics.fmean(per_point) + SEARCH_TOP_K5 * (max(top) if top else 0))
+        out["search"] = {"points": points, "point_s": round(statistics.fmean(per_point), 1),
+                         "hours": round(seconds / 3600, 2)}
+        out["hours"] = round(sum(v["hours"] for v in out["runs"].values()) + out["search"]["hours"], 1)
+    else:
+        out["hours"] = None
+    return out
+
+
+def smoke5(args):
+    """The smoke test's verdict of G4-5 and the estimate of the warmup, the branches and the search; exit 1 if a check
+    fails or the estimate is above MAX_HOURS3"""
+    load = lambda p: json.loads(Path(p).read_text())  # noqa: E731
+    w, wa, b, ba, c = (load(p) for p in (args.warmup_summary, args.warmup_adapter, args.branch_summary,
+                                         args.branch_adapter, args.combine_summary))
+    wm, bm, data_report = load(args.warmup_manifest), load(args.branch_manifest), load(args.data_report)
+    if data_report.get("arm") != ARM5:
+        raise SystemExit(f"{args.data_report}: not G4-5's data report")
+    result = smoke5_verdict(w, wa, b, ba, c, wm, bm, load(args.g43_summary), load(args.g43_novels_summary))
+    result["estimate"] = smoke5_estimate(w, b, c, data_report, wm, bm)
+    result["combine"] = c.get("combine")
+    Path(args.out).with_suffix(".json").write_text(json.dumps(result, indent=1, default=str) + "\n")
+    x = result["estimate"]
+    L = ["# Smoke-test G4-5 (concept-amendement G4-5)", "",
+         f"**{'Geslaagd' if result['passed'] else 'Niet geslaagd'}.** Schatting van warmup, takken en zoektocht: "
+         f"{x.get('hours')} uur (grens {MAX_HOURS3} uur; daarboven stopt de keten vóór de training).", "",
+         "| controle | waarde | gehaald |", "|---|---|---|"]
+    for k, v in result["checks"].items():
+        L.append(f"| {k} | `{json.dumps(v['value'], default=str)[:240]}` | {'ja' if v['holds'] else 'nee'} |")
+    L += ["", f"Schatting [schatting, uit de smoke-test en build5]: {json.dumps(x)}", ""]
+    Path(args.out).write_text("\n".join(L), encoding="utf-8")
+    print(f"SMOKE5 {'PASSED' if result['passed'] else 'FAILED'} {json.dumps({k: v['holds'] for k, v in result['checks'].items()})} "
+          f"HOURS {x.get('hours')}", flush=True)
+    if not result["passed"] or x.get("hours") is None or x["hours"] > MAX_HOURS3:
+        raise SystemExit(1)
+
+
+# ---------------------------------------------------------------------------------------------------- G4-5 report
+
+def part_ids5(evalsets, assign, part):
+    """{set: [ids]} of a part: wmt24pp the segments without is_bad_source, flores, ntrex, flan"""
+    out = {s: [] for s in SPLIT_SETS5}
+    for i, r in sorted(evalsets.items()):
+        if r["set"] in out and assign.get(i) == part and not (r["set"] == "wmt24pp" and bad_source(r["meta"])):
+            out[r["set"]].append(i)
+    return out
+
+
+def part_measures5(scored, predictions, refqe, ids, base):
+    """Per model on one part: the mean QE per (a1) set and the human reference's on the same segments, (a1); the share
+    "original" on WMT24++ + FLAN pooled and its difference to the base, (b)"""
+    human = {s: mean(refqe[i] for i in ids[s]) for s in HUMAN_QE}
+    wanted = {("wmt24pp", i) for i in ids["wmt24pp"]} | {("flan", i) for i in ids["flan"]}
+    shares = {}
+    for name in scored:
+        got = [r["p_original"] >= 0.5 for r in predictions if r["model"] == name and (r["set"], r["id"]) in wanted]
+        if len(got) != len(wanted):
+            raise SystemExit(f"{name}: {len(got)} classifier texts of the {len(wanted)} of the part")
+        shares[name] = sum(got) / len(got)
+    out = {}
+    for name, rows in scored.items():
+        qe = {s: mean(rows[i]["metricx_qe"] for i in ids[s]) for s in HUMAN_QE}
+        a1 = {s: qe[s] is not None and qe[s] <= human[s] + TOLERANCE for s in HUMAN_QE}
+        out[name] = {"qe": qe, "a1_sets": a1, "a1": all(a1.values()),
+                     "excess": max(qe[s] - human[s] for s in HUMAN_QE), "share": shares[name],
+                     "b_delta": shares[name] - shares[base], "b": shares[name] - shares[base] >= RULE_B - TOLERANCE}
+    return {"human": human, "n": {s: len(v) for s, v in ids.items()}, "models": out}
+
+
+def select5(candidates, search_part):
+    """The fixed rule: of the candidates that hold (a1) on the search part, the largest (b) difference there (equal:
+    the earlier one of the top K, i.e. the lower search loss); if none holds (a1), the smallest largest QE excess"""
+    m = search_part["models"]
+    eligible = [c for c in candidates if m[c]["a1"]]
+    if eligible:
+        return min(eligible, key=lambda c: (-m[c]["b_delta"], candidates.index(c))), "a1 on the search part, max (b)"
+    return min(candidates, key=lambda c: (m[c]["excess"], -m[c]["b_delta"], candidates.index(c))), \
+        "no candidate holds (a1) on the search part: the smallest QE excess"
+
+
+def training_table5(runs):
+    """Per run the eval loss at its first and last step per set, the branches also against the warmup's last"""
+    out = {}
+    for name, s in runs:
+        evals = s.get("eval") or []
+        steps = sorted({e["step"] for e in evals})
+        if not steps:
+            raise SystemExit(f"{name}: no eval")
+        out[name] = {"first_step": steps[0], "last_step": steps[-1], "first": eval_at(s, steps[0]),
+                     "last": eval_at(s, steps[-1]), "steps_done": s.get("steps_done"),
+                     "resume": (s.get("resume") or {}).get("step")}
+    warm = out.get(WARMUP5)
+    for name, x in out.items():
+        if warm and name != WARMUP5:
+            x["vs_warmup"] = {k: v - warm["last"][k] for k, v in x["last"].items() if k in warm["last"]}
+            x["start_is_warmup_end"] = all(abs(x["first"].get(k, math.inf) - v) <= EQUAL5
+                                           for k, v in warm["last"].items())
+    return out
+
+
+def report5(args):
+    import g4mix
+
+    evalsets = {r["id"]: r for r in read_rows(args.evalsets)}
+    split = json.loads(Path(args.split).read_text())
+    assign = split["assign"]
+    if g4mix.digest(assign) != split["digest"]:
+        raise SystemExit(f"{args.split}: the assignment is not the one of its digest")
+    cands = [c.split("=", 1) for c in args.candidate]
+    refs = [c.split("=", 1) for c in args.reference or []]
+    scored = {name: scored_dir(d) for name, d in cands + [(BASE, args.base)] + refs}
+    for name, rows in scored.items():
+        if set(rows) != set(evalsets):
+            raise SystemExit(f"{name}: scores for {len(rows)} of {len(evalsets)} segments")
+    refqe = {r["id"]: r["qe_source_reference"] for r in read_rows(args.refqe)}
+    missing = [i for i, r in evalsets.items() if r["set"] in HUMAN_QE and refqe.get(i) is None]
+    if missing:
+        raise SystemExit(f"{args.refqe}: no QE of the human reference of {len(missing)} segments, e.g. {missing[:3]}")
+    check = {}
+    for s in HUMAN_QE:
+        ids = [i for i, r in evalsets.items() if r["set"] == s and not (s == "wmt24pp" and bad_source(r["meta"]))]
+        got = mean(refqe[i] for i in ids)
+        check[s] = {"again": got, "protocol": HUMAN_QE[s], "diff": got - HUMAN_QE[s]}
+        if abs(got - HUMAN_QE[s]) > REFQE_MAX_DIFF5:
+            raise SystemExit(f"the human references' QE of {s} again: {got:.4f}, the protocol's {HUMAN_QE[s]:.4f}")
+    predictions = read_rows(args.predictions)
+    parts = {p: part_measures5(scored, predictions, refqe, part_ids5(evalsets, assign, p), BASE)
+             for p in ("search", "decision")}
+    names = [n for n, _ in cands]
+    chosen, why = select5(names, parts["search"])
+    d = parts["decision"]["models"][chosen]
+    result = {"arm": ARM5, "base": BASE, "candidates": names, "selected": chosen, "selection": why,
+              "refqe_check": check, "split": {k: split[k] for k in ("seed", "share", "sets", "digest")},
+              "parts": parts, "a1": {"holds": d["a1"], "sets": d["a1_sets"]}, "b": {"holds": d["b"],
+                                                                                    "delta": d["b_delta"]}}
+    search = json.loads(Path(args.search).read_text())
+    result["search"] = {k: (search.get("combine") or {}).get(k) for k in ("spec", "search", "repeat", "seconds")}
+    result["search"]["base"] = eval_at(search, 0)
+    stacked = {}
+    for name, dpath in cands:
+        meta = Path(dpath) / "adapter.json"
+        if meta.exists():
+            stacked[name] = json.loads(meta.read_text())
+    result["stacked"] = stacked
+    result["training"] = training_table5([(n, json.loads(Path(p).read_text())) for n, p in
+                                          (x.split("=", 1) for x in args.run)])
+    if args.tally:
+        t = json.loads(Path(args.tally).read_text())
+        if t.get("arm") != chosen:
+            raise SystemExit(f"{args.tally}: a tally of {t.get('arm')}, the selected candidate is {chosen}")
+        result["blind"], result["a2"], result["c"] = t, t["a2"], t["c"]
+    else:
+        result["blind"] = None
+    result["verdict"] = verdict(result)
+    Path(args.out).with_suffix(".json").write_text(json.dumps(result, indent=1, ensure_ascii=False, default=str) + "\n")
+    Path(args.out).write_text(report5_text(result), encoding="utf-8")
+    print(f"REPORT5 {json.dumps({'selected': chosen, 'a1': d['a1'], 'b': d['b_delta'], 'verdict': result['verdict']})}",
+          flush=True)
+
+
+def report5_text(r):
+    sets = list(HUMAN_QE)
+    L = [f"# Arm {r['arm']}: uitslag volgens het concept-amendement G4-5", "",
+         "Gemaakt door `g4arm.py report5`. Per bron een LoRA vanaf een gezamenlijke warmup, gecombineerd met gewichten "
+         "die op het zoekdeel gezocht zijn; de regels (a1) en (b) tegen G4-0 op het beslisdeel.", "",
+         f"**Uitslag: {r['verdict']}.** Gekozen combinatie: **{r['selected']}** ({r['selection']}).", "",
+         "## Besluit op het beslisdeel", "",
+         "| set | n | " + r["selected"] + " | G4-0 | mens (zelfde segmenten) | (a1) |", "|---|---:|---:|---:|---:|---|"]
+    dec = r["parts"]["decision"]
+    m, base = dec["models"][r["selected"]], dec["models"][r["base"]]
+    for s in sets:
+        L.append(f"| {s} | {dec['n'][s]} | {f3(m['qe'][s])} | {f3(base['qe'][s])} | {f3(dec['human'][s])} | "
+                 f"{'ja' if m['a1_sets'][s] else 'nee'} |")
+    L += ["", f"(a1) **{'gehaald' if r['a1']['holds'] else 'niet gehaald'}**. (b): aandeel \"origineel\" "
+          f"{pct(m['share'])} tegen G4-0 {pct(base['share'])} (WMT24++ {dec['n']['wmt24pp']} + FLAN {dec['n']['flan']}), "
+          f"verschil {f3(m['b_delta'], True)} (grens +0,10) → **{'gehaald' if r['b']['holds'] else 'niet gehaald'}**.", ""]
+    if r.get("blind"):
+        b = r["blind"]
+        L += [f"Blind tegen G4-0: {b['arm_better']} beter, {b['base_better']} slechter, {b['equal']} gelijk; fouten "
+              f"{b['errors_arm']} tegen {b['errors_base']} → (a2) {'ja' if r['a2'] else 'nee'}, (c) "
+              f"{'ja' if r['c'] else 'nee'}.", ""]
+    else:
+        L += ["(a2) en (c): nog niet beoordeeld (alleen als (a1) en (b) gelden).", ""]
+    for part, title in (("search", "Zoekdeel (de keuze)"), ("decision", "Beslisdeel, alle kandidaten (na de keuze, "
+                                                                          "rapporteren)")):
+        p = r["parts"][part]
+        L += [f"## {title}", "", "| model | " + " | ".join(f"QE {s}" for s in sets) + " | (a1) | origineel | "
+              "verschil met G4-0 |", "|---|" + "---:|" * len(sets) + "---|---:|---:|"]
+        L.append("| mens | " + " | ".join(f3(p["human"][s]) for s in sets) + " | | | |")
+        for name, x in p["models"].items():
+            L.append(f"| {name} | " + " | ".join(f3(x["qe"][s]) for s in sets) +
+                     f" | {'ja' if x['a1'] else 'nee'} | {pct(x['share'])} | {f3(x['b_delta'], True)} |")
+        L.append("")
+    s = r["search"]
+    x = s.get("search") or {}
+    L += ["## Zoektocht naar de gewichten (verlies op het zoekdeel, forward-only)", "",
+          f"Doel {json.dumps((s.get('spec') or {}).get('objective'))}; {x.get('evaluations')} punten, gestopt: "
+          f"{x.get('stopped')}; beste {json.dumps(x.get('best'))}; herhaling van het eerste punt: "
+          f"{json.dumps(s.get('repeat'))}. Basismodel (stap 0): {json.dumps(s.get('base'))}.", "",
+          "| fase | gewichten | doel | verliezen |", "|---|---|---:|---|"]
+    for p in x.get("points") or []:
+        if p["phase"].startswith("anchor") or p in (x.get("top") or []):
+            L.append(f"| {p['phase']} | {p['w']} | {p['value']:.4f} | "
+                     f"{json.dumps({k: round(v, 4) for k, v in (p.get('losses') or {}).items()})} |")
+    L += ["", "## Per tak: welke bron beweegt welke maat (verlies, laatste stap; tak − warmup)", ""]
+    t = r["training"]
+    names = sorted({k for v in t.values() for k in v["last"]})
+    L += ["| run | stap | " + " | ".join(names) + " |", "|---|---:|" + "---:|" * len(names)]
+    for run, v in t.items():
+        cells = [f"{v['last'][k]:.3f}" + (f" ({v['vs_warmup'][k]:+.3f})" if 'vs_warmup' in v and k in v['vs_warmup']
+                                          else "") if k in v["last"] else "–" for k in names]
+        L.append(f"| {run} | {v['last_step']} | " + " | ".join(cells) + " |")
+    L += ["", f"Controle menselijke referenties (QE opnieuw, hele set): {json.dumps(r['refqe_check'])}", ""]
+    return "\n".join(L) + "\n"
+
+
 # ---------------------------------------------------------------------------------------------------- main
 
 def main(argv=None):
@@ -3012,11 +3685,42 @@ def main(argv=None):
     p.add_argument("--blind", required=True)
     p.add_argument("--tokenizer", required=True)
     p.add_argument("--out", required=True)
+    p = sub.add_parser("build5")
+    p.add_argument("--g44", required=True, help="G4-4's set ($G/data/G4-4)")
+    p.add_argument("--g44-report", required=True, help="G4-4's data report ($G/data/report-G4-4.json)")
+    p.add_argument("--novels-eval", required=True, help="eval-novels-meta.parquet of novels4 ($G/data/heldout4)")
+    p.add_argument("--warmup-steps", type=int, default=WARMUP_STEPS5)
+    p.add_argument("--branch-steps", type=int, default=BRANCH_STEPS5)
+    p.add_argument("--steps", action="append", default=[], help="BRANCH=N: another number of steps for one branch")
+    p.add_argument("--flanval", type=int, default=FLANVAL5, help="G4-4's replay rows held out as the eval set flanval")
+    p.add_argument("--out", required=True)
+    p = sub.add_parser("split5")
+    p.add_argument("--evalsets", required=True, help="$G/data/eval/evalsets.parquet (the four sets, FLAN, blind)")
+    p.add_argument("--share", type=float, default=SPLIT_SHARE5)
+    p.add_argument("--tokenizer", required=True)
+    p.add_argument("--out", required=True)
+    p = sub.add_parser("smoke5")
+    for name in ("warmup-summary", "warmup-adapter", "branch-summary", "branch-adapter", "combine-summary",
+                 "warmup-manifest", "branch-manifest", "data-report", "g43-summary", "g43-novels-summary", "out"):
+        p.add_argument(f"--{name}", required=True)
+    p = sub.add_parser("report5")
+    p.add_argument("--evalsets", required=True)
+    p.add_argument("--split", required=True, help="split5's split.json")
+    p.add_argument("--refqe", required=True, help="MetricX-QE of the human references (id, qe_source_reference)")
+    p.add_argument("--candidate", action="append", required=True, help="NAME=DIR (pairs/, scores/) in the top's order")
+    p.add_argument("--base", required=True, help="G4-0's output (pairs/, scores/)")
+    p.add_argument("--reference", action="append", default=[], help="NAME=DIR of another model, reported")
+    p.add_argument("--predictions", required=True)
+    p.add_argument("--search", required=True, help="summary.json of the search run")
+    p.add_argument("--run", action="append", required=True, help="NAME=summary.json of the warmup and every branch")
+    p.add_argument("--tally", default=None, help="tally's json of the selected candidate against G4-0")
+    p.add_argument("--out", required=True)
     args = parser.parse_args(argv)
     {"fetch": fetch, "build": build, "check": check, "evaldata": evaldata, "texts": texts, "report": report,
      "tally": tally, "smoke": smoke, "heldout": heldout, "own": own, "replay": replay_candidates, "build2": build2,
      "smoke2": smoke2, "heldout3": heldout3, "build3": build3, "smoke3": smoke3, "build4": build4,
-     "smoke4": smoke4, "novels4": novels4}[args.command](args)
+     "smoke4": smoke4, "novels4": novels4, "build5": build5, "split5": split5, "smoke5": smoke5,
+     "report5": report5}[args.command](args)
 
 
 if __name__ == "__main__":

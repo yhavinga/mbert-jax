@@ -709,3 +709,77 @@ novels4`, `$G/data/heldout4/`].
    geen reden om de training te stoppen of te verlengen.
 4. Uitvoer: `$G/data/heldout4/`, run `$G/runs/g4arm_G4-3_novels/`, stappen `novels4` en `g43novels` in
    `$G/stages/g4-4/`.
+
+## 10. Amendement G4-5
+
+**Amendement 17 nov 2026 (tijdstip: de commit van deze sectie op branch `en-nl-g4arm5`): arm G4-5** [besluiten van Yeb
+17 nov; uitwerking door een subagent (spec `mbert-ops/translator-sft/g4-5-spec.md`, code `8cd6619`), labels als in de
+kop]. Vastgelegd vóór de bouw van de sets van G4-5, vóór de splitsing in zoek- en beslisdeel, vóór de eerste stap op
+een worker (ook vóór de CPU-proef en de smoke-test) en vóór elke uitslag van G4-5. Waar deze sectie niets zegt, gelden
+§1–§8 en de amendementen van §9 met "G4-5" in plaats van "G4-4".
+
+*G4-5.0 Keuzes.* De open keuzes van de spec (§9 daar) staan op de **standaardwaarden van de spec, gekozen door de
+hoofdsessie op 17 nov** (~22:30, toen Yeb 8 uur weg was en vroeg wat handig was om te starten) [keuze hoofdsessie]:
+G4-5 nu draaien; warmup 1.000 stappen; elke tak 1.000 stappen; LR 1e-5 constant, cooldown over de laatste 10% van de
+eigen stappen van elke tak; optimizer-state mee naar de takken; rank 32 (gevolg daarvan); zoekdoel het
+referentieverlies van WMT24++, FLORES en NTREX op het zoekdeel; w ∈ [0; 1,5], c_s = 1, ten hoogste 80 punten, top 4;
+aandeel zoekdeel 0,5; romantak G4-4's 172.168 paren; G4-4 als referentie in de classify-run en het verslag
+(`REFS=G4-4`). **Yeb kan de stappen per tak vóór het begin van de takken nog wijzigen met een nieuw amendement.**
+
+*G4-5.1 Aanleiding.* G4-2, G4-3 en G4-4 haalden (b) niet (+1,0 / +0,4 / +0,7 pp). G4-4: teacher-forced verlies op
+menselijk Nederlands sterk omlaag, `own` 0,075 → 0,339: de modus van G4-0 blijft. Yeb wil per bron een eigen LoRA,
+vanaf een gezamenlijke warmup, gecombineerd met gezochte gewichten [besluit 17 nov]. Verwachting vooraf
+[gevolgtrekking, spec §1]: (b) +10 pp halen is onwaarschijnlijk (elke tak traint met het verlies en de LR van G4-4;
+alleen gewichten boven 1 kunnen een tak-delta versterken); de waarde van G4-5 ligt eerder in de diagnose per bron.
+
+*G4-5.2 Data* (`g4arm.py build5`, `$G/data/G4-5/`). Uit de set van G4-4, byte voor byte (sha256 in `report-G4-5.json`).
+Warmup: doorgang 1 van G4-4 zonder replay, opnieuw geschud (seed `en-nl-g4arm/0/G4-5/warmup`), de kortste prefix voor
+1.000 stappen. Takken (8): `bt_handelingen`, `bt_raad`, `bt_fineweb`, `bt_rechtspraak`, `bt_dpc` (elk kort en lang),
+`books`, `novels` (G4-4's drie doorgangen als epochs), `flan` (G4-4's replayrijen zonder `flanval`); elke epoch de hele
+bron in een nieuwe volgorde (seed `…/G4-5/<tak>/epoch/<e>`), de kortste prefix voor de 1.000 stappen van de tak. Geen
+FLAN in de warmup en geen FLAN in de andere takken [besluit]. `flanval`: 500 replayrijen (seed `…/G4-5/flanval`).
+
+*G4-5.3 Training.* Als G4-4.4 (rank 32 / alpha 16, 410 modules, AdamW, clipping 1,0, 4.096, packing, 16 per stap),
+behalve: warmup 1.000 stappen, LR lineair naar 1e-5 over 279 stappen, dan constant, geen cooldown; elke tak 1.000
+stappen vanaf de volledige trainingsstate van de warmup (LoRA-parameters en optimizer-state, Tunix' checkpoint van
+stap 1.000; gecontroleerd: herstelde stap, LoRA-parameters gelijk aan de adapter van de warmup, staptellers 1.000),
+LR 1e-5 constant, de laatste 10% van de eigen stappen lineair naar 1e-6 [besluit 4–6]. Evaluatie bij de start, elke
+500 stappen en na de laatste op `books`, `btval`, `own`, `btlong`, `novels`, `flanval`, `wmt24pp_s`, `flores_s`,
+`ntrex_s`. Runs `g4arm_G4-5_warmup`, `g4arm_G4-5_<tak>`.
+
+*G4-5.4 Zoek- en beslisdeel* (`g4arm.py split5`, `$G/data/G4-5-split/`, seed `en-nl-g4arm/0/G4-5/split/<set>/<stratum>`,
+aandeel 0,5): WMT24++, FLORES, NTREX en de 1.000 FLAN-rijen, per domein (WMT24++, FLORES), FLORES per artikel, anders
+per segment; de 35 WMT24++-segmenten van de blinde passages in het beslisdeel. Digest van de toewijzing
+`f953c026597eedcb20ab56dab7d0b4389057697c01550017ba954ba6963440f3` (code `8cd6619`, `evalsets.parquet` sha256
+`4b025635941cf1fff8813206d85e398b0335e62f30408da7e8d9b464be20062c`); de keten stopt bij een andere digest en
+`report5` stopt bij een andere toewijzing. Europarl en de blinde passages worden niet gesplitst.
+
+*G4-5.5 Combinatie en zoektocht.* W = W₀ + Δ_s + Σ wᵢ (Δᵢ − Δ_s), als één adapter van rank 288 (`g4mix.py stack`). Run
+`g4arm_G4-5_search` (`sft_lora.py --combine`): ankers (w = 0; elke tak alleen; uniform), dan coordinate search vanaf
+uniform, stap 0,25 tot 0,0625, w ∈ [0; 1,5], ten hoogste 80 punten, doel het gemiddelde van de token-gewogen
+verliezen van de menselijke referentie op het zoekdeel van WMT24++, FLORES en NTREX; de top 4 (onderling ≥ 0,125)
+op alle eval-sets. Die vier (`G4-5c1`–`G4-5c4`) worden vertaald en gescoord zoals G4-4 (§4.1, fork `f4d8615`), met
+G4-0 (en G4-4, gerapporteerd) in één classify-run.
+
+*G4-5.6 Keuze en beslisregel.* Keuze op het zoekdeel (vast): van de kandidaten die (a1) halen de grootste (b)-afstand
+tot G4-0, bij gelijkheid de eerdere in de top; haalt geen (a1), de kleinste grootste QE-overschrijding. Besluit op het
+beslisdeel voor de gekozen kandidaat, met §5 tegen G4-0: (a1) gemiddelde QE ≤ die van de menselijke referentie op
+dezelfde segmenten (opnieuw gescoord in de keten, stap `refqe5`; het gemiddelde over de hele set moet binnen 0,05 van
+§5's getallen liggen), (b) "origineel" − G4-0 ≥ 0,10 op WMT24++ (goed) + FLAN van het beslisdeel; (a2) en (c) op de 100
+blinde passages zoals §5, alleen als (a1) en (b) gelden (pakket `$S/blind/G4-5/` met de naam van de gekozen
+kandidaat). Gerapporteerd, beslist niet: de verliezen per tak (G4-5.3), de zoektocht, alle kandidaten op beide delen.
+
+*G4-5.7 Smoke-test* (vóór de training): `g4arm_G4-5_s8` (8 stappen op de smoke-set van de warmup, LR-opwarming 2),
+`g4arm_G4-5_b8` (8 stappen vanaf stap 8 van s8, cooldown 4), `g4arm_G4-5_c8` (zoektocht op s8, b8 en G4-3's
+eindadapter, doel `books` + `novels`, 8 punten, top 2), en de gestapelde adapter op 50 smoke-segmenten. Geslaagd als
+de controles van G4-3.5 voor s8 en b8 gelden (EXIT 0, eindige verliezen, piek ≤ 29,5 GiB, adapter 32/16, batches zoals
+build5, evaluaties op de stappen), b8 stap 8 herstelde (tellers 8) en zijn evaluatie op stap 8 gelijk is aan die van
+s8 (≤ 1e-6), de LR op stap 8 1e-5 en op stap 15 1e-6 is, de zoektocht zijn basisverlies gelijk aan s8's stap 0 geeft,
+het herhaalde punt gelijk is, het anker "G4-3 alleen" binnen 0,02 van G4-3's eigen verlies op `books` en `novels`
+ligt en het anker "warmup alleen" binnen 0,02 van s8's stap 8, de gestapelde adapter (rank 96, 410 modules) ten minste
+48 van de 50 smoke-segmenten af vertaalt, en de schatting (`g4arm.py smoke5`) ≤ 120 u is. Faalt de smoke-test, dan
+stopt de keten vóór de training.
+
+*G4-5.8 Uitvoer.* `$G/data/G4-5/`, `$G/data/G4-5-split/`, `$G/runs/g4arm_G4-5_*`, `$G/eval/G4-5c<k>/`,
+`$G/naturalness-G4-5/`, `$S/blind/G4-5/`, `$G/report-G4-5/` (kopie `mbert-ops/translator-sft/g4-5-report.md`), stappen
+in `$G/stages/g4-5/`. Keten `mbert-ops/scripts/g4arm5_run.sh` op mbert-corpus.

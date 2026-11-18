@@ -783,3 +783,42 @@ stopt de keten vóór de training.
 *G4-5.8 Uitvoer.* `$G/data/G4-5/`, `$G/data/G4-5-split/`, `$G/runs/g4arm_G4-5_*`, `$G/eval/G4-5c<k>/`,
 `$G/naturalness-G4-5/`, `$S/blind/G4-5/`, `$G/report-G4-5/` (kopie `mbert-ops/translator-sft/g4-5-report.md`), stappen
 in `$G/stages/g4-5/`. Keten `mbert-ops/scripts/g4arm5_run.sh` op mbert-corpus.
+
+**Aanvulling 18 nov 2026 (tijdstip: de commit van deze aanvulling op branch `en-nl-g4arm5`): G4-5.7a, de uitslag van
+de smoke-test en wat daarop start** [besluit van de hoofdsessie 18 nov ~01:50, terwijl Yeb weg is; uitwerking door
+een subagent, labels als in de kop]. Vastgelegd na de smoke-test (keten TAG `g4e1117a`, `FAILED` op 18 nov 01:34 CET)
+en vóór de eerste stap van de warmup, de zoektocht en elke uitslag van de training van G4-5.
+
+*Gehaald* [gemeten: `mbert-ops/translator-sft/g4arm5-smoke.json`, `$G/smoke5/g4e1117a/`]: alle controles van
+`g4arm_G4-5_s8` (warmup) en `g4arm_G4-5_b8` (tak): EXIT 0, eindige verliezen, piek 29,13 GiB, adapter 32/16, batches
+zoals build5, evaluaties op stap 0/4/8 en 8/12/16; b8 herstelde stap 8 (tellers `step`, `opt_state/1/0/count`,
+`opt_state/1/2/count` alle 8), zijn evaluatie op stap 8 is op elke set gelijk aan die van s8 (books 2,456876575668341
+in beide); LR op stap 8 1e-5 en op stap 15 1e-6. Van de zoektocht (`g4arm_G4-5_c8`): de zoektocht liep (8 punten),
+het basisverlies is op elke set gelijk aan s8's stap 0, piek 29,13 GiB, het anker "G4-3 alleen" binnen 0,02 van G4-3
+(books 0,8777 tegen 0,8787, novels 0,8897 tegen 0,8991); de gestapelde adapter `G4-5c1` (rank 96, 410 modules,
+relatieve update-norm 0,0095) vertaalde 50 van de 50 smoke-segmenten af. Schatting 34,4 u (warmup 3,51 u, elke tak
+3,62–3,63 u, zoektocht 1,88 u bij 63,9 s per punt).
+
+*Gefaald*:
+1. `search_repeat_equal`: eerste waarde van het anker 2,4015402793884277, herhaling 2,401540332915216 (verschil 5e-8).
+   [gemeten] float32(2,401540332915216) = 2,4015402793884277. [gevolgtrekking, uit de code van `sft_lora.py`] de
+   doelwaarde van elk punt gaat door `broadcast_float` (`multihost_utils.broadcast_one_to_all`, zonder x64 in float32),
+   de herhaling niet; met één proces (CPU-proef) geeft `broadcast_float` de float64 terug en was de herhaling gelijk.
+   Het verschil is precisie, geen niet-determinisme.
+2. `merge_warmup_is_lora`: het samengevoegde anker "warmup alleen" (W₀ + Δ van s8) geeft books 2,5363 / novels
+   2,2668, s8 zelf (LoRA) op stap 8 2,4569 / 2,2041, de basis 2,5704 / 2,2935; verschil 0,079 / 0,063, grens 0,02.
+   [gemeten] de update van s8 heeft een Frobenius-norm van 0,0108 × die van G4-3 (b8: 0,0199 ×); G4-3's relatieve
+   update-norm in de bf16-kernels is 0,00946, en 59,1% van de elementen verandert bij het samenvoegen (LORA-regel van
+   `translate.py`). In de CPU-proef met float32-kernels week hetzelfde anker 1,6e-6 / 0 af. [gevolgtrekking] De
+   relatieve update van s8 is ~1,0e-4, ~20× kleiner dan een halve ulp van een bf16-kernel (relatief 2⁻⁹–2⁻⁸): W₀ + Δ
+   rondt voor de meeste elementen terug naar W₀, terwijl LoRA naast de kernel de update in de forward-pass houdt. Het
+   anker van G4-3 (update ~0,01) haalt de grens. Dezelfde afronding geldt voor `translate.py --lora` (samenvoegen in de
+   bf16-kernels) bij elke arm.
+
+*Besluit*: de grenzen van G4-5.7 blijven zoals ze zijn. **De warmup en de 8 takken starten** op grond van hun gehaalde
+controles: de keten neemt de smoke-test van `g4e1117a` over als alleen deze twee controles faalden en de schatting
+≤ 120 u is. **De keten stopt vóór de zoektocht** (regel `HOLD before search: amendment G4-5.7a, Yeb decides on
+search_repeat_equal and merge_warmup_is_lora`, `EXIT 0`). Yeb beslist vóór de zoektocht over deze twee controles (voor
+de herhaling bijvoorbeeld een tolerantie van 1e-6 of beide waarden door dezelfde broadcast; voor het warmup-anker wat
+er moet gelden, bijvoorbeeld de grens toetsen op een adapter met de update van een echte warmup, of samenvoegen in
+float32). Dat besluit wordt een nieuwe aanvulling, gecommit vóór de zoektocht.

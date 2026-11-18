@@ -498,6 +498,12 @@ def test_pref_measure_reports_the_sets_own_and_the_training_windows():
     assert [w["steps"] for w in p["train"]] == [[1, 50], [51, 100], [101, 120]]
     text = "\n".join(g4arm.pref_text(p))
     assert "Voorkeuren" in text and "pref_novels" in text and "0,075 → 0,339" in text
+    # the reading on the last eval step's accuracy (0.6 here): mixed
+    assert p["reading"]["verdict"] == "gemengd" and "Lezing" in text
+    s["eval"] = [dict(e, accuracy=0.8) if e.get("kind") == "pref" and e["step"] == 8 else e for e in s["eval"]]
+    assert g4arm.pref_measure(s)["reading"]["verdict"] == "voorkeur geleerd"
+    s["eval"] = [dict(e, accuracy=0.5) if e.get("kind") == "pref" and e["step"] == 8 else e for e in s["eval"]]
+    assert g4arm.pref_measure(s)["reading"]["verdict"] == "niet geleerd"
 
 
 def test_pairtexts6_and_pairclass6(tmp_path):

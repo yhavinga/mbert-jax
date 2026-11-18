@@ -4597,6 +4597,13 @@ def pref_measure(summary):
     out["sets"] = {k: dict(sorted(v.items())) for k, v in sorted(out["sets"].items())}
     out["own"] = dict(sorted(out["own"].items()))
     out["spec"] = (summary.get("dpo") or {}).get("spec")
+    # the reading fixed beforehand (draft amendment G4-6.7; reported, deciding nothing): the held-out accuracy of the
+    # held-out books and BT validation at the last eval step
+    last = {k: out["sets"][k][max(out["sets"][k])]["accuracy"] for k in READING_SETS6 if out["sets"].get(k)}
+    if len(last) == len(READING_SETS6):
+        learned = [v >= READING_LEARNED6 for v in last.values()]
+        out["reading"] = {"accuracy_last": last, "verdict": "voorkeur geleerd" if all(learned) else
+                          "niet geleerd" if all(v < READING_NOT6 for v in last.values()) else "gemengd"}
     return out
 
 
@@ -4612,6 +4619,10 @@ def pref_text(p):
             L.append(f"| {name} | {step} | {v['pairs']} | {f3(v['loss'])} | {f3(v['accuracy'])} | {f3(v['margin'])} | "
                      f"{f3(v['chosen_nll'])} | {f3(v['rejected_nll'])} | {f3(v['ref_chosen_nll'])} | "
                      f"{f3(v['ref_rejected_nll'])} |")
+    if p.get("reading"):
+        L += ["", f"**Lezing (vooraf vastgelegd, beslist niet): {p['reading']['verdict']}** (nauwkeurigheid na de laatste "
+              f"stap: {json.dumps(p['reading']['accuracy_last'])}; geleerd: beide ≥ {READING_LEARNED6}, niet geleerd: "
+              f"beide < {READING_NOT6})."]
     L += ["", "Verlies op `own` (G4-0's eigen greedy vertalingen van de BT-validatie; G4-4: 0,075 → 0,339): " + ", ".join(
         f"{k}: {f3(v)}" for k, v in p["own"].items()) + ".", "",
         "Training per 50 stappen (gewogen naar paren): " + "; ".join(
@@ -4620,6 +4631,9 @@ def pref_text(p):
     return L
 
 
+READING_SETS6 = ("pref_books", "pref_btval")
+READING_LEARNED6 = 0.70   # the reading's bound: accuracy on both held-out preference sets at the last step
+READING_NOT6 = 0.60
 PAIRTEXTS6 = 1000         # the classifier on chosen and rejected: at most this many pairs per kind (reported only)
 
 

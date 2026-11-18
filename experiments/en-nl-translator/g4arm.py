@@ -2898,6 +2898,14 @@ SMOKE5_EVAL_STEPS = [0, 4, 8]
 SMOKE5_BRANCH_EVAL_STEPS = [8, 12, 16]
 EQUAL5 = 1e-6                        # the same model on the same eval batches: the same loss
 MERGE_MAX_DIFF5 = 0.02               # a merged kernel (bf16 at use) against LoRA in the forward pass, same adapter
+# addendum G4-5.7b (Yeb, 18 Nov): before the search, the merged warmup alone (w = 0) on these sets against the warmup's
+# own eval at its step 1,000 (MERGE_MAX_DIFF5); g4mix.REPEAT_MAX_DIFF for the repeated first point
+WARMUP_CHECK_SETS5 = ("books", "novels")
+# addendum G4-5.7b: the temperature probe (reported, decides nothing): G4-0 and the warmup, eval only, the loss at
+# logits / T for T on this grid; T chosen on the mean loss of TEMP_FIT_SETS5; T = 1 against the stack within TEMP_EQUAL5
+TEMPERATURES5 = "0.5:3.0:0.05"
+TEMP_FIT_SETS5 = ("books", "btval")
+TEMP_EQUAL5 = 1e-4
 
 
 def g44_set(directory, report_path):
@@ -3448,7 +3456,15 @@ def report5(args):
               "parts": parts, "a1": {"holds": d["a1"], "sets": d["a1_sets"]}, "b": {"holds": d["b"],
                                                                                     "delta": d["b_delta"]}}
     search = json.loads(Path(args.search).read_text())
-    result["search"] = {k: (search.get("combine") or {}).get(k) for k in ("spec", "search", "repeat", "seconds")}
+    combine = search.get("combine") or {}
+    if not (combine.get("repeat") or {}).get("equal") or not (combine.get("warmup_check") or {}).get("holds"):
+        raise SystemExit(f"{args.search}: the search's checks of addendum G4-5.7b do not hold: repeat "
+                         f"{combine.get('repeat')}, warmup check {combine.get('warmup_check')}")
+    result["search"] = {k: combine.get(k) for k in ("spec", "search", "repeat", "warmup_check", "seconds")}
+    if args.smoke:
+        # addendum G4-5.7b: the smoke test's anchor "G4-3 alone" (merged as translated) stays the evidence that a
+        # merge of an update of G4-3's size keeps its loss
+        result["smoke_g43"] = json.loads(Path(args.smoke).read_text())["checks"]["merge_g43_is_g43"]
     result["search"]["base"] = eval_at(search, 0)
     stacked = {}
     for name, dpath in cands:
@@ -3510,8 +3526,19 @@ def report5_text(r):
     L += ["## Zoektocht naar de gewichten (verlies op het zoekdeel, forward-only)", "",
           f"Doel {json.dumps((s.get('spec') or {}).get('objective'))}; {x.get('evaluations')} punten, gestopt: "
           f"{x.get('stopped')}; beste {json.dumps(x.get('best'))}; herhaling van het eerste punt: "
-          f"{json.dumps(s.get('repeat'))}. Basismodel (stap 0): {json.dumps(s.get('base'))}.", "",
-          "| fase | gewichten | doel | verliezen |", "|---|---|---:|---|"]
+          f"{json.dumps(s.get('repeat'))}. Basismodel (stap 0): {json.dumps(s.get('base'))}.", ""]
+    w = s.get("warmup_check") or {}
+    L += [f"Controle vóór de zoektocht (aanvulling G4-5.7b): de samengevoegde warmup alleen (w = 0) tegen het eigen "
+          f"eval-verlies van de warmup op stap {w.get('step')}: "
+          f"{json.dumps({k: [round(w['got'][k], 4), round(w['want'][k], 4)] for k in w.get('want', {})})}, grootste "
+          f"verschil {f3(max(w.get('diff', {}).values(), default=None))} (grens {w.get('max_diff')}), zelfde doeltokens "
+          f"{'ja' if w.get('tokens_equal') else 'nee'}: {'gehaald' if w.get('holds') else 'niet gehaald'}.", ""]
+    if r.get("smoke_g43"):
+        g = r["smoke_g43"]
+        L += [f"Smoke-test (aanvulling G4-5.7a/b): het anker \"G4-3 alleen\", samengevoegd in de bf16-kernels, tegen "
+              f"G4-3's eigen verlies (samengevoegd, eigen): {json.dumps(g['value'])}: "
+              f"{'gehaald' if g['holds'] else 'niet gehaald'}.", ""]
+    L += ["| fase | gewichten | doel | verliezen |", "|---|---|---:|---|"]
     for p in x.get("points") or []:
         if p["phase"].startswith("anchor") or p in (x.get("top") or []):
             L.append(f"| {p['phase']} | {p['w']} | {p['value']:.4f} | "
@@ -3525,6 +3552,155 @@ def report5_text(r):
                                           else "") if k in v["last"] else "–" for k in names]
         L.append(f"| {run} | {v['last_step']} | " + " | ".join(cells) + " |")
     L += ["", f"Controle menselijke referenties (QE opnieuw, hele set): {json.dumps(r['refqe_check'])}", ""]
+    return "\n".join(L) + "\n"
+
+
+# ---------------------------------------------------------------------------------------------------- G4-5 temperature
+
+def temp_curves(summary, name):
+    """{set: {"t", "loss", "stack", "tokens"}} of an eval-only temperature run (sft_lora.py --temperatures), its eval
+    at step 0; "stack" is the same round's own loss, which T = 1 must give within TEMP_EQUAL5"""
+    out = {e["set"]: {"t": e["temperatures"]["t"], "loss": e["temperatures"]["loss"], "stack": e["loss"],
+                      "tokens": e["tokens"]}
+           for e in summary.get("eval") or [] if e["step"] == 0 and e.get("temperatures")}
+    if not out or summary.get("steps_done") != 0:
+        raise SystemExit(f"{name}: no eval-only temperature round at step 0 ({summary.get('steps_done')} steps)")
+    for s, c in out.items():
+        if 1.0 not in c["t"] or abs(c["loss"][c["t"].index(1.0)] - c["stack"]) > TEMP_EQUAL5:
+            raise SystemExit(f"{name}: {s} at T = 1 is not the round's own loss {c['stack']} within {TEMP_EQUAL5}")
+    return out
+
+
+def best_t(t, values):
+    """(T, value, at an end of the grid) of the lowest value; equal values: the T nearest to 1"""
+    k = min(range(len(t)), key=lambda i: (values[i], abs(t[i] - 1.0)))
+    return t[k], values[k], k in (0, len(t) - 1)
+
+
+def temp_fit(curves, sets):
+    """T of the lowest mean loss over the fit sets (each set's token-weighted loss, the sets weighted equally)"""
+    t = curves[sets[0]]["t"]
+    if any(curves[s]["t"] != t for s in sets):
+        raise SystemExit(f"the fit sets {sets} have different grids")
+    mean_loss = [statistics.fmean(curves[s]["loss"][k] for s in sets) for k in range(len(t))]
+    T, value, edge = best_t(t, mean_loss)
+    return {"sets": list(sets), "t": T, "value": value, "edge": edge, "value_at_1": mean_loss[t.index(1.0)]}
+
+
+def drop_share(l1, lt, lft):
+    """(L1 - L_T) / (L1 - L_fine-tune): the share of the fine-tune's change that one temperature gives; None when the
+    fine-tune changes the loss by less than 0.001"""
+    if l1 is None or lt is None or lft is None or abs(l1 - lft) < 1e-3:
+        return None
+    return (l1 - lt) / (l1 - lft)
+
+
+def g44_final(report):
+    """G4-4's loss per set at its last step and at step 0 (g4arm.py report's json: heldout.loss, novels)"""
+    final, start = {}, {}
+    for s, by_step in ((report.get("heldout") or {}).get("loss") or {}).items():
+        last = max(by_step, key=int)
+        final[s], start[s] = by_step[last], by_step.get("0")
+    nov = report.get("novels") or {}
+    if nov.get("arm_loss") is not None:
+        final["novels"], start["novels"] = nov["arm_loss"], nov.get("base_loss")
+    return final, start
+
+
+def temp5(args):
+    """Addendum G4-5.7b: how much of the drop of the teacher-forced loss on human Dutch one temperature of G4-0 gives
+    (reported, decides nothing)"""
+    load = lambda p: json.loads(Path(p).read_text())  # noqa: E731
+    base = temp_curves(load(args.base), args.base)
+    warm = load(args.warmup)
+    w0, wend = eval_at(warm, 0), eval_at(warm, warm["steps"])
+    wtok = {e["set"]: e["tokens"] for e in warm.get("eval") or [] if e["step"] == warm["steps"]}
+    other = [s for s in base if base[s]["tokens"] != wtok.get(s)]
+    if other or set(base) != set(wtok):
+        raise SystemExit(f"the probe's sets or target tokens are not the warmup run's: {other or sorted(set(base) ^ set(wtok))}")
+    g44, g44_start = g44_final(load(args.g44_report))
+    off = {s: (g44_start[s], w0.get(s)) for s in g44 if g44_start.get(s) is None or w0.get(s) is None
+           or abs(g44_start[s] - w0[s]) > TEMP_EQUAL5}
+    if off:
+        raise SystemExit(f"G4-4's loss at step 0 is not G4-0's of the warmup run (other batches?): {off}")
+    run_w = temp_curves(load(args.warmup_run), args.warmup_run) if args.warmup_run else None
+    fit = temp_fit(base, TEMP_FIT_SETS5)
+    rows = {}
+    for s, c in base.items():
+        l1 = c["loss"][c["t"].index(1.0)]
+        lfit = c["loss"][c["t"].index(fit["t"])]
+        tb, lb, edge = best_t(c["t"], c["loss"])
+        row = {"tokens": c["tokens"], "g40_t1": l1, "g40_stack_step0": w0.get(s), "g40_t1_vs_stack": l1 - w0[s],
+               "g40_tfit": lfit, "best_t": tb, "best_loss": lb, "best_edge": edge, "warmup": wend.get(s),
+               "g44": g44.get(s)}
+        for ft in ("warmup", "g44"):
+            row[f"share_fit_{ft}"] = drop_share(l1, lfit, row[ft])
+            row[f"share_best_{ft}"] = drop_share(l1, lb, row[ft])
+        if run_w and s in run_w:
+            cw = run_w[s]
+            tw, lw, ew = best_t(cw["t"], cw["loss"])
+            row |= {"warmup_t1": cw["loss"][cw["t"].index(1.0)], "warmup_t1_vs_run": cw["loss"][cw["t"].index(1.0)] - wend[s],
+                    "warmup_best_t": tw, "warmup_best_loss": lw, "warmup_best_edge": ew}
+        rows[s] = row
+    result = {"arm": ARM5, "grid": {"t": base[next(iter(base))]["t"]}, "fit": fit,
+              "fit_warmup": temp_fit(run_w, TEMP_FIT_SETS5) if run_w else None, "sets": rows,
+              "curves": {"G4-0": base, "warmup": run_w}, "warmup_step": warm["steps"],
+              "inputs": {"base": args.base, "warmup_run": args.warmup_run, "warmup": args.warmup,
+                         "g44_report": args.g44_report}}
+    Path(args.out).with_suffix(".json").write_text(json.dumps(result, indent=1) + "\n")
+    Path(args.out).write_text(temp5_text(result), encoding="utf-8")
+    print(f"TEMP5 {json.dumps({'fit': fit, 'fit_warmup': result['fit_warmup'], 'share_fit_warmup': {s: r['share_fit_warmup'] for s, r in rows.items()}})}",
+          flush=True)
+
+
+def temp5_text(r):
+    t = r["grid"]["t"]
+    lo, hi = f3(t[0]).replace(",000", ",00"), f3(t[-1]).replace(",000", ",00")
+
+    def tt(x, edge):
+        if edge:
+            return f"≤ {lo}" if x == t[0] else f"≥ {hi}"
+        return f"{x:.2f}".replace(".", ",")
+
+    fit, fw = r["fit"], r["fit_warmup"]
+    sets = list(r["sets"])
+    L = [f"# Arm {r['arm']}: temperatuurproef (aanvulling G4-5.7b; rapporteren, beslist niets)", "",
+         "Gemaakt door `g4arm.py temp5`. Vraag: welk deel van de daling van het teacher-forced verlies op menselijk "
+         "Nederlands bij de fine-tunes geeft één temperatuur van G4-0 al (kalibratie)? Verlies van softmax(logits / T), "
+         "token-gewogen, op dezelfde eval-sets en doeltokens als de trainingsstack, één forward-pass per batch voor alle T "
+         f"(rooster {lo}–{hi}, stap {t[1] - t[0]:.2f}".replace(".", ",") + "). T verandert de volgorde van de logits "
+         "niet: de greedy-uitvoer is bij elke T gelijk.", "",
+         f"**T gekozen op {' + '.join(fit['sets'])}** (gemiddelde van de twee verliezen): **T\\* = "
+         f"{tt(fit['t'], fit['edge'])}** (gemiddeld verlies {f3(fit['value_at_1'])} bij T = 1, {f3(fit['value'])} bij "
+         "T\\*).", ""]
+    if fw:
+        L += [f"Warmup-adapter (stap {r['warmup_step']}), zelfde keuze: T\\* = {tt(fw['t'], fw['edge'])} "
+              f"({f3(fw['value_at_1'])} bij T = 1, {f3(fw['value'])} bij T\\*).", ""]
+    L += ["Lezing: aandeel = (L₁ − L_T) / (L₁ − L_fine-tune) per set, L₁ en L_T van G4-0 in deze proef; "
+          "1 = één temperatuur geeft de hele verandering, 0 = niets. Bij `own` (G4-0's eigen greedy uitvoer als doel) "
+          "stijgt het verlies bij de fine-tunes: het aandeel is dan dat van de stijging.", "",
+          "## Per set", "",
+          "| set | doeltokens | G4-0 T=1 | G4-0 T\\* | beste T (set) | G4-0 bij beste T | warmup stap "
+          f"{r['warmup_step']} | G4-4 eind | aandeel T\\* (warmup) | aandeel T\\* (G4-4) | aandeel beste T (warmup) | "
+          "aandeel beste T (G4-4) |", "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
+    for s in sets:
+        x = r["sets"][s]
+        L.append(f"| {s} | {x['tokens']} | {f3(x['g40_t1'])} | {f3(x['g40_tfit'])} | {tt(x['best_t'], x['best_edge'])} | "
+                 f"{f3(x['best_loss'])} | {f3(x['warmup'])} | {f3(x['g44'])} | {pct(x['share_fit_warmup'])} | "
+                 f"{pct(x['share_fit_g44'])} | {pct(x['share_best_warmup'])} | {pct(x['share_best_g44'])} |")
+    if fw:
+        L += ["", f"## Warmup-adapter (stap {r['warmup_step']}): ligt zijn optimum bij T = 1?", "",
+              "| set | T=1 (deze proef) | T=1 − eigen eval | beste T | verlies bij beste T |", "|---|---:|---:|---:|---:|"]
+        for s in sets:
+            x = r["sets"][s]
+            if "warmup_t1" in x:
+                L.append(f"| {s} | {f3(x['warmup_t1'])} | {x['warmup_t1_vs_run']:+.1e} | "
+                         f"{tt(x['warmup_best_t'], x['warmup_best_edge'])} | {f3(x['warmup_best_loss'])} |")
+    L += ["", "## Controles", "",
+          f"- T = 1 is per set het eigen verlies van dezelfde ronde (binnen {TEMP_EQUAL5}); de doeltokens zijn die van "
+          "de warmup-run; G4-4's verlies op stap 0 is dat van de warmup-run (zelfde batches).",
+          "- G4-0 T = 1 in deze proef (num_vocab_tiling 1) tegen stap 0 van de warmup-run (trainingsstack, "
+          "num_vocab_tiling 8): " + ", ".join(f"{s} {r['sets'][s]['g40_t1_vs_stack']:+.1e}" for s in sets) + ".", ""]
     return "\n".join(L) + "\n"
 
 
@@ -3714,13 +3890,20 @@ def main(argv=None):
     p.add_argument("--search", required=True, help="summary.json of the search run")
     p.add_argument("--run", action="append", required=True, help="NAME=summary.json of the warmup and every branch")
     p.add_argument("--tally", default=None, help="tally's json of the selected candidate against G4-0")
+    p.add_argument("--smoke", default=None, help="smoke5's json (its anchor G4-3 alone, reported)")
+    p.add_argument("--out", required=True)
+    p = sub.add_parser("temp5")
+    p.add_argument("--base", required=True, help="summary.json of G4-0's temperature run (sft_lora.py --temperatures)")
+    p.add_argument("--warmup-run", default=None, help="summary.json of the warmup adapter's temperature run")
+    p.add_argument("--warmup", required=True, help="summary.json of the warmup run (its evals at step 0 and 1,000)")
+    p.add_argument("--g44-report", required=True, help="G4-4's report.json (its losses at the last step)")
     p.add_argument("--out", required=True)
     args = parser.parse_args(argv)
     {"fetch": fetch, "build": build, "check": check, "evaldata": evaldata, "texts": texts, "report": report,
      "tally": tally, "smoke": smoke, "heldout": heldout, "own": own, "replay": replay_candidates, "build2": build2,
      "smoke2": smoke2, "heldout3": heldout3, "build3": build3, "smoke3": smoke3, "build4": build4,
      "smoke4": smoke4, "novels4": novels4, "build5": build5, "split5": split5, "smoke5": smoke5,
-     "report5": report5}[args.command](args)
+     "report5": report5, "temp5": temp5}[args.command](args)
 
 
 if __name__ == "__main__":

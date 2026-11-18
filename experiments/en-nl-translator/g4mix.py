@@ -5,7 +5,8 @@ arithmetic is tested on any machine; sft_lora.py --combine and g4arm.py use it o
 
   stack   one adapter of rank sum(r_k) whose update is sum_k c_k * update_k: the A's side by side along the rank, each B
           times its coefficient (float32); with the shared warmup first, c = (shared - sum(w), w_1, ..., w_N)
-  spec    the search's specification for sft_lora.py --combine (components, objective, coordinate search, top K)
+  spec    the search's specification for sft_lora.py --combine (components, objective, coordinate search, top K, the
+          tolerance of the repeated first point, and with --warmup-check the check of the merged warmup before it)
 
     python g4mix.py stack --component shared=DIR --component bt_raad=DIR ... --weights 0.5,0.25,... --out DIR
     python g4mix.py stack --component ... --from-summary summary.json --candidate 1 --out DIR
@@ -31,6 +32,9 @@ import translate  # noqa: E402  (lora_modules, lora_delta: the merge that transl
 
 SHARED = "shared"
 DECIMALS = 6            # a point of the search is its weights rounded to this many decimals (the cache key)
+# addendum G4-5.7b (Yeb, 18 Nov): the repeated first point is "equal" within this; float32 rounding of a broadcast
+# value is ~1e-7, a rest of an earlier point after a failed restore of the base kernels would be >= 1e-2
+REPEAT_MAX_DIFF = 1e-4
 
 
 # ---------------------------------------------------------------------------------------------------- stacking
@@ -230,7 +234,8 @@ def run_search(objective, spec):
 # ---------------------------------------------------------------------------------------------------- spec, split
 
 def spec_dict(components, objective, *, shared=1.0, start="uniform", step=0.25, min_step=0.0625, lower=0.0,
-              upper=1.5, budget=80, top_k=4, min_distance=0.125, uniform_anchor=True, scale=None):
+              upper=1.5, budget=80, top_k=4, min_distance=0.125, uniform_anchor=True, scale=None,
+              repeat_max_diff=REPEAT_MAX_DIFF, warmup_check=None):
     names = [n for n, _ in components]
     if not names or names[0] != SHARED:
         raise ValueError(f"the first component is the shared warmup ('{SHARED}'), not {names[:1]}")
@@ -240,11 +245,46 @@ def spec_dict(components, objective, *, shared=1.0, start="uniform", step=0.25, 
         raise ValueError(f"objective {objective}")
     if not lower <= upper:
         raise ValueError(f"bounds {lower} {upper}")
-    return {"components": [{"name": n, "adapter": str(p)} for n, p in components], "objective": dict(objective),
-            "shared_coef": float(shared), "scale": scale,
-            "search": {"start": start, "step": step, "min_step": min_step, "lower": lower, "upper": upper,
-                       "budget": budget, "top_k": top_k, "min_distance": min_distance,
-                       "uniform_anchor": uniform_anchor}}
+    if not repeat_max_diff >= 0:
+        raise ValueError(f"repeat_max_diff {repeat_max_diff}")
+    out = {"components": [{"name": n, "adapter": str(p)} for n, p in components], "objective": dict(objective),
+           "shared_coef": float(shared), "scale": scale, "repeat_max_diff": float(repeat_max_diff),
+           "search": {"start": start, "step": step, "min_step": min_step, "lower": lower, "upper": upper,
+                      "budget": budget, "top_k": top_k, "min_distance": min_distance,
+                      "uniform_anchor": uniform_anchor}}
+    if warmup_check is not None:
+        out["warmup_check"] = warmup_check
+    return out
+
+
+def warmup_check_of(summary, sets, max_diff, source=None):
+    """Addendum G4-5.7b: what the merged warmup alone (w = 0, c_s = 1) must give before the search goes on: the warmup
+    run's own eval at its last step on these sets (loss and target tokens, so that the batches are the same)"""
+    step = summary["steps"]
+    got = {e["set"]: e for e in summary.get("eval") or [] if e["step"] == step}
+    missing = [s for s in sets if s not in got]
+    if missing or not sets:
+        raise ValueError(f"the warmup has no eval of {missing or sets} at its last step {step}")
+    if not max_diff > 0:
+        raise ValueError(f"max_diff {max_diff}")
+    return {"step": step, "losses": {s: got[s]["loss"] for s in sets}, "tokens": {s: got[s]["tokens"] for s in sets},
+            "max_diff": float(max_diff), "source": source}
+
+
+def warmup_check_result(check, losses, tokens):
+    """The merged warmup's losses and target tokens against the check: holds if the tokens are the same and every loss
+    is within max_diff"""
+    diff = {s: abs(losses[s] - want) for s, want in check["losses"].items()}
+    tokens_equal = all(tokens[s] == want for s, want in check["tokens"].items())
+    return {"step": check["step"], "want": dict(check["losses"]), "got": {s: losses[s] for s in check["losses"]},
+            "diff": diff, "tokens_equal": tokens_equal, "max_diff": check["max_diff"],
+            "holds": tokens_equal and max(diff.values()) <= check["max_diff"]}
+
+
+def repeat_result(w, first, again, max_diff):
+    """The first point of the search evaluated again after the top K: equal within max_diff (the base came back)"""
+    diff = abs(again - first)
+    return {"w": list(w), "first": first, "again": again, "diff": diff, "max_diff": max_diff, "equal": diff <= max_diff}
 
 
 def stratum_of(row):
@@ -347,9 +387,16 @@ def spec_cli(args):
     comps = parse_named(args.component, "component")
     objective = {n: float(w) for n, w in parse_named(args.objective, "objective")}
     start = "uniform" if args.start == "uniform" else [float(x) for x in args.start.split(",")]
+    check = None
+    if args.warmup_check:
+        check = warmup_check_of(json.loads(Path(args.warmup_check).read_text()), args.check_set,
+                                args.check_max_diff, source=args.warmup_check)
+    elif args.check_set:
+        raise SystemExit("--check-set goes with --warmup-check")
     spec = spec_dict(comps, objective, shared=args.shared_coef, start=start, step=args.step, min_step=args.min_step,
                      lower=args.lower, upper=args.upper, budget=args.budget, top_k=args.top_k,
-                     min_distance=args.min_distance, scale=args.scale)
+                     min_distance=args.min_distance, scale=args.scale, repeat_max_diff=args.repeat_max_diff,
+                     warmup_check=check)
     Path(args.out).write_text(json.dumps(spec, indent=1) + "\n")
     print(f"SPEC {json.dumps(spec)}", flush=True)
 
@@ -377,6 +424,13 @@ def main(argv=None):
     p.add_argument("--top-k", type=int, default=4)
     p.add_argument("--min-distance", type=float, default=0.125)
     p.add_argument("--scale", type=float, default=0.5, help="the components' LoRA scale (alpha / rank)")
+    p.add_argument("--repeat-max-diff", type=float, default=REPEAT_MAX_DIFF,
+                   help="the repeated first point is equal within this (addendum G4-5.7b)")
+    p.add_argument("--warmup-check", default=None,
+                   help="summary.json of the warmup run: the merged warmup alone must give its own eval at its last "
+                        "step on the --check-set sets before the search goes on (addendum G4-5.7b)")
+    p.add_argument("--check-set", action="append", default=[], help="an eval set of the warmup check (repeatable)")
+    p.add_argument("--check-max-diff", type=float, default=0.02)
     p.add_argument("--out", required=True)
     args = parser.parse_args(argv)
     if args.command == "stack":

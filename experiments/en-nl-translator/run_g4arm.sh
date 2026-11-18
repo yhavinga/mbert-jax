@@ -88,6 +88,10 @@
 #   RUN=g4arm_G4-5_search train (STEPS=1: the search at step 0; SEARCH_BUDGET, SEARCH_TOP_K, SEARCH_STEP, ... override)
 #   MODEL=G4-5c<k> translate and score (the k-th of the search's top, stacked on every worker from the runs' adapters);
 #   CANDIDATES="G4-5c1 ..." [REFS=G4-4] texts, classify, report5 (w0); SELECTED=<report5's choice> blind
+#   Addendum G4-5.7b (Yeb, 18 Nov): RUN=g4arm_G4-5_temp0 train and RUN=g4arm_G4-5_tempw train (eval only, the
+#     temperature probe: G4-0 and the warmup's adapter, the loss at logits / T on every eval set, num_vocab_tiling=1);
+#     the search's spec checks the merged warmup alone against the warmup's own eval at its last step first;
+#     report5 takes SMOKE5=<gs:// smoke5 json> (its anchor G4-3 alone, reported)
 # The code is beside this script (a copy of $G/scripts/). TAG names the jobs of one chain.
 set -euo pipefail
 STAGE=${1:?a stage: fetchbt, build, check, evaldata, setup, train, adapter, translate, score, texts, classify, blind, report, smoke-translate, smoke-score, smoke-report, fetchval, heldout, own, smoke2-report, replay, build2, heldout3, build3, smoke3-report, build4, smoke4-report, novels4, build5, split5, refqe5, resume5, report5, smoke5-report}
@@ -254,7 +258,7 @@ g45_stack() {  # g45_stack MODEL OUT: G4-5c<k>, the k-th of the search's top, st
 g45_train() {  # the training runs of G4-5 (draft amendment G4-5): the warmup, the branches, the search, the smoke runs
   RUN=${RUN:?g4arm_G4-5_warmup, g4arm_G4-5_<branch>, $G5_SEARCH or a smoke run (g4arm_G4-5_s8, _b8, _c8)}
   tpu_free
-  local setdir steps every lrw decay from="" resume=0 combine="" b
+  local setdir steps every lrw decay from="" resume=0 combine="" temps="" init="" b
   every=$(g4a_const EVAL_EVERY5)
   lrw=$(g4a_const LR_WARMUP_STEPS5)
   decay=$(g4a_const DECAY_FRACTION5)
@@ -265,6 +269,9 @@ g45_train() {  # the training runs of G4-5 (draft amendment G4-5): the warmup, t
     g4arm_G4-5_b8) setdir=$G5/G4-5-smoke-branch; steps=8; every=4; lrw=$(g4a_const SMOKE5_LR_WARMUP)
                    decay=$(g4a_const SMOKE5_DECAY); from=g4arm_G4-5_s8 ;;
     g4arm_G4-5_c8|"$G5_SEARCH") setdir=$G5/G4-5-smoke-warmup; steps=1; every=1; lrw=0; decay=0; combine=1 ;;
+    # addendum G4-5.7b: the temperature probe, eval only (no step runs; the set is only the stack's training input)
+    g4arm_G4-5_temp0) setdir=$G5/G4-5-smoke-warmup; steps=1; every=1; lrw=0; decay=0; temps=1 ;;
+    g4arm_G4-5_tempw) setdir=$G5/G4-5-smoke-warmup; steps=1; every=1; lrw=0; decay=0; temps=1; init=$G5_WARMUP ;;
     "$G5_WARMUP") setdir=$G5/G4-5-warmup; decay=0 ;;
     g4arm_G4-5_*) b=${RUN#g4arm_G4-5_}
                   case " $G5_BRANCHES " in *" $b "*) ;; *) echo "RUN $RUN: $b is no branch of G4-5 ($G5_BRANCHES)"; exit 1 ;; esac
@@ -292,8 +299,16 @@ g45_train() {  # the training runs of G4-5 (draft amendment G4-5): the warmup, t
       { echo "no checkpoint of step $resume in $G/runs/$RUN/maxtext/$RUN/checkpoints/ (resume5 first)"; exit 1; }
     ARGS="$ARGS --resume-step $resume --resume-adapter $D/resume-adapter.npz"
   fi
+  if [ -n "$init" ]; then
+    # the adapter of the run's last step as the LoRA parameters before the eval-only round
+    gsutil -q cp "$G/runs/$init/adapter.npz" "$D/init-adapter.npz"
+    gsutil -q cp "$G/runs/$init/adapter.json" "$D/init-adapter.json"
+    g45_check_adapter "$D/init-adapter.json"
+    ARGS="$ARGS --init-adapter $D/init-adapter.npz"
+  fi
+  [ -z "$temps" ] || ARGS="$ARGS --temperatures $(g4a_const TEMPERATURES5)"
   if [ -n "$combine" ]; then
-    local comps="" n names objective
+    local comps="" n names objective check=""
     if [ "$RUN" = g4arm_G4-5_c8 ]; then
       names="shared b8 g43"
       objective="--objective books=1 --objective novels=1"
@@ -302,6 +317,10 @@ g45_train() {  # the training runs of G4-5 (draft amendment G4-5): the warmup, t
     else
       names="shared $G5_BRANCHES"
       objective=$($SFT_PY -c "import sys; sys.path.insert(0, '$CODE'); import g4arm; print(' '.join(f'--objective {k}={v}' for k, v in g4arm.OBJECTIVE5.items()))")
+      # addendum G4-5.7b: the merged warmup alone against the warmup's own eval at its last step, before the search
+      gsutil -q cp "$G/runs/$G5_WARMUP/summary.json" "$D/warmup-summary.json"
+      check=$($SFT_PY -c "import sys; sys.path.insert(0, '$CODE'); import g4arm; print(' '.join(f'--check-set {s}' for s in g4arm.WARMUP_CHECK_SETS5), '--check-max-diff', g4arm.MERGE_MAX_DIFF5)")
+      check="--warmup-check $D/warmup-summary.json $check"
     fi
     for n in $names; do
       mkdir -p "$D/components/$n"
@@ -312,13 +331,13 @@ g45_train() {  # the training runs of G4-5 (draft amendment G4-5): the warmup, t
     $SFT_PY "$CODE/g4mix.py" spec $comps $objective --budget "${SEARCH_BUDGET:-$(g4a_const SEARCH_BUDGET5)}" \
       --top-k "${SEARCH_TOP_K:-$(g4a_const SEARCH_TOP_K5)}" --step "${SEARCH_STEP:-0.25}" --min-step "${SEARCH_MIN_STEP:-0.0625}" \
       --lower "${SEARCH_LOWER:-0.0}" --upper "${SEARCH_UPPER:-1.5}" --start "${SEARCH_START:-uniform}" \
-      --shared-coef "${SEARCH_SHARED:-1.0}" --scale 0.5 --out "$D/spec.json" > /dev/null
+      --shared-coef "${SEARCH_SHARED:-1.0}" --scale 0.5 $check --out "$D/spec.json" > /dev/null
     ARGS="$ARGS --combine $D/spec.json"
   fi
   SFT_ARGS="$ARGS" MULTIHOST=1 NAME=$RUN MODEL=gemma4-31b DATA=$D/train.parquet TEMPLATE=$D/template.jinja ROOT=$G \
     STEPS=$steps bash "$CODE/run_sft.sh" per_device_batch_size=1 max_target_length="$(g4a_const SEQ3)" \
     lora.lora_rank=32 lora.lora_alpha=16.0 learning_rate="$(g4a_const LR5)" lr_schedule_type=wsd \
-    wsd_decay_style=linear learning_rate_final_fraction=0.1
+    wsd_decay_style=linear learning_rate_final_fraction=0.1 ${temps:+num_vocab_tiling=1}
 }
 
 case $STAGE in
@@ -1157,10 +1176,11 @@ for m in $MODELS5; do mkdir -p $X/\$m; gsutil -m -q rsync -r -x 'translations/.*
 gsutil -q cp $G/data/eval/evalsets.parquet $G5S/split.json $G5S/refqe.parquet $NAT/predictions.parquet $X/
 gsutil -q cp $G/runs/$G5_SEARCH/summary.json $X/search.json
 for r in $RUNS5; do gsutil -q cp $G/runs/\$r/summary.json $X/runs/\$r.json; done
+${SMOKE5:+gsutil -q cp $SMOKE5 $X/smoke5.json}
 TALLY=""
 if gsutil -q stat $REP/tally.json; then gsutil -q cp $REP/tally.json $X/; TALLY="--tally $X/tally.json"; fi
 $FPY -I -u $CODE/g4arm.py report5 --evalsets $X/evalsets.parquet --split $X/split.json --refqe $X/refqe.parquet \
-  --base $X/G4-0 --predictions $X/predictions.parquet --search $X/search.json $ARGS5 \$TALLY --out $X/report.md
+  --base $X/G4-0 --predictions $X/predictions.parquet --search $X/search.json $ARGS5 \$TALLY ${SMOKE5:+--smoke $X/smoke5.json} --out $X/report.md
 gsutil -m -q cp $X/report.md $X/report.json $REP/
 echo "REPORT5_DONE $REP/report.md"
 EOF

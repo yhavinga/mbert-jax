@@ -32,7 +32,14 @@ MaxText's `steps` and the schedule run over N + own steps, so the learning rate 
 the end (the fractions of MaxText's schedule computed for N + own). With --combine SPEC (g4mix.py spec) the first
 eval runs, after its usual round, the search over the weights of a shared warmup and its branches (KernelMerger: the
 model's base kernels replaced by W0 + the stacked update, one point at a time, forward only), the top K on every eval
-file, and puts the base kernels back; summary.json keeps it under "combine".
+file, and puts the base kernels back; summary.json keeps it under "combine". Addendum G4-5.7b: the repeated first point
+is equal within the spec's repeat_max_diff; with the spec's warmup_check the merged warmup alone (w = 0) is evaluated
+first on the check's sets and must give the warmup's own eval (same target tokens, within max_diff), else the run stops
+before any other point.
+With --temperatures GRID (addendum G4-5.7b, a measurement that decides nothing) the run is eval only: the first eval
+(before any step) also gives, per file and per temperature T of the grid, the token-weighted loss of softmax(logits / T)
+from the same forward pass (MaxText's loss on the full logits: num_vocab_tiling=1), and the run stops after that round
+without a training step; summary.json keeps it per eval under "temperatures".
 Writes to DIR (process 0): summary.json (configuration, times, throughput, memory per chip, loss per step), adapter.npz
 (the LoRA parameters in float32, keys as decoder/layers_0/self_attention/query/kernel_lora_a), adapter.json (rank,
 alpha, module regex, model, checkpoint, original dtype); MaxText's output (metrics file, tensorboard, Tunix's checkpoint
@@ -265,6 +272,89 @@ def needs_final_eval(evals, steps):
     return bool(evals) and evals[-1]["step"] != steps
 
 
+class EvalOnlyDone(Exception):
+    """--temperatures: the first eval round is done; no training step follows"""
+
+
+def temperature_grid(text):
+    """--temperatures LOW:HIGH:STEP (both ends included) or T1,T2,...: ascending, distinct, all > 0, with 1.0 among
+    them (the training stack's own loss, the check of the measurement)"""
+    if ":" in text:
+        parts = text.split(":")
+        if len(parts) != 3:
+            raise SystemExit(f"--temperatures {text!r}: LOW:HIGH:STEP or T1,T2,...")
+        low, high, step = (float(x) for x in parts)
+        if not 0 < low <= high or step <= 0:
+            raise SystemExit(f"--temperatures {text!r}: 0 < LOW <= HIGH, STEP > 0")
+        n = int(round((high - low) / step))
+        if abs(low + n * step - high) > 1e-9:
+            raise SystemExit(f"--temperatures {text!r}: HIGH is not LOW + k x STEP")
+        temps = [round(low + k * step, 6) for k in range(n + 1)]
+    else:
+        temps = sorted({float(x) for x in text.split(",")})
+    if not temps or temps[0] <= 0 or 1.0 not in temps:
+        raise SystemExit(f"--temperatures {text!r}: every T > 0, and 1.0 among them")
+    return temps
+
+
+def temperature_losses(logits, one_hot, temps):
+    """Per temperature T the per-token cross entropy of softmax(logits / T), logsumexp(z / T) - z_target / T, in
+    float32, shape [len(temps), *logits.shape[:-1]]; one T at a time (lax.map), so one scaled copy of the logits at most
+    is live. T changes no argmax: the greedy output is the same at every T."""
+    import jax
+    import jax.numpy as jnp
+
+    z = logits.astype(jnp.float32)
+    target = jnp.sum(one_hot * z, axis=-1)
+    t = jnp.asarray(temps, jnp.float32)
+    lse = jax.lax.map(lambda x: jax.scipy.special.logsumexp(z / x, axis=-1), t)
+    return lse - target[None] / t.reshape((-1,) + (1,) * target.ndim)
+
+
+def with_temperatures(eval_loss_fn, temps, micro_batch, module):
+    """MaxText's eval loss with aux["xent_temps"]: per temperature the cross-entropy sum over the target tokens
+    (targets_segmentation != 0, as MaxText's xent_sum) from the same forward pass. MaxText's loss_fn hands the full
+    logits (num_vocab_tiling 1) to module.cross_entropy_with_logits; that function is wrapped so that, while this loss
+    is traced, it gives the logits to temperature_losses too (under jit the Python here runs once, at tracing)."""
+    import jax.numpy as jnp
+
+    original = module.cross_entropy_with_logits
+    seen = {"on": False}
+
+    def cross_entropy(logits, targets, z_loss=0.0):
+        if seen["on"]:
+            if "per_token" in seen:
+                raise SystemExit("--temperatures: two cross entropies in one eval loss")
+            seen["per_token"] = temperature_losses(logits, targets, temps)
+        return original(logits, targets, z_loss=z_loss)
+
+    module.cross_entropy_with_logits = cross_entropy
+
+    def loss_fn(model, **inputs):
+        seen.pop("per_token", None)
+        seen["on"] = True
+        try:
+            loss, aux = eval_loss_fn(model, **inputs)
+        finally:
+            seen["on"] = False
+        if "per_token" not in seen:
+            raise SystemExit("--temperatures: MaxText's eval loss did not call cross_entropy_with_logits "
+                             "(num_vocab_tiling must be 1)")
+        per_token = seen.pop("per_token")
+        mask = (inputs["targets_segmentation"][:micro_batch] != 0).astype(jnp.float32)
+        return loss, {**aux, "xent_temps": jnp.sum(per_token * mask[None], axis=tuple(range(1, per_token.ndim)))}
+
+    return loss_fn
+
+
+def temperature_record(temps, sums, weights, batches):
+    """{"t": temps, "loss": per T the file's cross entropy over its target tokens} from the per-batch sums"""
+    if len(sums) != batches or any(len(x) != len(temps) for x in sums) or weights <= 0:
+        raise SystemExit(f"--temperatures: {len(sums)} batches of {[len(x) for x in sums[:3]]} sums for "
+                         f"{len(temps)} temperatures, {batches} planned, {weights} tokens")
+    return {"t": list(temps), "loss": [sum(x[k] for x in sums) / weights for k in range(len(temps))]}
+
+
 def lr_points(steps, warmup_fraction, decay_fraction, extra=()):
     """The steps whose learning rate summary.json records: start, end of warmup, middle, start of the decay, last (and
     `extra`, e.g. a resumed run's first steps)"""
@@ -450,17 +540,30 @@ def run_combine(spec, model, mesh, run_files, names):
     objective_sets = list(spec["objective"])
     records = []
 
-    def evaluate(w, tag, sets):
+    def evaluate(w, tag, sets, into=records):
         coefs = g4mix.coefficients(w, spec["shared_coef"])
         t = time.perf_counter()
         merger.apply(coefs)
         merge_s = time.perf_counter() - t
         rows = run_files(sets, tag)
         losses = {r["set"]: r["loss"] for r in rows}
-        records.append({"tag": tag, "w": list(w), "coefs": coefs, "losses": losses,
-                        "tokens": {r["set"]: r["tokens"] for r in rows}, "merge_s": round(merge_s, 1),
-                        "seconds": round(time.perf_counter() - t, 1)})
+        into.append({"tag": tag, "w": list(w), "coefs": coefs, "losses": losses,
+                     "tokens": {r["set"]: r["tokens"] for r in rows}, "merge_s": round(merge_s, 1),
+                     "seconds": round(time.perf_counter() - t, 1)})
         return losses
+
+    warmup = None
+    if spec.get("warmup_check"):
+        # addendum G4-5.7b: the merged warmup alone against the warmup's own eval, before any point of the search
+        check, kept = spec["warmup_check"], []
+        losses = evaluate([0.0] * (len(spec["components"]) - 1), "check/warmup", list(check["losses"]), into=kept)
+        warmup = g4mix.warmup_check_result(check, losses, kept[0]["tokens"]) | {"seconds": kept[0]["seconds"]}
+        # process 0's verdict everywhere, so that all processes stop or go on together
+        warmup["holds"] = broadcast_float(1.0 if warmup["holds"] else 0.0) == 1.0
+        print(f"WARMUP_CHECK {json.dumps(warmup)}", flush=True)
+        if not warmup["holds"]:
+            raise SystemExit(f"--combine: the merged warmup alone is not the warmup's own eval at step {check['step']} "
+                             f"(same tokens, within {check['max_diff']}; addendum G4-5.7b): {json.dumps(warmup)}")
 
     def objective(w):
         losses = evaluate(w, f"search/{len(records)}", objective_sets)
@@ -478,8 +581,8 @@ def run_combine(spec, model, mesh, run_files, names):
     again = g4mix.objective_value(evaluate(first["w"], "repeat", objective_sets), spec["objective"])
     merger.restore()
     out = {"spec": spec, "search": search, "evals": records,
-           "repeat": {"w": first["w"], "first": first["value"], "again": again, "equal": again == first["value"]},
-           "seconds": round(time.perf_counter() - t0, 1)}
+           "repeat": g4mix.repeat_result(first["w"], first["value"], again, spec["repeat_max_diff"]),
+           "warmup_check": warmup, "seconds": round(time.perf_counter() - t0, 1)}
     print(f"COMBINE {json.dumps({k: out[k] for k in ('repeat', 'seconds')} | {'best': search['best'], 'top': [(p['w'], p['value']) for p in search['top']], 'evaluations': search['evaluations'], 'stopped': search['stopped']})}",
           flush=True)
     return out
@@ -491,6 +594,19 @@ def scalar(x):
 
     value = x.addressable_data(0) if hasattr(x, "addressable_data") else x
     return float(np.asarray(value))
+
+
+def vector(x):
+    """A device vector on the host (this process's copy if replicated, else gathered from every process)"""
+    import numpy as np
+
+    if getattr(x, "is_fully_replicated", True):
+        value = x.addressable_data(0) if hasattr(x, "addressable_data") else x
+    else:
+        from jax.experimental import multihost_utils
+
+        value = multihost_utils.process_allgather(x, tiled=True)
+    return [float(v) for v in np.asarray(value).reshape(-1)]
 
 
 def count_batches(iterator):
@@ -573,6 +689,9 @@ def main(argv=None):
                         help="WSD decay over int(this x the run's own steps) steps at its end (0: none)")
     parser.add_argument("--combine", default=None,
                         help="g4mix.py spec: the search over the weights of a warmup and its branches at the first eval")
+    parser.add_argument("--temperatures", default=None,
+                        help="LOW:HIGH:STEP or T1,T2,...: eval only, the first eval's loss per file also at logits / T "
+                             "for every T (with 1.0), from the same forward pass; needs num_vocab_tiling=1")
     args = parser.parse_args(own)
     if args.resume_step < 0 or bool(args.resume_step) != bool(args.resume_adapter):
         raise SystemExit("--resume-step N (> 0) and --resume-adapter go together")
@@ -587,9 +706,17 @@ def main(argv=None):
         combine_spec = json.loads(Path(args.combine).read_text())
     evals_wanted = parse_evals(args.eval)
     if combine_spec:
+        if "repeat_max_diff" not in combine_spec:
+            raise SystemExit("--combine: the spec has no repeat_max_diff (g4mix.py spec of addendum G4-5.7b)")
         unknown = [s for s in combine_spec["objective"] if s not in evals_wanted]
+        unknown += [s for s in (combine_spec.get("warmup_check") or {}).get("losses", {}) if s not in evals_wanted]
         if unknown or not evals_wanted:
-            raise SystemExit(f"--combine: the objective's sets {unknown} are no --eval")
+            raise SystemExit(f"--combine: the objective's or the warmup check's sets {unknown} are no --eval")
+    temps = None
+    if args.temperatures:
+        if combine_spec or args.resume_step or not evals_wanted:
+            raise SystemExit("--temperatures is an eval-only measurement: --eval files, no --combine, no --resume-step")
+        temps = temperature_grid(args.temperatures)
     overrides = overrides + eval_overrides(evals_wanted, args.eval_every)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -660,6 +787,11 @@ def main(argv=None):
         decay = int(args.decay_fraction * own_steps)
         base = base + schedule_overrides(steps, args.warmup_steps, decay)
     config = pyconfig.initialize_pydantic(base + [f"steps={steps}"])
+    if temps and (config.num_vocab_tiling != 1 or config.z_loss_multiplier != 0):
+        # the wrapped cross entropy must see the full logits at the top of the loss (no tiles in a scan), and the
+        # loss must be the plain cross entropy
+        raise SystemExit(f"--temperatures needs num_vocab_tiling=1 and z_loss_multiplier=0, not "
+                         f"{config.num_vocab_tiling} and {config.z_loss_multiplier}")
     # before the training, so that a schedule this cannot read stops the run before it costs anything
     lr_at = learning_rates(config, steps, extra=(args.resume_step, args.resume_step + 1) if args.resume_step else ())
     print(f"LR {json.dumps({'type': str(config.lr_schedule_type), 'at': lr_at})}", flush=True)
@@ -708,6 +840,12 @@ def main(argv=None):
     resumed = check_resume(trainer, args.resume_step, args.resume_adapter) if args.resume_step else None
     if resumed:
         print(f"RESUMED {json.dumps(resumed)}", flush=True)
+    if temps:
+        from maxtext.utils import max_utils
+
+        trainer.eval_loss_fn = with_temperatures(trainer.eval_loss_fn, temps, config.micro_batch_size_to_eval_on,
+                                                 max_utils)
+        print(f"TEMPERATURES {json.dumps(temps)}", flush=True)
 
     hooks = trainer.training_hooks
     records, batch_counts = [], []
@@ -737,7 +875,7 @@ def main(argv=None):
         data_hooks = trainer.data_hooks
         close(data_hooks.eval_data_iterator)          # the hooks' own iterator of the first file, never read
         data_hooks.eval_data_iterator = [None]        # truthy for Tunix's `if eval_ds`; iterated, never read
-        feed = {"iter": None, "left": 0, "parts": [], "eval_step": None}
+        feed = {"iter": None, "left": 0, "parts": [], "temps": [], "eval_step": None}
 
         def load_next_eval_batch(ctx):  # noqa: ARG001 - Tunix's signature
             if feed["left"] <= 0:
@@ -756,6 +894,8 @@ def main(argv=None):
             def eval_recorded(*args_, **kwargs_):
                 loss, aux = eval_step(*args_, **kwargs_)
                 feed["parts"].append((aux["xent_sum"], aux["total_weights"]))
+                if temps:
+                    feed["temps"].append(aux["xent_temps"])
                 return loss, aux
 
             feed["eval_step"] = eval_recorded
@@ -770,14 +910,17 @@ def main(argv=None):
             for name in names:
                 plan = eval_plan[name]
                 feed["iter"] = eval_iterator(plan["config"], mesh)
-                feed["left"], feed["parts"] = plan["batches"], []
+                feed["left"], feed["parts"], feed["temps"] = plan["batches"], [], []
                 t0 = time.perf_counter()
                 run_eval_tunix(eval_ds, eval_step_fn)
                 close(feed["iter"])
                 if feed["left"]:
                     raise SystemExit(f"eval {name} at step {step}: {feed['left']} planned batches not run")
-                record = eval_loss(name, step, [(scalar(x), scalar(w)) for x, w in feed["parts"]], plan["batches"],
-                                   time.perf_counter() - t0)
+                parts = [(scalar(x), scalar(w)) for x, w in feed["parts"]]
+                record = eval_loss(name, step, parts, plan["batches"], time.perf_counter() - t0)
+                if temps:
+                    record["temperatures"] = temperature_record(temps, [vector(x) for x in feed["temps"]],
+                                                                sum(w for _, w in parts), plan["batches"])
                 if tag is not None:
                     record["combo"] = tag
                 out.append(record)
@@ -790,6 +933,9 @@ def main(argv=None):
                 combined["result"] = run_combine(
                     combine_spec, trainer.model, mesh,
                     lambda names, tag: run_files(names, eval_ds, eval_step_fn, tag), list(eval_plan))
+            if temps:
+                # eval only: Tunix's first eval comes before the first train step, which is then never compiled
+                raise EvalOnlyDone()
 
         trainer._run_eval = run_eval  # noqa: SLF001
         on_end = hooks.on_train_end
@@ -803,9 +949,16 @@ def main(argv=None):
         hooks.on_train_end = train_end
 
     t_train = time.time()
-    train_sft.train_model(config, trainer, mesh)
+    try:
+        train_sft.train_model(config, trainer, mesh)
+    except EvalOnlyDone:
+        if not temps:
+            raise
     train_s = time.time() - t_train
-    if trainer.train_steps != steps or len(records) != own_steps:
+    if temps:
+        if records or not evals or any("temperatures" not in e for e in evals):
+            raise SystemExit(f"--temperatures: {len(records)} steps ran, {len(evals)} evals: not the eval-only round")
+    elif trainer.train_steps != steps or len(records) != own_steps:
         # the loop ended early (the data ran out) or a step went unlogged: not the run that was set up
         raise SystemExit(f"trained up to step {trainer.train_steps} ({len(records)} logged), not {steps} "
                          f"({own_steps} own steps)")
@@ -861,10 +1014,13 @@ def main(argv=None):
         "lr_at": lr_at,
         "init_adapter": init_adapter,
         "combine": combined.get("result"),
+        "temperatures": temps,
     }
     if summary["throughput"]:
         summary["throughput"]["tokens_per_s_per_chip"] = round(summary["throughput"]["tokens_per_s"] / jax.device_count(), 1)
     if main_process:
+        if temps and not (out / "metrics.txt").exists():
+            (out / "metrics.txt").write_text("")   # eval only: MaxText logged no step; run_sft.sh copies the file
         np.savez(out / "adapter.npz", **flat)
         adapter = {"rank": lora.lora_rank, "alpha": lora.lora_alpha, "scale": lora.lora_alpha / lora.lora_rank,
                    "module_path": summary["lora"]["module_path"], "model": config.model_name,

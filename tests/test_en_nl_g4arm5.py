@@ -182,6 +182,42 @@ def test_spec_wants_the_shared_warmup_first():
         g4mix.spec_dict([("b0", "x")], {"a": 1.0})
     s = spec(2)
     assert s["components"][0]["name"] == "shared" and s["search"]["budget"] == 80 and s["search"]["top_k"] == 4
+    assert s["repeat_max_diff"] == 1e-4 and "warmup_check" not in s
+
+
+def test_repeat_is_equal_within_1e_4_addendum_g4_5_7b():
+    # the smoke test's pair (18 Nov): the first value broadcast in float32, the repeat in float64
+    r = g4mix.repeat_result([0.0, 0.0], 2.4015402793884277, 2.401540332915216, g4mix.REPEAT_MAX_DIFF)
+    assert r["equal"] and r["diff"] == pytest.approx(5.4e-8, abs=1e-8)
+    # a rest of an earlier point after a failed restore of the base kernels (>= 1e-2)
+    assert not g4mix.repeat_result([0.0], 2.40, 2.41, g4mix.REPEAT_MAX_DIFF)["equal"]
+
+
+def warmup_summary(books=2.0, novels=1.5, tokens=130996):
+    return {"steps": 1000, "eval": [{"step": s, "set": n, "loss": v + (1.0 if s == 0 else 0.0), "tokens": tokens}
+                                    for s in (0, 500, 1000) for n, v in (("books", books), ("novels", novels))]}
+
+
+def test_warmup_check_takes_the_warmups_last_eval_and_holds_within_its_bound(tmp_path):
+    check = g4mix.warmup_check_of(warmup_summary(), ["books", "novels"], 0.02)
+    assert check["step"] == 1000 and check["losses"] == {"books": 2.0, "novels": 1.5}
+    assert check["tokens"] == {"books": 130996, "novels": 130996}
+    tokens = {"books": 130996, "novels": 130996}
+    ok = g4mix.warmup_check_result(check, {"books": 2.019, "novels": 1.49}, tokens)
+    assert ok["holds"] and ok["diff"]["books"] == pytest.approx(0.019)
+    # the smoke test's s8 merged (0.079 off) fails; other batches (tokens) fail
+    assert not g4mix.warmup_check_result(check, {"books": 2.079, "novels": 1.5}, tokens)["holds"]
+    assert not g4mix.warmup_check_result(check, {"books": 2.0, "novels": 1.5}, {**tokens, "novels": 1})["holds"]
+    with pytest.raises(ValueError, match="no eval"):
+        g4mix.warmup_check_of(warmup_summary(), ["books", "flanval"], 0.02)
+    # the CLI puts it into the spec
+    (tmp_path / "w.json").write_text(json.dumps(warmup_summary()))
+    g4mix.main(["spec", "--component", "shared=s.npz", "--component", "b0=b.npz", "--objective", "wmt24pp_s=1",
+                "--warmup-check", str(tmp_path / "w.json"), "--check-set", "books", "--check-set", "novels",
+                "--check-max-diff", "0.02", "--out", str(tmp_path / "spec.json")])
+    x = json.loads((tmp_path / "spec.json").read_text())
+    assert x["warmup_check"]["losses"] == {"books": 2.0, "novels": 1.5} and x["warmup_check"]["max_diff"] == 0.02
+    assert x["repeat_max_diff"] == 1e-4
 
 
 # ---------------------------------------------------------------------------------------------------- the split
@@ -375,11 +411,80 @@ def test_lr_points_hold_the_resumed_steps_and_the_cooldown():
 
 
 def test_sft_lora_refuses_inconsistent_arguments_before_jax(tmp_path):
+    old = {k: v for k, v in spec(1).items() if k != "repeat_max_diff"}       # a spec from before addendum G4-5.7b
+    (tmp_path / "old.json").write_text(json.dumps(old))
+    checked = spec(1, warmup_check=g4mix.warmup_check_of(warmup_summary(), ["books", "novels"], 0.02))
+    (tmp_path / "checked.json").write_text(json.dumps(checked))
     for argv, msg in ((["--resume-step", "8"], "go together"), (["--warmup-steps", "2"], "go together"),
                       (["--warmup-steps", "2", "--decay-fraction", "1.0"], r"\[0, 1\)"),
-                      (["--combine", "x.json", "--steps", "8"], "measurement")):
+                      (["--combine", "x.json", "--steps", "8"], "measurement"),
+                      (["--combine", str(tmp_path / "old.json"), "--steps", "1", "--eval", "wmt24pp_s=f"],
+                       "repeat_max_diff"),
+                      (["--combine", str(tmp_path / "checked.json"), "--steps", "1", "--eval", "wmt24pp_s=f",
+                        "--eval", "books=g"], r"\['novels'\]"),
+                      (["--temperatures", "1,2", "--eval", "wmt24pp_s=f", "--eval", "books=g", "--eval", "novels=h",
+                        "--combine", str(tmp_path / "checked.json"), "--steps", "1"], "eval-only"),
+                      (["--temperatures", "1,2"], "eval-only"),
+                      (["--temperatures", "0.5,2", "--eval", "a=f"], "1.0 among them")):
         with pytest.raises(SystemExit, match=msg):
             sft_lora.main(["--out", str(tmp_path / "o"), *argv, "--", "steps=1"])
+
+
+def test_temperature_grid_and_record():
+    grid = sft_lora.temperature_grid("0.5:3.0:0.05")
+    assert len(grid) == 51 and grid[0] == 0.5 and grid[-1] == 3.0 and 1.0 in grid and grid[10] == 1.0
+    assert sft_lora.temperature_grid("2,1,1.5") == [1.0, 1.5, 2.0]
+    for bad in ("0.5:3.0:0.07", "0:2:0.5", "1:2", "-1,1"):
+        with pytest.raises(SystemExit):
+            sft_lora.temperature_grid(bad)
+    r = sft_lora.temperature_record([1.0, 2.0], [[3.0, 2.0], [1.0, 2.0]], 8.0, 2)
+    assert r == {"t": [1.0, 2.0], "loss": [0.5, 0.5]}
+    with pytest.raises(SystemExit, match="planned"):
+        sft_lora.temperature_record([1.0, 2.0], [[3.0, 2.0]], 8.0, 2)
+
+
+def test_temperature_losses_are_the_cross_entropy_of_the_scaled_logits_from_one_pass():
+    jax = pytest.importorskip("jax")
+    jnp = jax.numpy
+    rng = np.random.default_rng(0)
+    logits = rng.standard_normal((2, 5, 7)).astype(np.float32) * 3
+    labels = rng.integers(0, 7, (2, 5))
+    one_hot = np.eye(7, dtype=np.float32)[labels]
+    temps = [0.5, 1.0, 2.0]
+
+    def ce(z):
+        lse = np.log(np.exp(z - z.max(-1, keepdims=True)).sum(-1)) + z.max(-1)
+        return lse - np.take_along_axis(z, labels[..., None], -1)[..., 0]
+
+    got = np.asarray(sft_lora.temperature_losses(jnp.asarray(logits), jnp.asarray(one_hot), temps))
+    for k, t in enumerate(temps):
+        np.testing.assert_allclose(got[k], ce(logits / t), rtol=1e-5, atol=1e-5)
+    # greedy is the same at every T
+    assert (np.argmax(logits / 0.5, -1) == np.argmax(logits / 2.0, -1)).all()
+
+    # the wrapped eval loss: MaxText's own result unchanged, xent_temps the masked sums of the same pass
+    class MaxUtils:
+        @staticmethod
+        def cross_entropy_with_logits(z, targets, z_loss=0.0):
+            lse = jax.scipy.special.logsumexp(z, axis=-1)
+            return lse - jnp.sum(targets * z, axis=-1), jnp.zeros(z.shape[:-1])
+
+    module = MaxUtils()
+    seg = np.ones((2, 5), np.int32)
+    seg[1, 3:] = 0
+
+    def maxtext_eval_loss(model, inputs, targets, targets_segmentation):
+        xent, _ = module.cross_entropy_with_logits(model, jax.nn.one_hot(targets, 7))
+        xent = xent * (targets_segmentation != 0)
+        return jnp.sum(xent) / jnp.sum(targets_segmentation != 0), {"xent_sum": jnp.sum(xent),
+                                                                     "total_weights": jnp.sum(targets_segmentation != 0)}
+
+    wrapped = sft_lora.with_temperatures(maxtext_eval_loss, temps, 2, module)
+    loss, aux = jax.jit(lambda z, y, s: wrapped(z, inputs=y, targets=y, targets_segmentation=s))(
+        jnp.asarray(logits), jnp.asarray(labels), jnp.asarray(seg))
+    want = [float((ce(logits / t) * (seg != 0)).sum()) for t in temps]
+    np.testing.assert_allclose(np.asarray(aux["xent_temps"]), want, rtol=1e-5)
+    np.testing.assert_allclose(float(aux["xent_sum"]), want[1], rtol=1e-5)
 
 
 # ---------------------------------------------------------------------------------------------------- smoke5
@@ -488,7 +593,14 @@ def report_world(tmp_path, qe, share, human=2.0):
                                                                   "search": {"points": top, "top": top,
                                                                              "evaluations": 1, "stopped": "budget",
                                                                              "best": top[0]},
-                                                                  "repeat": {"equal": True}, "seconds": 1.0}}))
+                                                                  "repeat": {"equal": True},
+                                                                  "warmup_check": {"step": 1000, "holds": True,
+                                                                                   "tokens_equal": True,
+                                                                                   "want": {"books": 2.0},
+                                                                                   "got": {"books": 2.01},
+                                                                                   "diff": {"books": 0.01},
+                                                                                   "max_diff": 0.02},
+                                                                  "seconds": 1.0}}))
     for name, steps in (("warmup", (0, 1000)), ("books", (1000, 2000))):
         (tmp_path / f"{name}.json").write_text(json.dumps({"eval": [{"step": s, "set": "books", "loss": 2.0 - s / 1e4}
                                                                     for s in steps], "steps_done": 1000}))
@@ -498,7 +610,7 @@ def report_world(tmp_path, qe, share, human=2.0):
               base=str(tmp_path / "G4-0"), reference=[], predictions=str(tmp_path / "pred.parquet"),
               search=str(tmp_path / "search.json"),
               run=[f"warmup={tmp_path / 'warmup.json'}", f"books={tmp_path / 'books.json'}"], tally=None,
-              out=str(tmp_path / "report.md"))
+              smoke=None, out=str(tmp_path / "report.md"))
 
 
 def test_report5_selects_on_the_search_part_and_decides_on_the_decision_part(tmp_path, monkeypatch):
@@ -527,6 +639,76 @@ def test_report5_selects_on_the_search_part_and_decides_on_the_decision_part(tmp
     (tmp_path / "tally.json").write_text(json.dumps({**tally, "arm": "G4-5c2"}))
     with pytest.raises(SystemExit, match="selected candidate"):
         g4arm.report5(args)
+
+
+def test_report5_wants_the_searchs_checks_of_addendum_g4_5_7b_and_reports_the_smoke_anchor(tmp_path, monkeypatch):
+    monkeypatch.setattr(g4arm, "HUMAN_QE", {"wmt24pp": 2.0, "flores": 2.0, "ntrex": 2.0})
+    qe = {k: {"search": 1.9, "decision": 1.9} for k in ("G4-5c1", "G4-5c2", "G4-0")}
+    share = {k: {"search": 0.25, "decision": 0.25} for k in qe}
+    args = report_world(tmp_path, qe, share)
+    (tmp_path / "smoke.json").write_text(json.dumps({"checks": {"merge_g43_is_g43": {
+        "value": {"books": [0.8787, 0.8777], "novels": [0.8991, 0.8897]}, "holds": True}}}))
+    args.smoke = str(tmp_path / "smoke.json")
+    g4arm.report5(args)
+    text = (tmp_path / "report.md").read_text()
+    assert "aanvulling G4-5.7b" in text and "gehaald" in text and "G4-3 alleen" in text
+    search = json.loads((tmp_path / "search.json").read_text())
+    for key, value in (("warmup_check", {**search["combine"]["warmup_check"], "holds": False}),
+                       ("warmup_check", None), ("repeat", {"equal": False})):
+        bad = json.loads(json.dumps(search))
+        bad["combine"][key] = value
+        (tmp_path / "search.json").write_text(json.dumps(bad))
+        with pytest.raises(SystemExit, match="G4-5.7b"):
+            g4arm.report5(args)
+
+
+# ---------------------------------------------------------------------------------------------------- temp5
+
+def temp_run(curves, tokens=100, steps_done=0, shift=0.0):
+    """An eval-only temperature run: per set a curve over the grid, its own (stack) loss at T = 1 (+ shift)"""
+    grid = sft_lora.temperature_grid(g4arm.TEMPERATURES5)
+    out = []
+    for name, f in curves.items():
+        loss = [f(t) for t in grid]
+        out.append({"step": 0, "set": name, "tokens": tokens, "loss": f(1.0) + shift,
+                    "temperatures": {"t": grid, "loss": loss}})
+    return {"steps_done": steps_done, "eval": out}
+
+
+def test_temp5_fits_t_on_books_and_btval_and_reports_the_share_of_the_drop(tmp_path):
+    sets = ("books", "btval", "own", "novels")
+    # G4-0: books and btval lowest at T = 1.5 (2.5 -> 2.0), own lowest at the grid's lower end
+    curve = {"books": lambda t: 2.0 + (t - 1.5) ** 2 * 2, "btval": lambda t: 1.5 + (t - 1.5) ** 2 * 2,
+             "own": lambda t: 0.05 + 0.1 * t, "novels": lambda t: 2.0 + (t - 1.3) ** 2}
+    (tmp_path / "base.json").write_text(json.dumps(temp_run(curve)))
+    (tmp_path / "w.json").write_text(json.dumps(temp_run({s: (lambda t: 0.8 + (t - 1.0) ** 2) for s in sets})))
+    warm = {"steps": 1000, "eval": [{"step": st, "set": s, "loss": curve[s](1.0) if st == 0 else 1.0, "tokens": 100}
+                                    for st in (0, 1000) for s in sets]}
+    (tmp_path / "warm.json").write_text(json.dumps(warm))
+    g44 = {"heldout": {"loss": {s: {"0": curve[s](1.0), "9316": 0.5} for s in ("books", "btval", "own")}},
+           "novels": {"arm_loss": 0.75, "base_loss": curve["novels"](1.0)}}
+    (tmp_path / "g44.json").write_text(json.dumps(g44))
+    args = ns(base=str(tmp_path / "base.json"), warmup_run=str(tmp_path / "w.json"), warmup=str(tmp_path / "warm.json"),
+              g44_report=str(tmp_path / "g44.json"), out=str(tmp_path / "temp.md"))
+    g4arm.temp5(args)
+    r = json.loads((tmp_path / "temp.json").read_text())
+    assert r["fit"]["sets"] == ["books", "btval"] and r["fit"]["t"] == 1.5 and not r["fit"]["edge"]
+    books = r["sets"]["books"]
+    # L1 2.5, L_T* 2.0, warmup 1.0: a third of the drop; G4-4 0.5: a quarter
+    assert books["share_fit_warmup"] == pytest.approx(1 / 3) and books["share_fit_g44"] == pytest.approx(0.25)
+    assert r["sets"]["own"]["best_t"] == 0.5 and r["sets"]["own"]["best_edge"]
+    assert r["sets"]["novels"]["best_t"] == pytest.approx(1.3)
+    assert r["fit_warmup"]["t"] == 1.0 and r["sets"]["books"]["warmup_best_t"] == 1.0
+    text = (tmp_path / "temp.md").read_text()
+    assert "T\\* = 1,50" in text and "≤ 0,50" in text and "33,3%" in text
+    # T = 1 is not the round's own loss: the measurement is wrong
+    (tmp_path / "base.json").write_text(json.dumps(temp_run(curve, shift=1e-3)))
+    with pytest.raises(SystemExit, match="T = 1"):
+        g4arm.temp5(args)
+    # other target tokens than the warmup run's
+    (tmp_path / "base.json").write_text(json.dumps(temp_run(curve, tokens=99)))
+    with pytest.raises(SystemExit, match="target tokens"):
+        g4arm.temp5(args)
 
 
 def test_report5_without_a1_on_the_search_part_takes_the_smallest_excess_and_checks_the_human_qe(tmp_path, monkeypatch):

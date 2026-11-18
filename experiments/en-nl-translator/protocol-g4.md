@@ -822,3 +822,72 @@ search_repeat_equal and merge_warmup_is_lora`, `EXIT 0`). Yeb beslist vóór de 
 de herhaling bijvoorbeeld een tolerantie van 1e-6 of beide waarden door dezelfde broadcast; voor het warmup-anker wat
 er moet gelden, bijvoorbeeld de grens toetsen op een adapter met de update van een echte warmup, of samenvoegen in
 float32). Dat besluit wordt een nieuwe aanvulling, gecommit vóór de zoektocht.
+
+**Aanvulling 18 nov 2026 (tijdstip: de commit van deze aanvulling op branch `en-nl-g4arm5`): G4-5.7b, de twee controles
+van de zoektocht en een temperatuurproef** [besluiten van Yeb 18 nov ~08:45; uitwerking door een subagent, labels als
+in de kop]. Vastgelegd terwijl de takken van keten `g4e1118a` lopen, vóór de zoektocht, vóór de temperatuurproef en
+vóór elke uitslag van de zoektocht. De warmup is klaar; zijn eval-verliezen op stap 1.000 zijn het doel van controle 2
+hieronder en worden door de keten uit zijn `summary.json` gelezen, niet gekozen. Deze aanvulling heft de stop vóór de
+zoektocht van G4-5.7a op.
+
+*1. `search_repeat_equal`* [besluit Yeb]: "gelijk" = |eerste waarde − herhaling| ≤ **1e-4**. Waarom deze grens [Yeb]:
+de afrondingsruis is ~1e-7 (smoke-test: 5e-8, de eerste waarde door de broadcast in float32); een rest van een vorig
+punt na een fout bij het terugzetten van de basiskernels zou ≥ 1e-2 geven. Code: `g4mix.REPEAT_MAX_DIFF` in de spec
+(`repeat_max_diff`); `sft_lora.py --combine` schrijft `repeat.diff` en `repeat.equal`; de keten en `report5` stoppen
+als `equal` niet geldt.
+
+*2. `merge_warmup_is_lora`* [besluit Yeb]: de controle van de smoke-test is een unit-test van het inbakken, geen
+kwaliteitsmaat; de adapter van 8 stappen is te klein voor bf16 (G4-5.7a). Vervangen door: aan het begin van de echte
+zoektocht (`g4arm_G4-5_search`), vóór elk ander punt, het anker "warmup alleen" (w = 0, c_s = 1, ingebakken in de
+kernels zoals elk punt) op `books` en `novels`; het moet binnen **0,02** (`MERGE_MAX_DIFF5`) liggen van het eigen
+eval-verlies van de warmup op stap 1.000 op die sets (de `eval` in `summary.json` van run `g4arm_G4-5_warmup`, dezelfde
+waarden als zijn EVAL-regels), met dezelfde doeltokens [keuze: tokens gelijk erbij, anders vergelijkt de controle andere
+batches]. Faalt dat, dan stopt de zoektocht vóór de andere punten (regel `WARMUP_CHECK`, de run eindigt met een fout,
+de keten op `FAILED`); alle processen nemen het oordeel van proces 0 (gebroadcast). `report5` stopt als de controle
+ontbreekt of faalde. Het anker "G4-3 alleen" van de smoke-test (gehaald: books 0,8777 tegen 0,8787, novels 0,8897
+tegen 0,8991, verschil 0,001 / 0,009) blijft als bewijs in het verslag (`report5 --smoke`). `smoke5` blijft
+ongewijzigd: zijn uitslag van 18 nov staat (G4-5.7a) en hij draait niet opnieuw.
+
+*3. Temperatuurproef* [besluit Yeb: "goed idee, laten we dat ook doen"; rapporteren, beslist niets]. Vraag: welk deel
+van de daling van het teacher-forced verlies op menselijk Nederlands bij de fine-tunes is alleen kalibratie, dus een
+andere scherpte van dezelfde verdeling?
+- Maat: het token-gewogen verlies van softmax(z / T), z de logits van de trainingsstack (Gemma 4 met zijn soft-cap, in
+  float32), op dezelfde negen eval-sets en doeltokens als de training (`books`, `btval`, `own`, `btlong`, `novels`,
+  `flanval`, `wmt24pp_s`, `flores_s`, `ntrex_s`), voor T op een rooster van **0,50 tot 3,00 met stap 0,05** (51
+  waarden, 1,00 erbij) [keuze: ook T < 1, zodat een optimum onder 1 te zien is, bijvoorbeeld bij `own`, waar G4-0's eigen
+  greedy uitvoer het doel is].
+- **T verandert de volgorde van de logits niet** (z / T met T > 0 is monotoon in z): de greedy-uitvoer is bij elke T
+  gelijk. De proef meet alleen kalibratie, niets van wat (b), QE of de blinde beoordeling meten.
+- Uitvoering: `sft_lora.py --temperatures 0.5:3.0:0.05`, eval-only: de eerste evaluatie van Tunix (vóór de eerste
+  stap), daarna stopt de run zonder trainingsstap; één forward-pass per batch voor alle T (MaxText's
+  `cross_entropy_with_logits` op de volle logits wordt tijdens het tracen omwikkeld, `lax.map` over T). Daarvoor
+  `num_vocab_tiling=1` (de trainingsruns hebben 8; zonder trainingsstap past het geheugen [schatting, niet gemeten]).
+  Runs `g4arm_G4-5_temp0` (G4-0, geen adapter) en `g4arm_G4-5_tempw` (de adapter van de warmup op stap 1.000 via
+  `--init-adapter`: ligt zijn optimum al bij T = 1?).
+- Controles (anders stopt het rapport): per set geeft T = 1 het eigen verlies van dezelfde ronde (binnen 1e-4); de
+  doeltokens zijn die van de warmup-run; G4-4's verlies op stap 0 is dat van de warmup-run (zelfde batches, binnen
+  1e-4). Gerapporteerd: G4-0 bij T = 1 hier (num_vocab_tiling 1) tegen stap 0 van de warmup-run (8), en de
+  warmup-adapter bij T = 1 tegen het eigen eval-verlies van de warmup op stap 1.000.
+- **Keuze van T**: T\* = het minimum op het rooster van het gemiddelde van de verliezen van **`books` en `btval`** (elk
+  token-gewogen, de twee gelijk gewogen; bij gelijke waarden de T het dichtst bij 1) [keuze; waarom: (1) twee sets met
+  menselijk Nederlands als doel (Nederlandse boeken en de originele Nederlandse doelen van de BT), waar de vraag over
+  gaat; (2) ze bestaan sinds G4-2 in elke arm, zodat het aandeel ook voor G4-4 op de keuzesets te lezen is; (3) ze zijn
+  geen deel van het zoekdoel of van het beslisdeel van G4-5, zodat de proef niets van de zoektocht of het besluit
+  gebruikt; (4) de zeven andere sets liggen buiten de keuze: verklaart één T daar ook de daling, dan is dat geen fit op
+  die sets]. Daarnaast per set de beste T op het rooster (gerapporteerd, met "≤ 0,50" of "≥ 3,00" aan de randen).
+- **Lezing**: aandeel van de daling dat één temperatuur verklaart = (L₁ − L_T) / (L₁ − L_fine-tune) per set, met L₁ en
+  L_T van G4-0 in deze proef en L_fine-tune = de warmup op stap 1.000 en G4-4 na zijn laatste stap (9.316; uit
+  `g4-4-report.json`: `books`, `btval`, `own`, `btlong`, `novels`; de andere vier sets heeft G4-4 niet); voor T\* en voor
+  de beste T per set (de bovengrens van wat één T op die set kan). 1 = één temperatuur geeft de hele daling, 0 = niets;
+  bij `own` stijgt het verlies bij de fine-tunes, het aandeel is dan dat van de stijging; geen aandeel als de fine-tune
+  het verlies minder dan 0,001 verandert.
+- Rapport: `g4arm.py temp5` (op co1, uit de `summary.json` van de runs en `g4-4-report.json`) →
+  `mbert-ops/translator-sft/g4-5-temperature.md` en `.json`, kopie in `$G/report-G4-5/`.
+
+*Wat de vervolgketen doet* (`mbert-ops/scripts/g4arm5_after_hold.sh`, TAG `g4e1118b`): wacht tot keten `g4e1118a`
+eindigt met de HOLD-regel en `EXIT 0` (eindigt hij anders, dan `FAILED` zonder iets op de TPU); neemt dan de locks over,
+zet de code van deze aanvulling op de workers, draait de temperatuurproef (`g4arm_G4-5_temp0`, `g4arm_G4-5_tempw`,
+`temp5`), dan de zoektocht met controles 1 en 2, en daarna G4-5.5–G4-5.6 ongewijzigd: de top 4 vertalen en scoren,
+texts (met G4-4), classify, `report5` (met `--smoke`), het blinde pakket van de gekozen kandidaat. Faalt een stap, ook
+de temperatuurproef, dan stopt de keten (`FAILED`); de temperatuurproef kan bij een herstart worden overgeslagen
+(`TEMPERATURE=skip`), de zoektocht niet.

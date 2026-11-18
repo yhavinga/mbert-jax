@@ -42,6 +42,13 @@ file and per temperature T of the grid, the token-weighted loss of softmax(logit
 the search) without a training step; summary.json keeps it per eval under "temperatures". With --combine every point
 then has both objectives, at T = 1 and at its best T (calibrated); the spec's objective_mode says which one the search
 follows (addendum G4-5.7b A).
+Arm G4-6 (draft amendment G4-6): with --dpo SPEC (g4dpo.spec) the run is preference training: the training data are
+--pref-train, a packed file of g4dpo.py (pairs, chosen and rejected side by side in a row; one epoch is every batch of
+the file, the same on every process, so nothing is counted through MaxText's pipeline), and the loss is g4dpo.make_loss
+(the reference is the model with its LoRA parameters at zero, in the same step) for training and eval. MaxText's own
+data hooks are still made from the config's hf_train_files (any SFT file; never read). --pref-eval NAME=FILE adds a
+packed eval file (its pairs' loss, accuracy, margin and rewards, and the NLL of both sides, per eval); the --eval files
+keep their token-weighted loss, as before. summary.json keeps the per-step preference measures under "dpo".
 Writes to DIR (process 0): summary.json (configuration, times, throughput, memory per chip, loss per step), adapter.npz
 (the LoRA parameters in float32, keys as decoder/layers_0/self_attention/query/kernel_lora_a), adapter.json (rank,
 alpha, module regex, model, checkpoint, original dtype); MaxText's output (metrics file, tensorboard, Tunix's checkpoint
@@ -267,6 +274,30 @@ def eval_loss(name, step, parts, batches, seconds):
         raise SystemExit(f"eval {name} at step {step}: no target token")
     return {"step": step, "set": name, "batches": batches, "tokens": int(round(weights)), "loss": xent / weights,
             "seconds": round(seconds, 1)}
+
+
+def dpo_args(args, evals_wanted):
+    """--dpo's spec and its preference eval files {name: file}, checked before JAX: a measurement of its own (no
+    --combine, --temperatures, --resume-step, --init-adapter), names apart from the --eval files"""
+    if not args.dpo:
+        if args.pref_train or args.pref_eval:
+            raise SystemExit("--pref-train and --pref-eval belong to --dpo")
+        return None, {}
+    import g4dpo
+
+    if not args.pref_train:
+        raise SystemExit("--dpo needs --pref-train (a packed file of g4dpo.py)")
+    if args.combine or args.temperatures or args.resume_step or args.init_adapter:
+        raise SystemExit("--dpo: no --combine, --temperatures, --resume-step or --init-adapter")
+    try:
+        opts = g4dpo.read_spec(args.dpo)
+    except ValueError as bad:
+        raise SystemExit(f"--dpo {args.dpo}: {bad}") from None
+    prefs = parse_evals(args.pref_eval)
+    both = sorted(set(prefs) & set(evals_wanted))
+    if both:
+        raise SystemExit(f"--pref-eval and --eval both name {both}")
+    return opts, prefs
 
 
 def needs_final_eval(evals, steps):
@@ -708,6 +739,11 @@ def main(argv=None):
     parser.add_argument("--temperatures", default=None,
                         help="LOW:HIGH:STEP or T1,T2,...: eval only, the first eval's loss per file also at logits / T "
                              "for every T (with 1.0), from the same forward pass; needs num_vocab_tiling=1")
+    parser.add_argument("--dpo", default=None,
+                        help="g4dpo spec (json): preference training on --pref-train with the base model as reference")
+    parser.add_argument("--pref-train", default=None, help="with --dpo: the packed training file of g4dpo.py")
+    parser.add_argument("--pref-eval", action="append", default=[],
+                        help="with --dpo: NAME=FILE, a packed eval file of pairs (repeatable)")
     args = parser.parse_args(own)
     if args.resume_step < 0 or bool(args.resume_step) != bool(args.resume_adapter):
         raise SystemExit("--resume-step N (> 0) and --resume-adapter go together")
@@ -736,6 +772,10 @@ def main(argv=None):
         temps = temperature_grid(args.temperatures)
     if combine_spec and combine_spec["objective_mode"] == "calibrated" and not temps:
         raise SystemExit("--combine: the calibrated objective needs --temperatures (addendum G4-5.7b A)")
+    dpo_opts, prefs_wanted = dpo_args(args, evals_wanted)
+    if prefs_wanted and not evals_wanted:
+        # Tunix runs its eval rounds only with an eval iterator, which eval_overrides makes from the first --eval file
+        raise SystemExit("--pref-eval needs at least one --eval file")
     overrides = overrides + eval_overrides(evals_wanted, args.eval_every)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -769,8 +809,17 @@ def main(argv=None):
 
     count = {"batches": 0, "tokens": 0, "loss_tokens": 0}
     batches_per_process = None
+    pref_rows = config.global_batch_size_to_train_on
+    if dpo_opts:
+        # --dpo: the packed file's global batches (every process takes its rows of each), counted from the file
+        import g4dpo
+
+        count = {**g4dpo.packed_info(args.pref_train, pref_rows, config.max_target_length), "file": args.pref_train}
+        own_steps = count["batches"] if args.steps == "auto" else int(args.steps)
+        if not 1 <= own_steps <= count["batches"]:
+            raise SystemExit(f"--dpo: {own_steps} steps, the packed file has {count['batches']} batches")
     # A multi-host job counts also when given a number of steps, to hold that number to step_limit
-    if args.steps == "auto" or jax.process_count() > 1:
+    elif args.steps == "auto" or jax.process_count() > 1:
         mesh = maxtext_utils.get_mesh_from_config(config)
         iterator, unused_eval = create_data_iterator(config, mesh)
         close(unused_eval)
@@ -797,7 +846,8 @@ def main(argv=None):
             batches_per_process = [int(x) for x in np.asarray(counts).reshape(-1)]
             count["batches_per_process"] = batches_per_process
             count["step_limit"] = step_limit(batches_per_process)
-    own_steps = choose_steps(args.steps, batches_per_process)
+    if not dpo_opts:
+        own_steps = choose_steps(args.steps, batches_per_process)
     # --resume-step: MaxText's steps (Tunix's max_steps) and the schedule count from the restored step
     steps = args.resume_step + own_steps
     print(f"EPOCH {json.dumps(count | {'requested': args.steps, 'steps': steps, 'own_steps': own_steps, 'resume_step': args.resume_step})}",
@@ -841,10 +891,39 @@ def main(argv=None):
                                                                           f"eval_steps={min(counts)}"])}
         print(f"EVAL_PLAN {json.dumps({k: v for k, v in eval_plan[name].items() if k != 'config'} | {'set': name})}",
               flush=True)
+    for name, path in prefs_wanted.items():
+        # --dpo: a packed eval file, its global batches the same on every process (the eval step's batch shape: as
+        # many rows as MaxText's eval batches, so that one compiled eval step serves both kinds)
+        if config.global_batch_size_to_load_eval != pref_rows:
+            raise SystemExit(f"--pref-eval: eval batches of {config.global_batch_size_to_load_eval} rows, training "
+                             f"batches of {pref_rows}; the packed files have one size")
+        info = g4dpo.packed_info(path, pref_rows, config.max_target_length)
+        eval_plan[name] = {"path": path, "batches": info["batches"], "kind": "pref", "pairs": info["pairs"],
+                           "batches_per_process": [info["batches"]] * jax.process_count(), "end": "packed file"}
+        print(f"EVAL_PLAN {json.dumps(eval_plan[name] | {'set': name})}", flush=True)
 
     t_setup = time.time()
     trainer, mesh = train_sft.setup_trainer_state(config)
     setup_s = time.time() - t_setup
+    dpo_steps = []
+    if dpo_opts:
+        # --dpo: MaxText's loss replaced by the preference loss (training and eval), MaxText's training data by the
+        # packed file's batches (one all-zero batch after them for Tunix's look-ahead), and every step's sums kept
+        trainer = trainer.with_loss_fn(g4dpo.make_loss(config, dpo_opts, True), has_aux=True)
+        trainer.eval_loss_fn = g4dpo.make_loss(config, dpo_opts, False)
+        hooks_data = trainer.data_hooks
+        close(hooks_data.train_data_iterator)
+        pref_iter = g4dpo.global_iterator(args.pref_train, mesh, pref_rows, own_steps, padding=1)
+        hooks_data.train_data_iterator = pref_iter
+        hooks_data.train_data_loader.data_iterator = pref_iter
+        post_train = trainer._post_process_train_step  # noqa: SLF001 - wrapped, not replaced
+
+        def keep_dpo_step(aux):
+            dpo_steps.append({k: aux[f"pref_{k}"] for k in g4dpo.SUMS})   # device scalars, read after training
+            return post_train(aux)
+
+        trainer._post_process_train_step = keep_dpo_step  # noqa: SLF001
+        print(f"DPO {json.dumps({'spec': dpo_opts, 'train': count, 'own_steps': own_steps})}", flush=True)
     # Shapes only (no transfer): what the LoRA regex reached, before the first step, so a run that fails in compilation
     # still shows it
     lora_sizes = {path_key(path): math.prod(leaf.shape) for path, leaf in jax.tree_util.tree_flatten_with_path(
@@ -894,7 +973,7 @@ def main(argv=None):
         data_hooks = trainer.data_hooks
         close(data_hooks.eval_data_iterator)          # the hooks' own iterator of the first file, never read
         data_hooks.eval_data_iterator = [None]        # truthy for Tunix's `if eval_ds`; iterated, never read
-        feed = {"iter": None, "left": 0, "parts": [], "temps": [], "eval_step": None}
+        feed = {"iter": None, "left": 0, "parts": [], "temps": [], "prefs": [], "eval_step": None}
 
         def load_next_eval_batch(ctx):  # noqa: ARG001 - Tunix's signature
             if feed["left"] <= 0:
@@ -913,6 +992,8 @@ def main(argv=None):
             def eval_recorded(*args_, **kwargs_):
                 loss, aux = eval_step(*args_, **kwargs_)
                 feed["parts"].append((aux["xent_sum"], aux["total_weights"]))
+                if dpo_opts:
+                    feed["prefs"].append({k: aux[f"pref_{k}"] for k in g4dpo.SUMS})
                 if temps:
                     feed["temps"].append(aux["xent_temps"])
                 return loss, aux
@@ -928,13 +1009,26 @@ def main(argv=None):
             out = []
             for name in names:
                 plan = eval_plan[name]
-                feed["iter"] = eval_iterator(plan["config"], mesh)
-                feed["left"], feed["parts"], feed["temps"] = plan["batches"], [], []
+                pref = plan.get("kind") == "pref"
+                if pref:
+                    feed["iter"] = g4dpo.global_iterator(plan["path"], mesh, pref_rows, plan["batches"])
+                else:
+                    feed["iter"] = eval_iterator(plan["config"], mesh)
+                feed["left"], feed["parts"], feed["temps"], feed["prefs"] = plan["batches"], [], [], []
                 t0 = time.perf_counter()
                 run_eval_tunix(eval_ds, eval_step_fn)
                 close(feed["iter"])
                 if feed["left"]:
                     raise SystemExit(f"eval {name} at step {step}: {feed['left']} planned batches not run")
+                if pref:
+                    sums = [{k: scalar(v) for k, v in p.items()} for p in feed["prefs"]]
+                    record = g4dpo.pref_record(name, step, sums, plan["batches"], time.perf_counter() - t0)
+                    if record["pairs"] != plan["pairs"]:
+                        raise SystemExit(f"eval {name} at step {step}: {record['pairs']} pairs, the file has "
+                                         f"{plan['pairs']}")
+                    out.append(record)
+                    print(f"EVAL {json.dumps(record)}", flush=True)
+                    continue
                 parts = [(scalar(x), scalar(w)) for x, w in feed["parts"]]
                 record = eval_loss(name, step, parts, plan["batches"], time.perf_counter() - t0)
                 if temps:
@@ -1034,6 +1128,10 @@ def main(argv=None):
         "init_adapter": init_adapter,
         "combine": combined.get("result"),
         "temperatures": temps,
+        # --dpo: the spec, the packed training file and every step's preference measures (its batch's pairs)
+        "dpo": ({"spec": dpo_opts, "train": count, "pref_eval": prefs_wanted,
+                 "steps": [g4dpo.step_record(k, {n: scalar(v) for n, v in s.items()})
+                           for k, s in enumerate(dpo_steps, args.resume_step + 1)]} if dpo_opts else None),
     }
     if summary["throughput"]:
         summary["throughput"]["tokens_per_s_per_chip"] = round(summary["throughput"]["tokens_per_s"] / jax.device_count(), 1)

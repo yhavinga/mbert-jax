@@ -56,6 +56,17 @@ Arm G4-5 (draft amendment G4-5, Yeb 17 Nov: one LoRA per source, branched from a
   smoke5    the verdict of G4-5's smoke test (warmup, a resumed branch, the search on G4-3's adapter) and its estimate
   report5   the training per branch, the search, the full evaluation of its top K on the search part, the selection by
             the fixed rule, (a1) and (b) of the selected one against G4-0 on the decision part
+Arm G4-6 (draft amendment G4-6: preference training, DPO with LoRA, G4-0 as the reference; g4dpo.py):
+  cands6    the candidates of the pairs from G4-4's set (books, novels, BT per source) and the novels of the eval set
+            novels, as the rejected run's input (G4-0 translates them: translate SET=dpo)
+  build6    the pairs (chosen = the human Dutch, rejected = G4-0's greedy translation; G4-0's failures, identical pairs,
+            the chrF band, the length ratio, 13-grams, the token bound out), drawn per stratum, packed at 4,096 and
+            2,048; the smoke sets; the preference eval sets pref_books, pref_btval, pref_novels; report
+  check6    MaxText's own SFT steps on every side of every pair, and every packed row against MaxText's shift
+  smoke6    the verdict of G4-6's smoke test (the policy is the reference at step 0, the base losses, memory, the
+            translation of 50 segments) and the estimate of the full run
+  pairtexts6, pairclass6   the classifier on chosen and rejected per kind (reported, decides nothing)
+  report --train-summary of a --dpo run: the preference measures beside the rules
 """
 
 import argparse
@@ -75,6 +86,7 @@ HERE = Path(__file__).resolve().parent
 for _path in (HERE.parent / "flan-nl", HERE):
     sys.path.insert(0, str(_path))
 
+import g4dpo  # noqa: E402
 import g4lora  # noqa: E402
 import select_passages as sp  # noqa: E402
 import sft_build  # noqa: E402
@@ -260,11 +272,18 @@ class TokenCounter:
         self.tok = Tokenizer.from_file(str(Path(tokenizer_dir) / "tokenizer.json"))
 
     def lengths(self, texts):
+        return [len(x) for x in self.ids(texts)]
+
+    def ids(self, texts):
+        """The token ids of each text, without special tokens (as MaxText's SFT tokenizes prompt and completion)"""
         out = []
         texts = list(texts)
         for k in range(0, len(texts), 4096):
-            out += [len(e.ids) for e in self.tok.encode_batch(texts[k:k + 4096], add_special_tokens=False)]
+            out += [list(e.ids) for e in self.tok.encode_batch(texts[k:k + 4096], add_special_tokens=False)]
         return out
+
+    def special_id(self, token):
+        return self.tok.token_to_id(token)
 
     def examples(self, rows):
         prompts = self.lengths(g4lora.prompt_text(r["en"]) for r in rows)
@@ -839,6 +858,9 @@ def report(args):
         result["training"] = {k: t.get(k) for k in ("steps", "steps_done", "throughput", "peak_gib_max", "times")}
         result["training"]["loss_first_last"] = [t["loss"][:3], t["loss"][-3:]] if t.get("loss") else None
         result["training"]["lr_at"] = t.get("lr_at")
+        if t.get("dpo"):
+            # amendment G4-6.7: the preference measures, reported
+            result["pref"] = pref_measure(t)
     if getattr(args, "heldout", None):
         t = json.loads(Path(args.train_summary).read_text()) if args.train_summary else {}
 
@@ -961,6 +983,8 @@ def report_text(r):
         L += other_text(r)
     if r.get("novels"):
         L += novels_text(r["novels"])
+    if r.get("pref"):
+        L += pref_text(r["pref"])
     if r.get("lora_merge"):
         L += ["", "LoRA-samenvoeging (`translate.py`, regel LORA): " + "; ".join(json.dumps(x) for x in r["lora_merge"][:4])]
     if r.get("training"):
@@ -3952,6 +3976,686 @@ def sample5_text(r):
 
 # ---------------------------------------------------------------------------------------------------- main
 
+# ---------------------------------------------------------------------------------------------------- G4-6
+
+ARM6 = "G4-6"
+SEED6 = f"{SEED}/G4-6"
+BT_SOURCES6 = ("handelingen", "raad", "fineweb", "rechtspraak", "dpc")
+# Pairs per stratum (draft amendment G4-6.2): every Dutch book (human English, original Dutch), the novels (original
+# English, human Dutch) and the back-translations (Gemma 4's English, original Dutch) about as many, the BT equal per
+# source
+WANT6 = {"book": 11000, "novel": 16000, **{f"bt:{s}": 3200 for s in BT_SOURCES6}}
+CANDIDATES6 = 1.25        # candidates translated per wanted pair, for what build6's filters take (books: every one)
+PAIR_MAX6 = 2048          # a pair's tokens (the prompt twice, both sides): every pair fits a row of the fallback
+SEQ6 = SEQ3               # 4,096: G4-4's rows
+SEQ6_FALLBACK = 2048      # amendment G4-6.4: the rows if 4,096 does not fit
+ROWS6 = HOSTS * ROWS_PER_HOST
+CHRF6 = {"novel": (25.0, 80.0), "book": (50.0, 80.0), "bt": (50.0, 80.0)}   # kept: low <= chrF(rejected, chosen) < high
+LENGTH6 = (0.67, 1.5)     # kept: characters of the rejected over the chosen
+PREF_SETS6 = ("pref_books", "pref_btval", "pref_novels")
+EVAL_EVERY6 = 200
+LR6 = 1e-5
+DPO6 = {"loss": "sigmoid", "beta": 0.1, "label_smoothing": 0.0, "nll_alpha": 1.0, "length_norm": False}
+SMOKE6_BATCHES = 12       # the smoke set: the training file's first batches (8 steps and room)
+SMOKE6_STEPS = 8
+SMOKE6_EVAL_STEPS = [0, 4, 8]
+STEP0_MAX_DIFF6 = 1e-4    # step 0: the policy is the reference (loss log 2, margin 0, each NLL the reference's)
+BASE_MAX_DIFF6 = 2e-3     # step 0: an SFT eval file's loss against G4-4's step 0 (the same base, the loss computed apart)
+MAX_HOURS6 = 24
+FAILURES6 = ("not_ended", "decode_loop", "empty", "english_left", "identical")
+BANDS6 = ("chrf_low", "chrf_high", "length_ratio", "eval_13gram")
+
+
+def english_of(user):
+    """The English of a natural-v1 user turn (g4lora.user_turn), checked by making the turn again"""
+    marker = "\u0000"
+    pre, post = g4lora.user_turn(marker).split(marker)
+    if not user.startswith(pre) or not user.endswith(post) or len(user) < len(pre) + len(post):
+        raise SystemExit(f"not a natural-v1 user turn: {user[:80]!r}")
+    en = user[len(pre):len(user) - len(post)]
+    if g4lora.user_turn(en) != user:
+        raise SystemExit(f"the English of a user turn does not make the turn again: {user[:80]!r}")
+    return en
+
+
+def stratum6(meta):
+    """novel, book, or bt:<source> of a G4-4 example"""
+    if meta["kind"] == "bt":
+        if meta["source"] not in BT_SOURCES6:
+            raise SystemExit(f"{meta['id']}: BT of an unknown source {meta['source']}")
+        return f"bt:{meta['source']}"
+    if meta["kind"] not in ("novel", "book"):
+        raise SystemExit(f"{meta['id']}: an example of kind {meta['kind']}")
+    return meta["kind"]
+
+
+def kind6(stratum):
+    return stratum.split(":")[0]
+
+
+def assign_balanced(rows, workers):
+    """{worker: [rows]}: every length class over every worker (a class's rows by tokens, in turn), so that each worker
+    decodes about the same tokens; a worker loads each of its classes once (~3 min)"""
+    out = {k: [] for k in range(workers)}
+    for cls in EVAL_CLASSES:
+        part = sorted((r for r in rows if r["length_class"] == cls), key=lambda r: (r["tokens"], r["id"]))
+        for i, r in enumerate(part):
+            out[i % workers].append(r)
+    if sum(len(v) for v in out.values()) != len(rows):
+        raise SystemExit("a row of a class beyond tiny-xlong")
+    return {k: sorted(v, key=lambda r: (r["tokens"], r["id"])) for k, v in out.items()}
+
+
+CANDS6_SCHEMA = (("id", "string"), ("example", "string"), ("set", "string"), ("stratum", "string"), ("kind", "string"),
+                 ("source", "string"), ("en", "string"), ("nl", "string"), ("tokens_en", "int64"),
+                 ("tokens_nl", "int64"), ("tokens_prompt", "int64"), ("tokens_target", "int64"),
+                 ("length_class", "string"))
+
+
+def cands6(args, counter=None):
+    """amendment G4-6.2, before the rejected run: the candidates of G4-6's pairs from G4-4's set (its distinct examples:
+    the Dutch books, the novels of the three passes, the BT of up to 512 Dutch tokens per source; no long BT, no FLAN
+    replay), each whose Dutch fits 0.8 of its class's decode limit (decode_class, as the held-out sets) and whose pair,
+    estimated with the rejected as long as the chosen, fits PAIR_MAX6; per stratum a seeded draw of CANDIDATES6 x WANT6
+    (books: every one); and the novels of the eval set novels (pref_novels). Writes the rejected run's input in
+    evalsets.py's format (evalsets.parquet, segments-w<k>.parquet, classes-w<k>.txt, every class over every worker),
+    cands.parquet and manifest.json"""
+    counter = counter or TokenCounter(args.tokenizer)
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    passes, _, _ = g44_set(args.g44, args.g44_report)
+    distinct = {}
+    for e in sorted(passes):
+        for x, m in passes[e]:
+            if m["kind"] not in ("bt", "book", "novel"):
+                continue
+            nl = x["messages"][1]["content"]
+            seen = distinct.setdefault(m["id"], (m, nl))
+            if seen[1] != nl or seen[0]["en"] != m["en"]:
+                raise SystemExit(f"{m['id']}: two examples under one id")
+    ids = sorted(distinct)
+    metas = [distinct[i][0] for i in ids]
+    src = counter.lengths(m["en"].strip() for m in metas)
+    tgt = counter.lengths(distinct[i][1].strip() for i in ids)
+    funnel = collections.defaultdict(collections.Counter)
+    eligible = collections.defaultdict(list)
+    for i, m, a, b in zip(ids, metas, src, tgt):
+        s = stratum6(m)
+        funnel[s]["examples"] += 1
+        cls = decode_class(a, b)
+        if cls is None:
+            funnel[s]["class_none"] += 1
+            continue
+        if 2 * (m["tokens_prompt"] + m["tokens_target"]) > PAIR_MAX6:
+            funnel[s]["pair_too_long_estimate"] += 1
+            continue
+        funnel[s]["eligible"] += 1
+        eligible[s].append({"id": f"g46:{i}", "example": i, "set": "train", "stratum": s, "kind": m["kind"],
+                            "source": m["source"], "en": m["en"].strip(), "nl": distinct[i][1].strip(),
+                            "tokens_en": a, "tokens_nl": b, "tokens_prompt": m["tokens_prompt"],
+                            "tokens_target": m["tokens_target"], "length_class": cls})
+    missing = sorted(s for s in WANT6 if not eligible.get(s))
+    if missing:
+        raise SystemExit(f"no eligible example of {missing}")
+    cands = []
+    for s in sorted(WANT6):
+        rows = sorted(eligible[s], key=lambda r: r["id"])
+        n = len(rows) if s == "book" else min(len(rows), math.ceil(WANT6[s] * args.factor))
+        random.Random(f"{SEED6}/candidates/{s}").shuffle(rows)
+        cands += rows[:n]
+        funnel[s]["drawn"] = n
+    novels = read_rows(args.novels_eval)
+    novels_meta = read_rows(args.novels_eval_meta)
+    if len(novels) != len(novels_meta):
+        raise SystemExit(f"{args.novels_eval}: {len(novels)} rows, its meta {len(novels_meta)}")
+    ens = [english_of(x["messages"][0]["content"]) for x in novels]
+    nls = [x["messages"][1]["content"].strip() for x in novels]
+    funnel["pref_novels"]["examples"] = len(novels)
+    for m, en, nl, a, b in zip(novels_meta, ens, nls, counter.lengths(ens), counter.lengths(nls)):
+        cls = decode_class(a, b)
+        if cls is None:
+            funnel["pref_novels"]["class_none"] += 1
+            continue
+        cands.append({"id": f"g46:pref_novels:{m['pid']}", "example": m["pid"], "set": "pref_novels",
+                      "stratum": "pref_novels", "kind": "novel", "source": "books_en", "en": en.strip(), "nl": nl,
+                      "tokens_en": a, "tokens_nl": b, "tokens_prompt": m["tokens_prompt"],
+                      "tokens_target": m["tokens_target"], "length_class": cls})
+    funnel["pref_novels"]["drawn"] = sum(r["set"] == "pref_novels" for r in cands)
+    if len({r["id"] for r in cands}) != len(cands):
+        raise SystemExit("an id twice among the candidates")
+    write_parquet(cands, out / "cands.parquet", schema(CANDS6_SCHEMA))
+    eval_rows = [{"id": r["id"], "set": r["stratum"], "source": r["en"], "reference": r["nl"], "tokens": r["tokens_en"],
+                  "over_512": r["tokens_en"] > 512, "length_class": r["length_class"],
+                  "meta": json.dumps({"kind": r["kind"], "source": r["source"], "example": r["example"],
+                                      "tokens_nl": r["tokens_nl"]})} for r in cands]
+    write_parquet(eval_rows, out / "evalsets.parquet", schema(EVAL_SCHEMA))
+    tokens_nl = {r["id"]: r["tokens_nl"] for r in cands}
+    workers = {}
+    for k, part in assign_balanced(eval_rows, args.workers).items():
+        write_parquet([{"id": r["id"], "text": r["source"], "tokens": r["tokens"]} for r in part],
+                      out / f"segments-w{k}.parquet", schema(SEGMENT_SCHEMA))
+        classes = [c for c in EVAL_CLASSES if any(r["length_class"] == c for r in part)]
+        (out / f"classes-w{k}.txt").write_text(" ".join(classes) + "\n")
+        workers[f"w{k}"] = {"segments": len(part), "classes": classes, "dutch_tokens": sum(tokens_nl[r["id"]] for r in part)}
+    g44 = Path(args.g44)
+    manifest = {"arm": ARM6, "seed": SEED6, "prompt": PROMPT, "model": MODEL, "want": WANT6, "factor": args.factor,
+                "pair_max": PAIR_MAX6, "funnel": {k: dict(v) for k, v in sorted(funnel.items())},
+                "segments": len(cands), "dutch_tokens": sum(tokens_nl.values()), "workers": workers,
+                "classes": dict(collections.Counter(r["length_class"] for r in cands)),
+                "inputs": {"g44_train": sha256_file(g44 / "train.parquet"),
+                           "g44_meta": sha256_file(g44 / "train-meta.parquet"),
+                           "g44_report": sha256_file(args.g44_report), "novels_eval": sha256_file(args.novels_eval),
+                           "novels_eval_meta": sha256_file(args.novels_eval_meta)}}
+    (out / "manifest.json").write_text(json.dumps(manifest, indent=1) + "\n")
+    for w, s in workers.items():
+        print(f"WORKER {w}: {s['segments']} segments, {s['dutch_tokens']} Dutch tokens, classes {s['classes']}",
+              flush=True)
+    print(f"CANDS6 {json.dumps({'segments': len(cands), 'funnel': manifest['funnel']})}", flush=True)
+
+
+def g40_rows(patterns):
+    """{id: row} of collected pairs (evalsets.py collect: hypothesis and its checks), every id once"""
+    rows = {}
+    for pattern in patterns:
+        files = sorted(glob.glob(pattern))
+        if not files:
+            raise SystemExit(f"no pairs in {pattern}")
+        for f in files:
+            for r in read_rows(f, ["id", "hypothesis", "ended", "decode_loop", "english_left", "empty"]):
+                if r["id"] in rows:
+                    raise SystemExit(f"{r['id']} twice in {pattern}")
+                rows[r["id"]] = r
+    return rows
+
+
+def failure6(chosen, g40):
+    """G4-0's translation as the rejected side: the first failure of FAILURES6 (None: usable), and the text"""
+    hyp = (g40["hypothesis"] or "").strip()
+    if not g40["ended"]:
+        return "not_ended", hyp
+    if g40["decode_loop"]:
+        return "decode_loop", hyp
+    if g40["empty"] or not hyp:
+        return "empty", hyp
+    if g40["english_left"]:
+        return "english_left", hyp
+    if hyp == chosen:
+        return "identical", hyp
+    return None, hyp
+
+
+def band6(kind, chosen, rejected, blocked, chrf):
+    """The first of BANDS6 a usable pair fails (None: kept), its chrF (rejected against chosen) and length ratio"""
+    c = chrf(rejected, chosen)
+    ratio = len(rejected) / max(1, len(chosen))
+    low, high = CHRF6[kind]
+    if c < low:
+        return "chrf_low", c, ratio
+    if c >= high:
+        return "chrf_high", c, ratio
+    if not LENGTH6[0] <= ratio <= LENGTH6[1]:
+        return "length_ratio", c, ratio
+    if sp.ngrams(rejected) & blocked:
+        return "eval_13gram", c, ratio
+    return None, c, ratio
+
+
+def tokenized6(pairs, counter):
+    """Each pair with its token ids: prompt (g4lora.prompt_text of its English), chosen and rejected
+    (g4lora.completion_text), as MaxText's SFT makes an example"""
+    prompts = counter.ids(g4lora.prompt_text(p["en"]) for p in pairs)
+    chosen = counter.ids(g4lora.completion_text(p["chosen"]) for p in pairs)
+    rejected = counter.ids(g4lora.completion_text(p["rejected"]) for p in pairs)
+    return [{**p, "prompt": a, "chosen_ids": b, "rejected_ids": c, "tokens_pair": 2 * len(a) + len(b) + len(c)}
+            for p, a, b, c in zip(pairs, prompts, chosen, rejected)]
+
+
+def packed6(pairs, seq, pad, bos):
+    return g4dpo.pack_rows([{"id": p["id"], "prompt": p["prompt"], "chosen": p["chosen_ids"],
+                             "rejected": p["rejected_ids"]} for p in pairs], seq, ROWS6, pad_id=pad, bos_id=bos)
+
+
+def pack_stats(rows, seq):
+    batches = 1 + max(r["batch"] for r in rows)
+    tokens = sum(r["tokens"] for r in rows)
+    pairs = sum(len(r["pairs"]) for r in rows)
+    return {"rows": len(rows), "batches": batches, "steps": batches, "pairs": pairs, "tokens": tokens,
+            "fill": round(tokens / (len(rows) * seq), 4), "pairs_per_step": round(pairs / batches, 2),
+            "max_pairs_in_row": max(len(r["pairs"]) for r in rows)}
+
+
+PAIRS6_SCHEMA = (("id", "string"), ("set", "string"), ("stratum", "string"), ("kind", "string"), ("source", "string"),
+                 ("en", "string"), ("chosen", "string"), ("rejected", "string"), ("chrf", "float64"),
+                 ("length_ratio", "float64"), ("tokens_prompt", "int64"), ("tokens_chosen", "int64"),
+                 ("tokens_rejected", "int64"), ("order", "int64"))
+
+
+def build6(args, counter=None, chrf=None):
+    """amendment G4-6.2-G4-6.3, after the rejected run: the pairs (the candidates of cands6 with G4-0's translation as
+    the rejected side; out: G4-0's failures and identical pairs, then the chrF band of the kind, the length ratio, a
+    13-gram of the evaluation sets in the rejected text, more than PAIR_MAX6 tokens), per stratum a seeded draw of
+    WANT6, one seeded order over all; packed (g4dpo.pack_rows) at SEQ6 and SEQ6_FALLBACK; the smoke sets (the first
+    SMOKE6_BATCHES batches); the preference eval sets (held-out books and BT validation with G4-0's held-out
+    translations, the novels of the eval set novels; out only G4-0's failures, identical pairs and too long ones);
+    train-chosen.parquet (the chosen sides as SFT examples), pairs.parquet, report.json and report.md"""
+    import armeval
+
+    counter = counter or TokenCounter(args.tokenizer)
+    chrf = chrf or armeval.chrf
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    pad, bos = counter.special_id("<pad>"), counter.special_id("<bos>")
+    if pad is None or bos is None:
+        raise SystemExit(f"{args.tokenizer}: no <pad> or <bos>")
+    cands = read_rows(args.cands)
+    g40 = g40_rows(args.rejected)
+    missing = [r["id"] for r in cands if r["id"] not in g40]
+    if missing:
+        raise SystemExit(f"{len(missing)} candidates without G4-0's translation, e.g. {missing[:3]}")
+    blind = read_jsonl(args.blind)
+    if sha256_file(args.blind) != blind_sha256():
+        raise SystemExit(f"{args.blind}: not the blind passages of the TG protocol (§4.2.4)")
+    blocked = blocked_grams(read_rows(args.evalsets), blind)
+    funnel = collections.defaultdict(collections.Counter)
+    measured = collections.defaultdict(lambda: {"chrf": [], "ratio": []})
+    survivors = collections.defaultdict(list)
+    pref_novels = []
+    for r in cands:
+        s = r["stratum"]
+        funnel[s]["candidates"] += 1
+        why, hyp = failure6(r["nl"], g40[r["id"]])
+        if why:
+            funnel[s][why] += 1
+            continue
+        pair = {"id": r["id"], "set": r["set"], "stratum": s, "kind": r["kind"], "source": r["source"], "en": r["en"],
+                "chosen": r["nl"], "rejected": hyp}
+        if r["set"] == "pref_novels":
+            pref_novels.append({**pair, "chrf": chrf(hyp, r["nl"]), "length_ratio": len(hyp) / max(1, len(r["nl"]))})
+            continue
+        why, c, ratio = band6(r["kind"], r["nl"], hyp, blocked, chrf)
+        measured[r["kind"]]["chrf"].append(c)
+        measured[r["kind"]]["ratio"].append(ratio)
+        if why:
+            funnel[s][why] += 1
+            continue
+        survivors[s].append({**pair, "chrf": c, "length_ratio": ratio})
+    drawn = []
+    for s in sorted(WANT6):
+        rows = tokenized6(sorted(survivors.get(s, []), key=lambda p: p["id"]), counter)
+        fit = [p for p in rows if p["tokens_pair"] <= PAIR_MAX6]
+        funnel[s]["too_long"] = len(rows) - len(fit)
+        funnel[s]["kept"] = len(fit)
+        random.Random(f"{SEED6}/draw/{s}").shuffle(fit)
+        drawn += fit[:WANT6[s]]
+        funnel[s]["drawn"] = min(len(fit), WANT6[s])
+        funnel[s]["short_of_want"] = max(0, WANT6[s] - len(fit))
+    drawn.sort(key=lambda p: p["id"])
+    random.Random(f"{SEED6}/order").shuffle(drawn)
+    # the preference eval sets: G4-0's held-out translations of the held-out books and BT validation
+    held = [r for r in read_rows(args.heldout) if r["set"] in ("books", "btval")]
+    held_g40 = g40_rows(args.heldout_g40)
+    prefs = {"pref_novels": pref_novels, "pref_books": [], "pref_btval": []}
+    for r in held:
+        name = f"pref_{r['set']}"
+        funnel[name]["candidates"] += 1
+        if r["id"] not in held_g40:
+            raise SystemExit(f"{r['id']}: no held-out translation of G4-0")
+        why, hyp = failure6(r["reference"].strip(), held_g40[r["id"]])
+        if why:
+            funnel[name][why] += 1
+            continue
+        chosen = r["reference"].strip()
+        prefs[name].append({"id": f"{name}:{r['id']}", "set": name, "stratum": name, "kind": r["set"],
+                            "source": json.loads(r["meta"]).get("source"), "en": r["source"].strip(),
+                            "chosen": chosen, "rejected": hyp, "chrf": chrf(hyp, chosen),
+                            "length_ratio": len(hyp) / max(1, len(chosen))})
+    for name in PREF_SETS6:
+        rows = tokenized6(sorted(prefs[name], key=lambda p: p["id"]), counter)
+        prefs[name] = [p for p in rows if p["tokens_pair"] <= PAIR_MAX6]
+        funnel[name]["too_long"] = len(rows) - len(prefs[name])
+        funnel[name]["kept"] = len(prefs[name])
+        if not prefs[name]:
+            raise SystemExit(f"{name}: no pair")
+    packing = {}
+    for seq in (SEQ6, SEQ6_FALLBACK):
+        rows = packed6(drawn, seq, pad, bos)
+        g4dpo.write_rows(rows, out / f"train-{seq}.parquet")
+        smoke_rows = [r for r in rows if r["batch"] < SMOKE6_BATCHES]
+        if 1 + max(r["batch"] for r in smoke_rows) < SMOKE6_BATCHES:
+            raise SystemExit(f"fewer than {SMOKE6_BATCHES} batches at {seq}")
+        g4dpo.write_rows(smoke_rows, out / f"smoke-{seq}.parquet")
+        packing[str(seq)] = {"train": pack_stats(rows, seq), "smoke": pack_stats(smoke_rows, seq)}
+        for name in PREF_SETS6:
+            pref_rows = packed6(prefs[name], seq, pad, bos)
+            g4dpo.write_rows(pref_rows, out / f"eval-{name}-{seq}.parquet")
+            packing[str(seq)][name] = pack_stats(pref_rows, seq)
+    write_parquet([messages_row(p["en"], p["chosen"]) for p in drawn], out / "train-chosen.parquet",
+                  row_group_size=ROW_GROUP4)
+    (out / "template.jinja").write_text(g4lora.TEMPLATE, encoding="utf-8")
+    every = [(k, p) for k, p in enumerate(drawn)] + [(-1, p) for name in PREF_SETS6 for p in prefs[name]]
+    write_parquet([{"id": p["id"], "set": p["set"], "stratum": p["stratum"], "kind": p["kind"], "source": p["source"],
+                    "en": p["en"], "chosen": p["chosen"], "rejected": p["rejected"], "chrf": p["chrf"],
+                    "length_ratio": p["length_ratio"], "tokens_prompt": len(p["prompt"]),
+                    "tokens_chosen": len(p["chosen_ids"]), "tokens_rejected": len(p["rejected_ids"]), "order": k}
+                   for k, p in every], out / "pairs.parquet", schema(PAIRS6_SCHEMA))
+    kept = collections.defaultdict(list)
+    for p in drawn:
+        kept[p["kind"]].append(p)
+    report = {
+        "arm": ARM6, "seed": SEED6, "prompt": PROMPT, "want": WANT6, "chrf_bands": CHRF6, "length_band": LENGTH6,
+        "pair_max": PAIR_MAX6, "pad_id": pad, "bos_id": bos, "rows_per_batch": ROWS6,
+        "funnel": {k: dict(v) for k, v in sorted(funnel.items())},
+        "pairs": {"train": len(drawn), **{name: len(prefs[name]) for name in PREF_SETS6}},
+        "by_stratum": dict(sorted(collections.Counter(p["stratum"] for p in drawn).items())),
+        "measured": {k: {"chrf": quantiles(v["chrf"]), "length_ratio": quantiles(v["ratio"])}
+                     for k, v in sorted(measured.items())},
+        "kept": {k: {"pairs": len(v), "chrf": quantiles([p["chrf"] for p in v]),
+                     "length_ratio": quantiles([p["length_ratio"] for p in v]),
+                     "tokens_chosen": quantiles([len(p["chosen_ids"]) for p in v]),
+                     "tokens_rejected": quantiles([len(p["rejected_ids"]) for p in v]),
+                     "tokens_pair": quantiles([p["tokens_pair"] for p in v])} for k, v in sorted(kept.items())},
+        "prefs": {name: {"chrf": quantiles([p["chrf"] for p in prefs[name]]),
+                         "length_ratio": quantiles([p["length_ratio"] for p in prefs[name]])} for name in PREF_SETS6},
+        "packing": packing,
+        "inputs": {"cands": sha256_file(args.cands), "heldout": sha256_file(args.heldout),
+                   "evalsets": sha256_file(args.evalsets), "blind": sha256_file(args.blind),
+                   "rejected": sorted(sha256_file(f) for p in args.rejected for f in glob.glob(p)),
+                   "heldout_g40": sorted(sha256_file(f) for p in args.heldout_g40 for f in glob.glob(p))},
+        "files": {f.name: sha256_file(f) for f in sorted(out.glob("*.parquet"))},
+    }
+    (out / "report.json").write_text(json.dumps(report, indent=1) + "\n")
+    (out / "report.md").write_text(report6_md(report), encoding="utf-8")
+    print(f"BUILT6 {json.dumps({'pairs': report['pairs'], 'steps': {k: v['train']['steps'] for k, v in packing.items()}})}",
+          flush=True)
+
+
+def report6_md(r):
+    L = ["# Arm G4-6: de paren (`g4arm.py build6`)", "",
+         f"Seed `{r['seed']}`, prompt `{r['prompt']}`; chrF-banden {json.dumps(r['chrf_bands'])}, lengteband "
+         f"{json.dumps(r['length_band'])}, paar ≤ {r['pair_max']} tokens.", "",
+         "## Trechter per stratum", "", "| stratum | " + " | ".join(
+             ("candidates", *FAILURES6, *BANDS6, "too_long", "kept", "drawn", "short_of_want")) + " |",
+         "|---|" + "---:|" * (len(FAILURES6) + len(BANDS6) + 5)]
+    for s, f in r["funnel"].items():
+        L.append(f"| {s} | " + " | ".join(str(f.get(k, 0)) for k in (
+            "candidates", *FAILURES6, *BANDS6, "too_long", "kept", "drawn", "short_of_want")) + " |")
+    L += ["", "## chrF (rejected tegen chosen) en lengteverhouding", "",
+          "| soort | wat | n | p5 | p25 | p50 | p75 | p95 |", "|---|---|---:|---:|---:|---:|---:|---:|"]
+    for k, v in r["measured"].items():
+        for what in ("chrf", "length_ratio"):
+            q = v[what]
+            L.append(f"| {k} | {what} (na de fouten van G4-0) | {q.get('n')} | {q.get('p5')} | {q.get('p25')} | "
+                     f"{q.get('p50')} | {q.get('p75')} | {q.get('p95')} |")
+    for k, v in r["kept"].items():
+        q = v["chrf"]
+        L.append(f"| {k} | chrf (getrokken) | {q.get('n')} | {q.get('p5')} | {q.get('p25')} | {q.get('p50')} | "
+                 f"{q.get('p75')} | {q.get('p95')} |")
+    L += ["", "## Packing", "", "| rijen van | set | rijen | batches (stappen) | paren | tokens | vulling | paren per stap |",
+          "|---|---|---:|---:|---:|---:|---:|---:|"]
+    for seq, sets in r["packing"].items():
+        for name, s in sets.items():
+            L.append(f"| {seq} | {name} | {s['rows']} | {s['batches']} | {s['pairs']} | {s['tokens']} | {s['fill']} | "
+                     f"{s['pairs_per_step']} |")
+    L += ["", f"Paren: {json.dumps(r['pairs'])}; per stratum {json.dumps(r['by_stratum'])}.", ""]
+    return "\n".join(L)
+
+
+def check6(args):
+    """amendment G4-6.3: every side of every pair through MaxText's own SFT steps (g4lora.check_examples: the ids of
+    MaxText's apply_chat_template, tokenization and prompt masking against the model's own tokenizer and template),
+    MaxText's pad id the build's; and every packed row equal to those ids packed as build6 packs them and shifted by
+    MaxText's own shift_and_refine"""
+    import multiprocessing
+
+    import transformers
+    from maxtext.input_pipeline import input_pipeline_utils as ipu
+
+    d = Path(args.data)
+    report = json.loads((d / "report.json").read_text())
+    pairs = {p["id"]: p for p in read_rows(d / "pairs.parquet")}
+    sides = [(f"{i}/{side}", p["en"], p[side]) for i, p in sorted(pairs.items()) for side in ("chosen", "rejected")]
+    jobs = []
+    for k in range(0, len(sides), args.chunk):
+        part = sides[k:k + args.chunk]
+        jobs.append(([[{"role": "user", "content": g4lora.user_turn(en)}, {"role": "assistant", "content": nl}]
+                      for _, en, nl in part], [en for _, en, _ in part], [label for label, _, _ in part],
+                     args.tokenizer))
+    if args.processes > 1:
+        with multiprocessing.get_context("spawn").Pool(args.processes) as pool:
+            results = pool.map(_check_chunk6, jobs, chunksize=1)
+    else:
+        results = [_check_chunk6(j) for j in jobs]
+    pads = {pad for _, _, pad in results}
+    if pads != {report["pad_id"]}:
+        raise SystemExit(f"MaxText's pad ids {pads}, the build's {report['pad_id']}")
+    own = transformers.AutoTokenizer.from_pretrained(args.tokenizer)
+    if own.bos_token_id != report["bos_id"]:
+        raise SystemExit(f"the tokenizer's bos id {own.bos_token_id}, the build's {report['bos_id']}")
+
+    def ids(text):
+        return own(text, add_special_tokens=False)["input_ids"]
+
+    cache, rows_checked = {}, 0
+    for f in sorted(d.glob("*.parquet")):
+        if f.name in ("pairs.parquet", "train-chosen.parquet"):
+            continue
+        seq = int(f.stem.rsplit("-", 1)[1])
+        for row in read_rows(f):
+            parts = []
+            for pid in row["pairs"]:
+                if pid not in cache:
+                    p = pairs[pid]
+                    prompt = ids(g4lora.prompt_text(p["en"]))
+                    cache[pid] = [(prompt, ids(g4lora.completion_text(p["chosen"]))),
+                                  (prompt, ids(g4lora.completion_text(p["rejected"])))]
+                parts += cache[pid]
+            want = g4dpo.row_unshifted(parts, seq, report["pad_id"])
+            batch = {k: v[None] for k, v in want.items()}
+            want = {k: v[0] for k, v in ipu.shift_and_refine(batch, ignored_ids=[report["pad_id"], report["bos_id"]],
+                                                              axis=1).items()}
+            differ = [k for k in g4dpo.KEYS if list(want[k]) != list(row[k])]
+            if differ:
+                raise SystemExit(f"{f.name} row of batch {row['batch']} with pairs {row['pairs'][:2]}: {differ} differ "
+                                 "from MaxText's packing and shift")
+            rows_checked += 1
+    print(f"CHECK6 {json.dumps({'sides': len(sides), 'pad_id': pads.pop(), 'rows': rows_checked})}", flush=True)
+
+
+def _check_chunk6(job):
+    messages, ens, labels, tokenizer = job
+    return g4lora.check_examples(messages, ens, tokenizer, MODEL, labels)
+
+
+def eval_at6(summary, name, step):
+    return next((e for e in summary.get("eval") or [] if e["set"] == name and e["step"] == step), None)
+
+
+def smoke6_verdict(summary, adapter, base_summary, seq, lora, arm_rows, base_rows, build_report):
+    """amendment G4-6.6: every check with its value and whether it holds"""
+    checks = {}
+    loss = summary.get("loss") or []
+    checks["steps"] = {"value": summary.get("steps_done"), "holds": summary.get("steps_done") == SMOKE6_STEPS}
+    checks["loss_finite"] = {"value": [v for _, v in loss],
+                             "holds": len(loss) == SMOKE6_STEPS and all(math.isfinite(v) for _, v in loss)}
+    checks["peak_gib"] = {"value": summary.get("peak_gib_max"),
+                          "holds": summary.get("peak_gib_max") is not None and summary["peak_gib_max"] <= MEM_MAX_GIB}
+    checks["adapter"] = {"value": {k: adapter.get(k) for k in ("rank", "alpha", "scale")},
+                         "holds": (adapter.get("rank"), adapter.get("alpha"), adapter.get("scale")) == (32, 16.0, 0.5)}
+    dpo = summary.get("dpo") or {}
+    steps = dpo.get("steps") or []
+    checks["dpo_steps"] = {"value": [(s["pairs"], round(s["loss"], 5)) for s in steps],
+                           "holds": len(steps) == SMOKE6_STEPS and all(s["pairs"] > 0 and math.isfinite(s["loss"])
+                                                                        for s in steps)}
+    checks["dpo_spec"] = {"value": dpo.get("spec"), "holds": dpo.get("spec") == g4dpo.spec(**DPO6)}
+    sft_sets = [s for s in EVAL_SETS4 if not (s == "btlong" and seq == SEQ6_FALLBACK)]
+    names = sft_sets + list(PREF_SETS6)
+    have = {(e["set"], e["step"]) for e in summary.get("eval") or []}
+    checks["evals"] = {"value": sorted(have), "holds": all((n, s) in have for n in names for s in SMOKE6_EVAL_STEPS)}
+    expected = g4dpo.expected_step0(g4dpo.spec(**DPO6))
+    step0 = {}
+    for name in PREF_SETS6:
+        e = eval_at6(summary, name, 0) or {}
+        diffs = [abs(e.get("loss", math.inf) - expected["loss"]), abs(e.get("margin", math.inf)),
+                 abs(e.get("chosen_nll", math.inf) - e.get("ref_chosen_nll", -math.inf)),
+                 abs(e.get("rejected_nll", math.inf) - e.get("ref_rejected_nll", -math.inf))]
+        step0[name] = {"loss": e.get("loss"), "margin": e.get("margin"), "max_diff": max(diffs)}
+    checks["policy_is_reference_at_step0"] = {
+        "value": step0, "holds": all(v["max_diff"] <= STEP0_MAX_DIFF6 for v in step0.values())}
+    base = {}
+    for name in sft_sets:
+        e, b = eval_at6(summary, name, 0), eval_at6(base_summary, name, 0)
+        base[name] = {"run": e and e["loss"], "g4_4_step0": b and b["loss"],
+                      "diff": abs(e["loss"] - b["loss"]) if e and b else None}
+    checks["base_losses_at_step0"] = {"value": base, "holds": all(v["diff"] is not None and v["diff"] <= BASE_MAX_DIFF6
+                                                                  for v in base.values())}
+    checks["lora_merge"] = {"value": lora, "holds": bool(lora) and lora.get("modules") == SMOKE_MODULES
+                            and (lora.get("relative_update_norm") or 0) > 0}
+    for name, rows in (("arm", arm_rows), ("base", base_rows)):
+        ended = sum(bool(r["ended"]) and not r["decode_loop"] and not r["empty"] for r in rows)
+        checks[f"decode_{name}"] = {"value": {"segments": len(rows), "ended_ok": ended},
+                                    "holds": len(rows) == SMOKE_N and ended >= SMOKE_MIN_ENDED}
+        qe = [r.get("metricx_qe") for r in rows]
+        checks[f"metricx_{name}"] = {"value": mean(qe),
+                                     "holds": len(qe) == SMOKE_N and all(q is not None and math.isfinite(q) for q in qe)}
+    delta = None
+    if checks["metricx_arm"]["value"] is not None and checks["metricx_base"]["value"] is not None:
+        delta = checks["metricx_arm"]["value"] - checks["metricx_base"]["value"]
+    checks["qe_delta"] = {"value": delta, "holds": delta is not None and abs(delta) <= SMOKE_QE_MAX_DELTA}
+    estimate = smoke6_estimate(summary, build_report, seq)
+    checks["estimate_hours"] = {"value": estimate["hours"], "holds": estimate["hours"] <= MAX_HOURS6}
+    # reported: the rejected side of pref_btval is G4-0's own translation of the BT validation, as the eval set own
+    own0, rej0 = eval_at6(summary, "own", 0), eval_at6(summary, "pref_btval", 0)
+    return {"checks": checks, "passed": all(c["holds"] for c in checks.values()), "estimate": estimate,
+            "own_against_pref_btval_rejected": {"own": own0 and own0["loss"], "pref_btval_rejected_nll":
+                                                rej0 and rej0.get("rejected_nll")}}
+
+
+def smoke6_estimate(summary, build_report, seq):
+    """The full run's hours: every batch of the training file at the smoke run's median step time, an eval round
+    (every set, as long as the smoke run's at step 0) at step 0, every EVAL_EVERY6 steps and after the last, and the
+    smoke run's time to its first step"""
+    steps = build_report["packing"][str(seq)]["train"]["steps"]
+    step_s = (summary.get("throughput") or {}).get("step_s_median")
+    round_s = sum(e.get("seconds", 0.0) for e in summary.get("eval") or [] if e["step"] == 0)
+    rounds = 1 + steps // EVAL_EVERY6 + (0 if steps % EVAL_EVERY6 == 0 else 1)
+    times = summary.get("times") or {}
+    before = (times.get("python_to_setup_s") or 0) + (times.get("setup_s") or 0) + (times.get("compile_s_est") or 0)
+    if step_s is None:
+        return {"steps": steps, "hours": math.inf}
+    total = steps * step_s + rounds * round_s + before
+    return {"steps": steps, "step_s": step_s, "eval_round_s": round_s, "rounds": rounds, "before_s": before,
+            "hours": round(total / 3600, 2)}
+
+
+def smoke6(args):
+    summary = json.loads(Path(args.summary).read_text())
+    adapter = json.loads(Path(args.adapter).read_text())
+    base_summary = json.loads(Path(args.base_summary).read_text())
+    build_report = json.loads(Path(args.build_report).read_text())
+    lora = lora_line(Path(args.translate_log).read_text(errors="replace"))
+    rows = {}
+    for name, pairs, metricx in (("arm", args.arm_pairs, args.arm_metricx), ("base", args.base_pairs, args.base_metricx)):
+        p = {r["id"]: r for r in read_rows(pairs)}
+        m = {r["id"]: r for r in read_rows(metricx)}
+        rows[name] = [{**r, "metricx_qe": m.get(i, {}).get("qe_source_hypothesis")} for i, r in p.items()]
+    result = smoke6_verdict(summary, adapter, base_summary, args.seq, lora, rows["arm"], rows["base"], build_report)
+    result["seq"] = args.seq
+    result["eval"] = summary.get("eval")
+    result["throughput"] = summary.get("throughput")
+    Path(args.out).with_suffix(".json").write_text(json.dumps(result, indent=1, default=str) + "\n")
+    L = [f"# Smoke-test G4-6 (concept-amendement G4-6.6), rijen van {args.seq}", "",
+         f"**{'Geslaagd' if result['passed'] else 'Niet geslaagd'}.** Schatting van de volle run: "
+         f"{result['estimate']['hours']} u.", "", "| controle | waarde | gehaald |", "|---|---|---|"]
+    for k, c in result["checks"].items():
+        L.append(f"| {k} | `{json.dumps(c['value'], default=str)[:200]}` | {'ja' if c['holds'] else 'nee'} |")
+    L += ["", f"Ter controle (beslist niet): {json.dumps(result['own_against_pref_btval_rejected'])}.", ""]
+    Path(args.out).write_text("\n".join(L), encoding="utf-8")
+    print(f"SMOKE6 {'PASSED' if result['passed'] else 'FAILED'} {json.dumps({k: c['holds'] for k, c in result['checks'].items()})}",
+          flush=True)
+    if not result["passed"]:
+        raise SystemExit(1)
+
+
+def pref_measure(summary):
+    """The preference measures of G4-6's training (reported, deciding nothing): per preference eval set and step the
+    pairs' loss, accuracy, margin, the NLL of the chosen and the rejected sides; the training steps per window of 50;
+    the loss on own (G4-0's greedy translations of the BT validation) per eval step"""
+    out = {"sets": collections.defaultdict(dict), "own": {}, "train": []}
+    for e in summary.get("eval") or []:
+        if e.get("kind") == "pref":
+            out["sets"][e["set"]][e["step"]] = {k: e[k] for k in ("pairs", "loss", "accuracy", "margin", "chosen_nll",
+                                                                  "rejected_nll", "ref_chosen_nll", "ref_rejected_nll")}
+        elif e["set"] == "own":
+            out["own"][e["step"]] = e["loss"]
+    steps = (summary.get("dpo") or {}).get("steps") or []
+    for k in range(0, len(steps), 50):
+        w = steps[k:k + 50]
+        n = sum(s["pairs"] for s in w) or 1
+        out["train"].append({"steps": [w[0]["step"], w[-1]["step"]],
+                             **{m: sum(s[m] * s["pairs"] for s in w) / n for m in ("loss", "accuracy", "margin",
+                                                                                 "chosen_nll", "rejected_nll")}})
+    out["sets"] = {k: dict(sorted(v.items())) for k, v in sorted(out["sets"].items())}
+    out["own"] = dict(sorted(out["own"].items()))
+    out["spec"] = (summary.get("dpo") or {}).get("spec")
+    return out
+
+
+def pref_text(p):
+    L = ["", "## Voorkeuren (G4-6, rapporteren, beslist niet)", "",
+         f"Verlies `{json.dumps(p['spec'])}`. Per held-out voorkeursset en eval-stap: paren, verlies, nauwkeurigheid "
+         "(beloning chosen > rejected), marge (beta × verschil van de log-ratio's), NLL per token van chosen en "
+         "rejected onder het model (en onder de referentie G4-0).", "",
+         "| set | stap | paren | verlies | nauwkeurigheid | marge | NLL chosen | NLL rejected | ref chosen | ref rejected |",
+         "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
+    for name, steps in p["sets"].items():
+        for step, v in steps.items():
+            L.append(f"| {name} | {step} | {v['pairs']} | {f3(v['loss'])} | {f3(v['accuracy'])} | {f3(v['margin'])} | "
+                     f"{f3(v['chosen_nll'])} | {f3(v['rejected_nll'])} | {f3(v['ref_chosen_nll'])} | "
+                     f"{f3(v['ref_rejected_nll'])} |")
+    L += ["", "Verlies op `own` (G4-0's eigen greedy vertalingen van de BT-validatie; G4-4: 0,075 → 0,339): " + ", ".join(
+        f"{k}: {f3(v)}" for k, v in p["own"].items()) + ".", "",
+        "Training per 50 stappen (gewogen naar paren): " + "; ".join(
+            f"{w['steps'][0]}–{w['steps'][1]}: verlies {f3(w['loss'])}, nauwk. {f3(w['accuracy'])}, marge "
+            f"{f3(w['margin'])}" for w in p["train"])]
+    return L
+
+
+PAIRTEXTS6 = 1000         # the classifier on chosen and rejected: at most this many pairs per kind (reported only)
+
+
+def pairtexts6(args):
+    """amendment G4-6.7 (reported, decides nothing): the classifier's texts of chosen and rejected, a seeded sample of
+    PAIRTEXTS6 training pairs per kind, model chosen / rejected, set = the kind"""
+    pairs = [p for p in read_rows(args.pairs) if p["set"] == "train"]
+    out = []
+    for kind in sorted({p["kind"] for p in pairs}):
+        part = sorted((p for p in pairs if p["kind"] == kind), key=lambda p: p["id"])
+        part = random.Random(f"{SEED6}/pairtexts/{kind}").sample(part, min(PAIRTEXTS6, len(part)))
+        for p in sorted(part, key=lambda p: p["id"]):
+            out += [{"model": side, "set": kind, "id": p["id"], "text": p[side]} for side in ("chosen", "rejected")]
+    write_parquet(out, args.out)
+    print(f"PAIRTEXTS6 {json.dumps(collections.Counter(r['model'] + '/' + r['set'] for r in out))}", flush=True)
+
+
+def pairclass6(args):
+    """The share the classifier calls original, per kind, of the chosen and the rejected sides (reported only)"""
+    by = collections.defaultdict(list)
+    for r in read_rows(args.predictions):
+        by[(r["set"], r["model"])].append(r["p_original"] >= 0.5)
+    result = {kind: {side: {"n": len(by[(kind, side)]), "original": sum(by[(kind, side)]) / len(by[(kind, side)])}
+                     for side in ("chosen", "rejected") if by[(kind, side)]}
+              for kind in sorted({k for k, _ in by})}
+    Path(args.out).with_suffix(".json").write_text(json.dumps(result, indent=1) + "\n")
+    L = ["# G4-6: de classifier op chosen en rejected (rapporteren, beslist niet)", "",
+         "| soort | n | \"origineel\" chosen | \"origineel\" rejected (G4-0) | verschil |", "|---|---:|---:|---:|---:|"]
+    for kind, v in result.items():
+        c, r = v.get("chosen", {}), v.get("rejected", {})
+        diff = c["original"] - r["original"] if c and r else None
+        L.append(f"| {kind} | {c.get('n')} | {pct(c.get('original'))} | {pct(r.get('original'))} | {f3(diff, True)} |")
+    Path(args.out).write_text("\n".join(L) + "\n", encoding="utf-8")
+    print(f"PAIRCLASS6 {json.dumps(result)}", flush=True)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -4167,13 +4871,48 @@ def main(argv=None):
     p.add_argument("--warmup", required=True, help="summary.json of the warmup run (its evals at step 0 and 1,000)")
     p.add_argument("--g44-report", required=True, help="G4-4's report.json (its losses at the last step)")
     p.add_argument("--out", required=True)
+    p = sub.add_parser("cands6")
+    p.add_argument("--g44", required=True, help="G4-4's set ($G/data/G4-4/)")
+    p.add_argument("--g44-report", required=True, help="report-G4-4.json")
+    p.add_argument("--novels-eval", required=True, help="$H4/eval-novels.parquet")
+    p.add_argument("--novels-eval-meta", required=True, help="$H4/eval-novels-meta.parquet")
+    p.add_argument("--tokenizer", required=True)
+    p.add_argument("--factor", type=float, default=CANDIDATES6, help="candidates per wanted pair")
+    p.add_argument("--workers", type=int, default=4)
+    p.add_argument("--out", required=True)
+    p = sub.add_parser("build6")
+    p.add_argument("--cands", required=True, help="cands6's cands.parquet")
+    p.add_argument("--rejected", action="append", required=True, help="glob of G4-0's collected pairs of the candidates")
+    p.add_argument("--heldout", required=True, help="$H/evalsets.parquet (held-out books and BT validation)")
+    p.add_argument("--heldout-g40", action="append", required=True, help="glob of G4-0's held-out pairs")
+    p.add_argument("--evalsets", required=True, help="$E/data/evalsets.parquet (13-grams)")
+    p.add_argument("--blind", required=True, help="blind100.jsonl (13-grams)")
+    p.add_argument("--tokenizer", required=True)
+    p.add_argument("--out", required=True)
+    p = sub.add_parser("check6")
+    p.add_argument("--data", required=True, help="build6's directory")
+    p.add_argument("--tokenizer", required=True)
+    p.add_argument("--processes", type=int, default=8)
+    p.add_argument("--chunk", type=int, default=5000)
+    p = sub.add_parser("smoke6")
+    for name in ("summary", "adapter", "base-summary", "build-report", "translate-log", "arm-pairs", "arm-metricx",
+                 "base-pairs", "base-metricx", "out"):
+        p.add_argument(f"--{name}", required=True)
+    p.add_argument("--seq", type=int, default=SEQ6, choices=(SEQ6, SEQ6_FALLBACK))
+    p = sub.add_parser("pairtexts6")
+    p.add_argument("--pairs", required=True, help="build6's pairs.parquet")
+    p.add_argument("--out", required=True)
+    p = sub.add_parser("pairclass6")
+    p.add_argument("--predictions", required=True)
+    p.add_argument("--out", required=True)
     args = parser.parse_args(argv)
     {"fetch": fetch, "build": build, "check": check, "evaldata": evaldata, "texts": texts, "report": report,
      "tally": tally, "smoke": smoke, "heldout": heldout, "own": own, "replay": replay_candidates, "build2": build2,
      "smoke2": smoke2, "heldout3": heldout3, "build3": build3, "smoke3": smoke3, "build4": build4,
      "smoke4": smoke4, "novels4": novels4, "build5": build5, "split5": split5, "smoke5": smoke5,
      "report5": report5, "temp5": temp5, "samples5": samples5_cli, "sampledata5": sampledata5, "best8": best8,
-     "sample5": sample5, "samplejoin": samplejoin, "samplesplit": samplesplit}[args.command](args)
+     "sample5": sample5, "samplejoin": samplejoin, "samplesplit": samplesplit, "cands6": cands6, "build6": build6,
+     "check6": check6, "smoke6": smoke6, "pairtexts6": pairtexts6, "pairclass6": pairclass6}[args.command](args)
 
 
 if __name__ == "__main__":

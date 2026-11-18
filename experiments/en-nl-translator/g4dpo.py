@@ -1,0 +1,393 @@
+#!/usr/bin/env python3
+"""Arm G4-6 (draft amendment G4-6): preference training (DPO) of Gemma 4 31B-it with LoRA in the translator's SFT stack
+(MaxText 0.2.5 train_sft, Tunix's PeftTrainer, qwix LoRA), with G4-0 (the model without the adapter) as the reference.
+
+A pair is (English, chosen Dutch, rejected Dutch): chosen a human Dutch text (a novel's translation, a book's or a
+back-translation's original), rejected G4-0's greedy translation of the same English (natural-v1, thinking off). Each
+side is an example as MaxText's SFT makes it (g4lora.prompt_text + completion_text, the loss on the Dutch and
+<turn|>\\n). The two sides of a pair are two segments next to each other in one packed row, chosen first (segments 2j-1
+and 2j), so that the loss reads the pairs from targets_segmentation alone and a batch keeps MaxText's six keys.
+
+The reference policy is the base model: the same model with every LoRA parameter at zero (qwix adds x A B x scale, which
+is then exactly zero), run in the same jitted step under stop_gradient and before the policy's forward pass (an
+optimization barrier), so that no second copy of the weights is needed. Tunix's DPOTrainer (tunix/sft/dpo/dpo_trainer.py
+@ a8d7058) takes a separate ref_model (MaxText 0.2.5's train_dpo.py passes nnx.clone(model) and applies no LoRA) and pads
+every prompt and response to fixed lengths; its loss is the one of dpo_terms with loss "sigmoid": -(1 - eps) log
+sigmoid(beta h) - eps log sigmoid(-beta h), rewards beta x the log-ratio, accuracy chosen reward > rejected reward.
+
+Pure parts (numpy, no JAX): packing pairs into rows, a row as MaxText's SFT batch row (targets shifted as ShiftData
+does), the per-process batches of a packed file, and the loss's arithmetic (dpo_terms, numpy or jax.numpy).
+JAX parts (on the TPU, imported by sft_lora.py --dpo): without_lora, the per-token log-probabilities from the decoder's
+hidden states in pieces along the sequence (MaxText's output head and cross_entropy_with_logits per piece, under
+jax.checkpoint), and the loss function in the signature of MaxText's SFT loss.
+"""
+
+import json
+import math
+from pathlib import Path
+
+import numpy as np
+
+KEYS = ("inputs", "inputs_position", "inputs_segmentation", "targets", "targets_position", "targets_segmentation")
+PAD_ID = 0                # Gemma 4's <pad>: the id MaxText's SFT masks the prompt with (hf_data_processing._get_pad_id)
+BOS_ID = 2                # Gemma 4's <bos>: ShiftData's second ignored id
+MAX_SEGMENTS = 64         # segments a packed row may hold (32 pairs); the loss's one-hot over the segment ids
+LOSSES = ("sigmoid", "ipo")
+DEFAULTS = {"loss": "sigmoid", "beta": 0.1, "label_smoothing": 0.0, "nll_alpha": 1.0, "length_norm": False,
+            "max_segments": MAX_SEGMENTS}
+# The sums dpo_terms gives per batch (aux "pref_<name>" in the training stack); a file's eval adds them over its batches
+SUMS = ("pairs", "dpo_sum", "correct", "margin_sum", "chosen_reward_sum", "rejected_reward_sum", "chosen_logp_sum",
+        "rejected_logp_sum", "ref_chosen_logp_sum", "ref_rejected_logp_sum", "chosen_tokens", "rejected_tokens")
+
+
+def spec(**kw):
+    """The preference loss's settings (DEFAULTS, overridden), checked"""
+    out = {**DEFAULTS, **{k: v for k, v in kw.items() if v is not None}}
+    unknown = sorted(set(out) - set(DEFAULTS))
+    if unknown:
+        raise ValueError(f"unknown settings {unknown}")
+    if out["loss"] not in LOSSES:
+        raise ValueError(f"loss {out['loss']!r}: one of {LOSSES}")
+    if not out["beta"] > 0 or not 0 <= out["label_smoothing"] < 0.5 or out["nll_alpha"] < 0:
+        raise ValueError(f"beta > 0, 0 <= label_smoothing < 0.5, nll_alpha >= 0: {out}")
+    if out["loss"] == "ipo" and out["label_smoothing"]:
+        raise ValueError("label smoothing is a setting of the sigmoid loss")
+    if out["max_segments"] < 2 or out["max_segments"] % 2:
+        raise ValueError(f"max_segments {out['max_segments']}: even, at least 2")
+    out["length_norm"] = bool(out["length_norm"])
+    return out
+
+
+def read_spec(path):
+    return spec(**json.loads(Path(path).read_text()))
+
+
+# ---------------------------------------------------------------------------------------------------- packing
+
+def pack_pairs(lengths, seq, rows, max_segments=MAX_SEGMENTS):
+    """[batch: [row: [pair index, ...]]] of pairs with lengths [(chosen side, rejected side), ...] in tokens: the order
+    is kept; a pair (both sides, one row) goes to the first row of the open batch with room for its tokens and two more
+    segments; a pair that fits no row closes the batch and opens the next (grain's PackAndBatchOperation, MaxText's SFT
+    packing, with a pair as the unit). The last batch may have empty rows."""
+    batches, cur, free, segs = [], None, None, None
+    for k, (a, b) in enumerate(lengths):
+        n = a + b
+        if n > seq:
+            raise ValueError(f"pair {k}: {n} tokens, more than a row of {seq}")
+        if cur is None:
+            cur, free, segs = [[] for _ in range(rows)], [seq] * rows, [0] * rows
+        for i in range(rows):
+            if free[i] >= n and segs[i] + 2 <= max_segments:
+                break
+        else:
+            batches.append(cur)
+            cur, free, segs = [[] for _ in range(rows)], [seq] * rows, [0] * rows
+            i = 0
+        cur[i].append(k)
+        free[i] -= n
+        segs[i] += 2
+    if cur is not None:
+        batches.append(cur)
+    return batches
+
+
+def row_unshifted(sides, seq, pad_id=PAD_ID):
+    """One packed row before ShiftData (KEYS, int32 of length seq), sides = [(prompt ids, completion ids), ...] in
+    segment order, as MaxText's SFT pipeline makes it: inputs the concatenation; targets the completion only (the prompt
+    as pad_id, SFTPromptMasking); segmentation 1, 2, ... and positions from 0 per example, zeros after (packing,
+    ReformatPacking: the targets' segmentation and positions are the inputs')"""
+    inputs, targets, seg, pos = (np.zeros(seq, np.int32) for _ in range(4))
+    at = 0
+    for s, (prompt, completion) in enumerate(sides, 1):
+        n = len(prompt) + len(completion)
+        if at + n > seq:
+            raise ValueError(f"the examples take more than {seq} tokens")
+        inputs[at:at + n] = list(prompt) + list(completion)
+        targets[at:at + len(prompt)] = pad_id
+        targets[at + len(prompt):at + n] = completion
+        seg[at:at + n] = s
+        pos[at:at + n] = np.arange(n)
+        at += n
+    return {"inputs": inputs, "inputs_position": pos, "inputs_segmentation": seg, "targets": targets,
+            "targets_position": pos.copy(), "targets_segmentation": seg.copy()}
+
+
+def shift_row(row, pad_id=PAD_ID, bos_id=BOS_ID):
+    """ShiftData's shift_and_refine on one row: targets and targets_segmentation one place to the left (the last
+    target pad_id, its segment 0), the segmentation 0 where the target is pad_id or bos_id; the positions unchanged"""
+    targets = np.append(row["targets"][1:], np.int32(pad_id)).astype(np.int32)
+    seg = np.append(row["targets_segmentation"][1:], np.int32(0)).astype(np.int32)
+    for ignored in (pad_id, bos_id):
+        seg = np.where(targets != ignored, seg, 0).astype(np.int32)
+    return {**row, "targets": targets, "targets_segmentation": seg}
+
+
+def row_arrays(sides, seq, pad_id=PAD_ID, bos_id=BOS_ID):
+    """One row of MaxText's SFT batch of packed examples: row_unshifted, then shift_row"""
+    return shift_row(row_unshifted(sides, seq, pad_id), pad_id, bos_id)
+
+
+def pack_rows(pairs, seq, rows, max_segments=MAX_SEGMENTS, pad_id=PAD_ID, bos_id=BOS_ID):
+    """The packed rows of pairs ({"id", "prompt", "chosen", "rejected"}, token ids) as a list of dicts (KEYS plus
+    "batch", "pairs": the pair ids in segment order, "tokens"), every batch `rows` rows (empty rows all zero)"""
+    lengths = [(len(p["prompt"]) + len(p["chosen"]), len(p["prompt"]) + len(p["rejected"])) for p in pairs]
+    out = []
+    for b, batch in enumerate(pack_pairs(lengths, seq, rows, max_segments)):
+        for row in batch:
+            sides = []
+            for k in row:
+                sides += [(pairs[k]["prompt"], pairs[k]["chosen"]), (pairs[k]["prompt"], pairs[k]["rejected"])]
+            arrays = row_arrays(sides, seq, pad_id, bos_id)
+            out.append({**{key: arrays[key].tolist() for key in KEYS}, "batch": b,
+                        "pairs": [pairs[k]["id"] for k in row], "tokens": int(np.count_nonzero(arrays["inputs_segmentation"]))})
+    return out
+
+
+def write_rows(rows, path):
+    """A packed file: one parquet row per packed row (KEYS as int32 lists, batch, pairs, tokens)"""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    schema = pa.schema([*((k, pa.list_(pa.int32())) for k in KEYS), ("batch", pa.int64()),
+                        ("pairs", pa.list_(pa.string())), ("tokens", pa.int64())])
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(pa.Table.from_pylist(rows, schema=schema), path, compression="zstd", row_group_size=1024)
+
+
+def read_packed(path):
+    """{key: int32 array [rows, seq]} of a packed file, and its batch index per row"""
+    import pyarrow.parquet as pq
+
+    table = pq.read_table(path, columns=[*KEYS, "batch"])
+    arrays = {k: np.asarray(table.column(k).to_pylist(), np.int32) for k in KEYS}
+    return arrays, np.asarray(table.column("batch").to_pylist(), np.int64)
+
+
+def batch_count(batch, rows):
+    """The global batches of a packed file: its rows in order, `rows` per batch"""
+    n = len(batch)
+    if n % rows or not np.array_equal(batch, np.repeat(np.arange(n // rows), rows)):
+        raise SystemExit(f"a packed file of {n} rows is not batches of {rows} rows in order")
+    return n // rows
+
+
+def local_batches(arrays, process, processes, rows, batches, padding=0):
+    """This process's part of each global batch (rows / processes consecutive rows), the first `batches` of the file,
+    then `padding` all-zero batches: Tunix loads the next batch before it checks max_steps, so a run of every batch
+    still finds one (every process the same, so that none leaves the loop another way)"""
+    if rows % processes:
+        raise SystemExit(f"{rows} rows per batch over {processes} processes")
+    local = rows // processes
+    seq = arrays["inputs"].shape[1]
+    for b in range(batches):
+        lo = b * rows + process * local
+        yield {k: arrays[k][lo:lo + local] for k in KEYS}
+    for _ in range(padding):
+        yield {k: np.zeros((local, seq), np.int32) for k in KEYS}
+
+
+def global_iterator(path, mesh, rows, batches, padding=0):
+    """MaxText's multi-host iterator over a packed file: each process puts its rows of a batch on its devices"""
+    import jax
+    from maxtext.input_pipeline.multihost_dataloading import MultiHostDataLoadIterator
+
+    arrays, batch = read_packed(path)
+    have = batch_count(batch, rows)
+    if batches > have:
+        raise SystemExit(f"{path}: {have} batches, {batches} wanted")
+    gen = list(local_batches(arrays, jax.process_index(), jax.process_count(), rows, batches, padding))
+    return MultiHostDataLoadIterator(gen, mesh)
+
+
+def packed_info(path, rows, seq):
+    """{batches, rows, tokens, loss_tokens, pairs} of a packed file of rows of `seq` tokens, `rows` per batch"""
+    import pyarrow.parquet as pq
+
+    arrays, batch = read_packed(path)
+    if arrays["inputs"].shape[1] != seq:
+        raise SystemExit(f"{path}: rows of {arrays['inputs'].shape[1]} tokens, the run's max_target_length is {seq}")
+    pairs = sum(len(p) for p in pq.read_table(path, columns=["pairs"]).column("pairs").to_pylist())
+    return {"batches": batch_count(batch, rows), "rows": len(batch), "pairs": pairs,
+            "tokens": int(np.count_nonzero(arrays["inputs_segmentation"])),
+            "loss_tokens": int(np.count_nonzero(arrays["targets_segmentation"]))}
+
+
+# ---------------------------------------------------------------------------------------------------- the loss
+
+def log_sigmoid(x, xp):
+    return -xp.logaddexp(0.0, -x)
+
+
+def dpo_terms(logp, ref_logp, segmentation, opts, xp=np):
+    """The preference loss of a batch and its sums (SUMS). logp and ref_logp: per-token log-probabilities of the
+    targets [B, L] (0 where targets_segmentation is 0) under the policy and the reference; segmentation:
+    targets_segmentation. A pair is segments 2j-1 (chosen) and 2j (rejected) of a row, both with target tokens; an
+    unpaired or empty segment counts nowhere. Per pair h = (chosen - ref chosen) - (rejected - ref rejected) of the
+    summed log-probabilities (each divided by its tokens with length_norm); sigmoid: -(1 - eps) log sigmoid(beta h) - eps
+    log sigmoid(-beta h) (Tunix's dpo_loss_fn); ipo: (h - 1 / (2 beta))^2. The loss is the mean over the batch's pairs
+    plus nll_alpha x the token-weighted NLL of the chosen sides (the SFT loss of G4-4 on them). Rewards beta x (logp -
+    ref); accuracy: chosen reward > rejected reward."""
+    f32 = xp.float32
+    s = int(opts["max_segments"])
+    ids = xp.arange(1, s + 1)
+    onehot = (segmentation[..., None] == ids).astype(f32)
+    pol = xp.einsum("bl,bls->bs", logp.astype(f32), onehot)
+    ref = xp.einsum("bl,bls->bs", ref_logp.astype(f32), onehot)
+    ntok = onehot.sum(axis=1)
+    pc, pr, rc, rr = pol[:, 0::2], pol[:, 1::2], ref[:, 0::2], ref[:, 1::2]
+    nc, nr = ntok[:, 0::2], ntok[:, 1::2]
+    valid = ((nc > 0) & (nr > 0)).astype(f32)
+    if opts["length_norm"]:
+        dc, dr = xp.maximum(nc, 1.0), xp.maximum(nr, 1.0)
+        a, b, c, d = pc / dc, pr / dr, rc / dc, rr / dr
+    else:
+        a, b, c, d = pc, pr, rc, rr
+    h = (a - c) - (b - d)
+    beta = float(opts["beta"])
+    if opts["loss"] == "sigmoid":
+        eps = float(opts["label_smoothing"])
+        losses = -(log_sigmoid(beta * h, xp) * (1.0 - eps) + log_sigmoid(-beta * h, xp) * eps)
+    elif opts["loss"] == "ipo":
+        losses = (h - 1.0 / (2.0 * beta)) ** 2
+    else:
+        raise ValueError(f"loss {opts['loss']!r}")
+    chosen_reward, rejected_reward = beta * (a - c), beta * (b - d)
+    pairs = valid.sum()
+    chosen_tokens = (nc * valid).sum()
+    sums = {"pairs": pairs, "dpo_sum": (losses * valid).sum(),
+            "correct": ((chosen_reward > rejected_reward).astype(f32) * valid).sum(),
+            "margin_sum": ((chosen_reward - rejected_reward) * valid).sum(),
+            "chosen_reward_sum": (chosen_reward * valid).sum(), "rejected_reward_sum": (rejected_reward * valid).sum(),
+            "chosen_logp_sum": (pc * valid).sum(), "rejected_logp_sum": (pr * valid).sum(),
+            "ref_chosen_logp_sum": (rc * valid).sum(), "ref_rejected_logp_sum": (rr * valid).sum(),
+            "chosen_tokens": chosen_tokens, "rejected_tokens": (nr * valid).sum()}
+    loss = sums["dpo_sum"] / xp.maximum(pairs, 1.0) + float(opts["nll_alpha"]) * (
+        -sums["chosen_logp_sum"] / xp.maximum(chosen_tokens, 1.0))
+    return loss, sums
+
+
+def pref_record(name, step, parts, batches, seconds):
+    """One preference file's eval at a step from the per-batch sums (dicts of SUMS): pairs, the mean loss, accuracy,
+    margin and rewards per pair, and per token the policy's NLL of the chosen and of the rejected sides and the
+    reference's (at step 0 the same)"""
+    if len(parts) != batches:
+        raise SystemExit(f"eval {name} at step {step}: {len(parts)} batches ran, {batches} planned")
+    t = {k: float(sum(p[k] for p in parts)) for k in SUMS}
+    if t["pairs"] <= 0:
+        raise SystemExit(f"eval {name} at step {step}: no pair")
+    n, ct, rt = t["pairs"], max(t["chosen_tokens"], 1.0), max(t["rejected_tokens"], 1.0)
+    return {"step": step, "set": name, "kind": "pref", "batches": batches, "pairs": int(round(n)),
+            "loss": t["dpo_sum"] / n, "accuracy": t["correct"] / n, "margin": t["margin_sum"] / n,
+            "chosen_reward": t["chosen_reward_sum"] / n, "rejected_reward": t["rejected_reward_sum"] / n,
+            "chosen_nll": -t["chosen_logp_sum"] / ct, "rejected_nll": -t["rejected_logp_sum"] / rt,
+            "ref_chosen_nll": -t["ref_chosen_logp_sum"] / ct, "ref_rejected_nll": -t["ref_rejected_logp_sum"] / rt,
+            "chosen_tokens": int(round(t["chosen_tokens"])), "rejected_tokens": int(round(t["rejected_tokens"])),
+            "seconds": round(seconds, 1)}
+
+
+def step_record(step, sums):
+    """A training step's preference measures (the batch's sums as floats)"""
+    n = max(sums["pairs"], 1.0)
+    return {"step": step, "pairs": int(round(sums["pairs"])), "loss": sums["dpo_sum"] / n,
+            "accuracy": sums["correct"] / n, "margin": sums["margin_sum"] / n,
+            "chosen_nll": -sums["chosen_logp_sum"] / max(sums["chosen_tokens"], 1.0),
+            "rejected_nll": -sums["rejected_logp_sum"] / max(sums["rejected_tokens"], 1.0)}
+
+
+# ---------------------------------------------------------------------------------------------------- JAX
+
+def without_lora(model):
+    """The reference policy: a copy of the model's graph with every LoRA parameter at zero (the base kernels are the
+    same arrays; nothing is copied on the device)"""
+    import jax
+    import jax.numpy as jnp
+    from flax import nnx
+
+    graphdef, lora, rest = nnx.split(model, nnx.LoRAParam, ...)
+    if not jax.tree_util.tree_leaves(lora):
+        raise SystemExit("--dpo: the model has no LoRA parameter (the reference is the model with them at zero)")
+    return nnx.merge(graphdef, jax.tree.map(jnp.zeros_like, lora), rest, copy=True)
+
+
+def chunked_logp(piece_fn, args, hidden, targets, pieces):
+    """Per-token log-probabilities [B, L] (float32) of the targets from the hidden states [B, L, D], in `pieces` pieces
+    along the sequence (every row keeps its place on its device): piece_fn(*args, hidden piece, target piece) gives the
+    per-token log-probabilities of one piece; under jax.checkpoint one piece at a time (lax.map), so that the backward
+    pass recomputes one piece's logits instead of keeping all of them (as MaxText's vocabulary tiling)"""
+    import jax
+    import jax.numpy as jnp
+
+    b, length, d = hidden.shape
+    if length % pieces:
+        raise SystemExit(f"--dpo: a sequence of {length} in {pieces} pieces")
+    c = length // pieces
+    h = jnp.swapaxes(hidden.reshape(b, pieces, c, d), 0, 1)
+    y = jnp.swapaxes(targets.reshape(b, pieces, c), 0, 1)
+    one = jax.checkpoint(piece_fn)
+    out = jax.lax.map(lambda hy: one(*args, hy[0], hy[1]).astype(jnp.float32), (h, y))
+    return jnp.swapaxes(out, 0, 1).reshape(b, length)
+
+
+def model_logp(model, config, data, dropout):
+    """The per-token log-probabilities of data's targets (0 off the target tokens) under the model, as MaxText's loss_fn
+    runs it (the decoder's hidden states with num_vocab_tiling > 1, its output head, cross_entropy_with_logits without
+    z-loss), in num_vocab_tiling pieces along the sequence"""
+    import jax
+    import jax.numpy as jnp
+    from flax import nnx
+    from maxtext.utils import max_utils, maxtext_utils
+
+    if config.num_vocab_tiling < 2:
+        raise SystemExit("--dpo needs num_vocab_tiling > 1 (the decoder then gives its hidden states)")
+    model(decoder_input_tokens=data["inputs"], decoder_positions=data["inputs_position"],
+          decoder_segment_ids=data["inputs_segmentation"], encoder_images=None, encoder_image_masks=None,
+          enable_dropout=dropout, decoder_target_tokens=data["targets"], decoder_target_mask=data["targets_segmentation"])
+    intermediates = nnx.pop(model, nnx.Intermediate).to_pure_dict()
+    hidden = maxtext_utils.get_nested_value(intermediates, ("decoder", "hidden_states"))[0]
+    graphdef, params, rest = nnx.split(model, nnx.Param, ...)
+    deterministic = not dropout
+
+    def piece(params, rest, h, y):
+        # the params as arguments, not captured: MaxText's vocabulary tiling does so for the tied embedding
+        local = nnx.merge(graphdef, params, rest, copy=True)
+        logits = local.logits_from_hidden_states_for_vocab_tiling(h, deterministic, "train")
+        xent, _ = max_utils.cross_entropy_with_logits(logits, jax.nn.one_hot(y, config.vocab_size), z_loss=0.0)
+        return -xent
+
+    logp = chunked_logp(piece, (params, rest), hidden, data["targets"], config.num_vocab_tiling)
+    return logp * (data["targets_segmentation"] != 0).astype(jnp.float32)
+
+
+def make_loss(config, opts, is_train):
+    """The preference loss in the signature of MaxText's SFT loss (train_sft.use_maxtext_loss_function): the reference
+    pass first (without_lora, stop_gradient), an optimization barrier, then the policy's; aux holds xent_sum and
+    total_weights over every target token (the SFT eval files' loss, as MaxText's) and the pairs' sums (pref_<sum>)"""
+    import jax
+    import jax.numpy as jnp
+
+    micro = config.micro_batch_size_to_train_on if is_train else config.micro_batch_size_to_eval_on
+    dropout = bool(config.enable_dropout) if is_train else False
+
+    def loss_func(model, inputs, inputs_position, inputs_segmentation, targets, targets_position,
+                  targets_segmentation):
+        data = {"inputs": inputs, "inputs_position": inputs_position, "inputs_segmentation": inputs_segmentation,
+                "targets": targets, "targets_position": targets_position,
+                "targets_segmentation": targets_segmentation}
+        data = {k: v[:micro] for k, v in data.items()}
+        ref = jax.lax.stop_gradient(model_logp(without_lora(model), config, data, False))
+        # the reference's pass ends before the policy's begins: its activations are never live beside the policy's
+        ref, data = jax.lax.optimization_barrier((ref, data))
+        logp = model_logp(model, config, data, dropout)
+        loss, sums = dpo_terms(logp, ref, data["targets_segmentation"], opts, jnp)
+        aux = {"xent_sum": -jnp.sum(logp), "total_weights": jnp.sum(data["targets_segmentation"] != 0),
+               **{f"pref_{k}": v for k, v in sums.items()}}
+        return loss, aux
+
+    return loss_func
+
+
+def expected_step0(opts):
+    """The preference measures at step 0, where the policy is the reference (LoRA's B is zero): h = 0 for every pair,
+    so the loss is log 2 (sigmoid) or 1 / (4 beta^2) (ipo), margin and rewards 0, accuracy 0 (no strict win)"""
+    loss = math.log(2.0) if opts["loss"] == "sigmoid" else (1.0 / (2.0 * opts["beta"])) ** 2
+    return {"loss": loss, "margin": 0.0, "accuracy": 0.0, "chosen_reward": 0.0, "rejected_reward": 0.0}

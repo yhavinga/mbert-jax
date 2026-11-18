@@ -3985,7 +3985,8 @@ BT_SOURCES6 = ("handelingen", "raad", "fineweb", "rechtspraak", "dpc")
 # English, human Dutch) and the back-translations (Gemma 4's English, original Dutch) about as many, the BT equal per
 # source
 WANT6 = {"book": 11000, "novel": 16000, **{f"bt:{s}": 3200 for s in BT_SOURCES6}}
-CANDIDATES6 = 1.25        # candidates translated per wanted pair, for what build6's filters take (books: every one)
+CANDIDATES6 = 1.4         # candidates translated per wanted pair, for what build6's filters take (books: every one);
+                          # DPC loses ~18% to the chrF ceiling alone (its round trip's p75-p95, spec §3.1)
 PAIR_MAX6 = 2048          # a pair's tokens (the prompt twice, both sides): every pair fits a row of the fallback
 SEQ6 = SEQ3               # 4,096: G4-4's rows
 SEQ6_FALLBACK = 2048      # amendment G4-6.4: the rows if 4,096 does not fit

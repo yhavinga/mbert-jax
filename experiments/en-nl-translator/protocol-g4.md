@@ -824,9 +824,11 @@ er moet gelden, bijvoorbeeld de grens toetsen op een adapter met de update van e
 float32). Dat besluit wordt een nieuwe aanvulling, gecommit vóór de zoektocht.
 
 **Aanvulling 18 nov 2026 (tijdstip: de commit van deze aanvulling op branch `en-nl-g4arm5`): G4-5.7b, de twee controles
-van de zoektocht en een temperatuurproef** [besluiten van Yeb 18 nov ~08:45; uitwerking door een subagent, labels als
-in de kop]. Vastgelegd terwijl de takken van keten `g4e1118a` lopen, vóór de zoektocht, vóór de temperatuurproef en
-vóór elke uitslag van de zoektocht. De warmup is klaar; zijn eval-verliezen op stap 1.000 zijn het doel van controle 2
+van de zoektocht en een temperatuurproef** [besluiten van Yeb 18 nov ~08:45, punten 1–3; uitgebreid met punt 4
+(gekalibreerd zoekdoel) en punt 5 (sampling-proef) op Yebs besluit van 18 nov ~09:15 ("allebei"); uitwerking door een
+subagent, labels als in de kop]. Vastgelegd terwijl de takken van keten `g4e1118a` lopen, vóór de zoektocht, vóór de
+temperatuurproef, vóór de sampling-proef en vóór elke uitslag daarvan; de eerste versie (punten 1–3) is commit
+`429e7f8`, deze versie de commit die haar vervangt, beide vóór elke stap van de vervolgketen op de TPU. De warmup is klaar; zijn eval-verliezen op stap 1.000 zijn het doel van controle 2
 hieronder en worden door de keten uit zijn `summary.json` gelezen, niet gekozen. Deze aanvulling heft de stop vóór de
 zoektocht van G4-5.7a op.
 
@@ -884,10 +886,53 @@ andere scherpte van dezelfde verdeling?
 - Rapport: `g4arm.py temp5` (op co1, uit de `summary.json` van de runs en `g4-4-report.json`) →
   `mbert-ops/translator-sft/g4-5-temperature.md` en `.json`, kopie in `$G/report-G4-5/`.
 
+*4. Zoekdoel: T = 1 of gekalibreerd, met een vooraf vastgelegde regel* [besluit Yeb 18 nov ~09:15].
+- Bij elk punt van de zoektocht naast het doel van G4-5.5 (het gemiddelde van de token-gewogen referentieverliezen op het
+  zoekdeel van WMT24++, FLORES en NTREX bij T = 1) ook het **gekalibreerde doel**: hetzelfde gemiddelde bij de beste T
+  van dat punt, één T voor de drie sets samen (het minimum op het rooster van punt 3, bij gelijke waarden de T het dichtst
+  bij 1) [keuze: één T per punt, zoals één temperatuur bij het decoderen]. Uit dezelfde forward-pass (`--temperatures`
+  in de zoektocht; die draait daarom eval-only met `num_vocab_tiling=1`, zonder trainingsstap: de zoektocht is een
+  meting). Beide doelen worden per punt gerapporteerd (`objective_t1`, `objective_calibrated`, `t_calibrated`).
+- **Regel** (vóór de zoektocht, uit de temperatuurproef, door `g4arm.py temp5` berekend en door `g4mix.py spec
+  --objective-rule` toegepast): T₀ = de ene T van G4-0 met het laagste gemiddelde op de drie zoekdeelsets (zoals het
+  gekalibreerde doel van een punt); per set aandeel = (L₁(G4-0) − L_T₀(G4-0)) / (L₁(G4-0) − L₁(warmup)), met L₁(warmup)
+  het eigen eval-verlies van de warmup op stap 1.000; het gemiddelde van de drie aandelen, de sets gelijk gewogen
+  [keuze: het gemiddelde van de aandelen per set, niet de verhouding van de gemiddelde verliezen]. Is dat
+  gemiddelde **≥ 0,5**, dan kiest de zoektocht (coordinate search, top 4, herhaling) op het gekalibreerde doel, anders
+  op het doel bij T = 1. Kan de regel niet berekend worden (een verandering van de warmup < 0,001 op een zoekdeelset),
+  dan stopt de keten vóór de zoektocht.
+- De keten past de regel toe en schrijft de keuze in zijn log; `temp5` en `report5` schrijven haar in hun rapport. De
+  keuze in het verdere protocol (G4-5.6) is ongewijzigd: de kandidaten worden vertaald en op (a1) en (b) gekozen.
+
+*5. Sampling-proef* [besluit Yeb 18 nov ~09:15; rapporteren, beslist niets; na `report5` en het blinde pakket].
+- Modellen: G4-0 (geen adapter) en G4-4 (eindadapter `$G/G4-4/`, ingebakken in de kernels zoals `translate.py --lora`).
+- Decoding: MaxText's eigen sampling in de fork `f4d8615` [gemeten in de code: `inference_utils.sampling`,
+  `decode_sampling_strategy` `weighted` = `jax.random.categorical(rng, logits / T)`, geen top-k of top-p; `MaxEngine.prefill`
+  en `generate` nemen `algorithm`, `temperature` en `rng` per aanroep]. `translate.py --sample NAAM=T:SEED` zet per instelling
+  `engine.rng = PRNGKey(SEED)` (MaxEngine splitst die bij elke aanroep) en geeft `algorithm="weighted"` en T per aanroep
+  mee; zonder `--sample` is het pad greedy zoals altijd. Prompt `natural-v1`, de klassen, lengtes en workers van de
+  evaluatie van G4-4 (`$G/data/eval/segments-w<k>.parquet`, gefilterd).
+- Instellingen [seeds vast]: `t07` (T = 0,7, seed 1); `t10s1`–`t10s8` (T = 1,0, seeds 1–8; `t10s1` is de instelling
+  T = 1,0); `tstar` (T = T\* van punt 3, op `books` + `btval`, seed 1), alleen als T\* ≤ 1,5 en niet 0,7 of 1,0 (anders
+  overgeslagen of gelijk aan een bestaande instelling, genoteerd in het rapport) [keuze: T\* van punt 3, de vooraf
+  vastgelegde T op origineel en menselijk Nederlands]; **best-of-8** bij T = 1,0: per segment van `t10s1`–`t10s8` het
+  sample met de laagste MetricX-24-QE (gelijk: de lagere seed).
+- Sets: WMT24++ (de 960 goede segmenten) en FLAN (1.000), heel.
+- Metingen per model en instelling (`t07`, `t10s1`, `tstar`, `best8`), naast de greedy uitvoer van G4-0 en G4-4: het
+  aandeel "origineel" (p ≥ 0,5) per set en samen, uit één classify-run met de greedy uitvoer van G4-0 en G4-4 als ankers
+  (en de controleteksten van 13 nov, zoals elke classify-run); MetricX-24-QE op beide sets, MetricX-ref en COMET-22 op
+  WMT24++; het aandeel niet af, lus en Engels over; de lengteverhouding (tekens uitvoer / tekens bron, en op WMT24++
+  tekens uitvoer / tekens referentie); de QE van de menselijke referentie op WMT24++ (§5). Best-of-8 kiest op QE: zijn
+  QE is geen onafhankelijke maat.
+- Uitvoer apart van de kandidaten: `$G/sampling/` (`data/`, `<model>/<instelling>/`, `<model>/best8/`, `naturalness/`,
+  `report/`), jobs `g4s_*` en classify-job `arms_classify_<TAG>s`; rapport `mbert-ops/translator-sft/g4-sampling.md` en
+  `.json` (`g4arm.py sample5`).
+
 *Wat de vervolgketen doet* (`mbert-ops/scripts/g4arm5_after_hold.sh`, TAG `g4e1118b`): wacht tot keten `g4e1118a`
 eindigt met de HOLD-regel en `EXIT 0` (eindigt hij anders, dan `FAILED` zonder iets op de TPU); neemt dan de locks over,
-zet de code van deze aanvulling op de workers, draait de temperatuurproef (`g4arm_G4-5_temp0`, `g4arm_G4-5_tempw`,
-`temp5`), dan de zoektocht met controles 1 en 2, en daarna G4-5.5–G4-5.6 ongewijzigd: de top 4 vertalen en scoren,
-texts (met G4-4), classify, `report5` (met `--smoke`), het blinde pakket van de gekozen kandidaat. Faalt een stap, ook
-de temperatuurproef, dan stopt de keten (`FAILED`); de temperatuurproef kan bij een herstart worden overgeslagen
-(`TEMPERATURE=skip`), de zoektocht niet.
+zet de code van deze aanvulling op de workers en ruimt de resten van de smoke-test op; dan (1) de temperatuurproef
+(`g4arm_G4-5_temp0`, `g4arm_G4-5_tempw`, `temp5` met de regel van punt 4); (2) de zoektocht met controles 1 en 2 en het
+doel volgens de regel; (3) G4-5.5–G4-5.6 ongewijzigd: de top 4 vertalen en scoren, texts (met G4-4), classify,
+`report5` (met `--smoke`), het blinde pakket van de gekozen kandidaat (het pakket na `report5`, dat de kandidaat kiest);
+(4) de sampling-proef van punt 5; (5) `DONE`. Faalt een stap, dan stopt de keten (`FAILED`); de zoektocht heeft de
+temperatuurproef nodig (de regel van punt 4).

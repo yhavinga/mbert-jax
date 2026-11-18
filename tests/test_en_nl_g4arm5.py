@@ -182,7 +182,20 @@ def test_spec_wants_the_shared_warmup_first():
         g4mix.spec_dict([("b0", "x")], {"a": 1.0})
     s = spec(2)
     assert s["components"][0]["name"] == "shared" and s["search"]["budget"] == 80 and s["search"]["top_k"] == 4
-    assert s["repeat_max_diff"] == 1e-4 and "warmup_check" not in s
+    assert s["repeat_max_diff"] == 1e-4 and "warmup_check" not in s and s["objective_mode"] == "t1"
+
+
+def test_calibrated_objective_is_the_lowest_mean_over_one_t_and_the_rule_chooses_the_mode():
+    grid = [0.5, 1.0, 1.5, 2.0]
+    curves = {"a": {"t": grid, "loss": [3.0, 2.0, 1.6, 1.8]}, "b": {"t": grid, "loss": [2.0, 1.0, 1.0, 1.4]}}
+    value, t = g4mix.calibrated_objective(curves, {"a": 1.0, "b": 1.0})
+    assert (value, t) == (pytest.approx(1.3), 1.5)
+    flat = {k: {"t": grid, "loss": [1.0] * 4} for k in ("a", "b")}
+    assert g4mix.calibrated_objective(flat, {"a": 1.0, "b": 1.0}) == (1.0, 1.0)      # equal: the T nearest to 1
+    rule = {"sets": ["wmt24pp_s"], "objective": "calibrated", "mean_share": 0.6, "threshold": 0.5}
+    assert spec(2, objective_rule=rule)["objective_mode"] == "calibrated"
+    with pytest.raises(ValueError, match="objective rule"):
+        spec(2, objective_rule={**rule, "sets": ["books"]})
 
 
 def test_repeat_is_equal_within_1e_4_addendum_g4_5_7b():
@@ -415,6 +428,8 @@ def test_sft_lora_refuses_inconsistent_arguments_before_jax(tmp_path):
     (tmp_path / "old.json").write_text(json.dumps(old))
     checked = spec(1, warmup_check=g4mix.warmup_check_of(warmup_summary(), ["books", "novels"], 0.02))
     (tmp_path / "checked.json").write_text(json.dumps(checked))
+    (tmp_path / "calibrated.json").write_text(json.dumps(spec(1, objective_rule={"sets": ["wmt24pp_s"],
+                                                                                 "objective": "calibrated"})))
     for argv, msg in ((["--resume-step", "8"], "go together"), (["--warmup-steps", "2"], "go together"),
                       (["--warmup-steps", "2", "--decay-fraction", "1.0"], r"\[0, 1\)"),
                       (["--combine", "x.json", "--steps", "8"], "measurement"),
@@ -422,8 +437,8 @@ def test_sft_lora_refuses_inconsistent_arguments_before_jax(tmp_path):
                        "repeat_max_diff"),
                       (["--combine", str(tmp_path / "checked.json"), "--steps", "1", "--eval", "wmt24pp_s=f",
                         "--eval", "books=g"], r"\['novels'\]"),
-                      (["--temperatures", "1,2", "--eval", "wmt24pp_s=f", "--eval", "books=g", "--eval", "novels=h",
-                        "--combine", str(tmp_path / "checked.json"), "--steps", "1"], "eval-only"),
+                      (["--combine", str(tmp_path / "calibrated.json"), "--steps", "1", "--eval", "wmt24pp_s=f"],
+                       "calibrated objective needs --temperatures"),
                       (["--temperatures", "1,2"], "eval-only"),
                       (["--temperatures", "0.5,2", "--eval", "a=f"], "1.0 among them")):
         with pytest.raises(SystemExit, match=msg):
@@ -676,10 +691,12 @@ def temp_run(curves, tokens=100, steps_done=0, shift=0.0):
 
 
 def test_temp5_fits_t_on_books_and_btval_and_reports_the_share_of_the_drop(tmp_path):
-    sets = ("books", "btval", "own", "novels")
-    # G4-0: books and btval lowest at T = 1.5 (2.5 -> 2.0), own lowest at the grid's lower end
+    sets = ("books", "btval", "own", "novels", "wmt24pp_s", "flores_s", "ntrex_s")
+    # G4-0: books and btval lowest at T = 1.5 (2.5 -> 2.0), own lowest at the grid's lower end; the search sets lowest
+    # at T = 1.2 (2.2 -> 2.0: a fifth of their drop of 1.0 to the warmup)
     curve = {"books": lambda t: 2.0 + (t - 1.5) ** 2 * 2, "btval": lambda t: 1.5 + (t - 1.5) ** 2 * 2,
-             "own": lambda t: 0.05 + 0.1 * t, "novels": lambda t: 2.0 + (t - 1.3) ** 2}
+             "own": lambda t: 0.05 + 0.1 * t, "novels": lambda t: 2.0 + (t - 1.3) ** 2,
+             **{s: (lambda t: 2.0 + (t - 1.2) ** 2 * 5) for s in ("wmt24pp_s", "flores_s", "ntrex_s")}}
     (tmp_path / "base.json").write_text(json.dumps(temp_run(curve)))
     (tmp_path / "w.json").write_text(json.dumps(temp_run({s: (lambda t: 0.8 + (t - 1.0) ** 2) for s in sets})))
     warm = {"steps": 1000, "eval": [{"step": st, "set": s, "loss": curve[s](1.0) if st == 0 else 1.0, "tokens": 100}
@@ -699,6 +716,18 @@ def test_temp5_fits_t_on_books_and_btval_and_reports_the_share_of_the_drop(tmp_p
     assert r["sets"]["own"]["best_t"] == 0.5 and r["sets"]["own"]["best_edge"]
     assert r["sets"]["novels"]["best_t"] == pytest.approx(1.3)
     assert r["fit_warmup"]["t"] == 1.0 and r["sets"]["books"]["warmup_best_t"] == 1.0
+    rule = r["search_rule"]
+    assert rule["t"] == pytest.approx(1.2) and rule["mean_share"] == pytest.approx(0.2 / 1.2)
+    assert rule["objective"] == "t1"
+    # the warmup gains less on the search sets: one T gives more than half of the drop -> calibrated
+    warm2 = {**warm, "eval": [{**e, "loss": 1.9} if e["step"] == 1000 and e["set"].endswith("_s") else e
+                              for e in warm["eval"]]}
+    (tmp_path / "warm.json").write_text(json.dumps(warm2))
+    g4arm.temp5(args)
+    rule = json.loads((tmp_path / "temp.json").read_text())["search_rule"]
+    assert rule["mean_share"] == pytest.approx(0.2 / 0.3) and rule["objective"] == "calibrated"
+    assert "gekalibreerde doel" in (tmp_path / "temp.md").read_text()
+    (tmp_path / "warm.json").write_text(json.dumps(warm))
     text = (tmp_path / "temp.md").read_text()
     assert "T\\* = 1,50" in text and "≤ 0,50" in text and "33,3%" in text
     # T = 1 is not the round's own loss: the measurement is wrong
@@ -724,3 +753,141 @@ def test_report5_without_a1_on_the_search_part_takes_the_smallest_excess_and_che
     monkeypatch.setattr(g4arm, "HUMAN_QE", {"wmt24pp": 2.2, "flores": 2.0, "ntrex": 2.0})
     with pytest.raises(SystemExit, match="human references' QE of wmt24pp"):
         g4arm.report5(args)
+
+
+# ---------------------------------------------------------------------------------------------------- sampling probe
+
+def test_samples5_takes_t_star_only_up_to_1_5_and_not_twice():
+    settings, note = g4arm.samples5(1.35)
+    names = [n for n, _, _ in settings]
+    assert names == ["t07"] + [f"t10s{k}" for k in range(1, 9)] + ["tstar"]
+    assert settings[-1] == ("tstar", 1.35, 1) and [seed for n, _, seed in settings if n.startswith("t10")] == list(range(1, 9))
+    assert [n for n, _, _ in g4arm.samples5(1.6)[0]][-1] == "t10s8" and "not sampled" in g4arm.samples5(1.6)[1]
+    assert [n for n, _, _ in g4arm.samples5(1.0)[0]][-1] == "t10s8"
+
+
+def scored_output(d, ids, qe, hyp="x y", with_ref=True):
+    write([{"id": i, "set": i.split("-")[0], "source": "a b c d", "hypothesis": hyp, "reference": "c d e" if
+            with_ref and i.startswith("wmt24pp") else None, "ended": True, "decode_loop": False, "english_left": False,
+            "empty": False} for i in ids], d / "pairs" / "pairs-w0.parquet")
+    write([{"id": i, "qe_source_hypothesis": qe[i] if isinstance(qe, dict) else qe,
+            "ref_source_hypothesis_reference": 1.0 if i.startswith("wmt24pp") else None} for i in ids],
+          d / "scores" / "metricx-w0.parquet")
+    write([{"id": i, "comet22": 0.8} for i in ids if i.startswith("wmt24pp")], d / "scores" / "comet-w0.parquet")
+
+
+def test_best8_takes_the_lowest_qe_per_segment_and_the_earlier_run_on_a_tie(tmp_path):
+    ids = ["wmt24pp-1", "flan-1"]
+    runs = []
+    for k in range(1, 9):
+        qe = {"wmt24pp-1": 3.0 - 0.1 * k if k < 5 else 9.0, "flan-1": 1.0}
+        scored_output(tmp_path / f"t10s{k}", ids, qe, hyp=f"s{k}")
+        runs.append(f"t10s{k}={tmp_path / f't10s{k}'}")
+    g4arm.best8(ns(run=runs, out=str(tmp_path / "best8")))
+    import armeval
+    rows = armeval.scored(str(tmp_path / "best8"))
+    assert rows["wmt24pp-1"]["hypothesis"] == "s4" and rows["wmt24pp-1"]["metricx_qe"] == pytest.approx(2.6)
+    assert rows["flan-1"]["hypothesis"] == "s1"
+    with pytest.raises(SystemExit, match="best-of-8"):
+        g4arm.best8(ns(run=runs[:7], out=str(tmp_path / "x")))
+
+
+def test_samplejoin_and_samplesplit_give_each_sample_its_rows_back(tmp_path):
+    for n in ("t07", "t10s1"):
+        write([{"id": "wmt24pp-1", "hypothesis": n}, {"id": "flan-1", "hypothesis": n}], tmp_path / f"{n}.parquet")
+    g4arm.samplejoin(ns(pairs=[f"t07={tmp_path / 't07.parquet'}", f"t10s1={tmp_path / 't10s1.parquet'}"],
+                        out=str(tmp_path / "all.parquet")))
+    rows = pq.read_table(tmp_path / "all.parquet").to_pylist()
+    assert sorted(r["id"] for r in rows) == ["t07|flan-1", "t07|wmt24pp-1", "t10s1|flan-1", "t10s1|wmt24pp-1"]
+    write([{"id": r["id"], "qe_source_hypothesis": 1.0} for r in rows], tmp_path / "scores.parquet")
+    g4arm.samplesplit(ns(scores=str(tmp_path / "scores.parquet"), out=str(tmp_path / "{sample}" / "metricx-w0.parquet")))
+    back = pq.read_table(tmp_path / "t10s1" / "metricx-w0.parquet").to_pylist()
+    assert sorted(r["id"] for r in back) == ["flan-1", "wmt24pp-1"]
+
+
+def test_sampledata5_keeps_wmt24pp_good_and_flan_on_their_workers(tmp_path, monkeypatch):
+    monkeypatch.setattr(g4arm, "N_WMT_GOOD", 2)
+    monkeypatch.setattr(g4arm, "N_FLAN", 1)
+    rows = [{"id": "wmt24pp-1", "set": "wmt24pp", "meta": json.dumps({"is_bad_source": False})},
+            {"id": "wmt24pp-2", "set": "wmt24pp", "meta": json.dumps({"is_bad_source": False})},
+            {"id": "wmt24pp-3", "set": "wmt24pp", "meta": json.dumps({"is_bad_source": True})},
+            {"id": "flan-1", "set": "flan", "meta": "{}"}, {"id": "ntrex-1", "set": "ntrex", "meta": "{}"}]
+    write(rows, tmp_path / "evalsets.parquet")
+    for k, mine in enumerate((["wmt24pp-1", "ntrex-1"], ["wmt24pp-2", "wmt24pp-3", "flan-1"])):
+        write([{"id": i, "text": "t", "tokens": 3} for i in mine], tmp_path / f"segments-w{k}.parquet")
+        (tmp_path / f"classes-w{k}.txt").write_text("tiny\n")
+    g4arm.sampledata5(ns(evalsets=str(tmp_path / "evalsets.parquet"), segments=str(tmp_path), workers=2,
+                         out=str(tmp_path / "out")))
+    assert [r["id"] for r in pq.read_table(tmp_path / "out" / "segments-w1.parquet").to_pylist()] == ["wmt24pp-2", "flan-1"]
+    assert (tmp_path / "out" / "classes-w0.txt").read_text() == "tiny\n"
+
+
+def test_sample5_reports_each_output_beside_the_greedy_anchors(tmp_path, monkeypatch):
+    monkeypatch.setattr(g4arm, "N_WMT_GOOD", 2)
+    monkeypatch.setattr(g4arm, "N_FLAN", 2)
+    ids = ["wmt24pp-1", "wmt24pp-2", "flan-1", "flan-2"]
+    write([{"id": i, "set": i.split("-")[0], "meta": "{}"} for i in ids], tmp_path / "evalsets.parquet")
+    outputs, preds = [], []
+    for k, name in enumerate(("G4-0", "G4-0/t07", "G4-0/best8")):
+        d = tmp_path / name.replace("/", "-")
+        scored_output(d, ids, 1.0 + k)
+        outputs.append(f"{name}={d}")
+        preds += [{"model": name, "set": i.split("-")[0], "id": i, "p_original": 0.9 if j < k else 0.1}
+                  for j, i in enumerate(ids)]
+    write(preds, tmp_path / "pred.parquet")
+    (tmp_path / "temp.json").write_text(json.dumps({"fit": {"t": 1.35}}))
+    g4arm.sample5(ns(evalsets=str(tmp_path / "evalsets.parquet"), output=outputs, predictions=str(tmp_path / "pred.parquet"),
+                     temperature=str(tmp_path / "temp.json"), out=str(tmp_path / "s.md")))
+    r = json.loads((tmp_path / "s.json").read_text())
+    assert r["outputs"]["G4-0"]["original_pooled"] == 0.0 and r["outputs"]["G4-0/best8"]["original_pooled"] == 0.5
+    w = r["outputs"]["G4-0/t07"]["wmt24pp"]
+    assert w["metricx_qe"] == 2.0 and w["comet22"] == pytest.approx(0.8) and w["length_reference"] == pytest.approx(3 / 5)
+    assert r["outputs"]["G4-0/t07"]["flan"]["length_reference"] is None
+    text = (tmp_path / "s.md").read_text()
+    assert "G4-0 T = 0,7 (seed 1)" in text and "best-of-8" in text and "tstar T = 1.35" in text
+
+
+def test_run_combine_checks_the_warmup_first_reports_both_objectives_and_follows_the_spec(tmp_path, monkeypatch):
+    """sft_lora.run_combine with a fake merger and fake evals: the loss of a point is a quadratic of its weights at T = 1
+    and drops by 0.1 at its best T (T = 1.5); the warmup check runs first; the repeat is the first point again"""
+    grid = [1.0, 1.5]
+    state = {"coefs": None}
+
+    class Merger:
+        def __init__(self, model, mesh, components, scale):
+            pass
+
+        def apply(self, coefs):
+            state["coefs"] = list(coefs)
+
+        def restore(self):
+            state["coefs"] = None
+
+    def run_files(names, tag):
+        w = state["coefs"][1:]
+        base = 1.0 + sum((x - 0.5) ** 2 for x in w)
+        return [{"set": s, "loss": base + (0.0 if s == "wmt24pp_s" else 0.5), "tokens": 100,
+                 "temperatures": {"t": grid, "loss": [base, base - 0.1 * (1 + sum(w))]}} for s in names]
+
+    monkeypatch.setattr(sft_lora, "KernelMerger", Merger)
+    monkeypatch.setattr(sft_lora, "broadcast_float", float)
+    for n in ("s", "b0", "b1"):
+        np.savez(tmp_path / f"{n}.npz", x=np.zeros(1))
+    comps = [("shared", tmp_path / "s.npz"), ("b0", tmp_path / "b0.npz"), ("b1", tmp_path / "b1.npz")]
+    check = {"step": 1000, "losses": {"books": 1.5 + 0.5, "novels": 2.0}, "tokens": {"books": 100, "novels": 100},
+             "max_diff": 0.02}
+    for mode in ("t1", "calibrated"):
+        rule = {"sets": ["wmt24pp_s"], "objective": mode}
+        sp = g4mix.spec_dict(comps, {"wmt24pp_s": 1.0}, budget=20, objective_rule=rule, warmup_check=check)
+        out = sft_lora.run_combine(sp, None, None, run_files, ["wmt24pp_s", "books", "novels"])
+        assert out["warmup_check"]["holds"] and out["repeat"]["equal"]
+        p0 = out["search"]["points"][0]                    # the warmup alone (w = 0): base 1.5
+        assert p0["objective_t1"] == pytest.approx(1.5) and p0["objective_calibrated"] == pytest.approx(1.4)
+        assert p0["t_calibrated"] == 1.5
+        assert p0["value"] == pytest.approx(1.5 if mode == "t1" else 1.4)
+        assert [e["tag"] for e in out["evals"]][:1] == ["search/0"]         # the check is not a point of the search
+    # the merged warmup is off by more than max_diff: the run stops before any point
+    sp = g4mix.spec_dict(comps, {"wmt24pp_s": 1.0}, budget=20, warmup_check={**check, "losses": {"books": 2.1,
+                                                                                                 "novels": 2.0}})
+    with pytest.raises(SystemExit, match="G4-5.7b"):
+        sft_lora.run_combine(sp, None, None, run_files, ["wmt24pp_s", "books", "novels"])

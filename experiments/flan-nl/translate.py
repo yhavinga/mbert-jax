@@ -32,6 +32,7 @@ import argparse
 import json
 import os
 import random
+import re
 import sys
 import time
 import traceback
@@ -427,12 +428,40 @@ def load_lora(engine_params, lora_dir):
     return engine_params
 
 
+def parse_samples(specs):
+    """--sample NAME=T:SEED (repeatable): [(name, temperature, seed)], names unique ([a-z0-9_]), T > 0, seed >= 0"""
+    out = []
+    for spec in specs or []:
+        name, sep, rest = spec.partition("=")
+        t, sep2, seed = rest.partition(":")
+        try:
+            temperature, seed = float(t), int(seed)
+        except ValueError:
+            temperature = seed = None
+        if not sep or not sep2 or not re.fullmatch(r"[a-z0-9_]+", name) or temperature is None or temperature <= 0 \
+                or seed < 0:
+            raise SystemExit(f"--sample {spec!r}: NAME=T:SEED, NAME of [a-z0-9_], T > 0, SEED >= 0")
+        out.append((name, temperature, seed))
+    if len({n for n, _, _ in out}) != len(out):
+        raise SystemExit(f"--sample: a name twice in {specs}")
+    return out
+
+
 class EngineSlots:
-    """The device side of decode_all: MaxEngine's prefill, insert and generate on one decode state."""
+    """The device side of decode_all: MaxEngine's prefill, insert and generate on one decode state. Greedy (the
+    engine's decode_sampling_strategy) unless sample() set a temperature: then MaxEngine's "weighted" sampling,
+    categorical over logits / T, with the engine's rng from the given seed (split by MaxEngine at every call)."""
 
     def __init__(self, engine, params, prefill_lengths):
         self.engine, self.params, self.prefill_lengths = engine, params, prefill_lengths
         self.state = engine.init_decode_state()
+        self.sampling = {}
+
+    def sample(self, temperature, seed):
+        import jax
+
+        self.engine.rng = jax.random.PRNGKey(seed)
+        self.sampling = {"algorithm": "weighted", "temperature": float(temperature)}
 
     def prefill(self, tokens):
         import jax.numpy as jnp
@@ -443,14 +472,15 @@ class EngineSlots:
                                f"{self.prefill_lengths[-1]}")
         padded = np.zeros(length, np.int32)
         padded[:len(tokens)] = tokens
-        prefix, first = self.engine.prefill(params=self.params, padded_tokens=jnp.asarray(padded), true_length=len(tokens))
+        prefix, first = self.engine.prefill(params=self.params, padded_tokens=jnp.asarray(padded), true_length=len(tokens),
+                                            **self.sampling)
         return prefix, first.data[0, 0]
 
     def insert(self, prefix, slot):
         self.state = self.engine.insert(prefix, self.state, slot=slot)
 
     def generate(self):
-        self.state, result = self.engine.generate(self.params, self.state)
+        self.state, result = self.engine.generate(self.params, self.state, **self.sampling)
         return result.data[:, 0]
 
     @staticmethod
@@ -608,7 +638,17 @@ def main(argv=None):
     parser.add_argument("--lora", default=None,
                         help="Local directory of a LoRA adapter of experiments/en-nl-translator/sft_lora.py "
                              "(adapter.npz, adapter.json), merged into the checkpoint's kernels after loading")
+    parser.add_argument("--sample", action="append", default=[],
+                        help="NAME=T:SEED (repeatable): sampling at temperature T from the seed instead of greedy, one "
+                             "pass per sample with the engine loaded once; --out then holds {sample}, the sample's name")
     args = parser.parse_args(argv)
+    samples = parse_samples(args.sample)
+    if bool(samples) != ("{sample}" in args.out):
+        parser.error("--out holds {sample} exactly when --sample is given")
+    settings = samples or [(None, None, None)]
+
+    def out_of(name):
+        return args.out if name is None else args.out.replace("{sample}", name)
     if args.source_lang == args.target_lang:
         parser.error(f"--source-lang and --target-lang are both {args.source_lang}")
     model = with_prompt(MODELS[args.model], args.prompt)
@@ -643,11 +683,12 @@ def main(argv=None):
     # first few is a fair sample of the whole class (the projection of the run's length)
     shards = shards_of(ids, texts, args.shard_size)
     shards = random.Random(0).sample(shards, len(shards))
-    done = done_shards(args.out)
-    pending = sum(name not in done for name, _, _ in shards)
-    print(f"{args.length_class}: {len(ids):,} segments in {len(shards)} shards, {len(shards) - pending} done before; "
+    done = {setting: done_shards(out_of(setting)) for setting, _, _ in settings}
+    pending = {setting: sum(name not in done[setting] for name, _, _ in shards) for setting, _, _ in settings}
+    print(f"{args.length_class}: {len(ids):,} segments in {len(shards)} shards, "
+          f"{', '.join(f'{len(shards) - n} done before' + (f' ({s})' if s else '') for s, n in pending.items())}; "
           f"shapes {json.dumps(shapes)}", flush=True)
-    if not pending:
+    if not any(pending.values()):
         return
 
     if args.ckpt is None:
@@ -657,7 +698,7 @@ def main(argv=None):
     probe = texts[:3] + texts[-3:]
     codec.check(probe, [context_of[i] for i in ids[:3] + ids[-3:]] if context_of else None,
                 [label_of[i] for i in ids[:3] + ids[-3:]] if label_of else None)
-    print(f"MAXTEXT {json.dumps({'model': args.model, 'prompt': model['prompt'], 'context_prompt': model.get('context_prompt'), 'lora': args.lora, 'ckpt': args.ckpt, **maxtext_source(), 'patches': patch_maxtext()})}", flush=True)
+    print(f"MAXTEXT {json.dumps({'model': args.model, 'prompt': model['prompt'], 'context_prompt': model.get('context_prompt'), 'lora': args.lora, 'ckpt': args.ckpt, 'samples': samples, **maxtext_source(), 'patches': patch_maxtext()})}", flush=True)
     started = time.time()
     engine, params = make_engine(args, shapes, chips)
     if args.lora:
@@ -667,17 +708,18 @@ def main(argv=None):
     local = Path(args.work_dir) / "shards" / args.length_class
     local.mkdir(parents=True, exist_ok=True)
     client = gcs_client()
-    totals = {"segments": 0, "tokens_in": 0, "tokens_out": 0, "seconds": 0.0}
+    current = {}
 
     def store(name, rows, seconds):
         path = local / name
         pq.write_table(pa.table(rows), path, compression="zstd")
-        upload(path, f"{args.out}/{name}", client)
+        upload(path, f"{out_of(current['sample'])}/{name}", client)
         path.unlink()
         n_in, n_out = sum(rows["tokens_in"]), sum(rows["tokens_out"])
+        totals = current["totals"]
         for key, value in (("segments", len(rows["id"])), ("tokens_in", n_in), ("tokens_out", n_out), ("seconds", seconds)):
             totals[key] += value
-        print(f"SHARD {json.dumps({'class': args.length_class, 'shard': name, 'segments': len(rows['id']), 'tokens_in': n_in, 'tokens_out': n_out, 'seconds': round(seconds, 1), 'out_per_s': round(n_out / seconds), 'all_per_s': round((n_in + n_out) / seconds), 'not_ended': rows['ended'].count(False)})}", flush=True)
+        print(f"SHARD {json.dumps({'class': args.length_class, 'shard': name, 'segments': len(rows['id']), 'tokens_in': n_in, 'tokens_out': n_out, 'seconds': round(seconds, 1), 'out_per_s': round(n_out / seconds), 'all_per_s': round((n_in + n_out) / seconds), 'not_ended': rows['ended'].count(False)} | ({'sample': current['sample']} if current['sample'] else {}))}", flush=True)
 
     def translate(shard_ids, shard_texts):
         shard_contexts = [context_of[i] for i in shard_ids] if context_of else None
@@ -685,8 +727,14 @@ def main(argv=None):
         return translate_shard(device, codec, tokenizer, shard_ids, shard_texts, shapes, args.sync_every,
                                shard_contexts, model["eos_ids"], shard_labels)
 
-    translate_pending(shards, done, translate, store, args.max_shards)
-    print(f"DONE {json.dumps({'class': args.length_class, **totals, 'out_per_s': round(totals['tokens_out'] / max(totals['seconds'], 1e-9))})}", flush=True)
+    for sample, temperature, seed in settings:
+        if sample is not None:
+            device.sample(temperature, seed)
+        current.update(sample=sample, totals={"segments": 0, "tokens_in": 0, "tokens_out": 0, "seconds": 0.0})
+        translate_pending(shards, done[sample], translate, store, args.max_shards)
+        totals = current["totals"]
+        extra = {"sample": sample, "temperature": temperature, "seed": seed} if sample else {}
+        print(f"DONE {json.dumps({'class': args.length_class, **totals, 'out_per_s': round(totals['tokens_out'] / max(totals['seconds'], 1e-9))} | extra)}", flush=True)
 
 
 if __name__ == "__main__":

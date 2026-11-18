@@ -90,8 +90,20 @@
 #   CANDIDATES="G4-5c1 ..." [REFS=G4-4] texts, classify, report5 (w0); SELECTED=<report5's choice> blind
 #   Addendum G4-5.7b (Yeb, 18 Nov): RUN=g4arm_G4-5_temp0 train and RUN=g4arm_G4-5_tempw train (eval only, the
 #     temperature probe: G4-0 and the warmup's adapter, the loss at logits / T on every eval set, num_vocab_tiling=1);
-#     the search's spec checks the merged warmup alone against the warmup's own eval at its last step first;
+#     the search's spec checks the merged warmup alone against the warmup's own eval at its last step first, and
+#     takes its objective (T = 1 or calibrated) from the probe's rule ($REP/temperature.json); the search runs eval only
+#     with --temperatures (both objectives per point);
 #     report5 takes SMOKE5=<gs:// smoke5 json> (its anchor G4-3 alone, reported)
+#   Addendum G4-5.7b B, the sampling probe (reported, decides nothing; its own places under $G/sampling/):
+#   bash run_g4arm.sh sample-data          w0 (CPU): g4arm.py sampledata5, WMT24++ (960) and FLAN (1,000) of the
+#                                          evaluation's segments per worker, to $G/sampling/data/
+#   MODEL=G4-0|G4-4 SAMPLES="t07=0.7:1 t10s1=1.0:1 ..." bash run_g4arm.sh sample-translate|sample-score   every worker:
+#                                          translate.py --sample (G4-4's adapter merged), collect, MetricX-24 (ref, QE),
+#                                          COMET-22, to $G/sampling/<MODEL>/<sample>/
+#   bash run_g4arm.sh sample-best8         w0 (CPU): best-of-8 of t10s1-t10s8 per model, $G/sampling/<MODEL>/best8/
+#   SETTINGS="t07 t10s1 [tstar] best8" bash run_g4arm.sh sample-texts | sample-classify (TAG<TAG>s) | sample-report
+#                                          w0: texts with the greedy G4-0 and G4-4 as anchors, the classifier,
+#                                          g4arm.py sample5, to $G/sampling/naturalness/ and $G/sampling/report/
 # The code is beside this script (a copy of $G/scripts/). TAG names the jobs of one chain.
 set -euo pipefail
 STAGE=${1:?a stage: fetchbt, build, check, evaldata, setup, train, adapter, translate, score, texts, classify, blind, report, smoke-translate, smoke-score, smoke-report, fetchval, heldout, own, smoke2-report, replay, build2, heldout3, build3, smoke3-report, build4, smoke4-report, novels4, build5, split5, refqe5, resume5, report5, smoke5-report}
@@ -138,6 +150,7 @@ G5_BRANCHES="bt_handelingen bt_raad bt_fineweb bt_rechtspraak bt_dpc books novel
 if [ "$ARM" = G4-5 ]; then
   NAT=$G/naturalness-G4-5; REP=$G/report-G4-5
 fi
+GS=$G/sampling                                                 # addendum G4-5.7b B: the sampling probe
 # The Gemma 4 FLAN-nl after its post step (flan_g4_full_run.sh), the replay's only source (amendment G4-2.3)
 FNL=gs://t5-dutch-english-usc2/mbert/flan-nl
 TRAIN_CKPT=$R/gemma4-ckpt/gemma-4-31b-it                       # run_sft.sh's gemma4-31b (MaxText 0.2.5 conversion)
@@ -268,7 +281,9 @@ g45_train() {  # the training runs of G4-5 (draft amendment G4-5): the warmup, t
     g4arm_G4-5_s8) setdir=$G5/G4-5-smoke-warmup; steps=8; every=4; lrw=$(g4a_const SMOKE5_LR_WARMUP); decay=0 ;;
     g4arm_G4-5_b8) setdir=$G5/G4-5-smoke-branch; steps=8; every=4; lrw=$(g4a_const SMOKE5_LR_WARMUP)
                    decay=$(g4a_const SMOKE5_DECAY); from=g4arm_G4-5_s8 ;;
-    g4arm_G4-5_c8|"$G5_SEARCH") setdir=$G5/G4-5-smoke-warmup; steps=1; every=1; lrw=0; decay=0; combine=1 ;;
+    g4arm_G4-5_c8|"$G5_SEARCH") setdir=$G5/G4-5-smoke-warmup; steps=1; every=1; lrw=0; decay=0; combine=1
+                                # addendum G4-5.7b A: both objectives per point, eval only (the search, no step)
+                                if [ "$RUN" = "$G5_SEARCH" ]; then temps=1; fi ;;
     # addendum G4-5.7b: the temperature probe, eval only (no step runs; the set is only the stack's training input)
     g4arm_G4-5_temp0) setdir=$G5/G4-5-smoke-warmup; steps=1; every=1; lrw=0; decay=0; temps=1 ;;
     g4arm_G4-5_tempw) setdir=$G5/G4-5-smoke-warmup; steps=1; every=1; lrw=0; decay=0; temps=1; init=$G5_WARMUP ;;
@@ -321,6 +336,9 @@ g45_train() {  # the training runs of G4-5 (draft amendment G4-5): the warmup, t
       gsutil -q cp "$G/runs/$G5_WARMUP/summary.json" "$D/warmup-summary.json"
       check=$($SFT_PY -c "import sys; sys.path.insert(0, '$CODE'); import g4arm; print(' '.join(f'--check-set {s}' for s in g4arm.WARMUP_CHECK_SETS5), '--check-max-diff', g4arm.MERGE_MAX_DIFF5)")
       check="--warmup-check $D/warmup-summary.json $check"
+      # addendum G4-5.7b A: the rule fixed before the search (temp5's search_rule) chooses its objective
+      gsutil -q cp "$REP/temperature.json" "$D/temperature.json" || { echo "no $REP/temperature.json (the temperature probe first)"; exit 1; }
+      check="$check --objective-rule $D/temperature.json"
     fi
     for n in $names; do
       mkdir -p "$D/components/$n"
@@ -1185,6 +1203,145 @@ gsutil -m -q cp $X/report.md $X/report.json $REP/
 echo "REPORT5_DONE $REP/report.md"
 EOF
   detach "g4a_report5_$TAG" bash ~/job_body_g4a_report5_$TAG.sh
+  ;;
+sample-data)
+  only 0
+  X=$G_SHM/sampledata-$TAG
+  cat > ~/job_body_g4s_data_$TAG.sh <<EOF
+set -euo pipefail
+mkdir -p $X/in $X/out
+gsutil -m -q cp $G/data/eval/evalsets.parquet '$G/data/eval/segments-w*.parquet' '$G/data/eval/classes-w*.txt' $X/in/
+$FPY -I -u $CODE/g4arm.py sampledata5 --evalsets $X/in/evalsets.parquet --segments $X/in --out $X/out
+gsutil -m -q cp $X/out/* $X/in/evalsets.parquet $GS/data/
+echo "SAMPLEDATA_DONE $GS/data/"
+EOF
+  detach "g4s_data_$TAG" bash ~/job_body_g4s_data_$TAG.sh
+  ;;
+sample-translate|sample-score)
+  MODEL=${MODEL:?G4-0 or G4-4}
+  case $MODEL in G4-0|G4-4) ;; *) echo "the sampling probe takes G4-0 or G4-4, not $MODEL"; exit 1 ;; esac
+  SAMPLES=${SAMPLES:?NAME=T:SEED ...}
+  tpu_free
+  if [ "$STAGE" = sample-translate ]; then
+    NAME=g4s_translate_${MODEL}_$TAG
+    CLASSES=$(echo $(gsutil cat "$GS/data/classes-w$W.txt"))
+    EXTRA=""
+    for x in $SAMPLES; do EXTRA="$EXTRA --sample $x"; done
+    if [ "$MODEL" = G4-4 ]; then
+      # G4-4's final adapter, merged into the kernels as translate.py --lora does for every arm
+      adapter_local "$G/G4-4" "$G_SHM/adapter-$NAME"
+      EXTRA="$EXTRA --lora $G_SHM/adapter-$NAME"
+    fi
+    {
+      echo "set -uo pipefail"
+      echo "$VARS"
+      echo "$ONE_HOST"
+      echo "export JAX_COMPILATION_CACHE_DIR=$G_SHM/jax_cache"
+      echo "mkdir -p $G_SHM/sseg-$TAG $G_SHM/work"
+      echo "gsutil -q cp $GS/data/segments-w$W.parquet $G_SHM/sseg-$TAG/segments-w$W.parquet || exit 1"
+      echo "$PREFLIGHT"
+      echo "$TRANSLATE_CLASS"
+      for cls in $CLASSES; do
+        # {sample}: translate.py writes each sample's shards under $GS/$MODEL/<sample>/
+        echo "translate_class $G_SHM/sseg-$TAG/segments-w$W.parquet $cls '$GS/$MODEL/{sample}/translations/w$W/$cls' ~/logs/${NAME}_$cls.log $EXTRA || exit 1"
+      done
+      echo "echo \"TRANSLATED w$W $MODEL: $CLASSES ($SAMPLES)\""
+    } > ~/job_body_$NAME.sh
+  else
+    NAME=g4s_score_${MODEL}_$TAG
+    L=$G_SHM/score-$NAME
+    NAMES=""
+    for x in $SAMPLES; do NAMES="$NAMES ${x%%=*}"; done
+    {
+      echo "set -euo pipefail"
+      echo "$ONE_HOST"
+      echo "export JAX_COMPILATION_CACHE_DIR=$G_SHM/jax_cache_metricx"
+      echo "mkdir -p $L/data"
+      echo "gsutil -q cp $GS/data/evalsets.parquet $GS/data/segments-w$W.parquet $L/data/"
+      echo "n=\$($FPY -I -c 'import pyarrow.parquet as pq, sys; print(pq.read_metadata(sys.argv[1]).num_rows)' $L/data/segments-w$W.parquet)"
+      echo "if [ \"\$n\" = 0 ]; then echo \"SCORED w$W $MODEL: no probe segment on this worker\"; exit 0; fi"
+      JOIN=""
+      for n in $NAMES; do
+        O=$GS/$MODEL/$n
+        echo "mkdir -p $L/$n/translations"
+        echo "gsutil -m -q rsync -r $O/translations/w$W $L/$n/translations"
+        echo "$FPY -I $CODE/evalsets.py collect --data $L/data --worker $W --shards $L/$n/translations --out $L/$n/pairs-w$W.parquet"
+        echo "gsutil -q cp $L/$n/pairs-w$W.parquet $O/pairs/pairs-w$W.parquet"
+        JOIN="$JOIN --pairs $n=$L/$n/pairs-w$W.parquet"
+      done
+      # one MetricX and one COMET pass over all samples of this worker (ids NAME|ID), split back per sample
+      echo "$FPY -I -u $CODE/g4arm.py samplejoin $JOIN --out $L/all-pairs.parquet"
+      echo "timeout 600 $FPY -c \"import jax; assert (jax.device_count(), jax.process_count()) == (4, 1)\""
+      echo "$FPY -I -u $CODE/metricx_qe.py score --pairs $L/all-pairs.parquet --pair source:hypothesis:reference --pair source:hypothesis --model xxl --root $MX_ROOT --empty-candidates --out $L/all-metricx.parquet"
+      echo "$FPY -I -u $CODE/g4arm.py samplesplit --scores $L/all-metricx.parquet --out '$L/{sample}/metricx-w$W.parquet'"
+      echo "r=\$($FPY -I -c \"import pyarrow.parquet as pq, pyarrow.compute as pc, sys; t = pq.read_table(sys.argv[1]); t = t.filter(pc.is_valid(t['reference'])); pq.write_table(t, sys.argv[2]); print(t.num_rows)\" $L/all-pairs.parquet $L/all-pairs-ref.parquet)"
+      echo "if [ \"\$r\" != 0 ]; then"
+      echo "  $SHM/comet-venv/bin/python -I -u $CODE/comet_score.py score --root $SHM/comet --pairs $L/all-pairs-ref.parquet --out $L/all-comet.parquet"
+      echo "  $FPY -I -u $CODE/g4arm.py samplesplit --scores $L/all-comet.parquet --out '$L/{sample}/comet-w$W.parquet'"
+      echo "fi"
+      for n in $NAMES; do
+        echo "gsutil -q cp $L/$n/metricx-w$W.parquet $GS/$MODEL/$n/scores/metricx-w$W.parquet"
+        echo "if [ -e $L/$n/comet-w$W.parquet ]; then gsutil -q cp $L/$n/comet-w$W.parquet $GS/$MODEL/$n/scores/comet-w$W.parquet; fi"
+      done
+      echo "echo \"SCORED w$W $MODEL: $NAMES\""
+    } > ~/job_body_$NAME.sh
+  fi
+  detach "$NAME" bash ~/job_body_$NAME.sh
+  ;;
+sample-best8)
+  only 0
+  X=$G_SHM/sbest8-$TAG
+  {
+    echo "set -euo pipefail"
+    for m in G4-0 G4-4; do
+      RUNS=""
+      for k in $(seq 1 "$(g4a_const SAMPLE_BEST_OF5)"); do
+        echo "mkdir -p $X/$m/t10s$k && gsutil -m -q rsync -r -x 'translations/.*' $GS/$m/t10s$k $X/$m/t10s$k"
+        RUNS="$RUNS --run t10s$k=$X/$m/t10s$k"
+      done
+      echo "$FPY -I -u $CODE/g4arm.py best8 $RUNS --out $X/$m/best8"
+      echo "gsutil -m -q rsync -r $X/$m/best8 $GS/$m/best8"
+    done
+    echo "echo \"BEST8_DONE $GS/<model>/best8/\""
+  } > ~/job_body_g4s_best8_$TAG.sh
+  detach "g4s_best8_$TAG" bash ~/job_body_g4s_best8_$TAG.sh
+  ;;
+sample-texts|sample-report)
+  only 0
+  SETTINGS=${SETTINGS:?t07 t10s1 [tstar] best8}
+  X=$G_SHM/${STAGE}-$TAG
+  PAIRS=""
+  OUTS=""
+  {
+    echo "set -euo pipefail"
+    for m in G4-0 G4-4; do
+      echo "mkdir -p $X/$m && gsutil -m -q rsync -r -x 'translations/.*' $G/eval/$m $X/$m"
+      PAIRS="$PAIRS --pairs '$m=$X/$m/pairs/pairs-w*.parquet'"
+      OUTS="$OUTS --output $m=$X/$m"
+      for s in $SETTINGS; do
+        echo "mkdir -p $X/$m-$s && gsutil -m -q rsync -r -x 'translations/.*' $GS/$m/$s $X/$m-$s"
+        PAIRS="$PAIRS --pairs '$m/$s=$X/$m-$s/pairs/pairs-w*.parquet'"
+        OUTS="$OUTS --output $m/$s=$X/$m-$s"
+      done
+    done
+    echo "gsutil -q cp $G/data/eval/evalsets.parquet $S/re/classify/g4-base-texts.parquet $X/"
+    if [ "$STAGE" = sample-texts ]; then
+      echo "$FPY -I -u $CODE/g4arm.py texts --evalsets $X/evalsets.parquet $PAIRS --control $X/g4-base-texts.parquet --out $X/texts.parquet"
+      echo "gsutil -q cp $X/texts.parquet $GS/naturalness/texts.parquet"
+      echo "echo \"TEXTS: $GS/naturalness/texts.parquet\""
+    else
+      echo "gsutil -q cp $GS/naturalness/predictions.parquet $G/report-G4-5/temperature.json $X/"
+      echo "$FPY -I -u $CODE/g4arm.py sample5 --evalsets $X/evalsets.parquet $OUTS --predictions $X/predictions.parquet --temperature $X/temperature.json --out $X/report.md"
+      echo "gsutil -m -q cp $X/report.md $X/report.json $GS/report/"
+      echo "echo \"SAMPLE5_DONE $GS/report/report.md\""
+    fi
+  } > ~/job_body_g4s_${STAGE#sample-}_$TAG.sh
+  detach "g4s_${STAGE#sample-}_$TAG" bash ~/job_body_g4s_${STAGE#sample-}_$TAG.sh
+  ;;
+sample-classify)
+  only 0
+  # run_arms.sh's classifier on the probe's texts, a job of its own (arms_classify_<TAG>s)
+  NAT=$GS/naturalness TAG=${TAG}s bash "$CODE/run_arms.sh" classify
   ;;
 smoke5-report)
   only 0

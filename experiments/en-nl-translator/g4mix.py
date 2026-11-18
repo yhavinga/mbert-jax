@@ -35,6 +35,8 @@ DECIMALS = 6            # a point of the search is its weights rounded to this m
 # addendum G4-5.7b (Yeb, 18 Nov): the repeated first point is "equal" within this; float32 rounding of a broadcast
 # value is ~1e-7, a rest of an earlier point after a failed restore of the base kernels would be >= 1e-2
 REPEAT_MAX_DIFF = 1e-4
+# addendum G4-5.7b A: the search's objective, the loss at T = 1 or at the point's best T (calibrated_objective)
+OBJECTIVE_MODES = ("t1", "calibrated")
 
 
 # ---------------------------------------------------------------------------------------------------- stacking
@@ -130,6 +132,21 @@ def objective_value(records, weights):
     if total <= 0:
         raise ValueError(f"objective weights {weights}")
     return sum(w * records[s] for s, w in weights.items()) / total
+
+
+def calibrated_objective(curves, weights):
+    """Addendum G4-5.7b A: the objective at the point's best temperature, (value, T): the lowest weighted mean of the
+    objective's sets over their common grid of T (curves {set: {"t": [...], "loss": [...]}}; equal values: the T
+    nearest to 1)"""
+    missing = [s for s in weights if s not in curves]
+    if missing:
+        raise ValueError(f"no temperature curve of {missing}")
+    grid = curves[next(iter(weights))]["t"]
+    if any(curves[s]["t"] != grid for s in weights):
+        raise ValueError("the objective's sets have different grids of T")
+    values = [objective_value({s: curves[s]["loss"][k] for s in weights}, weights) for k in range(len(grid))]
+    k = min(range(len(grid)), key=lambda i: (values[i], abs(grid[i] - 1.0)))
+    return values[k], grid[k]
 
 
 def key_of(w):
@@ -235,7 +252,7 @@ def run_search(objective, spec):
 
 def spec_dict(components, objective, *, shared=1.0, start="uniform", step=0.25, min_step=0.0625, lower=0.0,
               upper=1.5, budget=80, top_k=4, min_distance=0.125, uniform_anchor=True, scale=None,
-              repeat_max_diff=REPEAT_MAX_DIFF, warmup_check=None):
+              repeat_max_diff=REPEAT_MAX_DIFF, warmup_check=None, objective_rule=None):
     names = [n for n, _ in components]
     if not names or names[0] != SHARED:
         raise ValueError(f"the first component is the shared warmup ('{SHARED}'), not {names[:1]}")
@@ -247,7 +264,14 @@ def spec_dict(components, objective, *, shared=1.0, start="uniform", step=0.25, 
         raise ValueError(f"bounds {lower} {upper}")
     if not repeat_max_diff >= 0:
         raise ValueError(f"repeat_max_diff {repeat_max_diff}")
+    mode = "t1"
+    if objective_rule is not None:
+        # addendum G4-5.7b A: the rule fixed before the search chooses the objective (temp5's search_rule)
+        if sorted(objective_rule.get("sets") or []) != sorted(objective) or objective_rule.get("objective") not in OBJECTIVE_MODES:
+            raise ValueError(f"the objective rule {objective_rule} is not one of this objective {sorted(objective)}")
+        mode = objective_rule["objective"]
     out = {"components": [{"name": n, "adapter": str(p)} for n, p in components], "objective": dict(objective),
+           "objective_mode": mode, "objective_rule": objective_rule,
            "shared_coef": float(shared), "scale": scale, "repeat_max_diff": float(repeat_max_diff),
            "search": {"start": start, "step": step, "min_step": min_step, "lower": lower, "upper": upper,
                       "budget": budget, "top_k": top_k, "min_distance": min_distance,
@@ -393,10 +417,16 @@ def spec_cli(args):
                                 args.check_max_diff, source=args.warmup_check)
     elif args.check_set:
         raise SystemExit("--check-set goes with --warmup-check")
+    rule = None
+    if args.objective_rule:
+        rule = json.loads(Path(args.objective_rule).read_text()).get("search_rule")
+        if not rule:
+            raise SystemExit(f"{args.objective_rule}: no search_rule (g4arm.py temp5)")
+        rule = {**rule, "source": args.objective_rule}
     spec = spec_dict(comps, objective, shared=args.shared_coef, start=start, step=args.step, min_step=args.min_step,
                      lower=args.lower, upper=args.upper, budget=args.budget, top_k=args.top_k,
                      min_distance=args.min_distance, scale=args.scale, repeat_max_diff=args.repeat_max_diff,
-                     warmup_check=check)
+                     warmup_check=check, objective_rule=rule)
     Path(args.out).write_text(json.dumps(spec, indent=1) + "\n")
     print(f"SPEC {json.dumps(spec)}", flush=True)
 
@@ -431,6 +461,8 @@ def main(argv=None):
                         "step on the --check-set sets before the search goes on (addendum G4-5.7b)")
     p.add_argument("--check-set", action="append", default=[], help="an eval set of the warmup check (repeatable)")
     p.add_argument("--check-max-diff", type=float, default=0.02)
+    p.add_argument("--objective-rule", default=None,
+                   help="temp5's json: its search_rule chooses the objective, t1 or calibrated (addendum G4-5.7b A)")
     p.add_argument("--out", required=True)
     args = parser.parse_args(argv)
     if args.command == "stack":

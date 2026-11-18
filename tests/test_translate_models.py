@@ -9,6 +9,7 @@ import os
 import sys
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -300,3 +301,50 @@ def test_a_tag_prompt_replaces_both_prompts_of_translategemma(name):
     else:
         assert tagged == plain.replace("commentary. ", "commentary. Translate into natural, original-sounding Dutch. ")
     assert "<unused0>" in "".join(map(chr, prompts.encode("x", CONTEXT))) or name != "chat-v1-tag-token"
+
+
+def test_sample_settings_are_named_with_a_temperature_and_a_seed():
+    assert tr.parse_samples(["t07=0.7:1", "t10s2=1.0:2"]) == [("t07", 0.7, 1), ("t10s2", 1.0, 2)]
+    for bad in (["T07=0.7:1"], ["t07=0:1"], ["t07=0.7"], ["t07=0.7:1", "t07=1.0:2"], ["t07=x:1"]):
+        with pytest.raises(SystemExit):
+            tr.parse_samples(bad)
+    # --out holds {sample} exactly when --sample is given
+    with pytest.raises(SystemExit):
+        tr.main(["--segments", "s", "--out", "gs://b/x", "--tokenizer", "t", "--length-class", "tiny",
+                 "--sample", "t07=0.7:1"])
+
+
+def test_engine_slots_sample_with_the_engine_and_stay_greedy_without():
+    pytest.importorskip("jax")
+    calls = []
+
+    class Engine:
+        rng = None
+
+        def init_decode_state(self):
+            return "state"
+
+        def prefill(self, **kw):
+            calls.append(("prefill", {k: v for k, v in kw.items() if k in ("algorithm", "temperature")}))
+
+            class First:
+                data = np.zeros((1, 1), np.int32)
+            return "prefix", First()
+
+        def generate(self, params, state, **kw):
+            calls.append(("generate", kw))
+
+            class Result:
+                data = np.zeros((2, 1), np.int32)
+            return state, Result()
+
+    slots = tr.EngineSlots(Engine(), None, [8])
+    slots.prefill([1, 2])
+    slots.generate()
+    assert calls == [("prefill", {}), ("generate", {})]
+    slots.sample(0.7, 3)
+    slots.prefill([1, 2])
+    slots.generate()
+    assert calls[2:] == [("prefill", {"algorithm": "weighted", "temperature": 0.7}),
+                         ("generate", {"algorithm": "weighted", "temperature": 0.7})]
+    assert slots.engine.rng is not None

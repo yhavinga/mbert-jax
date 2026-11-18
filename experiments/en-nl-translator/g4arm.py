@@ -2906,6 +2906,9 @@ WARMUP_CHECK_SETS5 = ("books", "novels")
 TEMPERATURES5 = "0.5:3.0:0.05"
 TEMP_FIT_SETS5 = ("books", "btval")
 TEMP_EQUAL5 = 1e-4
+# addendum G4-5.7b A (Yeb 18 Nov ~09:15): the search follows the calibrated objective if one temperature on G4-0 gives
+# at least this share of the loss drop from G4-0 to the warmup on the objective's sets (mean of the per-set shares)
+SEARCH_RULE_SHARE5 = 0.5
 
 
 def g44_set(directory, report_path):
@@ -3523,7 +3526,13 @@ def report5_text(r):
         L.append("")
     s = r["search"]
     x = s.get("search") or {}
+    spec = s.get("spec") or {}
+    rule = spec.get("objective_rule") or {}
     L += ["## Zoektocht naar de gewichten (verlies op het zoekdeel, forward-only)", "",
+          f"Zoekdoel (aanvulling G4-5.7b A): **{spec.get('objective_mode')}** "
+          f"({'het verlies bij de beste T van elk punt' if spec.get('objective_mode') == 'calibrated' else 'het verlies bij T = 1'}); "
+          f"regel: aandeel van de daling dat één T op G4-0 verklaart {pct(rule.get('mean_share'))} (grens "
+          f"{pct(rule.get('threshold'))}, T = {rule.get('t')}). Beide doelen staan per punt in de tabel.", "",
           f"Doel {json.dumps((s.get('spec') or {}).get('objective'))}; {x.get('evaluations')} punten, gestopt: "
           f"{x.get('stopped')}; beste {json.dumps(x.get('best'))}; herhaling van het eerste punt: "
           f"{json.dumps(s.get('repeat'))}. Basismodel (stap 0): {json.dumps(s.get('base'))}.", ""]
@@ -3538,10 +3547,14 @@ def report5_text(r):
         L += [f"Smoke-test (aanvulling G4-5.7a/b): het anker \"G4-3 alleen\", samengevoegd in de bf16-kernels, tegen "
               f"G4-3's eigen verlies (samengevoegd, eigen): {json.dumps(g['value'])}: "
               f"{'gehaald' if g['holds'] else 'niet gehaald'}.", ""]
-    L += ["| fase | gewichten | doel | verliezen |", "|---|---|---:|---|"]
+    L += ["| fase | gewichten | doel (gekozen) | doel T = 1 | gekalibreerd (T) | verliezen |",
+          "|---|---|---:|---:|---:|---|"]
     for p in x.get("points") or []:
         if p["phase"].startswith("anchor") or p in (x.get("top") or []):
-            L.append(f"| {p['phase']} | {p['w']} | {p['value']:.4f} | "
+            cal = (f"{p['objective_calibrated']:.4f} ({p['t_calibrated']:.2f})"
+                   if p.get("objective_calibrated") is not None else "–")
+            t1 = f"{p['objective_t1']:.4f}" if p.get("objective_t1") is not None else "–"
+            L.append(f"| {p['phase']} | {p['w']} | {p['value']:.4f} | {t1} | {cal} | "
                      f"{json.dumps({k: round(v, 4) for k, v in (p.get('losses') or {}).items()})} |")
     L += ["", "## Per tak: welke bron beweegt welke maat (verlies, laatste stap; tak − warmup)", ""]
     t = r["training"]
@@ -3625,6 +3638,7 @@ def temp5(args):
         raise SystemExit(f"G4-4's loss at step 0 is not G4-0's of the warmup run (other batches?): {off}")
     run_w = temp_curves(load(args.warmup_run), args.warmup_run) if args.warmup_run else None
     fit = temp_fit(base, TEMP_FIT_SETS5)
+    rule = search_rule5(base, wend)
     rows = {}
     for s, c in base.items():
         l1 = c["loss"][c["t"].index(1.0)]
@@ -3643,14 +3657,35 @@ def temp5(args):
                     "warmup_best_t": tw, "warmup_best_loss": lw, "warmup_best_edge": ew}
         rows[s] = row
     result = {"arm": ARM5, "grid": {"t": base[next(iter(base))]["t"]}, "fit": fit,
-              "fit_warmup": temp_fit(run_w, TEMP_FIT_SETS5) if run_w else None, "sets": rows,
+              "fit_warmup": temp_fit(run_w, TEMP_FIT_SETS5) if run_w else None, "search_rule": rule, "sets": rows,
               "curves": {"G4-0": base, "warmup": run_w}, "warmup_step": warm["steps"],
               "inputs": {"base": args.base, "warmup_run": args.warmup_run, "warmup": args.warmup,
                          "g44_report": args.g44_report}}
     Path(args.out).with_suffix(".json").write_text(json.dumps(result, indent=1) + "\n")
     Path(args.out).write_text(temp5_text(result), encoding="utf-8")
-    print(f"TEMP5 {json.dumps({'fit': fit, 'fit_warmup': result['fit_warmup'], 'share_fit_warmup': {s: r['share_fit_warmup'] for s, r in rows.items()}})}",
+    print(f"TEMP5 {json.dumps({'fit': fit, 'fit_warmup': result['fit_warmup'], 'search_rule': rule, 'share_fit_warmup': {s: r['share_fit_warmup'] for s, r in rows.items()}})}",
           flush=True)
+
+
+def search_rule5(base, warmup_end):
+    """Addendum G4-5.7b A, fixed before the search: on the objective's sets (OBJECTIVE5) the one T of G4-0 with the
+    lowest objective (as the calibrated objective of a point), per set the share (L1 - L_T) / (L1 - L1 of the warmup at
+    its last step), their mean; at least SEARCH_RULE_SHARE5: the search follows the calibrated objective, else T = 1"""
+    import g4mix
+
+    sets = list(OBJECTIVE5)
+    value, t = g4mix.calibrated_objective({s: base[s] for s in sets}, OBJECTIVE5)
+    shares = {}
+    for s in sets:
+        c = base[s]
+        l1, lt = c["loss"][c["t"].index(1.0)], c["loss"][c["t"].index(t)]
+        shares[s] = drop_share(l1, lt, warmup_end.get(s))
+    if any(v is None for v in shares.values()):
+        raise SystemExit(f"the search rule needs the warmup's drop on {sets}: shares {shares}")
+    mean_share = statistics.fmean(shares.values())
+    return {"sets": sets, "t": t, "objective_at_t": value, "shares": shares, "mean_share": mean_share,
+            "threshold": SEARCH_RULE_SHARE5,
+            "objective": "calibrated" if mean_share >= SEARCH_RULE_SHARE5 else "t1"}
 
 
 def temp5_text(r):
@@ -3676,6 +3711,12 @@ def temp5_text(r):
     if fw:
         L += [f"Warmup-adapter (stap {r['warmup_step']}), zelfde keuze: T\\* = {tt(fw['t'], fw['edge'])} "
               f"({f3(fw['value_at_1'])} bij T = 1, {f3(fw['value'])} bij T\\*).", ""]
+    sr = r["search_rule"]
+    L += [f"**Regel voor de zoektocht (aanvulling G4-5.7b A)**: één T voor G4-0 op {', '.join(sr['sets'])} "
+          f"(laagste gemiddelde): T = {tt(sr['t'], sr['t'] in (t[0], t[-1]))}; aandeel van de daling G4-0 → warmup "
+          f"per set {', '.join(f'{k} {pct(v)}' for k, v in sr['shares'].items())}, gemiddeld **{pct(sr['mean_share'])}** "
+          f"(grens {pct(sr['threshold'])}) → de zoektocht kiest op het **"
+          f"{'gekalibreerde doel (verlies bij de beste T per punt)' if sr['objective'] == 'calibrated' else 'doel bij T = 1'}**.", ""]
     L += ["Lezing: aandeel = (L₁ − L_T) / (L₁ − L_fine-tune) per set, L₁ en L_T van G4-0 in deze proef; "
           "1 = één temperatuur geeft de hele verandering, 0 = niets. Bij `own` (G4-0's eigen greedy uitvoer als doel) "
           "stijgt het verlies bij de fine-tunes: het aandeel is dan dat van de stijging.", "",
@@ -3701,6 +3742,211 @@ def temp5_text(r):
           "de warmup-run; G4-4's verlies op stap 0 is dat van de warmup-run (zelfde batches).",
           "- G4-0 T = 1 in deze proef (num_vocab_tiling 1) tegen stap 0 van de warmup-run (trainingsstack, "
           "num_vocab_tiling 8): " + ", ".join(f"{s} {r['sets'][s]['g40_t1_vs_stack']:+.1e}" for s in sets) + ".", ""]
+    return "\n".join(L) + "\n"
+
+
+# ---------------------------------------------------------------------------------------------------- sampling probe
+
+# addendum G4-5.7b B (Yeb 18 Nov ~09:15; reported, decides nothing): G4-0 and G4-4 sampled at T = 0.7, T = 1.0 and T*
+# of the temperature probe (only if T* <= 1.5), and best-of-8 at T = 1.0 (seeds 1-8, seed 1 the T = 1.0 setting, per
+# segment the sample with the lowest MetricX-24-QE), on WMT24++ (960) and FLAN (1,000)
+SAMPLE_MODELS5 = ("G4-0", "G4-4")
+SAMPLE_TSTAR_MAX5 = 1.5
+SAMPLE_BEST_OF5 = 8
+SAMPLE_SEED5 = 1
+
+
+def samples5(t_star):
+    """([(name, T, seed)], note): t07, t10s1 ... t10s8 (t10s1 is the T = 1.0 setting), tstar if T* <= 1.5 and not
+    0.7 or 1.0 (then the same setting as one already there)"""
+    out = [("t07", 0.7, SAMPLE_SEED5)] + [(f"t10s{k}", 1.0, k) for k in range(1, SAMPLE_BEST_OF5 + 1)]
+    if t_star > SAMPLE_TSTAR_MAX5:
+        return out, f"T* = {t_star:g} > {SAMPLE_TSTAR_MAX5:g}: not sampled"
+    if t_star in (0.7, 1.0):
+        return out, f"T* = {t_star:g}: the setting {'t07' if t_star == 0.7 else 't10s1'}"
+    return out + [("tstar", t_star, SAMPLE_SEED5)], f"T* = {t_star:g}: sampled (tstar)"
+
+
+def samples5_cli(args):
+    t_star = json.loads(Path(args.temperature).read_text())["fit"]["t"]
+    settings, note = samples5(t_star)
+    print("SAMPLES " + " ".join(f"{n}={t:g}:{seed}" for n, t, seed in settings))
+    print(f"NOTE {note}")
+
+
+def sampledata5(args):
+    """The sampling probe's segments: WMT24++ without is_bad_source (960) and FLAN (1,000) of the evaluation's
+    segments-w<k>.parquet, each on its worker as there (the same length classes; classes-w<k>.txt copied)"""
+    evalsets = {r["id"]: r for r in read_rows(args.evalsets, ["id", "set", "meta"])}
+    keep = {i for i, r in evalsets.items() if (r["set"] == "wmt24pp" and not bad_source(r["meta"])) or r["set"] == "flan"}
+    n = collections.Counter(evalsets[i]["set"] for i in keep)
+    if (n["wmt24pp"], n["flan"]) != (N_WMT_GOOD, N_FLAN):
+        raise SystemExit(f"{args.evalsets}: {dict(n)}, not {N_WMT_GOOD} WMT24++ and {N_FLAN} FLAN")
+    src, out = Path(args.segments), Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    seen = collections.Counter()
+    for k in range(args.workers):
+        mine = [r for r in read_rows(src / f"segments-w{k}.parquet") if r["id"] in keep]
+        write_parquet(mine, out / f"segments-w{k}.parquet")
+        (out / f"classes-w{k}.txt").write_text((src / f"classes-w{k}.txt").read_text())
+        seen.update(r["id"] for r in mine)
+    if set(seen) != keep or max(seen.values()) != 1:
+        raise SystemExit(f"the workers' segments hold {len(seen)} of the {len(keep)} probe segments (or one twice)")
+    print(f"SAMPLEDATA {json.dumps({'wmt24pp': n['wmt24pp'], 'flan': n['flan'], 'workers': args.workers})}", flush=True)
+
+
+def samplejoin(args):
+    """The pairs of several samples as one file, so that MetricX and COMET load once: ids NAME|ID"""
+    out = []
+    for name, path in (x.split("=", 1) for x in args.pairs):
+        if "|" in name:
+            raise SystemExit(f"--pairs {name}: no | in a sample's name")
+        out += [{**r, "id": f"{name}|{r['id']}"} for r in read_rows(path)]
+    write_parquet(out, args.out)
+    print(f"SAMPLEJOIN {len(out)} pairs of {len(args.pairs)} samples", flush=True)
+
+
+def samplesplit(args):
+    """samplejoin's scores back per sample: --out holds {sample}; a sample without a row gets no file"""
+    by = collections.defaultdict(list)
+    for r in read_rows(args.scores):
+        name, sep, i = r["id"].partition("|")
+        if not sep:
+            raise SystemExit(f"{args.scores}: the id {r['id']} is not NAME|ID")
+        by[name].append({**r, "id": i})
+    for name, rows in by.items():
+        path = Path(args.out.replace("{sample}", name))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        write_parquet(rows, path)
+    print(f"SAMPLESPLIT {json.dumps({k: len(v) for k, v in by.items()})}", flush=True)
+
+
+def rows_by_id(pattern):
+    out = {}
+    for f in sorted(glob.glob(pattern)):
+        for r in read_rows(f):
+            out[r["id"]] = r
+    return out
+
+
+def best8(args):
+    """Best-of-N: per segment the sample with the lowest MetricX-24-QE (equal: the earlier run), its pairs and scores
+    as an output of its own (pairs/pairs-wall.parquet, scores/metricx-wall.parquet, comet-wall.parquet) and the choice"""
+    runs = [x.split("=", 1) for x in args.run]
+    if len(runs) != SAMPLE_BEST_OF5:
+        raise SystemExit(f"best-of-{SAMPLE_BEST_OF5}: {len(runs)} runs")
+    data = {name: {k: rows_by_id(f"{d}/{sub}/{k}-w*.parquet") for k, sub in
+                   (("pairs", "pairs"), ("metricx", "scores"), ("comet", "scores"))} for name, d in runs}
+    ids = set(data[runs[0][0]]["pairs"])
+    for name, x in data.items():
+        if set(x["pairs"]) != ids or set(x["metricx"]) != ids:
+            raise SystemExit(f"{name}: {len(x['pairs'])} pairs, {len(x['metricx'])} MetricX rows, not the {len(ids)} of {runs[0][0]}")
+    pairs, metricx, comet, choice = [], [], [], []
+    for i in sorted(ids):
+        qe = [data[n]["metricx"][i].get("qe_source_hypothesis") for n, _ in runs]
+        if any(q is None for q in qe):
+            raise SystemExit(f"{i}: a sample without MetricX-QE {qe}")
+        k = min(range(len(runs)), key=lambda j: (qe[j], j))
+        name = runs[k][0]
+        pairs.append(data[name]["pairs"][i])
+        metricx.append(data[name]["metricx"][i])
+        if i in data[name]["comet"]:
+            comet.append(data[name]["comet"][i])
+        choice.append({"id": i, "chosen": name, "qe": qe})
+    out = Path(args.out)
+    (out / "pairs").mkdir(parents=True, exist_ok=True)
+    (out / "scores").mkdir(parents=True, exist_ok=True)
+    write_parquet(pairs, out / "pairs" / "pairs-wall.parquet")
+    write_parquet(metricx, out / "scores" / "metricx-wall.parquet")
+    if comet:
+        write_parquet(comet, out / "scores" / "comet-wall.parquet")
+    write_parquet(choice, out / "choice.parquet")
+    print(f"BEST8 {json.dumps({'segments': len(ids), 'chosen': collections.Counter(c['chosen'] for c in choice)})}",
+          flush=True)
+
+
+def sample_measures5(rows, ids, origin):
+    """The probe's measures of one output on one set: QE, MetricX-ref and COMET (with a reference), not ended, loop,
+    English left, length against the source and the reference, share "original" (origin: {id: p_original})"""
+    rs = [rows[i] for i in ids]
+    with_ref = [r for r in rs if r["reference"]]
+    n = len(rs)
+    return {"n": n, "metricx_qe": mean(r["metricx_qe"] for r in rs),
+            "metricx_ref": mean(r["metricx_ref"] for r in with_ref) if with_ref else None,
+            "comet22": mean(r["comet22"] for r in with_ref) if with_ref else None,
+            "not_ended": sum(not r["ended"] for r in rs) / n, "decode_loop": sum(bool(r["decode_loop"]) for r in rs) / n,
+            "english_left": sum(bool(r["english_left"]) for r in rs) / n,
+            "length_source": sum(len(r["hypothesis"]) for r in rs) / sum(len(r["source"]) for r in rs),
+            "length_reference": (sum(len(r["hypothesis"]) for r in with_ref) / sum(len(r["reference"]) for r in with_ref)
+                                 if with_ref else None),
+            "original": sum(origin[i] >= 0.5 for i in ids) / n}
+
+
+def sample5(args):
+    """The sampling probe's report (addendum G4-5.7b B): per model and setting the measures on WMT24++ (960) and FLAN
+    (1,000), the share "original" of one classify run with the greedy outputs of G4-0 and G4-4 as anchors"""
+    evalsets = {r["id"]: r for r in read_rows(args.evalsets, ["id", "set", "meta"])}
+    ids = {"wmt24pp": sorted(i for i, r in evalsets.items() if r["set"] == "wmt24pp" and not bad_source(r["meta"])),
+           "flan": sorted(i for i, r in evalsets.items() if r["set"] == "flan")}
+    settings, note = samples5(json.loads(Path(args.temperature).read_text())["fit"]["t"])
+    meta = {"settings": settings, "note": note}
+    predictions = read_rows(args.predictions)
+    result = {"arm": ARM5, "settings": meta, "human_qe_wmt24pp": HUMAN_QE["wmt24pp"], "outputs": {}}
+    for name, d in (x.split("=", 1) for x in args.output):
+        rows = scored_dir(d)
+        origin = {r["id"]: r["p_original"] for r in predictions if r["model"] == name}
+        out = {}
+        for s, want in ids.items():
+            missing = [i for i in want if i not in rows or i not in origin]
+            if missing:
+                raise SystemExit(f"{name}: {len(missing)} of the {len(want)} {s} segments without a score or a "
+                                 f"classifier text, e.g. {missing[:3]}")
+            out[s] = sample_measures5(rows, want, origin)
+        both = ids["wmt24pp"] + ids["flan"]
+        out["original_pooled"] = sum(origin[i] >= 0.5 for i in both) / len(both)
+        result["outputs"][name] = out
+    Path(args.out).with_suffix(".json").write_text(json.dumps(result, indent=1) + "\n")
+    Path(args.out).write_text(sample5_text(result), encoding="utf-8")
+    print(f"SAMPLE5 {json.dumps({k: round(v['original_pooled'], 4) for k, v in result['outputs'].items()})}", flush=True)
+
+
+def sample5_text(r):
+    by_name = {n: (t, seed) for n, t, seed in r["settings"]["settings"]}
+    label = {"best8": f"best-of-{SAMPLE_BEST_OF5} bij T = 1,0 (laagste QE)"}
+
+    def name_of(key):
+        model, _, setting = key.partition("/")
+        if not setting:
+            return f"{model} greedy"
+        if setting in label:
+            return f"{model} {label[setting]}"
+        t, seed = by_name[setting]
+        return f"{model} T = {t:g} (seed {seed})".replace(".", ",")
+
+    L = ["# Sampling-proef (aanvulling G4-5.7b B; rapporteren, beslist niets)", "",
+         "Gemaakt door `g4arm.py sample5`. G4-0 en G4-4 (eindadapter, ingebakken zoals `translate.py --lora`) met "
+         "MaxText's `weighted`-sampling (categorisch over logits / T) in de fork `f4d8615`, prompt `natural-v1`, de "
+         "klassen en lengtes van de evaluatie van G4-4, op WMT24++ (960 goede segmenten) en FLAN (1.000). Het aandeel "
+         "\"origineel\" komt uit één classify-run met de greedy uitvoer van G4-0 en G4-4 als ankers.", "",
+         f"Instellingen: {', '.join(f'{n} T = {t:g} seed {seed}' for n, t, seed in r['settings']['settings'])}; "
+         f"{r['settings']['note']}.", "",
+         "## Aandeel \"origineel\" (regel (b): WMT24++ + FLAN samen)", "",
+         "| uitvoer | origineel (samen) | WMT24++ | FLAN |", "|---|---:|---:|---:|"]
+    for key, x in r["outputs"].items():
+        L.append(f"| {name_of(key)} | {pct(x['original_pooled'])} | {pct(x['wmt24pp']['original'])} | "
+                 f"{pct(x['flan']['original'])} |")
+    L += ["", "## Kwaliteit en vorm", "",
+          "| uitvoer | set | QE | MetricX-ref | COMET-22 | niet af | lus | Engels over | tekens / bron | tekens / ref |",
+          "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+          f"| mens | wmt24pp | {f3(r['human_qe_wmt24pp'])} | | | | | | | |"]
+    for key, x in r["outputs"].items():
+        for s in ("wmt24pp", "flan"):
+            m = x[s]
+            L.append(f"| {name_of(key)} | {s} | {f3(m['metricx_qe'])} | {f3(m['metricx_ref'])} | {f3(m['comet22'])} | "
+                     f"{pct(m['not_ended'])} | {pct(m['decode_loop'])} | {pct(m['english_left'])} | "
+                     f"{f3(m['length_source'])} | {f3(m['length_reference'])} |")
+    L += ["", "QE en MetricX-ref: lager is beter; COMET-22: hoger is beter. Best-of-8 kiest op QE, dus zijn QE is per "
+          "constructie de laagste van de acht en geen onafhankelijke maat.", ""]
     return "\n".join(L) + "\n"
 
 
@@ -3892,6 +4138,29 @@ def main(argv=None):
     p.add_argument("--tally", default=None, help="tally's json of the selected candidate against G4-0")
     p.add_argument("--smoke", default=None, help="smoke5's json (its anchor G4-3 alone, reported)")
     p.add_argument("--out", required=True)
+    p = sub.add_parser("samples5")
+    p.add_argument("--temperature", required=True, help="temp5's json (its T* on books + btval)")
+    p = sub.add_parser("sampledata5")
+    p.add_argument("--evalsets", required=True)
+    p.add_argument("--segments", required=True, help="a directory with the evaluation's segments-w<k>.parquet, classes-w<k>.txt")
+    p.add_argument("--workers", type=int, default=4)
+    p.add_argument("--out", required=True)
+    p = sub.add_parser("best8")
+    p.add_argument("--run", action="append", required=True, help="NAME=DIR (pairs/, scores/) of a sample, in seed order")
+    p.add_argument("--out", required=True)
+    p = sub.add_parser("sample5")
+    p.add_argument("--evalsets", required=True)
+    p.add_argument("--output", action="append", required=True,
+                   help="NAME=DIR (pairs/, scores/): G4-0 and G4-4 greedy, MODEL/SETTING sampled, MODEL/best8")
+    p.add_argument("--predictions", required=True, help="the probe's classify run (predictions.parquet)")
+    p.add_argument("--temperature", required=True, help="temp5's json (T*: the settings, as samples5)")
+    p.add_argument("--out", required=True)
+    p = sub.add_parser("samplejoin")
+    p.add_argument("--pairs", action="append", required=True, help="NAME=pairs parquet of a sample")
+    p.add_argument("--out", required=True)
+    p = sub.add_parser("samplesplit")
+    p.add_argument("--scores", required=True, help="scores of samplejoin's pairs (ids NAME|ID)")
+    p.add_argument("--out", required=True, help="a path with {sample}")
     p = sub.add_parser("temp5")
     p.add_argument("--base", required=True, help="summary.json of G4-0's temperature run (sft_lora.py --temperatures)")
     p.add_argument("--warmup-run", default=None, help="summary.json of the warmup adapter's temperature run")
@@ -3903,7 +4172,8 @@ def main(argv=None):
      "tally": tally, "smoke": smoke, "heldout": heldout, "own": own, "replay": replay_candidates, "build2": build2,
      "smoke2": smoke2, "heldout3": heldout3, "build3": build3, "smoke3": smoke3, "build4": build4,
      "smoke4": smoke4, "novels4": novels4, "build5": build5, "split5": split5, "smoke5": smoke5,
-     "report5": report5, "temp5": temp5}[args.command](args)
+     "report5": report5, "temp5": temp5, "samples5": samples5_cli, "sampledata5": sampledata5, "best8": best8,
+     "sample5": sample5, "samplejoin": samplejoin, "samplesplit": samplesplit}[args.command](args)
 
 
 if __name__ == "__main__":

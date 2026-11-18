@@ -36,10 +36,12 @@ file, and puts the base kernels back; summary.json keeps it under "combine". Add
 is equal within the spec's repeat_max_diff; with the spec's warmup_check the merged warmup alone (w = 0) is evaluated
 first on the check's sets and must give the warmup's own eval (same target tokens, within max_diff), else the run stops
 before any other point.
-With --temperatures GRID (addendum G4-5.7b, a measurement that decides nothing) the run is eval only: the first eval
-(before any step) also gives, per file and per temperature T of the grid, the token-weighted loss of softmax(logits / T)
-from the same forward pass (MaxText's loss on the full logits: num_vocab_tiling=1), and the run stops after that round
-without a training step; summary.json keeps it per eval under "temperatures".
+With --temperatures GRID (addendum G4-5.7b) the run is eval only: the first eval (before any step) also gives, per
+file and per temperature T of the grid, the token-weighted loss of softmax(logits / T) from the same forward pass
+(MaxText's loss on the full logits: num_vocab_tiling=1), and the run stops after that round (and, with --combine, after
+the search) without a training step; summary.json keeps it per eval under "temperatures". With --combine every point
+then has both objectives, at T = 1 and at its best T (calibrated); the spec's objective_mode says which one the search
+follows (addendum G4-5.7b A).
 Writes to DIR (process 0): summary.json (configuration, times, throughput, memory per chip, loss per step), adapter.npz
 (the LoRA parameters in float32, keys as decoder/layers_0/self_attention/query/kernel_lora_a), adapter.json (rank,
 alpha, module regex, model, checkpoint, original dtype); MaxText's output (metrics file, tensorboard, Tunix's checkpoint
@@ -547,10 +549,22 @@ def run_combine(spec, model, mesh, run_files, names):
         merge_s = time.perf_counter() - t
         rows = run_files(sets, tag)
         losses = {r["set"]: r["loss"] for r in rows}
-        into.append({"tag": tag, "w": list(w), "coefs": coefs, "losses": losses,
-                     "tokens": {r["set"]: r["tokens"] for r in rows}, "merge_s": round(merge_s, 1),
-                     "seconds": round(time.perf_counter() - t, 1)})
+        record = {"tag": tag, "w": list(w), "coefs": coefs, "losses": losses,
+                  "tokens": {r["set"]: r["tokens"] for r in rows}, "merge_s": round(merge_s, 1),
+                  "seconds": round(time.perf_counter() - t, 1)}
+        if all("temperatures" in r for r in rows):
+            record["curves"] = {r["set"]: r["temperatures"] for r in rows}
+        into.append(record)
         return losses
+
+    def objectives(record):
+        """addendum G4-5.7b A: both objectives of a point, at T = 1 and at its best T (from the same forward pass)"""
+        out = {"objective_t1": g4mix.objective_value(record["losses"], spec["objective"])}
+        if "curves" in record:
+            out["objective_calibrated"], out["t_calibrated"] = g4mix.calibrated_objective(record["curves"],
+                                                                                          spec["objective"])
+        record.update(out)
+        return out["objective_calibrated" if spec["objective_mode"] == "calibrated" else "objective_t1"]
 
     warmup = None
     if spec.get("warmup_check"):
@@ -566,8 +580,8 @@ def run_combine(spec, model, mesh, run_files, names):
                              f"(same tokens, within {check['max_diff']}; addendum G4-5.7b): {json.dumps(warmup)}")
 
     def objective(w):
-        losses = evaluate(w, f"search/{len(records)}", objective_sets)
-        return broadcast_float(g4mix.objective_value(losses, spec["objective"]))
+        evaluate(w, f"search/{len(records)}", objective_sets)
+        return broadcast_float(objectives(records[-1]))
 
     search = g4mix.run_search(objective, spec)
     for p in search["points"]:
@@ -575,15 +589,17 @@ def run_combine(spec, model, mesh, run_files, names):
         if r["tag"] != f"search/{p['order']}" or g4mix.key_of(r["w"]) != g4mix.key_of(p["w"]):
             raise SystemExit(f"--combine: point {p['order']} is not the evaluation {r['tag']}")
         p["losses"] = r["losses"]
+        p.update({k: r[k] for k in ("objective_t1", "objective_calibrated", "t_calibrated") if k in r})
     for k, p in enumerate(search["top"], 1):
         p["losses"] = evaluate(p["w"], f"top/{k}", names)
     first = search["points"][0]
-    again = g4mix.objective_value(evaluate(first["w"], "repeat", objective_sets), spec["objective"])
+    evaluate(first["w"], "repeat", objective_sets)
+    again = objectives(records[-1])
     merger.restore()
     out = {"spec": spec, "search": search, "evals": records,
            "repeat": g4mix.repeat_result(first["w"], first["value"], again, spec["repeat_max_diff"]),
            "warmup_check": warmup, "seconds": round(time.perf_counter() - t0, 1)}
-    print(f"COMBINE {json.dumps({k: out[k] for k in ('repeat', 'seconds')} | {'best': search['best'], 'top': [(p['w'], p['value']) for p in search['top']], 'evaluations': search['evaluations'], 'stopped': search['stopped']})}",
+    print(f"COMBINE {json.dumps({k: out[k] for k in ('repeat', 'seconds')} | {'objective_mode': spec['objective_mode'], 'best': search['best'], 'top': [(p['w'], p['value']) for p in search['top']], 'evaluations': search['evaluations'], 'stopped': search['stopped']})}",
           flush=True)
     return out
 
@@ -706,17 +722,20 @@ def main(argv=None):
         combine_spec = json.loads(Path(args.combine).read_text())
     evals_wanted = parse_evals(args.eval)
     if combine_spec:
-        if "repeat_max_diff" not in combine_spec:
-            raise SystemExit("--combine: the spec has no repeat_max_diff (g4mix.py spec of addendum G4-5.7b)")
+        if "repeat_max_diff" not in combine_spec or combine_spec.get("objective_mode") not in ("t1", "calibrated"):
+            raise SystemExit("--combine: the spec has no repeat_max_diff or objective_mode (g4mix.py spec of addendum "
+                             "G4-5.7b)")
         unknown = [s for s in combine_spec["objective"] if s not in evals_wanted]
         unknown += [s for s in (combine_spec.get("warmup_check") or {}).get("losses", {}) if s not in evals_wanted]
         if unknown or not evals_wanted:
             raise SystemExit(f"--combine: the objective's or the warmup check's sets {unknown} are no --eval")
     temps = None
     if args.temperatures:
-        if combine_spec or args.resume_step or not evals_wanted:
-            raise SystemExit("--temperatures is an eval-only measurement: --eval files, no --combine, no --resume-step")
+        if args.resume_step or not evals_wanted:
+            raise SystemExit("--temperatures is an eval-only measurement: --eval files, no --resume-step")
         temps = temperature_grid(args.temperatures)
+    if combine_spec and combine_spec["objective_mode"] == "calibrated" and not temps:
+        raise SystemExit("--combine: the calibrated objective needs --temperatures (addendum G4-5.7b A)")
     overrides = overrides + eval_overrides(evals_wanted, args.eval_every)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)

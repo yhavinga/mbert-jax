@@ -7,8 +7,10 @@
 #        logits (scripts/check_hf_export.py jax, in the venv of the evaluations, $JAXPY, JAX on CPU); venv-a (torch CPU, transformers 4.57.1 as the evaluations);
 #        convert_flax_to_hf.py into $W/hf; check_hf_export.py hf on $W/hf; the tokenizer and config files of $W/hf
 #        against those of the public repo (read only). Reports to $OUT.
-# stage  the model card into $W/hf/README.md; push_staging.py into the private $REPO; check_hf_export.py hf from the
-#        Hub with venv-a and with venv-b (the newest transformers); reports and the export directory to $OUT.
+# stage  the model card ($CARD, refused while it holds a TODO( placeholder) into $W/hf/README.md; push_staging.py into
+#        the private $REPO; check_hf_export.py hf from the Hub with venv-a and with venv-b (the newest transformers);
+#        reports and the export directory to $OUT.
+# CKPT, OUT, REPO, PUBLIC, PUBLIC_REV and CARD default to T2's; another model's export sets them (stage_release_v2.sh).
 # Every Python step runs at nice 19, ionice idle, on $CPUS, with JAX_PLATFORMS=cpu; process names match no busy
 # pattern of the chains (convert_gcs_checkpoint.py is run from stdin). Disk: ~6 GB in $W (no /dev/shm). Nothing is
 # deleted; $W is removed by hand afterwards with its literal path.
@@ -18,8 +20,9 @@ COMMIT=${COMMIT:?set COMMIT to the hf-release commit}
 CKPT=${CKPT:-gs://t5-dutch-english-usc2/mbert/final-culturax-230m-epoch2/ckpt_keep/1306000}
 OUT=${OUT:-gs://t5-dutch-english-usc2/mbert/final/hf-release}
 REPO=${REPO:-yhavinga/dmbert-230m-culturax-staging}
-PUBLIC=yhavinga/dmbert-230m-culturax
-PUBLIC_REV=cf67c63e62d2cdcccf4a13eb0eca2cab332af296
+PUBLIC=${PUBLIC:-yhavinga/dmbert-230m-culturax}
+PUBLIC_REV=${PUBLIC_REV:-cf67c63e62d2cdcccf4a13eb0eca2cab332af296}
+CARD=${CARD:-experiments/final/release/MODEL_CARD.md}
 TOKENIZER=yhavinga/dutch-llama-tokenizer
 W=${W:-$HOME/hf_release}
 JAXPY=${JAXPY:-$HOME/mbert-dumb/.venv/bin/python}
@@ -93,7 +96,9 @@ fi
 
 if [ "$PHASE" = stage ]; then
   [ -f "$W/hf/model.safetensors" ] && [ -f "$W/reports/check-local-4.57.1.json" ] || { echo "run PHASE=local first"; exit 2; }
-  cp experiments/final/release/MODEL_CARD.md "$W/hf/README.md"
+  [ -f "$CARD" ] || { echo "no $CARD at $COMMIT"; exit 2; }
+  ! grep -n "TODO(" "$CARD" || { echo "$CARD still holds the TODO( placeholders above"; exit 2; }
+  cp "$CARD" "$W/hf/README.md"
   venv venv-a 4.57.1 0.36.2
   log "push to $REPO (private)"
   "$W/venv-a/bin/python" experiments/final/release/push_staging.py --folder "$W/hf" --repo "$REPO" --out "$W/reports/push.json"

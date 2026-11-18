@@ -6,15 +6,19 @@
   # the replacement:
   python replace_public.py --staging-revision <sha> --execute [--delete-staging]
 
+  # a model without a repo yet: --public NAME --create private|public (refused when NAME exists)
+  python replace_public.py --staging S --staging-revision <sha> --public NAME --create private --execute
+
 With --execute, in this order, each step only when the previous one succeeded:
   1. staging (private) at --staging-revision: every file is downloaded to --workdir and its sha256 checked against
      the Hub's;
-  2. one commit on the public repo's main: every staging file added or replaced, every public file that staging does
-     not have deleted (in the same commit);
+  2. with --create: the public repo is created with that visibility; then one commit on the public repo's main: every
+     staging file added or replaced, every public file that staging does not have deleted (in the same commit);
   3. super_squash_history of the public repo's main into one commit;
   4. read back: the set of files of the public repo's main and the sha256 of each equal staging's;
   5. with --delete-staging, and only when 4 passed: the staging repo is deleted.
-The public repo keeps its visibility. Exit 1 at the first failing step. The token comes from the existing login.
+An existing public repo keeps its visibility. Exit 1 at the first failing step. The token comes from the existing
+login.
 """
 
 from __future__ import annotations
@@ -39,6 +43,8 @@ def main() -> int:
     parser.add_argument("--public", default=PUBLIC)
     parser.add_argument("--message", default="Dutch ModernBERT 230M trained on CulturaX (nl): model, tokenizer, config and model card")
     parser.add_argument("--workdir", default=None, help="for the downloaded staging files (default: a temporary directory)")
+    parser.add_argument("--create", choices=["private", "public"],
+                        help="the public repo does not exist yet: create it with this visibility")
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--delete-staging", action="store_true")
     args = parser.parse_args()
@@ -55,10 +61,19 @@ def main() -> int:
         if sha != args.staging_revision or not private:
             print(f"FAILED: {args.staging} at {args.staging_revision}: resolved {sha}, private {private}")
             return 1
-        public_sha, public_private, public = remote_sha256(api, args.public, "main", cache)
+        exists = api.repo_exists(args.public, repo_type="model")
+        if exists == bool(args.create):
+            print(f"FAILED: {args.public} " + ("exists: it is replaced without --create" if exists
+                                               else "does not exist: --create private|public makes it"))
+            return 1
+        if exists:
+            public_sha, public_private, public = remote_sha256(api, args.public, "main", cache)
+        else:
+            public_sha, public_private, public = None, args.create == "private", {}
         adds, deletes = plan(list(public), {p: Path(p) for p in staging}, keep=set())
         print(f"staging {args.staging} @ {sha} (private): {len(staging)} files")
-        print(f"public  {args.public} @ {public_sha} (private={public_private}): {len(public)} files")
+        print(f"public  {args.public} @ {public_sha} (private={public_private}): {len(public)} files"
+              + ("" if exists else f" (does not exist yet: --execute creates it {args.create})"))
         for p in adds:
             state = "new" if p not in public else ("same" if public[p] == staging[p] else "replaced")
             print(f"  add {p}  sha256 {staging[p][:16]}…  ({state})")
@@ -80,7 +95,13 @@ def main() -> int:
                 return 1
             files[p] = f
         print(f"step 1 done: {len(files)} files of {args.staging} @ {sha} in {local_dir}")
-        # 2. one commit with all of them, and the deletions
+        # 2. the repo when it is new, then one commit with all of them, and the deletions
+        if not exists:
+            api.create_repo(args.public, repo_type="model", private=public_private)
+            if bool(api.model_info(args.public).private) != public_private:
+                print(f"FAILED step 2: {args.public} was not created {args.create}")
+                return 1
+            print(f"step 2: {args.public} created {args.create}")
         oid, deleted = commit_exactly(api, args.public, files, args.message, keep=set())
         print(f"step 2 done: commit {oid} on {args.public}, deleted {deleted}")
         # 3. one commit in the history

@@ -8,9 +8,11 @@ side is an example as MaxText's SFT makes it (g4lora.prompt_text + completion_te
 <turn|>\\n). The two sides of a pair are two segments next to each other in one packed row, chosen first (segments 2j-1
 and 2j), so that the loss reads the pairs from targets_segmentation alone and a batch keeps MaxText's six keys.
 
-The reference policy is the base model: the same model with every LoRA parameter at zero (qwix adds x A B x scale, which
-is then exactly zero), run in the same jitted step under stop_gradient and before the policy's forward pass (an
-optimization barrier), so that no second copy of the weights is needed. Tunix's DPOTrainer (tunix/sft/dpo/dpo_trainer.py
+The reference policy is the base model: the model before its first step, whose every LoRA B is zero (qwix adds
+x A B x scale, which is then exactly zero), so that no second copy of the weights is needed. Its per-segment sums of
+log-probabilities are computed once before training, forward only (amendment G4-6.4a: reference_sums, one pass over
+every batch of the training file and the preference eval files), and travel with the batches as ref_seg; the training
+step runs only the policy's forward and backward pass. Tunix's DPOTrainer (tunix/sft/dpo/dpo_trainer.py
 @ a8d7058) takes a separate ref_model (MaxText 0.2.5's train_dpo.py passes nnx.clone(model) and applies no LoRA) and pads
 every prompt and response to fixed lengths; its loss is the one of dpo_terms with loss "sigmoid": -(1 - eps) log
 sigmoid(beta h) - eps log sigmoid(-beta h), rewards beta x the log-ratio, accuracy chosen reward > rejected reward.
@@ -19,7 +21,8 @@ Pure parts (numpy, no JAX): packing pairs into rows, a row as MaxText's SFT batc
 does), the per-process batches of a packed file, and the loss's arithmetic (dpo_terms, numpy or jax.numpy).
 JAX parts (on the TPU, imported by sft_lora.py --dpo): without_lora, the per-token log-probabilities from the decoder's
 hidden states in pieces along the sequence (MaxText's output head and cross_entropy_with_logits per piece, under
-jax.checkpoint), and the loss function in the signature of MaxText's SFT loss.
+jax.checkpoint), the reference's per-segment sums, and the loss function in the signature of MaxText's SFT loss (with the
+batch's ref_seg).
 """
 
 import json
@@ -32,6 +35,8 @@ KEYS = ("inputs", "inputs_position", "inputs_segmentation", "targets", "targets_
 PAD_ID = 0                # Gemma 4's <pad>: the id MaxText's SFT masks the prompt with (hf_data_processing._get_pad_id)
 BOS_ID = 2                # Gemma 4's <bos>: ShiftData's second ignored id
 MAX_SEGMENTS = 64         # segments a packed row may hold (32 pairs); the loss's one-hot over the segment ids
+REF_KEY = "ref_seg"       # amendment G4-6.4a: a batch's precomputed reference, [rows, max_segments] float32
+ROW_KEY = "row"           # the file's row index of each row of a batch (the reference pass only)
 LOSSES = ("sigmoid", "ipo")
 DEFAULTS = {"loss": "sigmoid", "beta": 0.1, "label_smoothing": 0.0, "nll_alpha": 1.0, "length_norm": False,
             "max_segments": MAX_SEGMENTS}
@@ -171,22 +176,34 @@ def batch_count(batch, rows):
     return n // rows
 
 
-def local_batches(arrays, process, processes, rows, batches, padding=0):
+def local_batches(arrays, process, processes, rows, batches, padding=0, ref=None, row_ids=False):
     """This process's part of each global batch (rows / processes consecutive rows), the first `batches` of the file,
     then `padding` all-zero batches: Tunix loads the next batch before it checks max_steps, so a run of every batch
-    still finds one (every process the same, so that none leaves the loop another way)"""
+    still finds one (every process the same, so that none leaves the loop another way). With ref (the reference's
+    per-segment sums of the file's rows, [rows, max_segments]) each batch carries its rows' REF_KEY (a padding batch
+    zeros); with row_ids each batch carries ROW_KEY, its rows' indices in the file (the reference pass)."""
     if rows % processes:
         raise SystemExit(f"{rows} rows per batch over {processes} processes")
     local = rows // processes
     seq = arrays["inputs"].shape[1]
+    if ref is not None and ref.shape[0] < batches * rows:
+        raise SystemExit(f"a reference of {ref.shape[0]} rows for {batches} batches of {rows} rows")
     for b in range(batches):
         lo = b * rows + process * local
-        yield {k: arrays[k][lo:lo + local] for k in KEYS}
+        out = {k: arrays[k][lo:lo + local] for k in KEYS}
+        if ref is not None:
+            out[REF_KEY] = np.asarray(ref[lo:lo + local], np.float32)
+        if row_ids:
+            out[ROW_KEY] = np.arange(lo, lo + local, dtype=np.int32)
+        yield out
     for _ in range(padding):
-        yield {k: np.zeros((local, seq), np.int32) for k in KEYS}
+        out = {k: np.zeros((local, seq), np.int32) for k in KEYS}
+        if ref is not None:
+            out[REF_KEY] = np.zeros((local, ref.shape[1]), np.float32)
+        yield out
 
 
-def global_iterator(path, mesh, rows, batches, padding=0):
+def global_iterator(path, mesh, rows, batches, padding=0, ref=None, row_ids=False):
     """MaxText's multi-host iterator over a packed file: each process puts its rows of a batch on its devices"""
     import jax
     from maxtext.input_pipeline.multihost_dataloading import MultiHostDataLoadIterator
@@ -195,7 +212,7 @@ def global_iterator(path, mesh, rows, batches, padding=0):
     have = batch_count(batch, rows)
     if batches > have:
         raise SystemExit(f"{path}: {have} batches, {batches} wanted")
-    gen = list(local_batches(arrays, jax.process_index(), jax.process_count(), rows, batches, padding))
+    gen = list(local_batches(arrays, jax.process_index(), jax.process_count(), rows, batches, padding, ref, row_ids))
     return MultiHostDataLoadIterator(gen, mesh)
 
 
@@ -218,22 +235,31 @@ def log_sigmoid(x, xp):
     return -xp.logaddexp(0.0, -x)
 
 
-def dpo_terms(logp, ref_logp, segmentation, opts, xp=np):
+def segment_sums(values, segmentation, max_segments, xp=np):
+    """[B, max_segments] float32: per row the sum of values [B, L] over each segment id 1..max_segments"""
+    onehot = (segmentation[..., None] == xp.arange(1, max_segments + 1)).astype(xp.float32)
+    return xp.einsum("bl,bls->bs", values.astype(xp.float32), onehot)
+
+
+def dpo_terms(logp, ref_logp, segmentation, opts, xp=np, ref_seg=None):
     """The preference loss of a batch and its sums (SUMS). logp and ref_logp: per-token log-probabilities of the
-    targets [B, L] (0 where targets_segmentation is 0) under the policy and the reference; segmentation:
-    targets_segmentation. A pair is segments 2j-1 (chosen) and 2j (rejected) of a row, both with target tokens; an
-    unpaired or empty segment counts nowhere. Per pair h = (chosen - ref chosen) - (rejected - ref rejected) of the
+    targets [B, L] (0 where targets_segmentation is 0) under the policy and the reference; or, in place of ref_logp
+    (then None), ref_seg: the reference's per-segment sums [B, max_segments] (segment_sums of its log-probabilities,
+    precomputed: amendment G4-6.4a); segmentation: targets_segmentation. A pair is segments 2j-1 (chosen) and 2j
+    (rejected) of a row, both with target tokens; an unpaired or empty segment counts nowhere. Per pair h = (chosen - ref chosen) - (rejected - ref rejected) of the
     summed log-probabilities (each divided by its tokens with length_norm); sigmoid: -(1 - eps) log sigmoid(beta h) - eps
     log sigmoid(-beta h) (Tunix's dpo_loss_fn); ipo: (h - 1 / (2 beta))^2. The loss is the mean over the batch's pairs
     plus nll_alpha x the token-weighted NLL of the chosen sides (the SFT loss of G4-4 on them). Rewards beta x (logp -
     ref); accuracy: chosen reward > rejected reward."""
     f32 = xp.float32
     s = int(opts["max_segments"])
-    ids = xp.arange(1, s + 1)
-    onehot = (segmentation[..., None] == ids).astype(f32)
-    pol = xp.einsum("bl,bls->bs", logp.astype(f32), onehot)
-    ref = xp.einsum("bl,bls->bs", ref_logp.astype(f32), onehot)
-    ntok = onehot.sum(axis=1)
+    if (ref_logp is None) == (ref_seg is None):
+        raise ValueError("dpo_terms: either ref_logp or ref_seg")
+    pol = segment_sums(logp, segmentation, s, xp)
+    ref = segment_sums(ref_logp, segmentation, s, xp) if ref_seg is None else ref_seg.astype(f32)
+    if ref.shape != pol.shape:
+        raise ValueError(f"dpo_terms: the reference's sums are {ref.shape}, the policy's {pol.shape}")
+    ntok = (segmentation[..., None] == xp.arange(1, s + 1)).astype(f32).sum(axis=1)
     pc, pr, rc, rr = pol[:, 0::2], pol[:, 1::2], ref[:, 0::2], ref[:, 1::2]
     nc, nr = ntok[:, 0::2], ntok[:, 1::2]
     valid = ((nc > 0) & (nr > 0)).astype(f32)
@@ -358,30 +384,111 @@ def model_logp(model, config, data, dropout):
     return logp * (data["targets_segmentation"] != 0).astype(jnp.float32)
 
 
-def make_loss(config, opts, is_train):
-    """The preference loss in the signature of MaxText's SFT loss (train_sft.use_maxtext_loss_function): the reference
-    pass first (without_lora, stop_gradient), an optimization barrier, then the policy's; aux holds xent_sum and
-    total_weights over every target token (the SFT eval files' loss, as MaxText's) and the pairs' sums (pref_<sum>)"""
+def reference_sums(model, config, data, max_segments):
+    """Amendment G4-6.4a: the reference's per-segment sums of log-probabilities [B, max_segments] of a batch, forward
+    only: model_logp of the model before its first step (every LoRA B zero, which the caller checks: the LoRA term
+    x A B is then exactly zero, so this is the model with its LoRA at zero) on the batch's eval rows, as the eval step's
+    policy pass computes them"""
+    import jax.numpy as jnp
+
+    data = {k: data[k][:config.micro_batch_size_to_eval_on] for k in KEYS}
+    return segment_sums(model_logp(model, config, data, False), data["targets_segmentation"], max_segments, jnp)
+
+
+def lora_b_zero(model):
+    """Whether every LoRA B of the model is all zero (the model is then its base model), read on this process"""
     import jax
+    import jax.numpy as jnp
+    from flax import nnx
+
+    leaves = [leaf for path, leaf in jax.tree_util.tree_flatten_with_path(nnx.to_pure_dict(nnx.state(
+        model, nnx.LoRAParam)))[0] if str(getattr(path[-1], "key", path[-1])).endswith("_lora_b")]
+    if not leaves:
+        raise SystemExit("--dpo: the model has no LoRA B")
+    zero = jax.jit(lambda xs: jnp.all(jnp.stack([jnp.all(x == 0) for x in xs])))(leaves)
+    return bool(np.asarray(zero.addressable_data(0) if hasattr(zero, "addressable_data") else zero))
+
+
+_REFERENCE_STEPS = {}
+
+
+def reference_step(config, max_segments):
+    """The jitted reference pass of a batch -> (reference_sums, the batch's ROW_KEY), one per run (every file the same
+    batch shape, so it compiles once)"""
+    from flax import nnx
+
+    key = (id(config), max_segments)
+    if key not in _REFERENCE_STEPS:
+        _REFERENCE_STEPS[key] = nnx.jit(lambda m, d: (reference_sums(m, config, d, max_segments), d[ROW_KEY]))
+    return _REFERENCE_STEPS[key]
+
+
+def precompute_reference(model, config, path, mesh, rows, batches, max_segments):
+    """Amendment G4-6.4a: reference_sums of the first `batches` global batches of a packed file, one jitted forward
+    step, gathered from every process: [batches x rows, max_segments] float32 in the file's row order (each row placed
+    by its ROW_KEY, so the mesh's order of the processes does not matter), and the seconds of each batch"""
+    import time
+
+    import jax
+    from jax.experimental import multihost_utils
+
+    if not lora_b_zero(model):
+        raise SystemExit("--dpo: a LoRA B is not zero before the reference pass (the reference is the base model)")
+    step = reference_step(config, max_segments)
+    out = np.full((batches * rows, max_segments), np.nan, np.float32)
+    seconds = []
+    for batch in global_iterator(path, mesh, rows, batches, row_ids=True):
+        t0 = time.perf_counter()
+        sums, ids = jax.block_until_ready(step(model, batch))
+        sums = np.asarray(multihost_utils.process_allgather(sums, tiled=True), np.float32)
+        ids = np.asarray(multihost_utils.process_allgather(ids, tiled=True)).reshape(-1)
+        if sums.shape != (rows, max_segments) or len(ids) != rows:
+            raise SystemExit(f"{path}: the reference pass gave {sums.shape} for rows {ids.shape}")
+        out[ids] = sums
+        seconds.append(time.perf_counter() - t0)
+    if np.isnan(out).any():
+        raise SystemExit(f"{path}: {int(np.isnan(out).any(axis=1).sum())} rows without a reference (or a NaN)")
+    return out, seconds
+
+
+def reference_rows(path, ref, batches, rows):
+    """Per pair of the first `batches` batches of a packed file: its reference sums (chosen: segment 2j-1, rejected:
+    2j of its row), for the record (dpo_ref.parquet)"""
+    import pyarrow.parquet as pq
+
+    table = pq.read_table(path, columns=["batch", "pairs"]).to_pydict()
+    out = []
+    for r in range(batches * rows):
+        for j, pid in enumerate(table["pairs"][r]):
+            out.append({"file": Path(path).name, "batch": int(table["batch"][r]), "row": r, "pair": pid,
+                        "ref_chosen_logp": float(ref[r, 2 * j]), "ref_rejected_logp": float(ref[r, 2 * j + 1])})
+    return out
+
+
+def make_loss(config, opts, is_train):
+    """The preference loss in the signature of MaxText's SFT loss (train_sft.use_maxtext_loss_function), with the
+    batch's precomputed reference (REF_KEY, amendment G4-6.4a): only the policy's pass; aux holds xent_sum and
+    total_weights over every target token (the SFT eval files' loss, as MaxText's) and the pairs' sums (pref_<sum>). A
+    batch without REF_KEY is an SFT eval file's (aux without the pairs' sums); a training batch always has it."""
     import jax.numpy as jnp
 
     micro = config.micro_batch_size_to_train_on if is_train else config.micro_batch_size_to_eval_on
     dropout = bool(config.enable_dropout) if is_train else False
 
     def loss_func(model, inputs, inputs_position, inputs_segmentation, targets, targets_position,
-                  targets_segmentation):
+                  targets_segmentation, ref_seg=None):
         data = {"inputs": inputs, "inputs_position": inputs_position, "inputs_segmentation": inputs_segmentation,
                 "targets": targets, "targets_position": targets_position,
                 "targets_segmentation": targets_segmentation}
         data = {k: v[:micro] for k, v in data.items()}
-        ref = jax.lax.stop_gradient(model_logp(without_lora(model), config, data, False))
-        # the reference's pass ends before the policy's begins: its activations are never live beside the policy's
-        ref, data = jax.lax.optimization_barrier((ref, data))
         logp = model_logp(model, config, data, dropout)
-        loss, sums = dpo_terms(logp, ref, data["targets_segmentation"], opts, jnp)
-        aux = {"xent_sum": -jnp.sum(logp), "total_weights": jnp.sum(data["targets_segmentation"] != 0),
-               **{f"pref_{k}": v for k, v in sums.items()}}
-        return loss, aux
+        aux = {"xent_sum": -jnp.sum(logp), "total_weights": jnp.sum(data["targets_segmentation"] != 0)}
+        if ref_seg is None:
+            if is_train:
+                raise ValueError(f"--dpo: a training batch without {REF_KEY} (the precomputed reference)")
+            return aux["xent_sum"] / jnp.maximum(aux["total_weights"], 1), aux
+        loss, sums = dpo_terms(logp, None, data["targets_segmentation"], opts, jnp, ref_seg=ref_seg[:micro])
+        return loss, {**aux, **{f"pref_{k}": v for k, v in sums.items()}}
 
     return loss_func
 

@@ -7,7 +7,8 @@
 # and checks: (a) ran 8 steps on the packed file's first 8 batches (tokens per step = the file's); at step 0 the
 # policy is the reference (pref loss log 2, margin 0, each NLL the reference's); (a)'s step-0 losses of books and own =
 # (b)'s (the preference loss's per-token log-probabilities = MaxText's cross entropy); at step 8 the reference is still
-# the base model (its NLL the same as at step 0) while the policy moved.
+# the base model (its NLL the same as at step 0) while the policy moved; (a)'s reference was computed before the first
+# step over the 8 trained batches and pref_btval (amendment G4-6.4a).
 # Started by run_g4arm.sh cpuproof6 (w1) with G, G6, H, PY (the SFT venv's python), TOK (Gemma 4's tokenizer), CODE
 # (the bundle) and X (the work directory) in the environment. Ends in CPU_PROOF6_OK or CPU_PROOF6_FAILED.
 set -euo pipefail
@@ -96,6 +97,9 @@ need(abs(p8["ref_chosen_nll"] - p0["ref_chosen_nll"]) <= 1e-5 and abs(p8["ref_re
 need(abs(p8["margin"]) > 1e-4 or abs(p8["chosen_nll"] - p0["chosen_nll"]) > 1e-4, f"a: the policy moved by step 8 {p8}")
 need(all(sorted(e["step"] for e in a["eval"] if e["set"] == n) == [0, 4, 8] for n in ("books", "own", "pref_btval")),
      "a: evals at 0, 4, 8")
+ref = a["dpo"].get("ref") or {}
+need(set(ref) == {"train", "pref_btval"} and ref["train"]["batches"] == 8 and ref["pref_btval"]["batches"] == p0["batches"],
+     f"a: the reference computed before the first step, the trained batches and pref_btval (amendment G4-6.4a) {ref}")
 print("CPU_PROOF6_OK" if not bad else f"CPU_PROOF6_FAILED {bad}", flush=True)
 raise SystemExit(1 if bad else 0)
 EOF

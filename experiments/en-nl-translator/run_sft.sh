@@ -98,6 +98,8 @@ COPY="gsutil -q cp ~/logs/$NAME.log $ROOT/runs/$NAME/$NAME-w$WORKER.log"
 # sft_lora.py writes its files on the job's process 0: this worker alone, or worker 0 of a multi-host job
 if [ "$MULTIHOST" != 1 ] || [ "$WORKER" = 0 ]; then
   COPY="$COPY; gsutil -m -q cp $OUT/summary.json $OUT/adapter.json $OUT/adapter.npz $OUT/metrics.txt $ROOT/runs/$NAME/"
+  # sft_lora.py --dpo: the reference's sums per pair (amendment G4-6.4a)
+  COPY="$COPY; if [ -s $OUT/dpo_ref.parquet ]; then gsutil -q cp $OUT/dpo_ref.parquet $ROOT/runs/$NAME/; fi"
 fi
 setsid nohup bash -c "bash ~/run_$NAME.sh > ~/logs/$NAME.log 2>&1; echo EXIT \$? >> ~/logs/$NAME.log; $COPY" > /dev/null 2>&1 < /dev/null &
 echo "started $NAME on $(hostname): ~/logs/$NAME.log, output in $OUT"

@@ -936,3 +936,96 @@ doel volgens de regel; (3) G4-5.5–G4-5.6 ongewijzigd: de top 4 vertalen en sco
 `report5` (met `--smoke`), het blinde pakket van de gekozen kandidaat (het pakket na `report5`, dat de kandidaat kiest);
 (4) de sampling-proef van punt 5; (5) `DONE`. Faalt een stap, dan stopt de keten (`FAILED`); de zoektocht heeft de
 temperatuurproef nodig (de regel van punt 4).
+
+## 11. Amendement G4-6
+
+**Amendement 19 nov 2026 (tijdstip: de commit van deze sectie op branch `en-nl-g4arm6`): arm G4-6, preference-training
+(DPO) met LoRA** [voorbereiding door een subagent op opdracht van de hoofdsessie, 18 nov (spec
+`mbert-ops/translator-sft/g4-6-spec.md`, code `53df95f`); besluit van Yeb 19 nov ~17:30: "akkoord om door te gaan met
+DPO"; labels als in de kop]. Vastgelegd vóór de kandidaten, vóór de rejected-run, vóór de eerste trainingsstap (ook vóór
+de CPU-proef en de smoke-test) en vóór elke uitslag van G4-6. Waar deze sectie niets zegt, gelden §1–§8 en de
+amendementen van §9 met "G4-6" in plaats van "G4-4".
+
+*G4-6.0 Keuzes.* De open keuzes van de spec (§9 daar) staan op het **advies van de spec, gekozen door de hoofdsessie op
+19 nov na Yebs akkoord** [keuze hoofdsessie]: G4-6 nu starten (G4-5 haalde (b) niet); mix ~43.000 paren (alle boeken
+die de filters halen, ten hoogste 11.000; 16.000 romans; 16.000 BT, 3.200 per bron); rejected = G4-0's greedy vertaling
+(fork `f4d8615`, prompt `natural-v1`); chrF-band BT en boeken [50, 80), romans [25, 80); lengteband [0,67; 1,5];
+sigmoid-DPO met β 0,1 plus de NLL van chosen met gewicht 1,0 (RPO), geen length-normalisatie; LR 1e-5 WSD; één epoch
+(~720 stappen bij 4.096 [schatting]); referentie = hetzelfde model met elke LoRA-parameter op nul in dezelfde stap; de
+classifier op chosen en rejected meten en rapporteren, geen paren erop kiezen; evaluatie-interval 200 stappen; G4-4
+naast G4-0 in het verslag; de geheugen-terugval naar rijen van 2.048 volgens de vaste regel van G4-6.4. G4-6 hangt niet
+af van de sampling-proef van G4-5.7b (punt 5); de keten wacht alleen tot de TPU vrij is.
+
+*G4-6.1 Aanleiding.* G4-2, G4-3, G4-4 en G4-5 haalden (b) niet (+1,0 / +0,4 / +0,7 / −0,4 pp; G4-5: de gekozen
+combinatie G4-5c2 op het beslisdeel, `mbert-ops/translator-sft/g4-5-report.md`). Bij G4-4 bleef G4-0's greedy vertaling
+zeer waarschijnlijk (`own` 0,075 → 0,339). De temperatuurproef van G4-5.7b [gemeten:
+`mbert-ops/translator-sft/g4-5-temperature.md`]: één temperatuur op G4-0 (T = 2,05) geeft gemiddeld 63,8% van de daling
+van het teacher-forced verlies G4-0 → warmup op de zoekdeelsets (books 65,1%, novels 64,4% van de daling naar G4-4);
+een temperatuur verandert de greedy uitvoer niet. [Gevolgtrekking] Het grootste deel van wat de SFT-armen aan verlies
+wonnen, is kalibratie; de modus verschuift niet. G4-6 traint daarom op voorkeuren: per paar het menselijke Nederlands
+(chosen) boven G4-0's greedy vertaling van hetzelfde Engels (rejected), met G4-0 als referentie.
+
+*G4-6.2 Kandidaten en rejected-run* (`g4arm.py cands6`, `$G/data/G4-6/rejected-in/`). Uit de set van G4-4
+(`g44_set`): de Nederlandse boeken, de romanparen van de drie doorgangen en de BT van ten hoogste 512 Nederlandse tokens
+per bron (geen lange BT, geen FLAN-replay), elk waarvan het Nederlands binnen 0,8 van de decodeerlimiet van de klasse
+van het Engels past en het paar (geschat) binnen 2.048 tokens; per stratum een trekking van 1,4 × het doel (boeken:
+alle; seed `en-nl-g4arm/0/G4-6/candidates/<stratum>`); daarbij de 500 romanpassages van `novels`. G4-0 vertaalt ze
+zoals §4.1 (fork `f4d8615`, `natural-v1`, tiny–xlong, greedy), elke klasse over elke worker, naar `$G/dpo/G4-0/`.
+
+*G4-6.3 Paren* (`g4arm.py build6`, `$G/data/G4-6/`). Chosen = het menselijke Nederlands, rejected = G4-0's vertaling.
+Uit, in deze volgorde: G4-0 niet af, lus, leeg, Engels over; identiek; chrF(rejected, chosen) buiten [50, 80) (BT,
+boeken) of [25, 80) (romans); tekens rejected / chosen buiten [0,67; 1,5]; een 13-gram van de evaluatiesets of de
+blinde passages in rejected; meer dan 2.048 tokens voor het paar. Per stratum een trekking (seed
+`…/G4-6/draw/<stratum>`) van: boeken 11.000, romans 16.000, BT 3.200 per bron (of wat er is); één volgorde (seed
+`…/G4-6/order`). Haalt een stratum zijn aantal niet (`short_of_want` > 0 in `report.json`), dan stopt de keten vóór de
+CPU-proef en beslist Yeb; de grenzen worden niet verschoven. Elke kant is een SFT-voorbeeld van G4-4 (§2.6); een paar
+zijn twee segmenten naast elkaar in één rij, chosen eerst, first-fit per batch van 16 rijen, op 4.096 en 2.048.
+Voorkeurssets (rapporteren): `pref_books` en `pref_btval` (de held-out sets van G4-2 met G4-0's held-out vertalingen),
+`pref_novels` (de 500 romanpassages); uit alleen fouten van G4-0, identieke en te lange paren. `check6`: elke kant door
+MaxText's eigen SFT-stappen, elke rij gelijk aan MaxText's `shift_and_refine`. Geen TEST-split, geen evaluatiesets in
+de training.
+
+*G4-6.4 Training.* Als G4-4.4 (rank 32 / alpha 16, 410 modules, AdamW, clipping 1,0, 16 rijen per stap), behalve:
+`sft_lora.py --dpo` (`g4dpo.py`): verlies sigmoid-DPO met β 0,1, label smoothing 0, plus 1,0 × het token-gewogen NLL
+van de chosen-kanten, geen length-normalisatie; de referentie is het model met elke LoRA-parameter op nul, in dezelfde
+stap onder `stop_gradient`; de log-kansen in 8 stukken (`num_vocab_tiling=8`); LR 1e-5 WSD (3% warmup, de laatste 10%
+naar 1e-6); één epoch (elke batch van `train-4096.parquet`); rijen van 4.096. Evaluatie op stap 0, elke 200 stappen en
+na de laatste op `books`, `btval`, `own`, `btlong`, `novels`, `pref_books`, `pref_btval`, `pref_novels`. Run
+`g4arm_G4-6`. **Terugval**: faalt de smoke-test bij 4.096 op `RESOURCE_EXHAUSTED` (in de log van een worker) of op
+alleen de controle van de piek (boven 29,5 GiB), dan de smoke-test bij 2.048 (`g4arm_G4-6_s8_2048`); slaagt die, dan
+de training bij 2.048 (`train-2048.parquet`, ~1.500 stappen [schatting]) zonder `btlong`; anders stoppen.
+
+*G4-6.5 Evaluatie en beslisregel*: als G4-4.7 met G4-6 als arm en G4-0 als uitgangspunt: (a1) gemiddelde
+MetricX-24-QE ≤ die van de menselijke referentie op WMT24++ (960), FLORES en NTREX; (b) "origineel"(G4-6) −
+"origineel"(G4-0) ≥ 0,10 op WMT24++ (960) + FLAN (1.000). De classifier in één run over G4-6, G4-0, G4-4 en G4-5c2 (de
+gekozen combinatie van G4-5; G4-4 en G4-5c2 alleen rapporteren). (a2) en (c) alleen als (a1) en (b) gelden: pas dan
+het blinde pakket (`$S/blind/G4-6/`, ook `$S/blind/G4-6-tg/`) en de beoordeling door één verse Claude-subagent (rubriek
+van `protocol.md` §4.2.4). G4-4 naast G4-0 op dezelfde maten (QE, MetricX-ref, COMET-22, "origineel", de directe maat,
+het verlies), alleen rapporteren.
+
+*G4-6.6 CPU-proef en smoke-test.* De CPU-proef (`cpuproof6.sh`, op de CPU van een worker) moet `CPU_PROOF6_OK` geven
+vóór de eerste TPU-stap van de training (de rejected-run is gewone decodering zoals de evaluatie en mag ervoor). Smoke-test
+`g4arm_G4-6_s8` (8 stappen op de eerste 12 batches, evaluaties op 0, 4, 8, 50 segmenten vertaald): de controles van
+`g4arm.smoke6` (§7 van de spec), waaronder: op stap 0 op elke voorkeursset |verlies − log 2|, |marge| en |NLL − NLL
+referentie| ≤ 1e-4; de SFT-verliezen op stap 0 binnen 2e-3 van stap 0 van G4-4; piek ≤ 29,5 GiB; schatting ≤ 24 u.
+Faalt een controle (buiten de terugval van G4-6.4): stoppen vóór de training.
+
+*G4-6.7 Rapportage* (beslist niets): de voorkeursmaten per voorkeursset en eval-stap, met de lezing "voorkeur
+geleerd" (nauwkeurigheid op `pref_books` en `pref_btval` na de laatste stap beide ≥ 0,70) / "niet geleerd" (beide
+< 0,60) / "gemengd"; het verlies op `own` en de andere eval-sets; de directe maat (G4-2.6) op de held-out sets en
+de lange rijen; de classifier op chosen en rejected per soort (1.000 paren per soort, seed `…/G4-6/pairtexts/<soort>`;
+kiest geen paren).
+
+*G4-6.8 Uitvoer.* `$G/data/G4-6/` (met `rejected-in/`), `$G/dpo/G4-0/`, `$G/data/report-G4-6.{md,json}`,
+`$G/data/check-G4-6.txt`, `$G/runs/g4arm_G4-6_s8[_2048]/`, `$G/smoke6/<tag>/`, `$G/runs/g4arm_G4-6/`, `$G/G4-6/`,
+`$G/eval/G4-6/`, `$G/heldout/G4-6/`, `$G/long/G4-6/`, `$G/naturalness-G4-6/`, `$G/naturalness-G4-6-pairs/`,
+`$S/blind/G4-6/`, `$S/blind/G4-6-tg/`, `$G/report-G4-6/` (kopie `mbert-ops/translator-sft/g4-6-report.md`).
+
+*G4-6.9 De keten* (`mbert-ops/scripts/g4arm6_run.sh`): wacht tot de vervolgketen van G4-5 (`g4arm5_after_hold.sh`)
+eindigt (`EXIT`, welke code ook; de code komt in de log), neemt dan de lock van mbert-corpus over en wacht tot de TPU
+vrij is; dan in deze volgorde: setup, `cands6`, de rejected-run (vertalen, verzamelen), `build6` (met de controle op
+`short_of_want` van G4-6.3), `check6`, de CPU-proef, de classifier op chosen en rejected, de smoke-test (met de
+terugval van G4-6.4), de training, de adapter, vertalen en scoren (evaluatie, held-out, lange rijen), texts, classify,
+het verslag, het blinde pakket alleen als (a1) en (b) gelden. Elke run start pas op de vier workers als hij op alle vier
+is klaargezet (code, geen protocolwijziging; de les van G4-5's zoektocht op 19 nov). Faalt een stap, dan stopt de keten
+(`FAILED`).

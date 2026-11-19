@@ -12,8 +12,8 @@
 #   (c) --dpo with --base-adapter (the adapter merged into the base kernels), 4 steps, evals at 0 and 4
 #   (d) plain SFT with --init-adapter (the same adapter as LoRA in the forward pass), its evals at step 0
 # and checks: (c)'s step-0 losses of books and own = (d)'s (the merged model is the adapter's model) and not (b)'s (the
-# merge changed the model); at step 0 (c)'s policy is its reference (pref loss log 2, |margin| <= 1e-4 as the smoke
-# test's bound, each NLL the reference's) and that reference is not (a)'s; at step 4 (c)'s reference is unchanged.
+# merge changed the model); at step 0 (c)'s policy is its reference (|pref loss - log 2| and |margin| <= 1e-4, G4-6.6's
+# bound as in addendum G4-6.6a; each NLL the reference's) and that reference is not (a)'s; at step 4 (c)'s reference is unchanged.
 # Started by run_g4arm.sh cpuproof6 (w1) with G, G6, H, PY (the SFT venv's python), TOK (Gemma 4's tokenizer), CODE
 # (the bundle) and X (the work directory) in the environment. Ends in CPU_PROOF6_OK or CPU_PROOF6_FAILED.
 set -euo pipefail
@@ -124,7 +124,7 @@ if "$BAKE" == "1":
         need(abs(x - y) <= 1e-4 * max(1.0, abs(y)), f"c: {name} at step 0 = the adapter as LoRA ({x} vs {y})")
         need(abs(x - z) > 1e-4, f"c: {name} at step 0 is not the base model's ({x} vs {z})")
     q0, q4 = ev(c, "pref_btval", 0), ev(c, "pref_btval", 4)
-    need(abs(q0["loss"] - math.log(2)) <= 1e-5 and abs(q0["margin"]) <= 1e-4, f"c: step 0 loss log 2, margin 0 {q0}")
+    need(abs(q0["loss"] - math.log(2)) <= 1e-4 and abs(q0["margin"]) <= 1e-4, f"c: step 0 loss log 2, margin 0 {q0}")  # G4-6.6a
     need(abs(q0["chosen_nll"] - q0["ref_chosen_nll"]) <= 1e-6 and abs(q0["rejected_nll"] - q0["ref_rejected_nll"]) <= 1e-6,
          "c: step 0 policy NLL = reference NLL")
     need(abs(q0["ref_chosen_nll"] - p0["ref_chosen_nll"]) > 1e-4, f"c: the reference is the merged model, not (a)'s ({q0['ref_chosen_nll']} vs {p0['ref_chosen_nll']})")

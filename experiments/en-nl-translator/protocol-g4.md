@@ -1095,11 +1095,12 @@ length-normalisatie, LR 1e-5 WSD, één epoch, rijen van 4.096, de terugval naar
 `--base-adapter` van G4-6b.2. Evaluatie op stap 0, elke 200 stappen en na de laatste op `books`, `btval`, `own`, `btlong`,
 `novels`, `own4`, `pref_books`, `pref_btval`, `pref_novels`.
 
-*G4-6b.6 CPU-proef en smoke-test.* De CPU-proef van G4-6.6 op de paren van G4-6b, met daarbij (`BAKE=1`): (c) `--dpo`
+*G4-6b.6 CPU-proef en smoke-test.* De CPU-proef van G4-6.6 met de grenzen van aanvulling G4-6.6a (op stap 0
+|verlies − log 2| en |marge| ≤ 1e-4; code `cab4c65`, in deze branch gemerged) op de paren van G4-6b, met daarbij (`BAKE=1`): (c) `--dpo`
 met de adapter van (a) als `--base-adapter`, 4 stappen; (d) gewone SFT met dezelfde adapter als `--init-adapter`, de eval
 op stap 0. Controles: de verliezen van `books` en `own` op stap 0 van (c) gelijk aan die van (d) (≤ 1e-4 relatief) en
-niet die van het basismodel (b); op stap 0 is de policy van (c) zijn referentie (verlies log 2 binnen 1e-5, |marge| ≤
-1e-4 [keuze: de grens van de smoke-test], elke NLL die van de referentie binnen 1e-6) en die referentie is niet die van
+niet die van het basismodel (b); op stap 0 is de policy van (c) zijn referentie (|verlies − log 2| en |marge| ≤ 1e-4, de
+grens van G4-6.6 zoals aanvulling G4-6.6a die voor de CPU-proef vastlegt; elke NLL die van de referentie binnen 1e-6) en die referentie is niet die van
 (a); op stap 4 is de referentie van (c) onveranderd (≤ 1e-5). Smoke-test `g4arm_G4-6b_s8` met de controles van
 `g4arm.smoke6` voor G4-6, behalve: de SFT-verliezen op stap 0 binnen **0,05** van G4-4's eigen eval na zijn laatste stap
 (9.316: books 0,858, btval 0,495, own 0,339, btlong 0,437, novels 0,776) [keuze: samengevoegd in bf16-kernels tegen LoRA

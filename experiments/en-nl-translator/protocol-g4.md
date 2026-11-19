@@ -1010,6 +1010,16 @@ vóór de eerste TPU-stap van de training (de rejected-run is gewone decodering 
 referentie| ≤ 1e-4; de SFT-verliezen op stap 0 binnen 2e-3 van stap 0 van G4-4; piek ≤ 29,5 GiB; schatting ≤ 24 u.
 Faalt een controle (buiten de terugval van G4-6.4): stoppen vóór de training.
 
+*G4-6.6a Aanvulling 19 nov 2026 ~20:45 (hoofdsessie; Yeb liet het besluit over de G4-6-armen aan de hoofdsessie, en
+besloot 18 nov voor G4-5 dat "gelijk" bij afrondingsruis ≤ 1e-4 is).* De CPU-proef (keten `g4f1119a`, 19 nov 20:10)
+faalde op één controle: op stap 0 |verlies − log 2| = 8,8e-7 en |marge| = 1,8e-6 op `pref_btval`, tegen de grenzen
+1e-5 / 1e-6 in `cpuproof6.sh`; alle andere controles van de proef gehaald (o.a. het NLL van het beleid gelijk aan dat van
+de referentie op stap 0, de referentie op stap 8 nog de basis, het beleid op stap 8 bewogen: marge 0,54). De grenzen van
+het script waren strenger dan de grens die G4-6.6 voor dezelfde grootheden vastlegt (≤ 1e-4); de afwijking is
+float-ruis van twee forward-passes in een andere fusie. De CPU-proef gebruikt voortaan G4-6.6's grens 1e-4 voor het
+verlies en de marge op stap 0; niets anders verandert. De nauwkeurigheid op stap 0 (0,25) zegt niets: bij marge ≈ 0
+beslist de ruis.
+
 *G4-6.7 Rapportage* (beslist niets): de voorkeursmaten per voorkeursset en eval-stap, met de lezing "voorkeur
 geleerd" (nauwkeurigheid op `pref_books` en `pref_btval` na de laatste stap beide ≥ 0,70) / "niet geleerd" (beide
 < 0,60) / "gemengd"; het verlies op `own` en de andere eval-sets; de directe maat (G4-2.6) op de held-out sets en

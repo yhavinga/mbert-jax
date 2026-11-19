@@ -85,7 +85,7 @@ arrays, batch = g4dpo.read_packed("$P/train.parquet")
 want = [int(np.count_nonzero(arrays["inputs_segmentation"][batch == k])) for k in range(8)]
 need(a["tokens"]["per_step"] == want, f"a: the steps' tokens are the packed file's batches {a['tokens']['per_step']} {want}")
 p0, p8 = ev(a, "pref_btval", 0), ev(a, "pref_btval", 8)
-need(abs(p0["loss"] - math.log(2)) <= 1e-5 and abs(p0["margin"]) <= 1e-6, f"a: step 0 loss log 2, margin 0 {p0}")
+need(abs(p0["loss"] - math.log(2)) <= 1e-4 and abs(p0["margin"]) <= 1e-4, f"a: step 0 loss log 2, margin 0 {p0}")  # G4-6.6's step-0 bound (addendum G4-6.6a)
 need(abs(p0["chosen_nll"] - p0["ref_chosen_nll"]) <= 1e-6 and abs(p0["rejected_nll"] - p0["ref_rejected_nll"]) <= 1e-6,
      "a: step 0 policy NLL = reference NLL")
 for name in ("books", "own"):

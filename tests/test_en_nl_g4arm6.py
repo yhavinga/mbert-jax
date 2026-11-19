@@ -520,3 +520,113 @@ def test_pairtexts6_and_pairclass6(tmp_path):
     g4arm.pairclass6(ns(predictions=str(tmp_path / "predictions.parquet"), out=str(tmp_path / "pc.md")))
     r = json.loads((tmp_path / "pc.json").read_text())
     assert r["bt"]["chosen"]["original"] == 1.0 and r["bt"]["rejected"]["original"] == 0.0
+
+
+# ---------------------------------------------------------------------------------------------------- run_g4arm.sh
+
+def g46_world(tmp_path):
+    """run_g4arm.sh and run_sft.sh with /dev/shm under tmp_path, a fake bucket with what G4-6's runs and its texts
+    read, and test_en_nl_g4arm5's fakes (gsutil, sudo, hostname, a setsid that only logs its call)"""
+    import os
+    import subprocess
+    import sys
+    import time
+
+    import test_en_nl_g4arm5 as t5
+
+    shm, gs, home, fake, code = (tmp_path / n for n in ("shm", "gs", "home", "bin", "code"))
+    for d in (code, home, fake):
+        d.mkdir(parents=True)
+    for name in ("run_g4arm.sh", "run_sft.sh"):
+        (code / name).write_text((t5.CODE / name).read_text().replace("/dev/shm/", f"{shm}/"))
+    (code / "g4arm.py").symlink_to(t5.CODE / "g4arm.py")
+    for name, body in {"gsutil": t5.FAKE_GSUTIL, "sudo": "#!/bin/bash\nexit 0\n", "hostname": "#!/bin/bash\necho t1v-n-x-w-0\n",
+                       "setsid": '#!/bin/bash\necho "SETSID $*" >> "$FAKELOG"\n'}.items():
+        (fake / name).write_text(body)
+        (fake / name).chmod(0o755)
+    py = shm / "translator/smoke-lora/venv/bin/python"
+    py.parent.mkdir(parents=True)
+    py.write_text(f'#!/bin/bash\nexec {sys.executable} "$@"\n')
+    py.chmod(0o755)
+    tok = shm / "translator/g4lora/tok-gemma4-31b"
+    tok.mkdir(parents=True)
+    (tok / "tokenizer.json").write_text("{}")
+    g = gs / "t5-dutch-english-usc2/mbert/translator/sft/g4arm"
+    files = ["../../gemma4-ckpt/gemma-4-31b-it/done.txt", "data/G4-6/report.json", "data/check-G4-6.txt",
+             "data/G4-6/smoke-4096.parquet", "data/G4-6/smoke-2048.parquet", "data/G4-6/train-4096.parquet",
+             "data/G4-6/train-chosen.parquet", "data/G4-6/template.jinja", "data/heldout/eval-books.parquet",
+             "data/heldout/eval-btval.parquet", "data/heldout/eval-own.parquet", "data/heldout3/eval-btlong.parquet",
+             "data/heldout4/eval-novels.parquet"]
+    files += [f"data/G4-6/eval-{n}-{seq}.parquet" for n in g4arm.PREF_SETS6 for seq in (4096, 2048)]
+    for rel in files:
+        p = (g / rel).resolve()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("x")
+    calls = tmp_path / "calls.log"
+
+    def run(stage, **env):
+        env = {"HOME": str(home), "PATH": f"{fake}:{os.environ['PATH']}", "FAKEGS": str(gs), "FAKELOG": str(calls),
+               "TAG": "t1", "ARM": "G4-6", **env}
+        calls.write_text("")
+        out = subprocess.run(["bash", str(code / "run_g4arm.sh"), stage], capture_output=True, text=True,
+                             timeout=120, env=env, cwd=home)
+        # run_sft.sh and detach put setsid in the background: its line may come after the script's end
+        deadline = time.time() + 30
+        while "started " in out.stdout and "SETSID" not in calls.read_text() and time.time() < deadline:
+            time.sleep(0.1)
+        return out, calls.read_text().splitlines()
+
+    return run, shm, home
+
+
+def test_g46_train_prepares_apart_from_the_launch_with_the_same_job(tmp_path):
+    run, shm, home = g46_world(tmp_path)
+    for name, steps in (("g4arm_G4-6_s8", "8"), ("g4arm_G4-6", None)):
+        job, out_dir = home / f"run_{name}.sh", shm / f"translator/smoke-lora/runs/{name}"
+        env = {"RUN": name, **({"STEPS": steps} if steps else {})}
+        # in one go, as before the split
+        out, calls = run("train", **env)
+        assert out.returncode == 0, out.stdout + out.stderr
+        assert f"started {name} on t1v-n-x-w-0" in out.stdout and sum(c.startswith("SETSID") for c in calls) == 1
+        whole = job.read_text()
+        assert "--dpo " in whole and "--pref-train " in whole and "learning_rate=1e-05" in whole
+        job.unlink()
+        out_dir.rmdir()
+        # the preparation copies and starts nothing
+        out, calls = run("train", PHASE="prep", **env)
+        assert out.returncode == 0, out.stdout + out.stderr
+        assert out.stdout.strip().splitlines()[-1] == f"prepared {name} on w0"
+        assert not any(c.startswith("SETSID") for c in calls) and not job.exists() and not out_dir.exists()
+        assert any("train-chosen.parquet" in c for c in calls if c.startswith("gsutil -m -q cp"))
+        # the launch copies nothing and starts the same job
+        out, calls = run("train", PHASE="launch", RUN=name)
+        assert out.returncode == 0, out.stdout + out.stderr
+        assert f"started {name} on t1v-n-x-w-0" in out.stdout
+        assert [c.split()[:3] for c in calls] == [["gsutil", "-q", "stat"], ["SETSID", "nohup", "bash"]]
+        assert job.read_text() == whole
+    # no launch without its preparation; a refused preparation leaves none behind
+    out, _ = run("train", PHASE="launch", RUN="g4arm_G4-6_s8_2048")
+    assert out.returncode != 0 and "PHASE=prep first" in out.stdout
+    out, _ = run("train", PHASE="prep", RUN="g4arm_G4-6_s8", STEPS="9")
+    assert out.returncode != 0 and "takes 8 steps" in out.stdout
+    assert not (shm / "translator/g4arm/data-g4arm_G4-6_s8/launch.sh").exists()   # the earlier preparation is gone
+    out, _ = run("train", PHASE="launch", RUN="g4arm_G4-6_s8")
+    assert out.returncode != 0 and "PHASE=prep first" in out.stdout
+    out, _ = run("train", PHASE="prep", RUN="g4arm_G4-6_s8")
+    assert out.returncode == 0 and (shm / "translator/g4arm/data-g4arm_G4-6_s8/launch.sh").exists()
+    (tmp_path / "gs/t5-dutch-english-usc2/mbert/translator/sft/g4arm/data/check-G4-6.txt").unlink()
+    out, _ = run("train", PHASE="prep", RUN="g4arm_G4-6_s8")
+    assert out.returncode != 0 and "not checked" in out.stdout
+    out, _ = run("train", PHASE="launch", RUN="g4arm_G4-6_s8")
+    assert out.returncode != 0 and "PHASE=prep first" in out.stdout
+
+
+def test_g46_texts_put_g4_4_and_g4_5c2_beside_g4_6_and_g4_0(tmp_path):
+    # amendment G4-6.5: one classify run over G4-6, G4-0, G4-4 and G4-5c2
+    run, _, home = g46_world(tmp_path)
+    out, calls = run("texts")
+    assert out.returncode == 0 and "started g4a_texts_t1 on w0" in out.stdout, out.stdout + out.stderr
+    body = (home / "job_body_g4a_texts_t1.sh").read_text()
+    for m in ("G4-6", "G4-0", "G4-4", "G4-5c2"):
+        assert f"/eval/{m}/pairs/pairs-w*.parquet" in body and f"--pairs '{m}=" in body
+    assert "naturalness-G4-6/texts.parquet" in body

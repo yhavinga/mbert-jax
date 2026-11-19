@@ -86,8 +86,8 @@
 #     SEARCH_RUN=g4arm_G4-5_c8 smoke-translate and smoke-score (w0: the stacked adapter decodes); smoke5-report (w0)
 #   RUN=g4arm_G4-5_warmup train; for every branch B: RUN=g4arm_G4-5_B resume5, then RUN=g4arm_G4-5_B train
 #   RUN=g4arm_G4-5_search train (STEPS=1: the search at step 0; SEARCH_BUDGET, SEARCH_TOP_K, SEARCH_STEP, ... override)
-#   PHASE=prep, then PHASE=launch with train (every run of G4-5): the copies and run_sft.sh's arguments on every worker
-#     first ("prepared <run> on wK", $G_SHM/data-<run>/launch.sh), then run_sft.sh on every worker at once
+#   PHASE=prep, then PHASE=launch with train (every run of G4-5 and G4-6): the copies and run_sft.sh's arguments on
+#     every worker first ("prepared <run> on wK", $G_SHM/data-<run>/launch.sh), then run_sft.sh on every worker at once
 #   MODEL=G4-5c<k> translate and score (the k-th of the search's top, stacked on every worker from the runs' adapters);
 #   CANDIDATES="G4-5c1 ..." [REFS=G4-4] texts, classify, report5 (w0); SELECTED=<report5's choice> blind
 #   Addendum G4-5.7b (Yeb, 18 Nov): RUN=g4arm_G4-5_temp0 train and RUN=g4arm_G4-5_tempw train (eval only, the
@@ -119,7 +119,7 @@
 #   RUN=g4arm_G4-6_s8 train (8 steps on the smoke set at 4,096; SEQ6=2048 and RUN=g4arm_G4-6_s8_2048: the fallback),
 #     MODEL=G4-6|G4-0 smoke-translate and smoke-score (w0), smoke6-report (w0): the smoke test and the estimate
 #   [SEQ6=2048] RUN=g4arm_G4-6 train (one epoch of the packed pairs), adapter, translate and score (SET=eval|heldout|
-#     long), texts (G4-6, G4-0, G4-4), classify, blind, report (G4-4 beside G4-0, the preference measures)
+#     long), texts (G4-6, G4-0, G4-4, G4-5c2), classify, blind, report (G4-4 beside G4-0, the preference measures)
 # The code is beside this script (a copy of $G/scripts/). TAG names the jobs of one chain.
 set -euo pipefail
 STAGE=${1:?a stage: fetchbt, build, check, evaldata, setup, train, adapter, translate, score, texts, classify, blind, report, smoke-translate, smoke-score, smoke-report, fetchval, heldout, own, smoke2-report, replay, build2, heldout3, build3, smoke3-report, build4, smoke4-report, novels4, build5, split5, refqe5, resume5, report5, smoke5-report, cands6, build6, check6, cpuproof6, smoke6-report, pairtexts6, pairclassify6, pairclass6}
@@ -409,10 +409,12 @@ g46_train() {  # the runs of G4-6 (draft amendment G4-6): the smoke runs at 4,09
     g4arm_G4-6) seq=$SEQ6; setfile=train-$SEQ6.parquet; steps=auto; every=$(g4a_const EVAL_EVERY6) ;;
     *) echo "RUN $RUN is no run of G4-6"; exit 1 ;;
   esac
+  D=$G_SHM/data-$RUN
+  # a launch never takes the arguments of an earlier or a refused preparation
+  rm -f -- "$D/launch.sh"
   [ "${STEPS:-$steps}" = "$steps" ] || { echo "$RUN takes $steps steps, not STEPS=$STEPS"; exit 1; }
   gsutil -q stat "$G6/report.json" || { echo "no $G6/report.json (build6)"; exit 1; }
   gsutil -q stat "$CHECK_TXT" || { echo "no $CHECK_TXT: the pairs are not checked (check6)"; exit 1; }
-  D=$G_SHM/data-$RUN
   mkdir -p "$D"
   local sft="$H/eval-books.parquet $H/eval-btval.parquet $H/eval-own.parquet $H4/eval-novels.parquet"
   # amendment G4-6.4: the long validation rows only in rows of 4,096 (MaxText would cut them at 2,048)
@@ -427,11 +429,19 @@ g46_train() {  # the runs of G4-6 (draft amendment G4-6): the smoke runs at 4,09
   local ARGS="--dpo $D/dpo.json --pref-train $D/$setfile"
   for n in pref_books pref_btval pref_novels; do ARGS="$ARGS --pref-eval $n=$D/eval-$n-$seq.parquet"; done
   for f in $sft; do n=$(basename "$f" .parquet); ARGS="$ARGS --eval ${n#eval-}=$D/$(basename "$f")"; done
-  SFT_ARGS="$ARGS --eval-every $every" MULTIHOST=1 NAME=$RUN MODEL=gemma4-31b DATA=$D/train-chosen.parquet \
-    TEMPLATE=$D/template.jinja ROOT=$G STEPS=$steps bash "$CODE/run_sft.sh" per_device_batch_size=1 \
-    max_target_length="$seq" lora.lora_rank=32 lora.lora_alpha=16.0 learning_rate="$(g4a_const LR6)" \
-    lr_schedule_type=wsd warmup_steps_fraction=0.03 wsd_decay_steps_fraction=0.1 wsd_decay_style=linear \
-    learning_rate_final_fraction=0.1
+  # PHASE=prep stops here and PHASE=launch starts run_sft.sh from this file, as G4-5's runs: the processes of the
+  # multi-host job meet in jax.distributed.initialize within a timeout, so a chain prepares every worker first
+  printf '%q ' env SFT_ARGS="$ARGS --eval-every $every" MULTIHOST=1 NAME="$RUN" MODEL=gemma4-31b \
+    DATA="$D/train-chosen.parquet" TEMPLATE="$D/template.jinja" ROOT="$G" STEPS="$steps" bash "$CODE/run_sft.sh" \
+    per_device_batch_size=1 max_target_length="$seq" lora.lora_rank=32 lora.lora_alpha=16.0 \
+    learning_rate="$(g4a_const LR6)" lr_schedule_type=wsd warmup_steps_fraction=0.03 wsd_decay_steps_fraction=0.1 \
+    wsd_decay_style=linear learning_rate_final_fraction=0.1 > "$D/launch.sh.new"
+  mv "$D/launch.sh.new" "$D/launch.sh"
+  if [ "${PHASE:-}" = prep ]; then
+    echo "prepared $RUN on w$W"
+    return 0
+  fi
+  bash "$D/launch.sh"
 }
 
 case $STAGE in
@@ -548,18 +558,14 @@ EOF
   detach "g4a_setup_$TAG" bash ~/job_body_g4a_setup_$TAG.sh
   ;;
 train)
-  if [ "$ARM" = G4-5 ]; then
+  if [ "$ARM" = G4-5 ] || [ "$ARM" = G4-6 ]; then
     case ${PHASE:-} in
-      ""|prep) g45_train ;;
+      ""|prep) if [ "$ARM" = G4-5 ]; then g45_train; else g46_train; fi ;;
       launch) RUN=${RUN:?the run that PHASE=prep prepared}
               [ -s "$G_SHM/data-$RUN/launch.sh" ] || { echo "w$W: no $G_SHM/data-$RUN/launch.sh (PHASE=prep first)"; exit 1; }
               bash "$G_SHM/data-$RUN/launch.sh" ;;
       *) echo "PHASE is prep, launch or empty (both), not $PHASE"; exit 1 ;;
     esac
-    exit 0
-  fi
-  if [ "$ARM" = G4-6 ]; then
-    g46_train
     exit 0
   fi
   RUN=${RUN:?$SMOKE_RUN (with STEPS=8) or $FULL_RUN}
@@ -815,7 +821,7 @@ texts)
   [ "$ARM" = G4-3 ] && MODELS="G4-3 G4-0 G4-2"                 # amendment G4-3.7
   [ "$ARM" = G4-4 ] && MODELS="G4-4 G4-0 G4-3"                 # amendment G4-4.7
   [ "$ARM" = G4-5 ] && MODELS="${CANDIDATES:?the candidates of the search, G4-5c1 ...} G4-0 ${REFS:-}"   # draft G4-5
-  [ "$ARM" = G4-6 ] && MODELS="G4-6 G4-0 G4-4"                 # draft amendment G4-6.7
+  [ "$ARM" = G4-6 ] && MODELS="G4-6 G4-0 G4-4 G4-5c2"          # amendment G4-6.5: G4-4 and G4-5c2 reported
   PAIRS=""
   for m in $MODELS; do PAIRS="$PAIRS --pairs '$m=$T/$m/pairs-w*.parquet'"; done
   {

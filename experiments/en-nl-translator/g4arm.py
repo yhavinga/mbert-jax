@@ -815,6 +815,14 @@ def report(args):
     if getattr(args, "other", None):
         other, other_dir = args.other.split("=", 1)
         models[other] = scored_dir(other_dir)
+    # amendment G4-6b.7: further arms beside the arm on the same measures and in the same classify run, reported
+    beside = []
+    for spec in getattr(args, "beside", None) or []:
+        name, beside_dir = spec.split("=", 1)
+        if name in models:
+            raise SystemExit(f"--beside {name}: already among {sorted(models)}")
+        models[name] = scored_dir(beside_dir)
+        beside.append(name)
     for name, rows in models.items():
         if set(rows) != set(evalsets):
             raise SystemExit(f"{name}: scores for {len(rows)} of {len(evalsets)} segments")
@@ -858,6 +866,7 @@ def report(args):
         result["training"] = {k: t.get(k) for k in ("steps", "steps_done", "throughput", "peak_gib_max", "times")}
         result["training"]["loss_first_last"] = [t["loss"][:3], t["loss"][-3:]] if t.get("loss") else None
         result["training"]["lr_at"] = t.get("lr_at")
+        result["training"]["base_adapter"] = t.get("base_adapter")
         if t.get("dpo"):
             # amendment G4-6.7: the preference measures, reported
             result["pref"] = pref_measure(t)
@@ -882,6 +891,8 @@ def report(args):
             raise SystemExit("an id twice among the held-out files")
         result["heldout"] = heldout_measure(held, pairs_of(args.heldout_arm), pairs_of(args.heldout_base),
                                             t.get("eval"), arm, BASE)
+        # amendment G4-6b: step 0 of the training is the start model with its adapter merged (G4-4), not G4-0
+        result["heldout"]["start"] = (t.get("base_adapter") or {}).get("name") or BASE
         if other and getattr(args, "heldout_other", None):
             result["other_heldout"] = heldout_measure(held, pairs_of(args.heldout_arm), pairs_of(args.heldout_other),
                                                       t.get("eval"), arm, other)
@@ -904,6 +915,8 @@ def report(args):
         n = novels_measure(t, o, arm, BASE, other or ARM3)
         if n["loss"] or "other_loss" in n:
             result["novels"] = n
+    if beside:
+        result["beside"] = {name: {"a1": rule_a1(sets[name]), "b": rule_b(shares, arm, name)} for name in beside}
     if args.tally:
         result["blind"] = json.loads(Path(args.tally).read_text())
         result["a2"] = result["blind"]["a2"]
@@ -981,6 +994,8 @@ def report_text(r):
         L += heldout_text(r["heldout"], r["arm"], r["base"])
     if r.get("other"):
         L += other_text(r)
+    if r.get("beside"):
+        L += beside_text(r)
     if r.get("novels"):
         L += novels_text(r["novels"])
     if r.get("pref"):
@@ -1000,7 +1015,7 @@ def heldout_text(h, arm, base):
          *(["De lange validation-rijen (`btlong`, meer dan 512 Nederlandse tokens, elk heel vertaald; amendement "
             "G4-3.6) staan erbij en tellen niet mee in de lezing.", ""] if h.get("reported") else []),
          f"**Lezing (vooraf vastgelegd): {h['verdict']}.**", "",
-         "| set | verlies stap 0 (G4-0) | verlies laatste stap | lager | chrF " + arm + " | chrF " + base + " | hoger |",
+         f"| set | verlies stap 0 ({h.get('start', BASE)}) | verlies laatste stap | lager | chrF " + arm + " | chrF " + base + " | hoger |",
          "|---|---:|---:|---|---:|---:|---|"]
     for name, v in list(h["reading"].items()) + list((h.get("reported") or {}).items()):
         sets = h["sets"][name]
@@ -1064,6 +1079,19 @@ def novels_text(n):
               f"{'ja' if n['same_batches'] else 'nee'}."]
     if n.get("loss"):
         L += ["", f"Verlies van {arm} per stap: " + ", ".join(f"{k}: {f3(x)}" for k, x in n["loss"].items()) + "."]
+    return L
+
+
+def beside_text(r):
+    """amendment G4-6b.7: the arms beside the arm, (a1) and (b) from the same run, reported, deciding nothing"""
+    arm = r["arm"]
+    L = ["", "## Daarnaast (rapporteren, beslist niet)", "",
+         "| model | " + " | ".join(f"QE {s}" for s in HUMAN_QE) + f" | (a1) | \"origineel\" | {arm} − model |",
+         "|---|" + "---:|" * len(HUMAN_QE) + "---|---:|---:|"]
+    for name, v in r["beside"].items():
+        L.append(f"| {name} | " + " | ".join(f3(v["a1"]["sets"][s]["model"]) for s in HUMAN_QE) +
+                 f" | {'gehaald' if v['a1']['holds'] else 'niet gehaald'} | {pct(v['b']['base'])} | "
+                 f"{f3(v['b']['delta'], True)} |")
     return L
 
 
@@ -4004,6 +4032,14 @@ STEP0_MAX_DIFF6 = 1e-4    # step 0: the policy is the reference (loss log 2, mar
 BASE_MAX_DIFF6 = 2e-3     # step 0: an SFT eval file's loss against G4-4's step 0 (the same base, the loss computed apart)
 MAX_HOURS6 = 24
 FAILURES6 = ("not_ended", "decode_loop", "empty", "english_left", "identical")
+# Arm G4-6b (amendment G4-6b): G4-6 from G4-4 (its final adapter merged into the base kernels: the start model and the
+# reference), G4-4's greedy translation of G4-6's candidates as the rejected side
+ARM6B = "G4-6b"
+START6B = "G4-4"
+BASE_MAX_DIFF6B = 0.05    # step 0: an SFT eval file's loss against G4-4's own eval at its last step (merged into bf16
+                          # kernels against LoRA in the forward pass; G4-5.7b measured 0.015 and 0.012 for its warmup)
+OWN6B = "own4"            # G4-4's greedy held-out translations of the BT validation as targets (as own is G4-0's)
+COMPARE6B = ("candidates", "identical", "chrf_low", "chrf_high", "length_ratio", "kept", "drawn", "short_of_want")
 BANDS6 = ("chrf_low", "chrf_high", "length_ratio", "eval_13gram")
 
 
@@ -4243,6 +4279,7 @@ def build6(args, counter=None, chrf=None):
 
     counter = counter or TokenCounter(args.tokenizer)
     chrf = chrf or armeval.chrf
+    arm, rejected_model = getattr(args, "arm", None) or ARM6, getattr(args, "rejected_model", None) or BASE
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     pad, bos = counter.special_id("<pad>"), counter.special_id("<bos>")
@@ -4252,7 +4289,7 @@ def build6(args, counter=None, chrf=None):
     g40 = g40_rows(args.rejected)
     missing = [r["id"] for r in cands if r["id"] not in g40]
     if missing:
-        raise SystemExit(f"{len(missing)} candidates without G4-0's translation, e.g. {missing[:3]}")
+        raise SystemExit(f"{len(missing)} candidates without {rejected_model}'s translation, e.g. {missing[:3]}")
     blind = read_jsonl(args.blind)
     if sha256_file(args.blind) != blind_sha256():
         raise SystemExit(f"{args.blind}: not the blind passages of the TG protocol (§4.2.4)")
@@ -4300,7 +4337,7 @@ def build6(args, counter=None, chrf=None):
         name = f"pref_{r['set']}"
         funnel[name]["candidates"] += 1
         if r["id"] not in held_g40:
-            raise SystemExit(f"{r['id']}: no held-out translation of G4-0")
+            raise SystemExit(f"{r['id']}: no held-out translation of {rejected_model}")
         why, hyp = failure6(r["reference"].strip(), held_g40[r["id"]])
         if why:
             funnel[name][why] += 1
@@ -4343,7 +4380,7 @@ def build6(args, counter=None, chrf=None):
     for p in drawn:
         kept[p["kind"]].append(p)
     report = {
-        "arm": ARM6, "seed": SEED6, "prompt": PROMPT, "want": WANT6, "chrf_bands": CHRF6, "length_band": LENGTH6,
+        "arm": arm, "rejected_model": rejected_model, "seed": SEED6, "prompt": PROMPT, "want": WANT6, "chrf_bands": CHRF6, "length_band": LENGTH6,
         "pair_max": PAIR_MAX6, "pad_id": pad, "bos_id": bos, "rows_per_batch": ROWS6,
         "funnel": {k: dict(v) for k, v in sorted(funnel.items())},
         "pairs": {"train": len(drawn), **{name: len(prefs[name]) for name in PREF_SETS6}},
@@ -4364,14 +4401,45 @@ def build6(args, counter=None, chrf=None):
                    "heldout_g40": sorted(sha256_file(f) for p in args.heldout_g40 for f in glob.glob(p))},
         "files": {f.name: sha256_file(f) for f in sorted(out.glob("*.parquet"))},
     }
+    if getattr(args, "compare", None):
+        report["compare"] = compare6(report, [p["id"] for p in drawn], Path(args.compare))
     (out / "report.json").write_text(json.dumps(report, indent=1) + "\n")
     (out / "report.md").write_text(report6_md(report), encoding="utf-8")
     print(f"BUILT6 {json.dumps({'pairs': report['pairs'], 'steps': {k: v['train']['steps'] for k, v in packing.items()}})}",
           flush=True)
 
 
+def compare6(report, drawn_ids, other_dir):
+    """amendment G4-6b.4 (reported, decides nothing): this build against another one (G4-6's, rejected = G4-0) on the
+    same candidates: the funnel per stratum, the chrF of the kept pairs, and the drawn training pairs both have"""
+    other = json.loads((other_dir / "report.json").read_text())
+    other_ids = {p["id"] for p in read_rows(other_dir / "pairs.parquet", ["id", "set"]) if p["set"] == "train"}
+    mine = set(drawn_ids)
+    return {"arm": other.get("arm", ARM6), "rejected_model": other.get("rejected_model", BASE),
+            "funnel": {s: {k: [other["funnel"].get(s, {}).get(k, 0), f.get(k, 0)] for k in COMPARE6B}
+                       for s, f in report["funnel"].items()},
+            "chrf_measured_p50": {k: [other["measured"].get(k, {}).get("chrf", {}).get("p50"), v["chrf"].get("p50")]
+                                  for k, v in report["measured"].items()},
+            "train_pairs": [len(other_ids), len(mine)], "train_pairs_in_both": len(mine & other_ids)}
+
+
+def compare6_md(c, r):
+    o, me = c["arm"], r["arm"]
+    L = ["", f"## Tegen {o} (rejected {c['rejected_model']}, dezelfde kandidaten; rapporteren, beslist niet)", "",
+         f"Per stratum: {o} / {me}.", "", "| stratum | " + " | ".join(COMPARE6B) + " |",
+         "|---|" + "---:|" * len(COMPARE6B)]
+    for s, f in c["funnel"].items():
+        L.append(f"| {s} | " + " | ".join(f"{a} / {b}" for a, b in (f[k] for k in COMPARE6B)) + " |")
+    L += ["", "Mediaan chrF(rejected, chosen) na de fouten, per soort: " + ", ".join(
+        f"{k} {a} / {b}" for k, (a, b) in c["chrf_measured_p50"].items()) + ".",
+          f"Getrokken trainingsparen: {o} {c['train_pairs'][0]}, {me} {c['train_pairs'][1]}, in beide "
+          f"{c['train_pairs_in_both']}."]
+    return L
+
+
 def report6_md(r):
-    L = ["# Arm G4-6: de paren (`g4arm.py build6`)", "",
+    rejected = r.get("rejected_model", BASE)
+    L = [f"# Arm {r.get('arm', ARM6)}: de paren (`g4arm.py build6`, rejected = {rejected})", "",
          f"Seed `{r['seed']}`, prompt `{r['prompt']}`; chrF-banden {json.dumps(r['chrf_bands'])}, lengteband "
          f"{json.dumps(r['length_band'])}, paar ≤ {r['pair_max']} tokens.", "",
          "## Trechter per stratum", "", "| stratum | " + " | ".join(
@@ -4385,7 +4453,7 @@ def report6_md(r):
     for k, v in r["measured"].items():
         for what in ("chrf", "length_ratio"):
             q = v[what]
-            L.append(f"| {k} | {what} (na de fouten van G4-0) | {q.get('n')} | {q.get('p5')} | {q.get('p25')} | "
+            L.append(f"| {k} | {what} (na de fouten van {rejected}) | {q.get('n')} | {q.get('p5')} | {q.get('p25')} | "
                      f"{q.get('p50')} | {q.get('p75')} | {q.get('p95')} |")
     for k, v in r["kept"].items():
         q = v["chrf"]
@@ -4398,6 +4466,8 @@ def report6_md(r):
             L.append(f"| {seq} | {name} | {s['rows']} | {s['batches']} | {s['pairs']} | {s['tokens']} | {s['fill']} | "
                      f"{s['pairs_per_step']} |")
     L += ["", f"Paren: {json.dumps(r['pairs'])}; per stratum {json.dumps(r['by_stratum'])}.", ""]
+    if r.get("compare"):
+        L += compare6_md(r["compare"], r) + [""]
     return "\n".join(L)
 
 
@@ -4471,8 +4541,20 @@ def eval_at6(summary, name, step):
     return next((e for e in summary.get("eval") or [] if e["set"] == name and e["step"] == step), None)
 
 
-def smoke6_verdict(summary, adapter, base_summary, seq, lora, arm_rows, base_rows, build_report):
-    """amendment G4-6.6: every check with its value and whether it holds"""
+def last_evals(summary):
+    """{set: the eval at the set's last step} of a training summary"""
+    last = {}
+    for e in summary.get("eval") or []:
+        if e["set"] not in last or e["step"] > last[e["set"]]["step"]:
+            last[e["set"]] = e
+    return last
+
+
+def smoke6_verdict(summary, adapter, base_summary, seq, lora, arm_rows, base_rows, build_report, start=None):
+    """amendment G4-6.6: every check with its value and whether it holds. start (amendment G4-6b.6): the arm that the
+    run starts from with its adapter merged (G4-4): step 0's SFT losses are then that arm's own eval at its last step
+    (within BASE_MAX_DIFF6B), the run's base_adapter is that arm's, own4 is evaluated too, and the smoke translations'
+    base is that arm"""
     checks = {}
     loss = summary.get("loss") or []
     checks["steps"] = {"value": summary.get("steps_done"), "holds": summary.get("steps_done") == SMOKE6_STEPS}
@@ -4489,7 +4571,7 @@ def smoke6_verdict(summary, adapter, base_summary, seq, lora, arm_rows, base_row
                                                                         for s in steps)}
     checks["dpo_spec"] = {"value": dpo.get("spec"), "holds": dpo.get("spec") == g4dpo.spec(**DPO6)}
     sft_sets = [s for s in EVAL_SETS4 if not (s == "btlong" and seq == SEQ6_FALLBACK)]
-    names = sft_sets + list(PREF_SETS6)
+    names = sft_sets + list(PREF_SETS6) + ([OWN6B] if start else [])
     have = {(e["set"], e["step"]) for e in summary.get("eval") or []}
     checks["evals"] = {"value": sorted(have), "holds": all((n, s) in have for n in names for s in SMOKE6_EVAL_STEPS)}
     expected = g4dpo.expected_step0(g4dpo.spec(**DPO6))
@@ -4503,12 +4585,19 @@ def smoke6_verdict(summary, adapter, base_summary, seq, lora, arm_rows, base_row
     checks["policy_is_reference_at_step0"] = {
         "value": step0, "holds": all(v["max_diff"] <= STEP0_MAX_DIFF6 for v in step0.values())}
     base = {}
+    start_last = last_evals(base_summary) if start else {}
     for name in sft_sets:
-        e, b = eval_at6(summary, name, 0), eval_at6(base_summary, name, 0)
-        base[name] = {"run": e and e["loss"], "g4_4_step0": b and b["loss"],
+        e = eval_at6(summary, name, 0)
+        b = start_last.get(name) if start else eval_at6(base_summary, name, 0)
+        base[name] = {"run": e and e["loss"], ("start_last" if start else "g4_4_step0"): b and b["loss"],
                       "diff": abs(e["loss"] - b["loss"]) if e and b else None}
-    checks["base_losses_at_step0"] = {"value": base, "holds": all(v["diff"] is not None and v["diff"] <= BASE_MAX_DIFF6
+    bound = BASE_MAX_DIFF6B if start else BASE_MAX_DIFF6
+    checks["base_losses_at_step0"] = {"value": base, "holds": all(v["diff"] is not None and v["diff"] <= bound
                                                                   for v in base.values())}
+    if start:
+        b = summary.get("base_adapter") or {}
+        checks["base_adapter"] = {"value": b, "holds": b.get("name") == start and b.get("modules") == SMOKE_MODULES
+                                  and (b.get("rank"), b.get("alpha"), b.get("scale")) == (32, 16.0, 0.5)}
     checks["lora_merge"] = {"value": lora, "holds": bool(lora) and lora.get("modules") == SMOKE_MODULES
                             and (lora.get("relative_update_norm") or 0) > 0}
     for name, rows in (("arm", arm_rows), ("base", base_rows)):
@@ -4524,10 +4613,12 @@ def smoke6_verdict(summary, adapter, base_summary, seq, lora, arm_rows, base_row
     checks["qe_delta"] = {"value": delta, "holds": delta is not None and abs(delta) <= SMOKE_QE_MAX_DELTA}
     estimate = smoke6_estimate(summary, build_report, seq)
     checks["estimate_hours"] = {"value": estimate["hours"], "holds": estimate["hours"] <= MAX_HOURS6}
-    # reported: the rejected side of pref_btval is G4-0's own translation of the BT validation, as the eval set own
-    own0, rej0 = eval_at6(summary, "own", 0), eval_at6(summary, "pref_btval", 0)
+    # reported: the rejected side of pref_btval is the start model's own translation of the BT validation, as the eval
+    # set own (G4-0) or own4 (G4-4)
+    own_set = OWN6B if start else "own"
+    own0, rej0 = eval_at6(summary, own_set, 0), eval_at6(summary, "pref_btval", 0)
     return {"checks": checks, "passed": all(c["holds"] for c in checks.values()), "estimate": estimate,
-            "own_against_pref_btval_rejected": {"own": own0 and own0["loss"], "pref_btval_rejected_nll":
+            "own_against_pref_btval_rejected": {own_set: own0 and own0["loss"], "pref_btval_rejected_nll":
                                                 rej0 and rej0.get("rejected_nll")}}
 
 
@@ -4559,12 +4650,16 @@ def smoke6(args):
         p = {r["id"]: r for r in read_rows(pairs)}
         m = {r["id"]: r for r in read_rows(metricx)}
         rows[name] = [{**r, "metricx_qe": m.get(i, {}).get("qe_source_hypothesis")} for i, r in p.items()]
-    result = smoke6_verdict(summary, adapter, base_summary, args.seq, lora, rows["arm"], rows["base"], build_report)
+    start = getattr(args, "start", None)
+    result = smoke6_verdict(summary, adapter, base_summary, args.seq, lora, rows["arm"], rows["base"], build_report,
+                            start=start)
     result["seq"] = args.seq
     result["eval"] = summary.get("eval")
     result["throughput"] = summary.get("throughput")
     Path(args.out).with_suffix(".json").write_text(json.dumps(result, indent=1, default=str) + "\n")
-    L = [f"# Smoke-test G4-6 (concept-amendement G4-6.6), rijen van {args.seq}", "",
+    arm = getattr(args, "arm", None) or ARM6
+    L = [f"# Smoke-test {arm} (amendement {'G4-6b.6' if start else 'G4-6.6'}), rijen van {args.seq}"
+         + (f"; startmodel {start} (ingebakken), basis van de vertalingen {start}" if start else ""), "",
          f"**{'Geslaagd' if result['passed'] else 'Niet geslaagd'}.** Schatting van de volle run: "
          f"{result['estimate']['hours']} u.", "", "| controle | waarde | gehaald |", "|---|---|---|"]
     for k, c in result["checks"].items():
@@ -4581,13 +4676,13 @@ def pref_measure(summary):
     """The preference measures of G4-6's training (reported, deciding nothing): per preference eval set and step the
     pairs' loss, accuracy, margin, the NLL of the chosen and the rejected sides; the training steps per window of 50;
     the loss on own (G4-0's greedy translations of the BT validation) per eval step"""
-    out = {"sets": collections.defaultdict(dict), "own": {}, "train": []}
+    out = {"sets": collections.defaultdict(dict), "own": {}, OWN6B: {}, "train": []}
     for e in summary.get("eval") or []:
         if e.get("kind") == "pref":
             out["sets"][e["set"]][e["step"]] = {k: e[k] for k in ("pairs", "loss", "accuracy", "margin", "chosen_nll",
                                                                   "rejected_nll", "ref_chosen_nll", "ref_rejected_nll")}
-        elif e["set"] == "own":
-            out["own"][e["step"]] = e["loss"]
+        elif e["set"] in ("own", OWN6B):
+            out[e["set"]][e["step"]] = e["loss"]
     steps = (summary.get("dpo") or {}).get("steps") or []
     for k in range(0, len(steps), 50):
         w = steps[k:k + 50]
@@ -4597,7 +4692,10 @@ def pref_measure(summary):
                                                                                  "chosen_nll", "rejected_nll")}})
     out["sets"] = {k: dict(sorted(v.items())) for k, v in sorted(out["sets"].items())}
     out["own"] = dict(sorted(out["own"].items()))
+    out[OWN6B] = dict(sorted(out[OWN6B].items()))
     out["spec"] = (summary.get("dpo") or {}).get("spec")
+    # amendment G4-6b: the reference is the start model with its adapter merged (G4-4), else G4-0
+    out["reference"] = (summary.get("base_adapter") or {}).get("name") or BASE
     # the reading fixed beforehand (draft amendment G4-6.7; reported, deciding nothing): the held-out accuracy of the
     # held-out books and BT validation at the last eval step
     last = {k: out["sets"][k][max(out["sets"][k])]["accuracy"] for k in READING_SETS6 if out["sets"].get(k)}
@@ -4609,10 +4707,11 @@ def pref_measure(summary):
 
 
 def pref_text(p):
-    L = ["", "## Voorkeuren (G4-6, rapporteren, beslist niet)", "",
+    ref = p.get("reference", BASE)
+    L = ["", "## Voorkeuren (rapporteren, beslist niet)", "",
          f"Verlies `{json.dumps(p['spec'])}`. Per held-out voorkeursset en eval-stap: paren, verlies, nauwkeurigheid "
          "(beloning chosen > rejected), marge (beta × verschil van de log-ratio's), NLL per token van chosen en "
-         "rejected onder het model (en onder de referentie G4-0).", "",
+         f"rejected onder het model (en onder de referentie {ref}).", "",
          "| set | stap | paren | verlies | nauwkeurigheid | marge | NLL chosen | NLL rejected | ref chosen | ref rejected |",
          "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
     for name, steps in p["sets"].items():
@@ -4625,7 +4724,11 @@ def pref_text(p):
               f"stap: {json.dumps(p['reading']['accuracy_last'])}; geleerd: beide ≥ {READING_LEARNED6}, niet geleerd: "
               f"beide < {READING_NOT6})."]
     L += ["", "Verlies op `own` (G4-0's eigen greedy vertalingen van de BT-validatie; G4-4: 0,075 → 0,339): " + ", ".join(
-        f"{k}: {f3(v)}" for k, v in p["own"].items()) + ".", "",
+        f"{k}: {f3(v)}" for k, v in p["own"].items()) + "."]
+    if p.get(OWN6B):
+        L += ["", f"Verlies op `{OWN6B}` (G4-4's eigen greedy vertalingen van de BT-validatie): " + ", ".join(
+            f"{k}: {f3(v)}" for k, v in p[OWN6B].items()) + "."]
+    L += ["",
         "Training per 50 stappen (gewogen naar paren): " + "; ".join(
             f"{w['steps'][0]}–{w['steps'][1]}: verlies {f3(w['loss'])}, nauwk. {f3(w['accuracy'])}, marge "
             f"{f3(w['margin'])}" for w in p["train"])]
@@ -4654,6 +4757,7 @@ def pairtexts6(args):
 
 def pairclass6(args):
     """The share the classifier calls original, per kind, of the chosen and the rejected sides (reported only)"""
+    arm, rejected = getattr(args, "arm", None) or ARM6, getattr(args, "rejected_model", None) or BASE
     by = collections.defaultdict(list)
     for r in read_rows(args.predictions):
         by[(r["set"], r["model"])].append(r["p_original"] >= 0.5)
@@ -4661,8 +4765,8 @@ def pairclass6(args):
                      for side in ("chosen", "rejected") if by[(kind, side)]}
               for kind in sorted({k for k, _ in by})}
     Path(args.out).with_suffix(".json").write_text(json.dumps(result, indent=1) + "\n")
-    L = ["# G4-6: de classifier op chosen en rejected (rapporteren, beslist niet)", "",
-         "| soort | n | \"origineel\" chosen | \"origineel\" rejected (G4-0) | verschil |", "|---|---:|---:|---:|---:|"]
+    L = [f"# {arm}: de classifier op chosen en rejected (rapporteren, beslist niet)", "",
+         f"| soort | n | \"origineel\" chosen | \"origineel\" rejected ({rejected}) | verschil |", "|---|---:|---:|---:|---:|"]
     for kind, v in result.items():
         c, r = v.get("chosen", {}), v.get("rejected", {})
         diff = c["original"] - r["original"] if c and r else None
@@ -4729,6 +4833,8 @@ def main(argv=None):
     p.add_argument("--other-tally", default=None, help="the other arm's tally.json against G4-0, if there is one")
     p.add_argument("--novels-other", default=None,
                    help="G4-4: summary.json of the other arm's novels run (g4arm_G4-3_novels), amendment G4-4.11")
+    p.add_argument("--beside", action="append", default=[],
+                   help="G4-6b: NAME=DIR of a further arm's output (pairs/, scores/), in the same classify run, reported")
     p.add_argument("--out", required=True)
     p = sub.add_parser("tally")
     p.add_argument("--judgments", required=True)
@@ -4904,6 +5010,10 @@ def main(argv=None):
     p.add_argument("--blind", required=True, help="blind100.jsonl (13-grams)")
     p.add_argument("--tokenizer", required=True)
     p.add_argument("--out", required=True)
+    p.add_argument("--arm", default=ARM6, choices=(ARM6, ARM6B))
+    p.add_argument("--rejected-model", default=BASE, choices=(BASE, START6B),
+                   help="whose translations --rejected and --heldout-g40 are (G4-6b: G4-4)")
+    p.add_argument("--compare", default=None, help="G4-6b: another build6 directory (report.json, pairs.parquet)")
     p = sub.add_parser("check6")
     p.add_argument("--data", required=True, help="build6's directory")
     p.add_argument("--tokenizer", required=True)
@@ -4914,12 +5024,17 @@ def main(argv=None):
                  "base-pairs", "base-metricx", "out"):
         p.add_argument(f"--{name}", required=True)
     p.add_argument("--seq", type=int, default=SEQ6, choices=(SEQ6, SEQ6_FALLBACK))
+    p.add_argument("--arm", default=ARM6, choices=(ARM6, ARM6B))
+    p.add_argument("--start", default=None, choices=(START6B,),
+                   help="G4-6b: the arm the run starts from (its adapter merged; --base-summary is its training)")
     p = sub.add_parser("pairtexts6")
     p.add_argument("--pairs", required=True, help="build6's pairs.parquet")
     p.add_argument("--out", required=True)
     p = sub.add_parser("pairclass6")
     p.add_argument("--predictions", required=True)
     p.add_argument("--out", required=True)
+    p.add_argument("--arm", default=ARM6, choices=(ARM6, ARM6B))
+    p.add_argument("--rejected-model", default=BASE, choices=(BASE, START6B))
     args = parser.parse_args(argv)
     {"fetch": fetch, "build": build, "check": check, "evaldata": evaldata, "texts": texts, "report": report,
      "tally": tally, "smoke": smoke, "heldout": heldout, "own": own, "replay": replay_candidates, "build2": build2,

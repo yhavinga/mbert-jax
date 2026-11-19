@@ -630,3 +630,238 @@ def test_g46_texts_put_g4_4_and_g4_5c2_beside_g4_6_and_g4_0(tmp_path):
     for m in ("G4-6", "G4-0", "G4-4", "G4-5c2"):
         assert f"/eval/{m}/pairs/pairs-w*.parquet" in body and f"--pairs '{m}=" in body
     assert "naturalness-G4-6/texts.parquet" in body
+
+
+# ---------------------------------------------------------------------------------------------------- G4-6b
+
+def test_sft_lora_base_adapter_belongs_to_dpo_and_needs_its_adapter_json(tmp_path):
+    # amendment G4-6b.2: --base-adapter NAME=FILE, only with --dpo, checked before JAX
+    spec = tmp_path / "dpo.json"
+    spec.write_text(json.dumps(g4arm.DPO6))
+    npz = tmp_path / "start" / "adapter.npz"
+    npz.parent.mkdir()
+    npz.write_bytes(b"x")
+    base = ["--out", str(tmp_path / "o")]
+    with pytest.raises(SystemExit, match="belong to --dpo"):
+        sft_lora.main([*base, "--base-adapter", f"G4-4={npz}"])
+    for value, msg in (("G4-4", "NAME=FILE"), (f"G4-4={npz}", "no .*adapter.json")):
+        with pytest.raises(SystemExit, match=msg):
+            sft_lora.base_adapter_arg(value)
+    (npz.parent / "adapter.json").write_text(json.dumps({"rank": 32, "alpha": 16.0, "scale": 0.25}))
+    with pytest.raises(SystemExit, match="scale = alpha / rank"):
+        sft_lora.base_adapter_arg(f"G4-4={npz}")
+    (npz.parent / "adapter.json").write_text(json.dumps({"rank": 32, "alpha": 16.0, "scale": 0.5}))
+    b = sft_lora.base_adapter_arg(f"G4-4={npz}")
+    assert (b["name"], b["path"], b["meta"]["scale"]) == ("G4-4", str(npz), 0.5)
+
+
+def test_g46b_stack_coefficients_add_g4_4s_update_and_the_runs():
+    # amendment G4-6b.7: g4mix.py stack --weights 1 --shared-coef 2 puts both adapters in with coefficient 1
+    import g4mix
+
+    assert g4mix.coefficients([1.0], 2.0) == [1.0, 1.0]
+    rng = np.random.default_rng(0)
+    comps = [{"m/kernel_lora_a": rng.normal(size=(6, 2)).astype(np.float32),
+              "m/kernel_lora_b": rng.normal(size=(2, 4)).astype(np.float32)} for _ in range(2)]
+    stacked = g4mix.stack(comps, g4mix.coefficients([1.0], 2.0))
+    delta = g4mix.translate.lora_delta(stacked["m/kernel_lora_a"], stacked["m/kernel_lora_b"], (6, 4), 0.5)
+    want = sum(g4mix.translate.lora_delta(c["m/kernel_lora_a"], c["m/kernel_lora_b"], (6, 4), 0.5) for c in comps)
+    assert stacked["m/kernel_lora_a"].shape == (6, 4) and np.allclose(delta, want, atol=1e-5)
+
+
+def test_build6_of_g4_6b_takes_g4_4s_translation_and_compares_with_g4_6s_pairs(world6):
+    cands_dir = run_cands6(world6)
+    g46 = run_build6(world6, cands_dir, {})
+    cands = pq.read_table(cands_dir / "cands.parquet").to_pylist()
+    novels = sorted(r["id"] for r in cands if r["stratum"] == "novel")
+    # G4-4's translations: closer to the chosen for some novels (chrF >= 80)
+    g40_pairs(cands, world6["tmp"] / "g44" / "pairs-w0.parquet", dict.fromkeys(novels[:5], "high"))
+    out = world6["tmp"] / "build6b"
+    g4arm.build6(ns(cands=str(cands_dir / "cands.parquet"), rejected=[str(world6["tmp"] / "g44" / "pairs-w*.parquet")],
+                    heldout=str(world6["tmp"] / "heldout" / "evalsets.parquet"),
+                    heldout_g40=[str(world6["tmp"] / "g40held" / "pairs-w*.parquet")],
+                    evalsets=str(world6["tmp"] / "evalsets.parquet"), blind=str(world6["blind"]), tokenizer="unused",
+                    out=str(out), arm="G4-6b", rejected_model="G4-4", compare=str(g46)),
+                 counter=FakeCounter6(), chrf=fake_chrf)
+    r = json.loads((out / "report.json").read_text())
+    assert (r["arm"], r["rejected_model"]) == ("G4-6b", "G4-4")
+    c = r["compare"]
+    assert (c["arm"], c["rejected_model"]) == ("G4-6", "G4-0")
+    assert c["funnel"]["novel"]["chrf_high"] == [0, 5] and c["funnel"]["novel"]["kept"][0] - 5 == c["funnel"]["novel"]["kept"][1]
+    g46_train = {p["id"] for p in pq.read_table(g46 / "pairs.parquet").to_pylist() if p["set"] == "train"}
+    mine = {p["id"] for p in pq.read_table(out / "pairs.parquet").to_pylist() if p["set"] == "train"}
+    assert c["train_pairs"] == [len(g46_train), len(mine)] and c["train_pairs_in_both"] == len(g46_train & mine)
+    md = (out / "report.md").read_text()
+    assert "# Arm G4-6b: de paren (`g4arm.py build6`, rejected = G4-4)" in md and "## Tegen G4-6 (rejected G4-0" in md
+    assert "(na de fouten van G4-4)" in md
+    # a candidate without G4-4's translation names G4-4
+    g40_pairs(cands[1:], world6["tmp"] / "g44" / "pairs-w0.parquet", {})
+    with pytest.raises(SystemExit, match="without G4-4's translation"):
+        g4arm.build6(ns(cands=str(cands_dir / "cands.parquet"), rejected=[str(world6["tmp"] / "g44" / "pairs-w*.parquet")],
+                        heldout="unused", heldout_g40=["unused"], evalsets="unused", blind=str(world6["blind"]),
+                        tokenizer="unused", out=str(world6["tmp"] / "b6b"), arm="G4-6b", rejected_model="G4-4",
+                        compare=None), counter=FakeCounter6(), chrf=fake_chrf)
+
+
+G44_LAST = {"books": 0.858, "btval": 0.495, "own": 0.339, "btlong": 0.437, "novels": 0.776}
+G44_RUN = {"steps": 9316, "eval": [{"step": st, "set": s, "loss": v + (1.5 if st == 0 else 0.0)}
+                                   for st in (0, 4500, 9316) for s, v in G44_LAST.items()]}
+BASE_ADAPTER = {"name": "G4-4", "path": "start/adapter.npz", "rank": 32, "alpha": 16.0, "scale": 0.5, "modules": 410}
+
+
+def smoke6b_summary(seq=4096, shift=0.02, **over):
+    s = smoke6_summary(seq, **{"base_adapter": BASE_ADAPTER, **over})
+    for e in s["eval"]:
+        if e["set"] in G44_LAST:
+            e["loss"] = G44_LAST[e["set"]] + shift - 0.01 * e["step"]
+    s["eval"] += [{"step": st, "set": "own4", "loss": 0.08, "seconds": 10.0} for st in (0, 4, 8)]
+    s["dpo"]["steps"] = [{"step": k, "pairs": 50, "loss": 0.69, "accuracy": 0.5, "margin": 0.0, "chosen_nll": 1.0,
+                          "rejected_nll": 0.1} for k in range(1, 9)]
+    return s
+
+
+def test_smoke6_of_g4_6b_takes_g4_4s_last_eval_its_merged_adapter_and_own4():
+    adapter = {"rank": 32, "alpha": 16.0, "scale": 0.5}
+    ok = g4arm.smoke6_verdict(smoke6b_summary(), adapter, G44_RUN, 4096, LORA, smoke_rows(), smoke_rows(qe=2.25),
+                              BUILD_REPORT, start="G4-4")
+    assert ok["passed"], {k: c for k, c in ok["checks"].items() if not c["holds"]}
+    assert ok["checks"]["base_losses_at_step0"]["value"]["books"]["start_last"] == 0.858
+    assert ok["own_against_pref_btval_rejected"]["own4"] == 0.08
+    # G4-6's rule on this run fails: its step 0 is not G4-4's step 0
+    assert not g4arm.smoke6_verdict(smoke6b_summary(), adapter, G44_RUN, 4096, LORA, smoke_rows(), smoke_rows(),
+                                    BUILD_REPORT)["checks"]["base_losses_at_step0"]["holds"]
+    bad = smoke6b_summary(shift=0.06, base_adapter={**BASE_ADAPTER, "modules": 400})
+    bad["eval"] = [e for e in bad["eval"] if not (e["set"] == "own4" and e["step"] == 4)]
+    v = g4arm.smoke6_verdict(bad, adapter, G44_RUN, 4096, LORA, smoke_rows(), smoke_rows(), BUILD_REPORT, start="G4-4")
+    assert {k for k, c in v["checks"].items() if not c["holds"]} == {"base_losses_at_step0", "base_adapter", "evals"}
+    assert not g4arm.smoke6_verdict(smoke6_summary(), adapter, G44_RUN, 4096, LORA, smoke_rows(), smoke_rows(),
+                                    BUILD_REPORT, start="G4-4")["checks"]["base_adapter"]["holds"]
+
+
+def test_pref_measure_of_g4_6b_names_its_reference_and_reports_own4():
+    p = g4arm.pref_measure(smoke6b_summary())
+    assert p["reference"] == "G4-4" and p["own4"] == {0: 0.08, 4: 0.08, 8: 0.08}
+    text = "\n".join(g4arm.pref_text(p))
+    assert "onder de referentie G4-4" in text and "`own4` (G4-4's eigen greedy" in text
+    assert g4arm.pref_measure(smoke6b_summary(base_adapter=None))["reference"] == "G4-0"
+
+
+def test_report_of_g4_6b_puts_further_arms_beside(tmp_path, monkeypatch):
+    monkeypatch.setattr(g4arm, "N_WMT_GOOD", 2)
+    monkeypatch.setattr(g4arm, "N_FLAN", 1)
+    evalsets = [{"id": f"{s}-{k}", "set": s, "source": "a b c", "reference": None if s in ("flan", "blind") else "x y z",
+                 "tokens": 3, "over_512": False, "length_class": "tiny", "meta": "{}"}
+                for s in ("wmt24pp", "flores", "ntrex", "europarl", "flan", "blind") for k in range(2)]
+    evalsets = [r for r in evalsets if r["id"] != "flan-1"]
+    write(evalsets, tmp_path / "evalsets.parquet")
+    for name, qe in (("G4-6b", 1.0), ("G4-0", 2.0), ("G4-5c2", 1.5), ("G4-6", 3.0)):
+        d = tmp_path / name
+        write([{"id": r["id"], "set": r["set"], "source": r["source"], "hypothesis": "p q r", "reference": r["reference"],
+                "ended": True, "decode_loop": False, "english_left": False, "empty": False} for r in evalsets],
+              d / "pairs" / "pairs-w0.parquet")
+        write([{"id": r["id"], "qe_source_hypothesis": qe,
+                "ref_source_hypothesis_reference": qe if r["reference"] else None} for r in evalsets],
+              d / "scores" / "metricx-w0.parquet")
+        write([{"id": r["id"], "comet22": 0.85} for r in evalsets if r["reference"]], d / "scores" / "comet-w0.parquet")
+    write([{"id": r["id"], "set": r["set"], "metricx_qe": 1.5, "metricx_ref": 1.4, "comet22": 0.86}
+           for r in evalsets if r["set"] in g4arm.FOUR_SETS], tmp_path / "tg.parquet")
+    preds = []
+    for model, p in (("G4-6b", 0.9), ("G4-0", 0.1), ("G4-5c2", 0.1), ("G4-6", 0.9), ("TG", 0.1)):
+        preds += [{"model": model, "set": s, "id": i, "truncated": False, "p_original": p}
+                  for s, i in (("wmt24pp", "wmt24pp-0"), ("wmt24pp", "wmt24pp-1"), ("flan", "flan-0"))]
+    write(preds, tmp_path / "pred.parquet")
+    s = smoke6b_summary()
+    s.update({"steps": 8, "lr_at": {"0": 0.0}})
+    (tmp_path / "summary.json").write_text(json.dumps(s))
+    out = tmp_path / "report.md"
+    args = ns(evalsets=str(tmp_path / "evalsets.parquet"), arm=str(tmp_path / "G4-6b"), base=str(tmp_path / "G4-0"),
+              tg_scores=str(tmp_path / "tg.parquet"), predictions=str(tmp_path / "pred.parquet"), classifier_results=None,
+              lora_line=[], train_summary=str(tmp_path / "summary.json"), tally=None, arm_name="G4-6b", heldout=None,
+              other=None, beside=[f"G4-5c2={tmp_path / 'G4-5c2'}", f"G4-6={tmp_path / 'G4-6'}"], out=str(out))
+    g4arm.report(args)
+    r = json.loads(out.with_suffix(".json").read_text())
+    assert r["b"]["base"] == 0.0 and r["b"]["holds"]          # the rule stays against G4-0
+    assert r["beside"]["G4-5c2"]["a1"]["sets"]["flores"]["model"] == pytest.approx(1.5)
+    assert r["beside"]["G4-5c2"]["b"]["delta"] == pytest.approx(1.0) and r["beside"]["G4-6"]["b"]["delta"] == 0.0
+    assert r["sets"]["wmt24pp"]["G4-6"]["metricx_qe"] == pytest.approx(3.0)
+    assert r["training"]["base_adapter"]["name"] == "G4-4" and r["pref"]["reference"] == "G4-4"
+    md = out.read_text()
+    assert "## Daarnaast (rapporteren, beslist niet)" in md and "| G4-5c2 | 1,500 | 1,500 | 1,500 | niet gehaald | 0,0% | +1,000 |" in md
+    args.beside = [f"G4-0={tmp_path / 'G4-0'}"]
+    with pytest.raises(SystemExit, match="already among"):
+        g4arm.report(args)
+
+
+def g46b_world(tmp_path):
+    """g46_world for ARM=G4-6b: G4-6b's pairs and check, G4-4's adapter, G4-6's candidates, and a gsutil that also
+    cats"""
+    import test_en_nl_g4arm5 as t5
+
+    run, shm, home = g46_world(tmp_path)
+    fake = tmp_path / "bin" / "gsutil"
+    fake.write_text(t5.FAKE_GSUTIL.replace('  *) echo "fake gsutil', '  cat) cat "$(map "${args[1]}")" ;;\n  *) echo "fake gsutil'))
+    g = tmp_path / "gs/t5-dutch-english-usc2/mbert/translator/sft/g4arm"
+    files = {"data/check-G4-6b.txt": "x", "data/G4-6b/report.json": "{}", "data/G4-6b/eval-own4.parquet": "x",
+             "G4-4/adapter.npz": "x", "G4-4/adapter.json": json.dumps({"rank": 32, "alpha": 16.0, "scale": 0.5}),
+             "data/G4-6/rejected-in/segments-w0.parquet": "x", "data/G4-6/rejected-in/classes-w0.txt": "tiny small\n"}
+    files.update({f"data/G4-6b/{n}": "x" for n in ("smoke-4096.parquet", "smoke-2048.parquet", "train-4096.parquet",
+                                                    "train-chosen.parquet", "template.jinja")})
+    files.update({f"data/G4-6b/eval-{n}-{seq}.parquet": "x" for n in g4arm.PREF_SETS6 for seq in (4096, 2048)})
+    for rel, body in files.items():
+        (g / rel).parent.mkdir(parents=True, exist_ok=True)
+        (g / rel).write_text(body)
+    return run, shm, home, g
+
+
+def test_g46b_train_merges_g4_4_and_evaluates_own4(tmp_path):
+    run, shm, home, g = g46b_world(tmp_path)
+    out, calls = run("train", ARM="G4-6b", RUN="g4arm_G4-6b_s8", STEPS="8", PHASE="prep")
+    assert out.returncode == 0 and out.stdout.strip().splitlines()[-1] == "prepared g4arm_G4-6b_s8 on w0", out.stdout + out.stderr
+    launch = (shm / "translator/g4arm/data-g4arm_G4-6b_s8/launch.sh").read_text()
+    d = shm / "translator/g4arm/data-g4arm_G4-6b_s8"
+    assert f"--base-adapter\\ G4-4={d}/start/adapter.npz" in launch or f"--base-adapter G4-4={d}/start/adapter.npz" in launch
+    assert "own4=" in launch and "--dpo" in launch and (d / "start" / "adapter.json").exists()
+    assert any("data/G4-6b/smoke-4096.parquet" in c for c in calls) and not any("data/G4-6/smoke" in c for c in calls)
+    # G4-6's run names are not G4-6b's
+    out, _ = run("train", ARM="G4-6b", RUN="g4arm_G4-6_s8", STEPS="8", PHASE="prep")
+    assert out.returncode != 0 and "no run of G4-6b" in out.stdout
+    # G4-4's adapter must be rank 32, alpha 16
+    (g / "G4-4/adapter.json").write_text(json.dumps({"rank": 16, "alpha": 16.0, "scale": 1.0}))
+    out, _ = run("train", ARM="G4-6b", RUN="g4arm_G4-6b_s8", STEPS="8", PHASE="prep")
+    assert out.returncode != 0 and "not rank 32, alpha 16" in out.stdout
+
+
+def test_g46b_rejected_run_is_g4_4_on_g4_6s_candidates(tmp_path):
+    run, shm, home, g = g46b_world(tmp_path)
+    out, calls = run("translate", ARM="G4-6b", MODEL="G4-4", SET="dpo")
+    assert out.returncode == 0 and "started g4a_dtranslate_G4-4_t1 on w0" in out.stdout, out.stdout + out.stderr
+    body = (home / "job_body_g4a_dtranslate_G4-4_t1.sh").read_text()
+    assert "data/G4-6/rejected-in/segments-w0.parquet" in body and "/dpo/G4-4/translations/w0/tiny" in body
+    assert "--lora" in body and any(c.startswith("gsutil -q cp") and "/G4-4/adapter.npz" in c for c in calls)
+    for model in ("G4-0", "G4-6b"):
+        out, _ = run("translate", ARM="G4-6b", MODEL=model, SET="dpo")
+        assert out.returncode != 0 and "G4-4 only" in out.stdout
+    out, _ = run("translate", ARM="G4-6", MODEL="G4-4", SET="dpo")
+    assert out.returncode != 0 and "G4-0 only" in out.stdout
+
+
+def test_g46b_texts_take_g4_6_once_its_report_is_there_and_report_takes_the_same(tmp_path):
+    run, shm, home, g = g46b_world(tmp_path)
+    out, _ = run("texts", ARM="G4-6b")
+    assert out.returncode == 0, out.stdout + out.stderr
+    body = (home / "job_body_g4a_texts_t1.sh").read_text()
+    assert "echo 'G4-6b G4-0 G4-4 G4-5c2' | gsutil -q cp - " in body and "naturalness-G4-6b/models.txt" in body
+    (g / "report-G4-6").mkdir()
+    (g / "report-G4-6/report.json").write_text("{}")
+    (home / "logs/g4a_texts_t1.log").unlink(missing_ok=True)
+    out, _ = run("texts", ARM="G4-6b", TAG="t2")
+    assert "echo 'G4-6b G4-0 G4-4 G4-5c2 G4-6' |" in (home / "job_body_g4a_texts_t2.sh").read_text()
+    # the report: without texts' list it stops; with it, the models beyond G4-6b, G4-0 and G4-4 go beside
+    out, _ = run("report", ARM="G4-6b")
+    assert out.returncode != 0 and "models.txt (texts)" in out.stdout
+    (g / "naturalness-G4-6b").mkdir()
+    (g / "naturalness-G4-6b/models.txt").write_text("G4-6b G4-0 G4-4 G4-5c2 G4-6\n")
+    out, _ = run("report", ARM="G4-6b", TAG="t3")
+    assert out.returncode == 0, out.stdout + out.stderr
+    body = (home / "job_body_g4a_report_t3.sh").read_text()
+    assert "for m in  G4-5c2 G4-6; do" in body and "--other G4-4=" in body and "heldout/G4-6b/pairs-w*" in body

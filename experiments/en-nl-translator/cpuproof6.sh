@@ -8,10 +8,17 @@
 # policy is the reference (pref loss log 2, margin 0, each NLL the reference's); (a)'s step-0 losses of books and own =
 # (b)'s (the preference loss's per-token log-probabilities = MaxText's cross entropy); at step 8 the reference is still
 # the base model (its NLL the same as at step 0) while the policy moved.
+# With BAKE=1 (amendment G4-6b.6) also, with (a)'s adapter as the adapter to merge:
+#   (c) --dpo with --base-adapter (the adapter merged into the base kernels), 4 steps, evals at 0 and 4
+#   (d) plain SFT with --init-adapter (the same adapter as LoRA in the forward pass), its evals at step 0
+# and checks: (c)'s step-0 losses of books and own = (d)'s (the merged model is the adapter's model) and not (b)'s (the
+# merge changed the model); at step 0 (c)'s policy is its reference (pref loss log 2, |margin| <= 1e-4 as the smoke
+# test's bound, each NLL the reference's) and that reference is not (a)'s; at step 4 (c)'s reference is unchanged.
 # Started by run_g4arm.sh cpuproof6 (w1) with G, G6, H, PY (the SFT venv's python), TOK (Gemma 4's tokenizer), CODE
 # (the bundle) and X (the work directory) in the environment. Ends in CPU_PROOF6_OK or CPU_PROOF6_FAILED.
 set -euo pipefail
 : "${G:?}" "${G6:?}" "${H:?}" "${PY:?}" "${TOK:?}" "${CODE:?}" "${X:?}"
+BAKE=${BAKE:-0}
 [ ! -e "$X" ] || { echo "$X exists"; exit 1; }
 P=$X/cpu
 mkdir -p $X/in $P
@@ -64,6 +71,15 @@ $PY -u $CODE/sft_lora.py --out $P/a --steps 8 "${EV[@]}" --eval-every 4 --warmup
   -- run_name=g4a6c_a "${MX[@]}"
 echo "$(date +%T) (b) plain SFT, the evals at step 0"
 $PY -u $CODE/sft_lora.py --out $P/b --steps 1 "${EV[@]}" --eval-every 1 -- run_name=g4a6c_b "${MX[@]}"
+if [ "$BAKE" = 1 ]; then
+  echo "$(date +%T) (c) --dpo with (a)'s adapter merged, 4 steps"
+  $PY -u $CODE/sft_lora.py --out $P/c --steps 4 "${EV[@]}" --eval-every 4 --warmup-steps 1 --decay-fraction 0 \
+    --dpo $P/dpo.json --pref-train $P/train.parquet --pref-eval pref_btval=$P/pref_btval.parquet \
+    --base-adapter tiny=$P/a/adapter.npz -- run_name=g4a6c_c "${MX[@]}"
+  echo "$(date +%T) (d) plain SFT with (a)'s adapter as LoRA, the evals at step 0"
+  $PY -u $CODE/sft_lora.py --out $P/d --steps 1 "${EV[@]}" --eval-every 1 --init-adapter $P/a/adapter.npz \
+    -- run_name=g4a6c_d "${MX[@]}"
+fi
 $PY - <<EOF
 import json, math, sys
 sys.path.insert(0, "$CODE")
@@ -96,6 +112,24 @@ need(abs(p8["ref_chosen_nll"] - p0["ref_chosen_nll"]) <= 1e-5 and abs(p8["ref_re
 need(abs(p8["margin"]) > 1e-4 or abs(p8["chosen_nll"] - p0["chosen_nll"]) > 1e-4, f"a: the policy moved by step 8 {p8}")
 need(all(sorted(e["step"] for e in a["eval"] if e["set"] == n) == [0, 4, 8] for n in ("books", "own", "pref_btval")),
      "a: evals at 0, 4, 8")
+if "$BAKE" == "1":
+    c, d = (json.load(open(f"$P/{r}/summary.json")) for r in "cd")
+    print("C_EVAL", json.dumps(c["eval"]))
+    print("C_BASE_ADAPTER", json.dumps(c["base_adapter"]))
+    print("D_EVAL", json.dumps(d["eval"]))
+    need(c["steps_done"] == 4 and len(c["dpo"]["steps"]) == 4, "c: 4 steps, 4 preference records")
+    need((c["base_adapter"] or {}).get("modules", 0) > 0 and c["base_adapter"]["name"] == "tiny", f"c: the adapter merged {c['base_adapter']}")
+    for name in ("books", "own"):
+        x, y, z = ev(c, name, 0)["loss"], ev(d, name, 0)["loss"], ev(b, name, 0)["loss"]
+        need(abs(x - y) <= 1e-4 * max(1.0, abs(y)), f"c: {name} at step 0 = the adapter as LoRA ({x} vs {y})")
+        need(abs(x - z) > 1e-4, f"c: {name} at step 0 is not the base model's ({x} vs {z})")
+    q0, q4 = ev(c, "pref_btval", 0), ev(c, "pref_btval", 4)
+    need(abs(q0["loss"] - math.log(2)) <= 1e-5 and abs(q0["margin"]) <= 1e-4, f"c: step 0 loss log 2, margin 0 {q0}")
+    need(abs(q0["chosen_nll"] - q0["ref_chosen_nll"]) <= 1e-6 and abs(q0["rejected_nll"] - q0["ref_rejected_nll"]) <= 1e-6,
+         "c: step 0 policy NLL = reference NLL")
+    need(abs(q0["ref_chosen_nll"] - p0["ref_chosen_nll"]) > 1e-4, f"c: the reference is the merged model, not (a)'s ({q0['ref_chosen_nll']} vs {p0['ref_chosen_nll']})")
+    need(abs(q4["ref_chosen_nll"] - q0["ref_chosen_nll"]) <= 1e-5 and abs(q4["ref_rejected_nll"] - q0["ref_rejected_nll"]) <= 1e-5,
+         f"c: the reference is still the merged model at step 4 ({q0['ref_chosen_nll']} {q4['ref_chosen_nll']})")
 print("CPU_PROOF6_OK" if not bad else f"CPU_PROOF6_FAILED {bad}", flush=True)
 raise SystemExit(1 if bad else 0)
 EOF

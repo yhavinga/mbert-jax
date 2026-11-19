@@ -202,3 +202,48 @@ def test_dpo_terms_is_the_same_in_numpy_and_jax():
         b, sb = jax.jit(lambda x, y, s, o=opts: g4dpo.dpo_terms(x, y, s, o, jnp))(logp, ref, seg)
         assert float(b) == pytest.approx(float(a), rel=1e-5)
         assert {k: float(v) for k, v in sb.items()} == pytest.approx({k: float(v) for k, v in sa.items()}, rel=1e-5)
+
+
+def test_bake_adapter_merges_into_the_base_kernels_and_the_reference_is_the_merged_model(tmp_path):
+    # amendment G4-6b.2: sft_lora.py --base-adapter (KernelMerger with one component at coefficient 1)
+    import sft_lora
+
+    model = Toy(nnx.Rngs(0))
+    w0 = {m: np.asarray(getattr(model.decoder, m).kernel[...]) for m in ("mix", "out")}
+    rng = np.random.default_rng(1)
+    adapter = {}
+    for m in ("mix", "out"):
+        adapter[f"decoder/{m}/kernel_lora_a"] = rng.normal(size=(D, R)).astype(np.float32)
+        adapter[f"decoder/{m}/kernel_lora_b"] = rng.normal(size=(R, D)).astype(np.float32)
+    np.savez(tmp_path / "adapter.npz", **adapter)
+    (tmp_path / "adapter.json").write_text('{"rank": 2, "alpha": 1.0, "scale": 0.5}')
+    # the same adapter as LoRA in the forward pass, on an unmerged copy
+    lora_model = Toy(nnx.Rngs(0))
+    for m in ("mix", "out"):
+        layer = getattr(lora_model.decoder, m)
+        layer.kernel_lora_a[...] = jnp.asarray(adapter[f"decoder/{m}/kernel_lora_a"])
+        layer.kernel_lora_b[...] = jnp.asarray(adapter[f"decoder/{m}/kernel_lora_b"])
+    mesh = jax.sharding.Mesh(np.array(jax.devices()[:1]), ("x",))
+    base = sft_lora.base_adapter_arg(f"G4-4={tmp_path / 'adapter.npz'}")
+    record = sft_lora.bake_adapter(model, mesh, base)
+    assert (record["name"], record["modules"], record["keys"], record["scale"]) == ("G4-4", 2, 4, 0.5)
+    for m in ("mix", "out"):
+        want = w0[m] + 0.5 * adapter[f"decoder/{m}/kernel_lora_a"] @ adapter[f"decoder/{m}/kernel_lora_b"]
+        assert np.allclose(np.asarray(getattr(model.decoder, m).kernel[...]), want, atol=1e-6)
+        assert not np.any(np.asarray(getattr(model.decoder, m).kernel_lora_b[...]))   # the run's own LoRA starts at 0
+    x = jax.random.normal(jax.random.key(2), (1, 5, D))
+    pos, seg = jnp.arange(5)[None], jnp.ones((1, 5), jnp.int32)
+
+    def hidden(mdl):
+        mdl.decoder(x, pos, seg)
+        return np.asarray(nnx.pop(mdl, nnx.Intermediate).to_pure_dict()["decoder"]["hidden_states"][0])
+
+    merged = hidden(model)
+    assert np.allclose(merged, hidden(lora_model), atol=1e-5)
+    # the reference of --dpo (the LoRA at zero) is the merged model, not the base
+    assert np.allclose(hidden(g4dpo.without_lora(model)), merged, atol=1e-6)
+    # an adapter module the model has no kernel for stops the run
+    np.savez(tmp_path / "adapter.npz", **adapter, **{"decoder/gone/kernel_lora_a": adapter["decoder/mix/kernel_lora_a"],
+                                                     "decoder/gone/kernel_lora_b": adapter["decoder/mix/kernel_lora_b"]})
+    with pytest.raises(SystemExit, match="without exactly one base kernel"):
+        sft_lora.bake_adapter(Toy(nnx.Rngs(0)), mesh, base)

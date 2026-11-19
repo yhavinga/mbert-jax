@@ -49,6 +49,12 @@ the file, the same on every process, so nothing is counted through MaxText's pip
 data hooks are still made from the config's hf_train_files (any SFT file; never read). --pref-eval NAME=FILE adds a
 packed eval file (its pairs' loss, accuracy, margin and rewards, and the NLL of both sides, per eval); the --eval files
 keep their token-weighted loss, as before. summary.json keeps the per-step preference measures under "dpo".
+Arm G4-6b (amendment G4-6b): with --dpo and --base-adapter NAME=FILE (an adapter.npz of this script, its adapter.json
+beside it) that adapter is merged into the base kernels before the first step and before any eval (KernelMerger, as
+G4-5's search merged a point: W0 + scale * A B in float32, then the kernel's own dtype and sharding; the model casts a
+kernel to bf16 at use, so the model is the one translate.py --lora decodes with that adapter); the run's own LoRA
+starts at zero on that model, and the reference (the LoRA at zero) is that model. summary.json keeps it under
+"base_adapter".
 Writes to DIR (process 0): summary.json (configuration, times, throughput, memory per chip, loss per step), adapter.npz
 (the LoRA parameters in float32, keys as decoder/layers_0/self_attention/query/kernel_lora_a), adapter.json (rank,
 alpha, module regex, model, checkpoint, original dtype); MaxText's output (metrics file, tensorboard, Tunix's checkpoint
@@ -276,12 +282,45 @@ def eval_loss(name, step, parts, batches, seconds):
             "seconds": round(seconds, 1)}
 
 
+def base_adapter_arg(spec):
+    """--base-adapter NAME=FILE (arm G4-6b), checked before JAX: the adapter.npz and its adapter.json (rank, alpha, scale
+    = alpha / rank) -> {"name", "path", "meta"}"""
+    name, sep, path = spec.partition("=")
+    if not sep or not name or not path:
+        raise SystemExit(f"--base-adapter {spec}: NAME=FILE")
+    npz = Path(path)
+    meta_path = npz.parent / "adapter.json"
+    if not npz.is_file() or not meta_path.is_file():
+        raise SystemExit(f"--base-adapter {spec}: no {npz} or no {meta_path}")
+    meta = json.loads(meta_path.read_text())
+    if any(k not in meta for k in ("rank", "alpha", "scale")) or abs(meta["alpha"] / meta["rank"] - meta["scale"]) > 1e-12:
+        raise SystemExit(f"--base-adapter {spec}: {meta_path} has no rank, alpha and scale = alpha / rank")
+    return {"name": name, "path": str(npz), "meta": meta}
+
+
+def bake_adapter(model, mesh, base):
+    """--base-adapter: the adapter merged into the base kernels with KernelMerger (every adapter module has exactly one
+    base kernel, else SystemExit); its host copy of the base kernels is dropped after the merge (nothing restores them)"""
+    import numpy as np
+
+    t = time.perf_counter()
+    with np.load(base["path"]) as z:
+        arrays = {k: z[k] for k in z.files}
+    merger = KernelMerger(model, mesh, [arrays], base["meta"]["scale"])
+    merger.apply([1.0])
+    modules = len(merger.modules)
+    merger.host.clear()
+    return {"name": base["name"], "path": base["path"], "rank": base["meta"]["rank"], "alpha": base["meta"]["alpha"],
+            "scale": base["meta"]["scale"], "modules": modules, "keys": len(arrays),
+            "seconds": round(time.perf_counter() - t, 1)}
+
+
 def dpo_args(args, evals_wanted):
     """--dpo's spec and its preference eval files {name: file}, checked before JAX: a measurement of its own (no
     --combine, --temperatures, --resume-step, --init-adapter), names apart from the --eval files"""
     if not args.dpo:
-        if args.pref_train or args.pref_eval:
-            raise SystemExit("--pref-train and --pref-eval belong to --dpo")
+        if args.pref_train or args.pref_eval or args.base_adapter:
+            raise SystemExit("--pref-train, --pref-eval and --base-adapter belong to --dpo")
         return None, {}
     import g4dpo
 
@@ -744,6 +783,9 @@ def main(argv=None):
     parser.add_argument("--pref-train", default=None, help="with --dpo: the packed training file of g4dpo.py")
     parser.add_argument("--pref-eval", action="append", default=[],
                         help="with --dpo: NAME=FILE, a packed eval file of pairs (repeatable)")
+    parser.add_argument("--base-adapter", default=None,
+                        help="with --dpo: NAME=FILE, an adapter.npz of this script merged into the base kernels before "
+                             "the first step (the start model and the reference; arm G4-6b)")
     args = parser.parse_args(own)
     if args.resume_step < 0 or bool(args.resume_step) != bool(args.resume_adapter):
         raise SystemExit("--resume-step N (> 0) and --resume-adapter go together")
@@ -773,6 +815,7 @@ def main(argv=None):
     if combine_spec and combine_spec["objective_mode"] == "calibrated" and not temps:
         raise SystemExit("--combine: the calibrated objective needs --temperatures (addendum G4-5.7b A)")
     dpo_opts, prefs_wanted = dpo_args(args, evals_wanted)
+    base_spec = base_adapter_arg(args.base_adapter) if args.base_adapter else None
     if prefs_wanted and not evals_wanted:
         # Tunix runs its eval rounds only with an eval iterator, which eval_overrides makes from the first --eval file
         raise SystemExit("--pref-eval needs at least one --eval file")
@@ -934,6 +977,10 @@ def main(argv=None):
                     if path and isinstance(value, nnx.Module)]
     lora_seen = lora_report(lora_utils._get_lora_module_path(config), lora_sizes, module_paths)  # noqa: SLF001
     print(f"LORA_MODULES {json.dumps(lora_seen)}", flush=True)
+    # before the first eval and step: the start model, and so the reference of --dpo
+    base_adapter = bake_adapter(trainer.model, mesh, base_spec) if base_spec else None
+    if base_adapter:
+        print(f"BASE_ADAPTER {json.dumps(base_adapter)}", flush=True)
     init_adapter = load_adapter(trainer.model, args.init_adapter) if args.init_adapter else None
     if init_adapter:
         print(f"INIT_ADAPTER {json.dumps(init_adapter)}", flush=True)
@@ -1128,6 +1175,7 @@ def main(argv=None):
                       for k, v in eval_plan.items()},
         "lr_at": lr_at,
         "init_adapter": init_adapter,
+        "base_adapter": base_adapter,
         "combine": combined.get("result"),
         "temperatures": temps,
         # --dpo: the spec, the packed training file and every step's preference measures (its batch's pairs)

@@ -86,6 +86,8 @@
 #     SEARCH_RUN=g4arm_G4-5_c8 smoke-translate and smoke-score (w0: the stacked adapter decodes); smoke5-report (w0)
 #   RUN=g4arm_G4-5_warmup train; for every branch B: RUN=g4arm_G4-5_B resume5, then RUN=g4arm_G4-5_B train
 #   RUN=g4arm_G4-5_search train (STEPS=1: the search at step 0; SEARCH_BUDGET, SEARCH_TOP_K, SEARCH_STEP, ... override)
+#   PHASE=prep, then PHASE=launch with train (every run of G4-5): the copies and run_sft.sh's arguments on every worker
+#     first ("prepared <run> on wK", $G_SHM/data-<run>/launch.sh), then run_sft.sh on every worker at once
 #   MODEL=G4-5c<k> translate and score (the k-th of the search's top, stacked on every worker from the runs' adapters);
 #   CANDIDATES="G4-5c1 ..." [REFS=G4-4] texts, classify, report5 (w0); SELECTED=<report5's choice> blind
 #   Addendum G4-5.7b (Yeb, 18 Nov): RUN=g4arm_G4-5_temp0 train and RUN=g4arm_G4-5_tempw train (eval only, the
@@ -304,6 +306,8 @@ g45_train() {  # the training runs of G4-5 (draft amendment G4-5): the warmup, t
   decay=$(g4a_const DECAY_FRACTION5)
   D=$G_SHM/data-$RUN
   mkdir -p "$D"
+  # a launch never takes the arguments of an earlier or a broken preparation
+  rm -f -- "$D/launch.sh"
   case $RUN in
     g4arm_G4-5_s8) setdir=$G5/G4-5-smoke-warmup; steps=8; every=4; lrw=$(g4a_const SMOKE5_LR_WARMUP); decay=0 ;;
     g4arm_G4-5_b8) setdir=$G5/G4-5-smoke-branch; steps=8; every=4; lrw=$(g4a_const SMOKE5_LR_WARMUP)
@@ -379,10 +383,20 @@ g45_train() {  # the training runs of G4-5 (draft amendment G4-5): the warmup, t
       --shared-coef "${SEARCH_SHARED:-1.0}" --scale 0.5 $check --out "$D/spec.json" > /dev/null
     ARGS="$ARGS --combine $D/spec.json"
   fi
-  SFT_ARGS="$ARGS" MULTIHOST=1 NAME=$RUN MODEL=gemma4-31b DATA=$D/train.parquet TEMPLATE=$D/template.jinja ROOT=$G \
-    STEPS=$steps bash "$CODE/run_sft.sh" per_device_batch_size=1 max_target_length="$(g4a_const SEQ3)" \
-    lora.lora_rank=32 lora.lora_alpha=16.0 learning_rate="$(g4a_const LR5)" lr_schedule_type=wsd \
-    wsd_decay_style=linear learning_rate_final_fraction=0.1 ${temps:+num_vocab_tiling=1}
+  # PHASE=prep stops here and PHASE=launch starts run_sft.sh from this file: the processes of the multi-host job meet in
+  # jax.distributed.initialize within a timeout, and the search's copies (~8 GB of components) take ~2 min per worker,
+  # so a chain prepares every worker before it launches any (19 Nov: four sequential starts 6 min apart failed)
+  printf '%q ' env SFT_ARGS="$ARGS" MULTIHOST=1 NAME="$RUN" MODEL=gemma4-31b DATA="$D/train.parquet" \
+    TEMPLATE="$D/template.jinja" ROOT="$G" STEPS="$steps" bash "$CODE/run_sft.sh" per_device_batch_size=1 \
+    max_target_length="$(g4a_const SEQ3)" lora.lora_rank=32 lora.lora_alpha=16.0 learning_rate="$(g4a_const LR5)" \
+    lr_schedule_type=wsd wsd_decay_style=linear learning_rate_final_fraction=0.1 ${temps:+num_vocab_tiling=1} \
+    > "$D/launch.sh.new"
+  mv "$D/launch.sh.new" "$D/launch.sh"
+  if [ "${PHASE:-}" = prep ]; then
+    echo "prepared $RUN on w$W"
+    return 0
+  fi
+  bash "$D/launch.sh"
 }
 
 g46_train() {  # the runs of G4-6 (draft amendment G4-6): the smoke runs at 4,096 and 2,048, the full run at SEQ6
@@ -535,7 +549,13 @@ EOF
   ;;
 train)
   if [ "$ARM" = G4-5 ]; then
-    g45_train
+    case ${PHASE:-} in
+      ""|prep) g45_train ;;
+      launch) RUN=${RUN:?the run that PHASE=prep prepared}
+              [ -s "$G_SHM/data-$RUN/launch.sh" ] || { echo "w$W: no $G_SHM/data-$RUN/launch.sh (PHASE=prep first)"; exit 1; }
+              bash "$G_SHM/data-$RUN/launch.sh" ;;
+      *) echo "PHASE is prep, launch or empty (both), not $PHASE"; exit 1 ;;
+    esac
     exit 0
   fi
   if [ "$ARM" = G4-6 ]; then

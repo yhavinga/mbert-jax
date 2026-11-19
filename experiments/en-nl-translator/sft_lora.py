@@ -791,7 +791,9 @@ def main(argv=None):
     absl_logging.set_verbosity(absl_logging.INFO)  # MaxText's own messages (LoRA match, step metrics) go to the log
 
     if args.distributed:
-        jax.distributed.initialize()
+        # the job's processes are started over ssh on four workers: JAX's default of 300 s for all of them to meet
+        # here leaves little margin (19 Nov: starts 6 min apart, every process gave up after 300 s)
+        jax.distributed.initialize(initialization_timeout=900)
     import jax.numpy as jnp
     import maxtext
     import numpy as np

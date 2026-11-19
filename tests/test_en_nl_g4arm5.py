@@ -3,7 +3,12 @@ search, the split), sft_lora.py's pure parts (the schedule of a resumed run, the
 build5, split5, smoke5 and report5 on small synthetic inputs (no tokenizer, no model, no TPU)."""
 
 import json
+import os
 import random
+import subprocess
+import sys
+import time
+from pathlib import Path
 
 import numpy as np
 import pyarrow.parquet as pq
@@ -19,6 +24,8 @@ world, world4, run_build4 = t4.world, t4.world4, t4.run_build4
 import g4mix  # noqa: E402
 import sft_lora  # noqa: E402
 import translate  # noqa: E402
+
+CODE = Path(__file__).resolve().parents[1] / "experiments" / "en-nl-translator"
 
 SHAPES = {"decoder/layers_0/self_attention/query": ((8, 2, 4), (8, 3), (3, 2, 4)),
           "decoder/layers_0/mlp/wo": ((12, 8), (12, 3), (3, 8))}
@@ -891,3 +898,121 @@ def test_run_combine_checks_the_warmup_first_reports_both_objectives_and_follows
                                                                                                  "novels": 2.0}})
     with pytest.raises(SystemExit, match="G4-5.7b"):
         sft_lora.run_combine(sp, None, None, run_files, ["wmt24pp_s", "books", "novels"])
+
+
+# ---------------------------------------------------------------------------------------------------- run_g4arm.sh train
+
+FAKE_GSUTIL = r"""#!/bin/bash
+# gs://X -> $FAKEGS/X; every call in $FAKELOG
+echo "gsutil $*" >> "$FAKELOG"
+args=(); for a in "$@"; do case $a in -q|-m) ;; *) args+=("$a") ;; esac; done
+map() { case $1 in gs://*) echo "$FAKEGS/${1#gs://}" ;; *) echo "$1" ;; esac; }
+case ${args[0]} in
+  stat) [ -e "$(map "${args[1]}")" ] ;;
+  cp) n=${#args[@]}; dst=$(map "${args[$((n - 1))]}")
+      for s in "${args[@]:1:$((n - 2))}"; do
+        if [[ $dst == */ ]] || [ -d "$dst" ]; then mkdir -p "$dst"; else mkdir -p "$(dirname "$dst")"; fi
+        cp "$(map "$s")" "$dst" || exit 1
+      done ;;
+  *) echo "fake gsutil: ${args[0]}" >&2; exit 2 ;;
+esac
+"""
+
+
+def g45_world(tmp_path):
+    """run_g4arm.sh and run_sft.sh with /dev/shm under tmp_path, a fake bucket with what the search of G4-5 reads
+    (components, warmup summary, temperature probe, eval files), fake gsutil/sudo/hostname and a setsid that starts
+    nothing (it logs its call)."""
+    shm, gs, home, fake = tmp_path / "shm", tmp_path / "gs", tmp_path / "home", tmp_path / "bin"
+    code = tmp_path / "code"
+    for d in (code, home, fake):
+        d.mkdir(parents=True)
+    for name in ("run_g4arm.sh", "run_sft.sh"):
+        (code / name).write_text((CODE / name).read_text().replace("/dev/shm/", f"{shm}/"))
+    for name in ("g4arm.py", "g4mix.py"):
+        (code / name).symlink_to(CODE / name)
+    for name, body in {"gsutil": FAKE_GSUTIL, "sudo": "#!/bin/bash\nexit 0\n", "hostname": "#!/bin/bash\necho t1v-n-x-w-0\n",
+                       "setsid": '#!/bin/bash\necho "SETSID $*" >> "$FAKELOG"\n'}.items():
+        (fake / name).write_text(body)
+        (fake / name).chmod(0o755)
+    py = shm / "translator/smoke-lora/venv/bin/python"
+    py.parent.mkdir(parents=True)
+    py.write_text(f'#!/bin/bash\nexec {sys.executable} "$@"\n')
+    py.chmod(0o755)
+    tok = shm / "translator/g4lora/tok-gemma4-31b"
+    tok.mkdir(parents=True)
+    (tok / "tokenizer.json").write_text("{}")
+    g = gs / "t5-dutch-english-usc2/mbert/translator/sft/g4arm"
+    files = {"../../gemma4-ckpt/gemma-4-31b-it/done.txt": "x", "data/G4-5/G4-5-smoke-warmup/manifest.json": "{}",
+             "data/G4-5/G4-5-smoke-warmup/train.parquet": "x", "data/G4-5/G4-5-smoke-warmup/train-meta.parquet": "x",
+             "data/G4-5/G4-5-smoke-warmup/template.jinja": "x", "data/heldout/eval-books.parquet": "x",
+             "data/heldout/eval-btval.parquet": "x", "data/heldout/eval-own.parquet": "x",
+             "data/heldout3/eval-btlong.parquet": "x", "data/heldout4/eval-novels.parquet": "x",
+             "data/G4-5/eval-flanval.parquet": "x", "data/G4-5-split/eval-wmt24pp-s.parquet": "x",
+             "data/G4-5-split/eval-flores-s.parquet": "x", "data/G4-5-split/eval-ntrex-s.parquet": "x",
+             "runs/g4arm_G4-5_warmup/summary.json": json.dumps(
+                 {"steps": 1000, "eval": [{"step": 1000, "set": s, "loss": 0.9, "tokens": 100} for s in ("books", "novels")]}),
+             "report-G4-5/temperature.json": json.dumps(
+                 {"search_rule": {"sets": sorted(g4arm.OBJECTIVE5), "objective": "calibrated", "t": 2.05}})}
+    for n in ("warmup", *g4arm.BRANCHES5):
+        files[f"runs/g4arm_G4-5_{n}/adapter.npz"] = n
+        files[f"runs/g4arm_G4-5_{n}/adapter.json"] = json.dumps({"rank": 32, "alpha": 16.0, "scale": 0.5})
+    for rel, text in files.items():
+        p = (g / rel).resolve()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text)
+    calls = tmp_path / "calls.log"
+
+    def run(run, phase=None):
+        env = {"HOME": str(home), "PATH": f"{fake}:{os.environ['PATH']}", "FAKEGS": str(gs), "FAKELOG": str(calls),
+               "TAG": "t1", "ARM": "G4-5", "RUN": run, "STEPS": "1", **({"PHASE": phase} if phase else {})}
+        calls.write_text("")
+        out = subprocess.run(["bash", str(code / "run_g4arm.sh"), "train"], capture_output=True, text=True,
+                             timeout=120, env=env, cwd=home)
+        # run_sft.sh puts setsid in the background: its line may come after the script's end
+        deadline = time.time() + 30
+        while "started " in out.stdout and "SETSID" not in calls.read_text() and time.time() < deadline:
+            time.sleep(0.1)
+        return out, calls.read_text().splitlines()
+
+    return run, shm, home
+
+
+def test_g45_train_prepares_apart_from_the_launch_with_the_same_job(tmp_path):
+    run, shm, home = g45_world(tmp_path)
+    name = "g4arm_G4-5_search"
+    job, out_dir = home / f"run_{name}.sh", shm / f"translator/smoke-lora/runs/{name}"
+    # in one go, as before the split
+    out, calls = run(name)
+    assert out.returncode == 0, out.stdout + out.stderr
+    assert f"started {name} on t1v-n-x-w-0" in out.stdout and sum(c.startswith("SETSID") for c in calls) == 1
+    whole = job.read_text()
+    assert "--combine " in whole and "--temperatures 0.5:3.0:0.05" in whole and whole.rstrip().endswith("num_vocab_tiling=1")
+    job.unlink()
+    out_dir.rmdir()
+    # the preparation copies and starts nothing
+    out, calls = run(name, "prep")
+    assert out.returncode == 0, out.stdout + out.stderr
+    assert out.stdout.strip().splitlines()[-1] == f"prepared {name} on w0"
+    assert not any(c.startswith("SETSID") for c in calls) and not job.exists() and not out_dir.exists()
+    assert any("components/flan/" in c for c in calls if c.startswith("gsutil -q cp"))
+    # the launch copies nothing and starts the same job
+    out, calls = run(name, "launch")
+    assert out.returncode == 0, out.stdout + out.stderr
+    assert f"started {name} on t1v-n-x-w-0" in out.stdout
+    assert [c.split()[:3] for c in calls] == [["gsutil", "-q", "stat"], ["SETSID", "nohup", "bash"]]
+    assert job.read_text() == whole
+    # no launch without its preparation, and a preparation that fails leaves none behind
+    out, _ = run("g4arm_G4-5_temp0", "launch")
+    assert out.returncode != 0 and "PHASE=prep first" in out.stdout
+    job.unlink()
+    out_dir.rmdir()
+    (shm / f"translator/g4arm/data-{name}/temperature.json").unlink()
+    (tmp_path / "gs/t5-dutch-english-usc2/mbert/translator/sft/g4arm/report-G4-5/temperature.json").unlink()
+    out, _ = run(name, "prep")
+    assert out.returncode != 0 and "no gs://" in out.stdout and "temperature.json" in out.stdout
+    assert not (shm / f"translator/g4arm/data-{name}/launch.sh").exists()
+    out, _ = run(name, "launch")
+    assert out.returncode != 0 and "PHASE=prep first" in out.stdout
+    out, _ = run(name, "both")
+    assert out.returncode != 0 and "PHASE is prep, launch or empty" in out.stdout

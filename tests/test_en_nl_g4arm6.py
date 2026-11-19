@@ -103,6 +103,24 @@ def test_local_batches_give_each_process_its_rows_and_the_padding_batch():
         list(g4dpo.local_batches(arrays, 0, 3, rows=4, batches=1))
 
 
+def test_local_batches_carry_their_rows_reference_and_row_ids():
+    # amendment G4-6.4a: each batch carries the reference sums of its own rows of the file (padding: zeros), and the
+    # reference pass's batches their rows' indices in the file
+    arrays = {k: np.arange(8 * 5, dtype=np.int32).reshape(8, 5) for k in g4dpo.KEYS}
+    ref = np.arange(8 * 6, dtype=np.float32).reshape(8, 6) + 0.5
+    for proc in (0, 1):
+        got = list(g4dpo.local_batches(arrays, proc, 2, rows=4, batches=2, padding=1, ref=ref))
+        for b, batch in enumerate(got[:2]):
+            lo = 4 * b + 2 * proc
+            assert np.array_equal(batch[g4dpo.REF_KEY], ref[lo:lo + 2]) and batch[g4dpo.REF_KEY].dtype == np.float32
+            assert np.array_equal(batch["inputs"], arrays["inputs"][lo:lo + 2]) and g4dpo.ROW_KEY not in batch
+        assert got[2][g4dpo.REF_KEY].shape == (2, 6) and not got[2][g4dpo.REF_KEY].any()
+        ids = [b[g4dpo.ROW_KEY].tolist() for b in g4dpo.local_batches(arrays, proc, 2, rows=4, batches=2, row_ids=True)]
+        assert ids == [[2 * proc, 2 * proc + 1], [4 + 2 * proc, 5 + 2 * proc]]
+    with pytest.raises(SystemExit, match="a reference of 4 rows"):
+        list(g4dpo.local_batches(arrays, 0, 2, rows=4, batches=2, ref=ref[:4]))
+
+
 # ---------------------------------------------------------------------------------------------------- the loss
 
 def batch_of(pairs, seq, rows):
@@ -142,6 +160,42 @@ def test_dpo_terms_is_tunixs_loss_per_pair_plus_the_nll_of_the_chosen_sides():
     assert sums["pairs"] == 9 and sums["correct"] == correct and sums["chosen_tokens"] == chosen_tok
     want = np.mean(losses) + 0.5 * (-chosen_logp / chosen_tok)
     assert float(loss) == pytest.approx(want, rel=1e-5)
+
+
+def test_dpo_terms_with_the_references_segment_sums_is_the_same_as_with_its_log_probabilities():
+    # amendment G4-6.4a: the precomputed reference enters as per-segment sums; the loss and every sum are the same
+    pairs = toy_pairs(12)
+    data, _ = batch_of(pairs, seq=48, rows=4)
+    seg = data["targets_segmentation"]
+    rng = np.random.default_rng(5)
+    logp = np.where(seg != 0, -rng.uniform(0.1, 2.0, seg.shape), 0.0).astype(np.float32)
+    ref = np.where(seg != 0, -rng.uniform(0.1, 2.0, seg.shape), 0.0).astype(np.float32)
+    ref_seg = g4dpo.segment_sums(ref, seg, OPTS["max_segments"])
+    assert ref_seg.shape == (len(seg), OPTS["max_segments"]) and ref_seg.dtype == np.float32
+    assert ref_seg[0, 0] == pytest.approx(float(ref[0][seg[0] == 1].sum()), rel=1e-6)
+    for opts in (OPTS, g4dpo.spec(loss="ipo", length_norm=True)):
+        a, sa = g4dpo.dpo_terms(logp, ref, seg, opts)
+        b, sb = g4dpo.dpo_terms(logp, None, seg, opts, ref_seg=ref_seg)
+        assert float(b) == float(a) and sb == sa
+    with pytest.raises(ValueError, match="either ref_logp or ref_seg"):
+        g4dpo.dpo_terms(logp, ref, seg, OPTS, ref_seg=ref_seg)
+    with pytest.raises(ValueError, match="either ref_logp or ref_seg"):
+        g4dpo.dpo_terms(logp, None, seg, OPTS)
+    with pytest.raises(ValueError, match="reference's sums are"):
+        g4dpo.dpo_terms(logp, None, seg, OPTS, ref_seg=ref_seg[:, :8])
+
+
+def test_reference_rows_name_each_pairs_chosen_and_rejected_segment(tmp_path):
+    pairs = toy_pairs(12)
+    packed = g4dpo.pack_rows(pairs, seq=48, rows=4)
+    g4dpo.write_rows(packed, tmp_path / "rows.parquet")
+    ref = np.arange(len(packed) * 64, dtype=np.float32).reshape(len(packed), 64)
+    out = g4dpo.reference_rows(tmp_path / "rows.parquet", ref, 1, 4)
+    assert [r["pair"] for r in out] == [i for r in packed[:4] for i in r["pairs"]]
+    for r in out:
+        j = packed[r["row"]]["pairs"].index(r["pair"])
+        assert (r["ref_chosen_logp"], r["ref_rejected_logp"]) == (ref[r["row"], 2 * j], ref[r["row"], 2 * j + 1])
+        assert r["batch"] == 0 and r["file"] == "rows.parquet"
 
 
 def test_dpo_terms_at_the_reference_is_log_2_and_moves_with_the_chosen_and_rejected():
@@ -224,7 +278,9 @@ def test_sft_lora_refuses_inconsistent_dpo_arguments_before_jax(tmp_path):
                        "no --combine"),
                       ([*base, "--dpo", str(spec), "--pref-train", "x", "--pref-eval", "a=x", "--eval", "a=y",
                         "--eval-every", "1"], "both name"),
-                      ([*base, "--dpo", str(spec), "--pref-train", "x", "--pref-eval", "a=x"], "at least one --eval")):
+                      ([*base, "--dpo", str(spec), "--pref-train", "x", "--pref-eval", "a=x"], "at least one --eval"),
+                      ([*base, "--dpo", str(spec), "--pref-train", "x", "--pref-eval", "train=x", "--eval", "a=y",
+                        "--eval-every", "1"], "the name train")):
         with pytest.raises(SystemExit, match=msg):
             sft_lora.main(argv)
     spec.write_text(json.dumps({"loss": "orpo"}))
@@ -464,6 +520,16 @@ def test_smoke6_passes_when_every_check_holds_and_names_each_failure():
                              smoke_rows(), BUILD_REPORT)
     failed = {k for k, c in v["checks"].items() if not c["holds"]}
     assert failed == {"peak_gib", "policy_is_reference_at_step0", "base_losses_at_step0"}
+    # amendment G4-6.4a: the reference pass, every training batch at the smoke run's time per batch and the
+    # preference files once, in the estimate
+    ref = {"train": {"seconds": 99.0, "batch_s_median": 4.5}, "pref_books": {"seconds": 40.0},
+           "pref_btval": {"seconds": 50.0}, "pref_novels": {"seconds": 40.0}}
+    with_ref = smoke6_summary()
+    with_ref["dpo"]["ref"] = ref
+    r = g4arm.smoke6_verdict(with_ref, {"rank": 32, "alpha": 16.0, "scale": 0.5}, G44_SUMMARY, 4096, LORA,
+                             smoke_rows(), smoke_rows(qe=2.25), BUILD_REPORT)
+    assert r["estimate"]["ref_s"] == 800 * 4.5 + 130
+    assert r["estimate"]["hours"] == pytest.approx((800 * 14 + 5 * 210 + 850 + 800 * 4.5 + 130) / 3600, abs=0.01)
     # the fallback at 2,048: no btlong, and its own step count
     fb = g4arm.smoke6_verdict(smoke6_summary(2048), {"rank": 32, "alpha": 16.0, "scale": 0.5}, G44_SUMMARY, 2048, LORA,
                               smoke_rows(), smoke_rows(), BUILD_REPORT)

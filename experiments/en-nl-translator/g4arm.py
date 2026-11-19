@@ -4624,19 +4624,23 @@ def smoke6_verdict(summary, adapter, base_summary, seq, lora, arm_rows, base_row
 
 def smoke6_estimate(summary, build_report, seq):
     """The full run's hours: every batch of the training file at the smoke run's median step time, an eval round
-    (every set, as long as the smoke run's at step 0) at step 0, every EVAL_EVERY6 steps and after the last, and the
-    smoke run's time to its first step"""
+    (every set, as long as the smoke run's at step 0) at step 0, every EVAL_EVERY6 steps and after the last, the
+    smoke run's time to its first step, and the reference pass before it (amendment G4-6.4a: every training batch at
+    the smoke run's median time per batch, and the preference eval files as in the smoke run)"""
     steps = build_report["packing"][str(seq)]["train"]["steps"]
     step_s = (summary.get("throughput") or {}).get("step_s_median")
     round_s = sum(e.get("seconds", 0.0) for e in summary.get("eval") or [] if e["step"] == 0)
     rounds = 1 + steps // EVAL_EVERY6 + (0 if steps % EVAL_EVERY6 == 0 else 1)
     times = summary.get("times") or {}
     before = (times.get("python_to_setup_s") or 0) + (times.get("setup_s") or 0) + (times.get("compile_s_est") or 0)
+    ref = (summary.get("dpo") or {}).get("ref") or {}
+    ref_s = steps * (ref.get("train") or {}).get("batch_s_median", 0.0) + sum(
+        r.get("seconds", 0.0) for name, r in ref.items() if name != "train")
     if step_s is None:
         return {"steps": steps, "hours": math.inf}
-    total = steps * step_s + rounds * round_s + before
+    total = steps * step_s + rounds * round_s + before + ref_s
     return {"steps": steps, "step_s": step_s, "eval_round_s": round_s, "rounds": rounds, "before_s": before,
-            "hours": round(total / 3600, 2)}
+            "ref_s": round(ref_s, 1), "hours": round(total / 3600, 2)}
 
 
 def smoke6(args):

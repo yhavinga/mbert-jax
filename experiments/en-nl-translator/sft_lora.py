@@ -45,10 +45,13 @@ follows (addendum G4-5.7b A).
 Arm G4-6 (draft amendment G4-6): with --dpo SPEC (g4dpo.spec) the run is preference training: the training data are
 --pref-train, a packed file of g4dpo.py (pairs, chosen and rejected side by side in a row; one epoch is every batch of
 the file, the same on every process, so nothing is counted through MaxText's pipeline), and the loss is g4dpo.make_loss
-(the reference is the model with its LoRA parameters at zero, in the same step) for training and eval. MaxText's own
-data hooks are still made from the config's hf_train_files (any SFT file; never read). --pref-eval NAME=FILE adds a
+for training and eval. The reference (the model with its LoRA at zero) is computed once before the first step
+(amendment G4-6.4a): a forward pass of the model while every LoRA B is zero over the batches that the run trains on and
+every --pref-eval file, its per-segment sums carried by each batch; the training step runs only the policy. MaxText's
+own data hooks are still made from the config's hf_train_files (any SFT file; never read). --pref-eval NAME=FILE adds a
 packed eval file (its pairs' loss, accuracy, margin and rewards, and the NLL of both sides, per eval); the --eval files
-keep their token-weighted loss, as before. summary.json keeps the per-step preference measures under "dpo".
+keep their token-weighted loss, as before. summary.json keeps the per-step preference measures under "dpo" (with the
+reference pass under "ref"); DIR/dpo_ref.parquet the reference's sums per pair.
 Arm G4-6b (amendment G4-6b): with --dpo and --base-adapter NAME=FILE (an adapter.npz of this script, its adapter.json
 beside it) that adapter is merged into the base kernels before the first step and before any eval (KernelMerger, as
 G4-5's search merged a point: W0 + scale * A B in float32, then the kernel's own dtype and sharding; the model casts a
@@ -336,6 +339,8 @@ def dpo_args(args, evals_wanted):
     both = sorted(set(prefs) & set(evals_wanted))
     if both:
         raise SystemExit(f"--pref-eval and --eval both name {both}")
+    if "train" in prefs:
+        raise SystemExit("--pref-eval: the name train is the training file's (its precomputed reference)")
     return opts, prefs
 
 
@@ -953,14 +958,9 @@ def main(argv=None):
     dpo_steps = []
     if dpo_opts:
         # --dpo: MaxText's loss replaced by the preference loss (training and eval), MaxText's training data by the
-        # packed file's batches (one all-zero batch after them for Tunix's look-ahead), and every step's sums kept
+        # packed file's batches (below, with the reference), and every step's sums kept
         trainer = trainer.with_loss_fn(g4dpo.make_loss(config, dpo_opts, True), has_aux=True)
         trainer.eval_loss_fn = g4dpo.make_loss(config, dpo_opts, False)
-        hooks_data = trainer.data_hooks
-        close(hooks_data.train_data_iterator)
-        pref_iter = g4dpo.global_iterator(args.pref_train, mesh, pref_rows, own_steps, padding=1)
-        hooks_data.train_data_iterator = pref_iter
-        hooks_data.train_data_loader.data_iterator = pref_iter
         post_train = trainer._post_process_train_step  # noqa: SLF001 - wrapped, not replaced
 
         def keep_dpo_step(aux):
@@ -987,6 +987,38 @@ def main(argv=None):
     resumed = check_resume(trainer, args.resume_step, args.resume_adapter) if args.resume_step else None
     if resumed:
         print(f"RESUMED {json.dumps(resumed)}", flush=True)
+    refs, ref_record, ref_s = {}, {}, 0.0
+    if dpo_opts:
+        # --dpo, amendment G4-6.4a: the model is now the one of the first eval and step (every LoRA B zero, checked):
+        # the reference's sums of the batches the run trains on and of every preference eval file, forward only, in the
+        # training's mesh and rules; then the training data are the packed file's batches with their reference (one
+        # all-zero batch after them for Tunix's look-ahead)
+        from flax.core.spmd import logical_axis_rules
+
+        t_ref = time.time()
+        ref_files = [("train", args.pref_train, own_steps)] + [(k, v, eval_plan[k]["batches"])
+                                                                for k, v in prefs_wanted.items()]
+        with jax.set_mesh(mesh), logical_axis_rules(config.logical_axis_rules):
+            for name, path, n in ref_files:
+                refs[name], secs = g4dpo.precompute_reference(trainer.model, config, path, mesh, pref_rows, n,
+                                                              dpo_opts["max_segments"])
+                ref_record[name] = {"file": path, "batches": n, "seconds": round(sum(secs), 1),
+                                    "batch_s_median": round(statistics.median(secs), 3),
+                                    "ref_sum": float(np.sum(refs[name], dtype=np.float64))}
+                print(f"REF {json.dumps(ref_record[name] | {'set': name})}", flush=True)
+        ref_s = time.time() - t_ref
+        if main_process:
+            import pyarrow as pa
+            import pyarrow.parquet as pq
+
+            rows_out = [{"set": name, **r} for name, path, n in ref_files
+                        for r in g4dpo.reference_rows(path, refs[name], n, pref_rows)]
+            pq.write_table(pa.Table.from_pylist(rows_out), out / "dpo_ref.parquet")
+        hooks_data = trainer.data_hooks
+        close(hooks_data.train_data_iterator)
+        pref_iter = g4dpo.global_iterator(args.pref_train, mesh, pref_rows, own_steps, padding=1, ref=refs["train"])
+        hooks_data.train_data_iterator = pref_iter
+        hooks_data.train_data_loader.data_iterator = pref_iter
     if temps:
         from maxtext.utils import max_utils
 
@@ -1041,7 +1073,7 @@ def main(argv=None):
             def eval_recorded(*args_, **kwargs_):
                 loss, aux = eval_step(*args_, **kwargs_)
                 feed["parts"].append((aux["xent_sum"], aux["total_weights"]))
-                if dpo_opts:
+                if dpo_opts and "pref_pairs" in aux:      # a preference file's batch (an SFT file's has no pairs)
                     feed["prefs"].append({k: aux[f"pref_{k}"] for k in g4dpo.SUMS})
                 if temps:
                     feed["temps"].append(aux["xent_temps"])
@@ -1060,7 +1092,7 @@ def main(argv=None):
                 plan = eval_plan[name]
                 pref = plan.get("kind") == "pref"
                 if pref:
-                    feed["iter"] = g4dpo.global_iterator(plan["path"], mesh, pref_rows, plan["batches"])
+                    feed["iter"] = g4dpo.global_iterator(plan["path"], mesh, pref_rows, plan["batches"], ref=refs[name])
                 else:
                     feed["iter"] = eval_iterator(plan["config"], mesh)
                 feed["left"], feed["parts"], feed["temps"], feed["prefs"] = plan["batches"], [], [], []
@@ -1163,7 +1195,7 @@ def main(argv=None):
         "epoch": count, "steps": steps, "steps_done": len(records), "own_steps": own_steps,
         "resume": resumed, "schedule": {"warmup_steps": args.warmup_steps, "decay_fraction": args.decay_fraction},
         "times": {"python_to_setup_s": round(t_setup - started, 1), "setup_s": round(setup_s, 1),
-                  "train_s": round(train_s, 1),
+                  "train_s": round(train_s, 1), "ref_s": round(ref_s, 1),
                   "first_step_s": round(first_compile, 1) if first_compile is not None else None,
                   "compile_s_est": round(first_compile - statistics.median(later), 1) if later else None},
         "throughput": throughput(records, tokens, loss_tokens),
@@ -1179,7 +1211,7 @@ def main(argv=None):
         "combine": combined.get("result"),
         "temperatures": temps,
         # --dpo: the spec, the packed training file and every step's preference measures (its batch's pairs)
-        "dpo": ({"spec": dpo_opts, "train": count, "pref_eval": prefs_wanted,
+        "dpo": ({"spec": dpo_opts, "train": count, "pref_eval": prefs_wanted, "ref": ref_record,
                  "steps": [g4dpo.step_record(k, {n: scalar(v) for n, v in s.items()})
                            for k, s in enumerate(dpo_steps, args.resume_step + 1)]} if dpo_opts else None),
     }

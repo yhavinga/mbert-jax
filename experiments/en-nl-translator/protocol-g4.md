@@ -995,6 +995,48 @@ na de laatste op `books`, `btval`, `own`, `btlong`, `novels`, `pref_books`, `pre
 alleen de controle van de piek (boven 29,5 GiB), dan de smoke-test bij 2.048 (`g4arm_G4-6_s8_2048`); slaagt die, dan
 de training bij 2.048 (`train-2048.parquet`, ~1.500 stappen [schatting]) zonder `btlong`; anders stoppen.
 
+*G4-6.4a Aanvulling 19 nov 2026 ~22:55 (hoofdsessie; Yeb liet de beslissingen over de DPO-armen aan de hoofdsessie,
+19 nov ~20:15): de referentie vooraf berekend.* De smoke-test van keten `g4f1119b` paste niet in het HBM van een
+v4-chip: de trainstap vroeg bij 4.096 38,86G (beschikbaar 30,75G), bij 2.048 34,20G; de keten stopte volgens G4-6.4
+[gemeten: `~/logs/g4arm_G4-6_s8-fail1.log`, `~/logs/g4arm_G4-6_s8_2048-fail1.log` op de workers van mbert-corpus].
+Besluit van de hoofdsessie: het geheugen terugdringen zonder de methode te veranderen. **Wat verandert**: de referentie
+wordt niet meer in elke stap berekend maar één keer vóór de eerste stap (`g4dpo.precompute_reference`, zoals TRL's
+`precompute_ref_log_probs`): één forward-pass zonder gradiënt van het model vóór zijn eerste stap, waarin elke LoRA-B
+nul is (de run controleert dat en stopt anders), over de batches die de run traint en over elke voorkeursset; per rij
+de som van de log-kansen per segment (per paar chosen en rejected), meegegeven met elke batch (`ref_seg`), en per paar
+in `dpo_ref.parquet` van de run. De trainstap doet alleen de forward- en backward-pass van het beleid; de eval-stap van
+een voorkeursset alleen die van het beleid; een SFT-evaluatieset alleen zijn token-gewogen verlies (ongewijzigd).
+**Waarom de methode gelijk blijft**: (1) de referentie is hetzelfde model: met B = 0 is de LoRA-term x·A·B exact nul,
+dus het model vóór de eerste stap is het model met de LoRA op nul; (2) de referentie hing in de stap niet van de
+LoRA-parameters af en kreeg geen gradiënt (`stop_gradient`), dus h = (log π − log π_ref)(chosen) − (log π −
+log π_ref)(rejected), het verlies (sigmoid-DPO β 0,1 + 1,0 × het NLL van chosen) en elke gradiënt zijn wiskundig
+dezelfde [getest op de CPU met een klein model: verlies, sommen en gradiënten gelijk aan die met de referentie in de
+stap, op stap 0 en na 6 stappen; `tests/test_en_nl_g4dpo_jax.py`]; (3) data, packing, LR en schema, 16 rijen per stap,
+één epoch, rijen van 4.096 met de terugval van G4-6.4, `num_vocab_tiling=8` en de remat-instelling van de SFT-stack
+blijven. De log-kansen per token werden al in 8 stukken uit de hidden states berekend zonder de volle logits
+(`g4dpo.model_logp`), en elke laag wordt al geremat zoals in de SFT-stack (`remat_policy` `full`); daaraan verandert
+niets. **Gemeten** [gemeten 19 nov 22:10–22:55 op mbert-corpus, eigen probes over `sft_lora.py`'s opzet van de
+smoke-test (`smoke-4096.parquet`, 16 rijen van 4.096): XLA's geheugenanalyse van de gecompileerde trainstap
+(`memory_analysis()`, piek = argumenten + tijdelijk + uitvoer − alias); logs `~/logs/g46probe1.log` en
+`~/logs/g46probe2.log` op de workers]: MaxText's eigen SFT-stap (het verlies van G4-4) piek 27,54 GiB (tijdelijk 11,98);
+de DPO-stap met de referentie in de stap: niet te compileren, 38,86G tijdelijk tegen 30,75G (dezelfde fout als de
+smoke-test); dezelfde stap zonder de referentiepass piek 25,18 GiB (tijdelijk 9,51); de trainstap van deze code piek
+25,18 GiB (tijdelijk 9,51), gelijk aan de stap zonder referentiepass. De referentiepass: 3,96 s per batch van 16
+rijen (mediaan; de eerste batch met de compilatie), voor de volle run ~720 batches ≈ 48 min [schatting]; de piek na de
+referentiepass en de eval op stap 0 van `pref_btval` 18,19 GiB per chip. Op stap 0 gaf de eval-stap op `pref_btval` (12 batches, 799 paren) met de vooraf
+berekende referentie |verlies − log 2| = 6e-9, marge 0 en |NLL − NLL referentie| = 0 voor chosen en rejected (de grens
+van G4-6.6 is 1e-4). Ter vergelijking: dezelfde log-kansen met elke LoRA-parameter op nul (`without_lora`) in een eigen
+programma wijken per segment tot 4,2 nats af van de vooraf berekende (2 batches; gemiddeld per token ~4e-5 [gemeten: de
+smoke-test van `g4f1119b`, NLL 1,84547 tegen 1,84551 nu]): bf16-ruis tussen verschillend gefuseerde programma's op de
+TPU, die de referentie in de stap ook had (op stap 0 van `g4f1119b`: |verlies − log 2| tot 1,3e-3 en |marge| tot 0,009
+op de voorkeurssets, boven de grens 1e-4 van G4-6.6) [gevolgtrekking: bij de oude code was ook die controle van de
+smoke-test gefaald]. In de trainstap (een ander programma dan de referentiepass) wijkt het beleid op stap 1 op dezelfde
+manier af van de vooraf berekende referentie als het vroeger van de referentie in de stap afweek [gevolgtrekking]. De
+CPU-proef draait opnieuw met deze code (de marker van `g4f1119b` weggezet), met een
+extra controle dat de referentie vooraf berekend is; de marker van de geheugenterugval van `g4f1119b` is weggezet, zodat
+de smoke-test eerst weer bij 4.096 draait. De schatting van de smoke-test telt de referentiepass mee (elke trainbatch ×
+de mediane tijd per batch van de smoke-test, plus de voorkeurssets één keer).
+
 *G4-6.5 Evaluatie en beslisregel*: als G4-4.7 met G4-6 als arm en G4-0 als uitgangspunt: (a1) gemiddelde
 MetricX-24-QE ≤ die van de menselijke referentie op WMT24++ (960), FLORES en NTREX; (b) "origineel"(G4-6) −
 "origineel"(G4-0) ≥ 0,10 op WMT24++ (960) + FLAN (1.000). De classifier in één run over G4-6, G4-0, G4-4 en G4-5c2 (de

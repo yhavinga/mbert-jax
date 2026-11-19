@@ -1,7 +1,8 @@
 """Arm G4-6 (draft amendment G4-6): the JAX parts of g4dpo.py on the CPU with a toy NNX model in MaxText's shape (a
 decoder that sows its hidden states, logits_from_hidden_states_for_vocab_tiling, qwix-style LoRA parameters) and MaxText's
 two helpers stubbed: the per-token log-probabilities in pieces, the reference as the model with its LoRA at zero, the loss
-in MaxTextPeftTrainer's train step (jax.value_and_grad over the LoRA parameters only). Needs JAX and Flax NNX (skipped
+in MaxTextPeftTrainer's train step (jax.value_and_grad over the LoRA parameters only), and the reference computed before
+training (amendment G4-6.4a) against the reference in the same step that it replaces. Needs JAX and Flax NNX (skipped
 otherwise; run with the SFT venv or a JAX 0.11 / Flax 0.12 CPU venv)."""
 
 import math
@@ -166,6 +167,8 @@ def test_the_loss_at_step_0_is_log_2_plus_the_nll_and_training_moves_only_the_lo
     model = Toy(nnx.Rngs(2))
     data = toy_batch(2)
     opts = g4dpo.spec(beta=0.5, nll_alpha=0.1)
+    # amendment G4-6.4a: the batch carries the reference, computed once before the first step
+    data[g4dpo.REF_KEY] = g4dpo.reference_sums(model, CONFIG, data, opts["max_segments"])
     loss_fn = g4dpo.make_loss(CONFIG, opts, True)
     graphdef, lora, rest = nnx.split(model, nnx.LoRAParam, ...)
     step = peft_train_step(loss_fn, graphdef)
@@ -247,3 +250,116 @@ def test_bake_adapter_merges_into_the_base_kernels_and_the_reference_is_the_merg
                                                      "decoder/gone/kernel_lora_b": adapter["decoder/mix/kernel_lora_b"]})
     with pytest.raises(SystemExit, match="without exactly one base kernel"):
         sft_lora.bake_adapter(Toy(nnx.Rngs(0)), mesh, base)
+
+
+def in_step_loss(config, opts):
+    """The reference in the same step, as make_loss computed it before amendment G4-6.4a (without_lora under
+    stop_gradient, then the policy): the loss the precomputed reference replaces"""
+    micro = config.micro_batch_size_to_train_on
+
+    def loss_func(model, **batch):
+        data = {k: batch[k][:micro] for k in g4dpo.KEYS}
+        ref = jax.lax.stop_gradient(g4dpo.model_logp(g4dpo.without_lora(model), config, data, False))
+        logp = g4dpo.model_logp(model, config, data, False)
+        loss, sums = g4dpo.dpo_terms(logp, ref, data["targets_segmentation"], opts, jnp)
+        return loss, {"xent_sum": -jnp.sum(logp), **{f"pref_{k}": v for k, v in sums.items()}}
+
+    return loss_func
+
+
+def test_the_precomputed_reference_gives_the_in_step_references_loss_and_gradients(maxtext_stub):
+    # amendment G4-6.4a: the reference's sums computed once before the first step (every LoRA B zero) give the same loss,
+    # sums and gradients as the reference computed in each step, at step 0 and after the LoRA has moved
+    model = Toy(nnx.Rngs(4))
+    data = toy_batch(4)
+    opts = g4dpo.spec()
+    assert g4dpo.lora_b_zero(model)
+    ref_seg = g4dpo.reference_sums(model, CONFIG, data, opts["max_segments"])
+    base = g4dpo.segment_sums(g4dpo.model_logp(g4dpo.without_lora(model), CONFIG, data, False),
+                              data["targets_segmentation"], opts["max_segments"], jnp)
+    np.testing.assert_allclose(ref_seg, base, rtol=1e-6, atol=1e-6)
+    graphdef, lora, rest = nnx.split(model, nnx.LoRAParam, ...)
+    pre = peft_train_step(g4dpo.make_loss(CONFIG, opts, True), graphdef)
+    old = peft_train_step(in_step_loss(CONFIG, opts), graphdef)
+    with_ref = {**data, g4dpo.REF_KEY: ref_seg}
+    for step in range(6):
+        loss_a, aux_a, new_lora, new_rest, grads_a = pre(lora, rest, with_ref, 0.5)
+        loss_b, aux_b, _, _, grads_b = old(lora, rest, data, 0.5)
+        assert float(loss_a) == pytest.approx(float(loss_b), rel=1e-5, abs=1e-6), step
+        for k in g4dpo.SUMS:
+            assert float(aux_a[f"pref_{k}"]) == pytest.approx(float(aux_b[f"pref_{k}"]), rel=1e-5, abs=1e-5), (step, k)
+        for x, y in zip(jax.tree_util.tree_leaves(grads_a), jax.tree_util.tree_leaves(grads_b)):
+            np.testing.assert_allclose(x, y, rtol=1e-4, atol=1e-6)
+        lora, rest = new_lora, new_rest
+    moved = nnx.merge(graphdef, lora, rest)
+    assert not g4dpo.lora_b_zero(moved) and float(aux_a["pref_margin_sum"]) != 0.0
+
+
+def test_make_loss_needs_the_reference_in_training_and_gives_an_sft_files_loss_without_it(maxtext_stub):
+    model = Toy(nnx.Rngs(5))
+    data = toy_batch(5)
+    with pytest.raises(ValueError, match="without ref_seg"):
+        g4dpo.make_loss(CONFIG, g4dpo.spec(), True)(model, **data)
+    loss, aux = g4dpo.make_loss(CONFIG, g4dpo.spec(), False)(model, **data)
+    lp = full_logp(Toy(nnx.Rngs(5)), data)
+    assert set(aux) == {"xent_sum", "total_weights"}
+    assert float(aux["xent_sum"]) == pytest.approx(-float(np.sum(lp)), rel=1e-5)
+    assert float(loss) == pytest.approx(-float(np.sum(lp)) / int((np.asarray(data["targets_segmentation"]) != 0).sum()),
+                                        rel=1e-5)
+
+
+def test_precompute_reference_places_each_row_by_its_index_and_refuses_a_moved_lora(maxtext_stub, monkeypatch,
+                                                                                    tmp_path):
+    # the reference pass over a packed file: rows come back in the mesh's order (here reversed within each batch) and
+    # are put back in the file's order by their ROW_KEY; the sums are reference_sums of each batch
+    rng = np.random.default_rng(6)
+    pairs = []
+    for k in range(20):
+        prompt = [2] + rng.integers(5, V, size=int(rng.integers(3, 7))).tolist()
+        pairs.append({"id": f"p{k}", "prompt": prompt, "chosen": rng.integers(5, V, size=int(rng.integers(2, 5))).tolist(),
+                      "rejected": rng.integers(5, V, size=int(rng.integers(2, 5))).tolist()})
+    packed = g4dpo.pack_rows(pairs, 32, 4)
+    g4dpo.write_rows(packed, tmp_path / "rows.parquet")
+    arrays, batch = g4dpo.read_packed(tmp_path / "rows.parquet")
+    batches = g4dpo.batch_count(batch, 4)
+    assert batches >= 2
+
+    def fake_iterator(path, mesh, rows, n, padding=0, ref=None, row_ids=False):
+        for b in g4dpo.local_batches(arrays, 0, 1, rows, n, padding, ref, row_ids):
+            yield {k: jnp.asarray(v[::-1]) for k, v in b.items()}
+
+    monkeypatch.setattr(g4dpo, "global_iterator", fake_iterator)
+    model = Toy(nnx.Rngs(6))
+    ref, seconds = g4dpo.precompute_reference(model, CONFIG, tmp_path / "rows.parquet", None, 4, batches, 64)
+    assert ref.shape == (batches * 4, 64) and len(seconds) == batches
+    for b in range(batches):
+        data = {k: jnp.asarray(arrays[k][4 * b:4 * b + 4]) for k in g4dpo.KEYS}
+        np.testing.assert_allclose(ref[4 * b:4 * b + 4], g4dpo.reference_sums(model, CONFIG, data, 64), rtol=1e-6,
+                                   atol=1e-6)
+    model.decoder.out.kernel_lora_b[...] = jnp.full((R, D), 0.1)
+    assert not g4dpo.lora_b_zero(model)
+    with pytest.raises(SystemExit, match="not zero before the reference pass"):
+        g4dpo.precompute_reference(model, CONFIG, tmp_path / "rows.parquet", None, 4, batches, 64)
+
+
+def test_the_precomputed_reference_after_the_bake_is_the_merged_model(maxtext_stub, tmp_path):
+    # amendments G4-6b.2 and G4-6b.5a: the reference pass runs after --base-adapter's merge, so its sums are the merged
+    # model's (every LoRA B still zero), not the base model's
+    import sft_lora
+
+    model = Toy(nnx.Rngs(7))
+    data = toy_batch(7)
+    base_sums = g4dpo.reference_sums(Toy(nnx.Rngs(7)), CONFIG, data, 64)
+    rng = np.random.default_rng(8)
+    adapter = {f"decoder/{m}/kernel_lora_{x}": rng.normal(size=(D, R) if x == "a" else (R, D)).astype(np.float32)
+               for m in ("mix", "out") for x in ("a", "b")}
+    np.savez(tmp_path / "adapter.npz", **adapter)
+    (tmp_path / "adapter.json").write_text('{"rank": 2, "alpha": 1.0, "scale": 0.5}')
+    mesh = jax.sharding.Mesh(np.array(jax.devices()[:1]), ("x",))
+    sft_lora.bake_adapter(model, mesh, sft_lora.base_adapter_arg(f"G4-4={tmp_path / 'adapter.npz'}"))
+    assert g4dpo.lora_b_zero(model)
+    ref = g4dpo.reference_sums(model, CONFIG, data, 64)
+    merged = g4dpo.segment_sums(g4dpo.model_logp(g4dpo.without_lora(model), CONFIG, data, False),
+                                data["targets_segmentation"], 64, jnp)
+    np.testing.assert_allclose(ref, merged, rtol=1e-6, atol=1e-6)
+    assert np.abs(np.asarray(ref) - np.asarray(base_sums)).max() > 1e-3

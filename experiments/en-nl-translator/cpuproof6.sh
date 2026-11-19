@@ -7,7 +7,8 @@
 # and checks: (a) ran 8 steps on the packed file's first 8 batches (tokens per step = the file's); at step 0 the
 # policy is the reference (pref loss log 2, margin 0, each NLL the reference's); (a)'s step-0 losses of books and own =
 # (b)'s (the preference loss's per-token log-probabilities = MaxText's cross entropy); at step 8 the reference is still
-# the base model (its NLL the same as at step 0) while the policy moved.
+# the base model (its NLL the same as at step 0) while the policy moved; (a)'s reference was computed before the first
+# step over the 8 trained batches and pref_btval (amendment G4-6.4a).
 # With BAKE=1 (amendment G4-6b.6) also, with (a)'s adapter as the adapter to merge:
 #   (c) --dpo with --base-adapter (the adapter merged into the base kernels), 4 steps, evals at 0 and 4
 #   (d) plain SFT with --init-adapter (the same adapter as LoRA in the forward pass), its evals at step 0
@@ -112,6 +113,9 @@ need(abs(p8["ref_chosen_nll"] - p0["ref_chosen_nll"]) <= 1e-5 and abs(p8["ref_re
 need(abs(p8["margin"]) > 1e-4 or abs(p8["chosen_nll"] - p0["chosen_nll"]) > 1e-4, f"a: the policy moved by step 8 {p8}")
 need(all(sorted(e["step"] for e in a["eval"] if e["set"] == n) == [0, 4, 8] for n in ("books", "own", "pref_btval")),
      "a: evals at 0, 4, 8")
+ref = a["dpo"].get("ref") or {}
+need(set(ref) == {"train", "pref_btval"} and ref["train"]["batches"] == 8 and ref["pref_btval"]["batches"] == p0["batches"],
+     f"a: the reference computed before the first step, the trained batches and pref_btval (amendment G4-6.4a) {ref}")
 if "$BAKE" == "1":
     c, d = (json.load(open(f"$P/{r}/summary.json")) for r in "cd")
     print("C_EVAL", json.dumps(c["eval"]))
@@ -130,6 +134,8 @@ if "$BAKE" == "1":
     need(abs(q0["ref_chosen_nll"] - p0["ref_chosen_nll"]) > 1e-4, f"c: the reference is the merged model, not (a)'s ({q0['ref_chosen_nll']} vs {p0['ref_chosen_nll']})")
     need(abs(q4["ref_chosen_nll"] - q0["ref_chosen_nll"]) <= 1e-5 and abs(q4["ref_rejected_nll"] - q0["ref_rejected_nll"]) <= 1e-5,
          f"c: the reference is still the merged model at step 4 ({q0['ref_chosen_nll']} {q4['ref_chosen_nll']})")
+    need(set(c["dpo"].get("ref") or {}) == {"train", "pref_btval"} and c["dpo"]["ref"]["train"]["batches"] == 4,
+         f"c: the reference (the merged model) computed before the first step (amendment G4-6.4a) {c['dpo'].get('ref')}")
 print("CPU_PROOF6_OK" if not bad else f"CPU_PROOF6_FAILED {bad}", flush=True)
 raise SystemExit(1 if bad else 0)
 EOF

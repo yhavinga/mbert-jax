@@ -1137,6 +1137,18 @@ length-normalisatie, LR 1e-5 WSD, één epoch, rijen van 4.096, de terugval naar
 `--base-adapter` van G4-6b.2. Evaluatie op stap 0, elke 200 stappen en na de laatste op `books`, `btval`, `own`, `btlong`,
 `novels`, `own4`, `pref_books`, `pref_btval`, `pref_novels`.
 
+*G4-6b.5a Aanvulling 19 nov 2026 ~23:00 (hoofdsessie, zoals aanvulling G4-6.4a): de referentie vooraf berekend.*
+G4-6b heeft dezelfde trainstap als G4-6 en dus hetzelfde geheugenprobleem (G4-6's smoke-test: 38,86G bij 4.096,
+34,20G bij 2.048, tegen 30,75G per v4-chip). Aanvulling G4-6.4a geldt ook voor G4-6b (merge van `en-nl-g4arm6` @
+`d1c9cfe`): de referentie wordt één keer vóór de eerste stap berekend, met een forward-pass zonder gradiënt van het model
+ná het
+samenvoegen van G4-4's adapter in de basiskernels (G4-6b.2) en vóór zijn eerste stap, waarin elke LoRA-B nul is (de run
+controleert dat); de referentie blijft dus het samengevoegde model G4-4 van G4-6b.2. Per rij de sommen van de
+log-kansen per segment, meegegeven met de batches en per paar in `dpo_ref.parquet`; de trainstap doet alleen het
+beleid. Verlies, data, LR, rijen, de terugval en de controles van G4-6b.6 blijven; de CPU-proef controleert voor (a) en
+(c) ook dat de referentie vooraf berekend is. Waarom dit de methode niet verandert en wat het geheugen oplevert: G4-6.4a.
+De keten `g4g1119a` stond nog in zijn wachtlus op dmbert v2 (niets op mbert-mix gedaan) en is herstart op deze code.
+
 *G4-6b.6 CPU-proef en smoke-test.* De CPU-proef van G4-6.6 met de grenzen van aanvulling G4-6.6a (op stap 0
 |verlies − log 2| en |marge| ≤ 1e-4; code `cab4c65`, in deze branch gemerged) op de paren van G4-6b, met daarbij (`BAKE=1`): (c) `--dpo`
 met de adapter van (a) als `--base-adapter`, 4 stappen; (d) gewone SFT met dezelfde adapter als `--init-adapter`, de eval

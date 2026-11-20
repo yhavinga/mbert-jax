@@ -227,4 +227,46 @@ verrassing is; ze verandert de regel niet.
 
 ## Amendementen
 
-(geen)
+1. **Precisie: drie float32-stukken en daarna float32 tot het eind (16 nov 2026). Achteraf vastgelegd, na de run, op
+   20 nov 2026** (een subagent in opdracht van de hoofdsessie). De ingrepen deden de hoofdsessie en een subagent op
+   16 nov; ze staan met tijd in `mbert-ops/dx/final-v2/events.txt` en in de ketenlogs
+   `mbert-ops/logs/final_v2_run.log` en `final_v2_run.v2c1116{a,b,c,d}.log`. Het committen is bewust uitgesteld tot na
+   de run: een commit verplaatst de HEAD van de worktree, en een herstart van de keten doet dan de setup opnieuw terwijl
+   de trainer loopt (`mbert-ops/HANDOVER-dmbert-v2.md` §0, open punt 1). De regel "Geldigheid van de run" hierboven
+   vraagt een amendement vóór de evaluatie; dit amendement komt erna (evaluatie 20 nov 08:03–08:55 CET). De evaluatie
+   draaide met ongewijzigde code, toetsen, drempels en beslisregel (keten op `43ec0ba`).
+   - **Waarom geen regel 2.** Geen van de drie bursts gaf een zelfstop: in bf16 werd tot ~70% van de stappen
+     overgeslagen (`apply_if_finite`), maar hoogstens 5 op rij, dus de stop van de trainer na 50 op rij kwam niet, en
+     daarmee ook niet het automatische float32-stuk.
+   - **Burst 1, vanaf ~252.700** (`Skipped` 36 @252.650, 1.765 @255.100). Keten `v2c1115a` om 12:46 met de hand gestopt
+     (vóór de NaN-regel), trainers bij 255.200 gestopt (`kill -9` van hun eigen pids). Vanaf checkpoint 250.000 in
+     float32 tot 270.000 (`COMPUTE_DTYPE=float32 STOP_AT=270000`, gestart 12:50; 270.000 in plaats van de 260.000 van
+     regel 2, omdat de burst al ≥ 2.500 stappen zonder afname duurde), klaar 14:44 met `EXIT 0` op alle workers, daarna
+     vanzelf weer bf16 (keten `v2c1116a`).
+   - **Burst 2, ~281.800–286.200** (`Skipped` 34 @280.100, 840 @286.200). De NaN-regel (regel 3) stopte de trainers om
+     15:59 en zette keten `v2c1116a` op `FAILED`. De hoofdsessie startte om 16:05 vanaf checkpoint 280.000 een
+     float32-stuk tot 320.000 (keten `v2c1116b`), klaar 19:38 met `EXIT 0`, daarna vanzelf weer bf16.
+   - **Burst 3, vanaf ~344.300** (`Skipped` 61 @344.260, 643 @345.030). Keten `v2c1116b` om 21:25 met de hand gestopt;
+     om 21:26 vanaf checkpoint 340.000 een float32-stuk met stopstap 380.000 (keten `v2c1116c`). **Yeb, 16 nov
+     ~23:00: de rest van de run in float32.** Het stuk stond toen op stap 356.400; keten `v2c1116c` is om 23:00 met de
+     hand gestopt en de trainer is om 23:01 herstart **vanaf checkpoint 350.000** (niet 340.000), in float32 en zonder
+     `STOP_AT`, tot 1.306.000 (keten `v2c1116d`). De stappen 350.001–356.400 van het stuk zijn daarmee vervangen door
+     dezelfde stappen op dezelfde data, ook in float32. [gemeten, coördinatorlog `logs/w0.log` van de run: de starts
+     met `Compute dtype: float32` hervatten van `micro_step: 340000` en `micro_step: 350000`]
+   - **Uitkomst** [gemeten, `card_facts.py` (mbert-jax `hf-release-v2` `6f9bede`) op het coördinatorlog en de
+     datastand van stap 1.306.000, 20 nov]: het eindcheckpoint is in bf16 gerekend voor de stappen 1–250.000,
+     270.001–280.000 en 320.001–340.000 (280.000 stappen) en in float32 voor 250.001–270.000, 280.001–320.000 en
+     340.001–1.306.000 (1.026.000 stappen); parameters, optimizerstate en logits waren altijd float32. In totaal 34
+     overgeslagen stappen (27 NONFINITE-regels, alle in bf16, tussen stap 196.680 en 275.570); de 453 NONFINITE-regels
+     van de bursts vallen in stappen die een latere hervatting verving. **`Skipped` bleef 34 vanaf de float32-hervatting
+     bij 340.000 tot het eind**: geen enkele NONFINITE-regel, en alle 19.448 gelogde stappen van beide float32-starts na
+     340.000 hebben `Skipped: 34`. Kosten: ~0,30 s per stap in float32 tegen 0,22 s in bf16 (+38%); training klaar
+     20 nov 08:03.
+   - **Niet veranderd.** Schema, data en volgorde (een hervatting met de datastand van het checkpoint gaat exact verder),
+     trainer- en startcode (`43ec0ba`; `COMPUTE_DTYPE` en `STOP_AT` waren al opties van `start_v2.sh`), evaluatie,
+     toetsen, drempels en beslisregel.
+   - **Les over de NaN-regel.** Regel 3 neemt aan dat een gelogde `Loss: nan` een uitgevoerde update is. Met
+     `optax.apply_if_finite` is een gelogde NaN juist een overgeslagen stap met gave parameters; in burst 2 zette de
+     bewaking de keten daardoor op `FAILED` in plaats van een float32-stuk te starten. Een volgende bewaking moet een
+     gelogde NaN koppelen aan `Skipped` (alleen stoppen als de loss NaN is terwijl `Skipped` niet stijgt) en een burst
+     (bijvoorbeeld > 50% overgeslagen over ~1.000 stappen) behandelen als zelfstop.

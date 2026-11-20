@@ -135,7 +135,7 @@ filtered the same way (22,591 documents, none of them also in the training data)
 
 The filters below, with their tests, are in
 [github.com/yhavinga/fineweb2-nl-optout](https://github.com/yhavinga/fineweb2-nl-optout), commit
-[`ecb4b68`](https://github.com/yhavinga/fineweb2-nl-optout/tree/ecb4b685581ba702762d527cae01f97730d8b9a3).
+[`c4ca0c5`](https://github.com/yhavinga/fineweb2-nl-optout/tree/c4ca0c5fccd6bfcc79f59da7851d4d10f28d7d3c).
 
 ### Opt-outs
 
@@ -217,24 +217,26 @@ Estimated training compute: about 2.3·10^20 FLOP (6 × parameters × tokens), w
 All models below went through the same fine-tuning and evaluation code with the same data splits, seeds and
 hyperparameters; nothing was tuned per model. dmbert-230m-culturax is the related model above.
 [RobBERT-2023-base](https://huggingface.co/DTAI-KULeuven/robbert-2023-dutch-base) (124.5M parameters, revision
-`1164b2d`) was run as a JAX re-implementation whose masked-LM logits match its PyTorch code. Each fine-tuned number
+`1164b2d`) and [RobBERT-2026](https://huggingface.co/pdelobelle/robbert-2026) (a NeoBERT, 275M parameters, revision
+`a406b1a`) were run as JAX re-implementations whose masked-LM logits match their PyTorch code. Each fine-tuned number
 is the mean over three seeds (42, 43, 44) with the range (max − min) in brackets, in percentage points, on the test
 split after the last epoch (no early stopping, no checkpoint selection).
 
-| Task | Metric | dmbert-230m-culturax | dmbert-230m-fineweb2-optout (this model) | RobBERT-2023-base |
-|---|---|---:|---:|---:|
-| DBRD, 1,024 tokens | accuracy | 96.12 [0.28] | 95.86 [1.14] | — |
-| DBRD, 512 tokens | accuracy | 96.05 [0.52] | 96.02 [0.90] | 94.93 [0.80] |
-| SICK-NL | accuracy | **87.23** [0.76] | 84.19 [1.64] | 83.95 [0.72] |
-| SQuAD-NL v1.1 | F1 | 84.74 [0.60] | 82.79 [1.33] | 84.43 [0.64] |
-| SQuAD-NL v1.1 | exact match | 72.70 [1.18] | 69.85 [0.42] | **73.94** [0.59] |
-| CoNLL-2002 | entity F1 | **91.86** [0.49] | 90.12 [0.29] | 90.47 [0.71] |
-| POS, UD Dutch LassySmall | UPOS accuracy | 97.90 [0.26] | 97.58 [0.08] | 97.91 [0.09] |
-| POS, UD Dutch Alpino | UPOS accuracy | 97.71 [0.52] | 97.38 [0.16] | 97.50 [0.40] |
-| BLiMP-NL (zero-shot) | accuracy | 94.94 | 94.76 | 83.74 |
+| Task | Metric | dmbert-230m-culturax | dmbert-230m-fineweb2-optout (this model) | RobBERT-2023-base | RobBERT-2026 |
+|---|---|---:|---:|---:|---:|
+| DBRD, 1,024 tokens | accuracy | 96.12 [0.28] | 95.86 [1.14] | — | — |
+| DBRD, 512 tokens | accuracy | 96.05 [0.52] | 96.02 [0.90] | 94.93 [0.80] | 93.15 [3.03] |
+| SICK-NL | accuracy | **87.23** [0.76] | 84.19 [1.64] | 83.95 [0.72] | 78.32 [0.95] |
+| SQuAD-NL v1.1 | F1 | 84.74 [0.60] | 82.79 [1.33] | 84.43 [0.64] | 76.99 [0.91] |
+| SQuAD-NL v1.1 | exact match | 72.70 [1.18] | 69.85 [0.42] | **73.94** [0.59] | 64.92 [2.03] |
+| CoNLL-2002 | entity F1 | **91.86** [0.49] | 90.12 [0.29] | 90.47 [0.71] | 85.85 [0.86] |
+| POS, UD Dutch LassySmall | UPOS accuracy | 97.90 [0.26] | 97.58 [0.08] | 97.91 [0.09] | 97.62 [0.24] |
+| POS, UD Dutch Alpino | UPOS accuracy | 97.71 [0.52] | 97.38 [0.16] | 97.50 [0.40] | 97.31 [0.43] |
+| BLiMP-NL (zero-shot) | accuracy | 94.94 | 94.76 | 83.74 | 82.23 |
 
 Bold: higher than each of the other models in its row by more than the larger seed range of the pair (BLiMP-NL: by
-more than 0.5 points). DBRD at 1,024 tokens only for the dmbert models: RobBERT-2023 accepts at most 512 tokens.
+more than 0.5 points). DBRD at 1,024 tokens only for the dmbert models: RobBERT-2023 accepts at most 512 tokens, and RobBERT-2026 was
+pretrained on 512.
 
 **Tasks and data.**
 
@@ -269,7 +271,8 @@ more than 0.5 points). DBRD at 1,024 tokens only for the dmbert models: RobBERT-
 | Precision | float32 | float32 |
 | Head (dmbert models) | the pretrained head transformation (dense, GELU, LayerNorm) on `<s>`, then a new linear classifier | the pretrained head transformation per token, then a new linear layer (start and end for SQuAD-NL) |
 
-RobBERT-2023 gets the task heads of its own Hugging Face classes. These hyperparameters were not tuned for any model,
+The RobBERT models get the task heads of their own Hugging Face classes (RobBERT-2026's classes have no token head; it
+gets the same form as RobBERT-2023). These hyperparameters were not tuned for any model,
 and they are not the settings the RobBERT authors used for their own published results, so the RobBERT numbers here
 differ from theirs.
 

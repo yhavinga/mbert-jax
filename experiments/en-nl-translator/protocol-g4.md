@@ -1200,3 +1200,10 @@ mbert-mix en draait in deze volgorde: setup (venvs, tokenizer, MetricX, COMET, d
 chosen en rejected, de smoke-test (met de terugval), de training, de adapter, vertalen en scoren (evaluatie, held-out,
 lange rijen), texts, classify, het verslag, het blinde pakket alleen als (a1) en (b) gelden. Elke run wordt eerst op
 alle vier workers klaargezet en dan op alle vier gestart (als G4-6). Faalt een stap, dan stopt de keten (`FAILED`).
+
+*G4-6b.4a Aanvulling 20 nov 2026 ~06:45 (hoofdsessie; Yeb liet de DPO-armen aan de hoofdsessie; G4-6b.4: een tekort
+is aan de hoofdsessie, de grenzen blijven).* `build6` (keten `g4g1120a`, 06:33) haalde twee strata niet: `bt:dpc` 3.019
+van 3.200 (−181) en `bt:rechtspraak` 3.078 van 3.200 (−122), omdat G4-4's vertaling daar vaker boven chrF 80 ligt
+(`chrf_high` 1.452 en 1.353 van 4.480 kandidaten, tegen 569 en 140 bij G4-6); alle andere strata vol. Besluit: G4-6b
+traint op de 42.697 paren die er zijn (−0,7%), zonder de chrF-band te verschuiven en zonder de andere strata aan te
+vullen; de keten aanvaardt precies dit tekort (`ACCEPT_SHORT`) en stopt bij elk ander.

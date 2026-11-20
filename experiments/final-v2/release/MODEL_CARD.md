@@ -122,9 +122,6 @@ and 127 unused tokens to 32,128 entries, the size of the embedding matrix.
   itself. Byte-fallback tokens of one character share that character's span. Strip the space when you need the span
   of the word alone. Checked on 12 texts (455 tokens, with punctuation, accents, emoji, runs of whitespace and a
   literal `<mask>`) and on the overlapping windows of a question–context pair (`return_overflowing_tokens`).
-- The tokenizer was trained before and apart from this model, on other data that was not filtered on opt-outs:
-  according to its card, Dutch and English mC4 text, English and Dutch Wikipedia, Dutch and English book datasets,
-  Dutch news articles, Python code, Markdown files and arXiv papers.
 
 ## Training data
 

@@ -1099,6 +1099,17 @@ hergebruikt, niet opnieuw getrokken); chosen, prompts, mix (~43k: boeken, romans
 rijen en de terugval als G4-6; de chrF-band opnieuw toegepast op G4-4's rejected, met een vergelijking met G4-6's paren
 in het dataverslag. Evaluatie als G4-6, met G4-4, G4-5c2 en (als zijn verslag er dan is) G4-6 ernaast.
 
+*G4-6b.0a Aanvulling 20 nov 2026 ~05:00 (besluit hoofdsessie 20 nov ~04:50; Yeb liet de DPO-armen aan de hoofdsessie):
+G4-6b draait op mbert-corpus in plaats van mbert-mix.* Reden: G4-6 is klaar (keten `g4f1119c`, `EXIT 0` op 20 nov
+04:43), dus mbert-corpus is vrij en heeft de vertaal- en evaluatie-opzet al in `/dev/shm`; op mbert-mix had G4-6b moeten
+wachten tot dmbert v2 klaar is (verwacht 20 nov ~08:00–09:30) en daarna alles opnieuw moeten opzetten. Alleen de VM
+verandert: G4-6b.0–G4-6b.9 en G4-6b.5a blijven, en de code is die van `da07029` (deze aanvulling verandert alleen dit
+bestand). Voor G4-6b.10 betekent dit: de keten (`g4arm6b_run.sh` met `VM=mbert-corpus`) wacht (alleen lezend) tot de
+keten van G4-6 (`mbert-ops/logs/g4arm6_run.log`) op een `EXIT`-regel eindigt (bij `EXIT` ≠ 0 doet hij niets), neemt de
+lock van mbert-corpus (`mbert-ops/final_run.lock`, als G4-6), wacht tot de TPU op alle workers vrij is en draait dan
+dezelfde stappen in dezelfde volgorde; de setup installeert alleen wat ontbreekt en controleert de rest. Vastgelegd vóór
+elke stap van G4-6b op een worker; de wachtende keten `g4g1119b` had niets op mbert-mix gedaan en is gestopt.
+
 *G4-6b.1 Aanleiding.* De sampling-proef van G4-5.7b [gemeten: `mbert-ops/translator-sft/g4-sampling.md`]: bij T = 1
 noemt de classifier G4-4's uitvoer op WMT24++ 60,9% "origineel" tegen 51,1% voor G4-0 bij T = 1; greedy kiest dat niet
 (G4-4 greedy 50,8%, G4-0 greedy 48,5%). [Gevolgtrekking] G4-4 heeft meer kansmassa op "originele" vertalingen dan G4-0,

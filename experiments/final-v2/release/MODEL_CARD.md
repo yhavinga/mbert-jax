@@ -318,7 +318,8 @@ For this model none of the four differences is distinguishable from chance: ever
 p-value is below 0.05. dmbert-230m-culturax was trained on other data (CulturaX), so for it both groups are documents it
 did not train on: its row shows what the test gives without memorization. Some of these documents may also occur in
 CulturaX, since both corpora come from Common Crawl; we did not measure how many. Whether dmbert-230m-culturax
-memorized its own training data was not tested. The test covers 1,000 documents and these two kinds of
+memorized its own training data was not tested: it was trained on all Dutch documents of CulturaX except those of
+www.hebban.nl, so CulturaX has no held-out documents of the same kind to compare with. The test covers 1,000 documents and these two kinds of
 reconstruction; it does not show that no training text can be recovered from a model.
 
 **Conclusion:** on these measures this model reconstructs the documents it was trained on no better than documents it

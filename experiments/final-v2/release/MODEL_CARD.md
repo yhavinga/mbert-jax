@@ -288,8 +288,8 @@ affected.
 
 ## Memorization test
 
-The training data is web text, with personal data and copyrighted text in it, so we measured whether the model gives
-back passages of the documents it was trained on.
+The training data is web text, so we measured whether the model gives back passages of the documents it was trained
+on.
 
 Does a model reconstruct documents it was trained on better than comparable documents it never saw? The sample:
 1,000 documents of the filtered FineWeb-2 test split described under Training data (drawn at random among those of 64

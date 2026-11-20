@@ -309,19 +309,30 @@ def base_adapter_arg(spec):
 
 def bake_adapter(model, mesh, base):
     """--base-adapter: the adapter merged into the base kernels with KernelMerger (every adapter module has exactly one
-    base kernel, else SystemExit); its host copy of the base kernels is dropped after the merge (nothing restores them)"""
+    base kernel, else SystemExit). Nothing restores the base, so (addendum G4-6c.6d) each kernel's merge takes the
+    kernel itself and donates its buffer: the kernels from before the merge leave the device even where the trainer
+    still holds them (G4-6b's peak 29.13 GiB against G4-6's 25.18), and no host copy of the base is made."""
     import numpy as np
 
     t = time.perf_counter()
     with np.load(base["path"]) as z:
         arrays = {k: z[k] for k in z.files}
-    merger = KernelMerger(model, mesh, [arrays], base["meta"]["scale"])
-    merger.apply([1.0])
+    merger = KernelMerger(model, mesh, [arrays], base["meta"]["scale"], keep_base=False)
+    before = device_bytes()
+    merger.bake()
+    after = device_bytes()
     modules = len(merger.modules)
-    merger.host.clear()
     return {"name": base["name"], "path": base["path"], "rank": base["meta"]["rank"], "alpha": base["meta"]["alpha"],
             "scale": base["meta"]["scale"], "modules": modules, "keys": len(arrays),
-            "seconds": round(time.perf_counter() - t, 1)}
+            "seconds": round(time.perf_counter() - t, 1), "device_gib_before": before, "device_gib_after": after}
+
+
+def device_bytes():
+    """The largest bytes in use of this process's devices now, GiB (None where the backend does not say)"""
+    import jax
+
+    used = [(d.memory_stats() or {}).get("bytes_in_use") for d in jax.local_devices()]
+    return round(max(used) / 2 ** 30, 2) if all(u is not None for u in used) and used else None
 
 
 def dpo_args(args, evals_wanted):
@@ -542,7 +553,7 @@ class KernelMerger:
     again. The model casts a kernel to its compute dtype (bf16) at use, so a point is the model translate.py --lora
     decodes with the stacked adapter."""
 
-    def __init__(self, model, mesh, components, scale):
+    def __init__(self, model, mesh, components, scale, keep_base=True):
         import g4mix
         import jax
         import numpy as np
@@ -562,6 +573,8 @@ class KernelMerger:
         self.vars = {m: found[from_decoder(m)][0] for m in self.modules}
         self.host, self.fns = {}, {}
         for m, var in self.vars.items():
+            if not keep_base:
+                break
             w = self.get(var)
             self.host[m] = {self.index_key(s.index): np.asarray(s.data) for s in w.addressable_shards}
         self.replicated = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
@@ -593,17 +606,32 @@ class KernelMerger:
 
         return self.jax.make_array_from_callback(w.shape, w.sharding, shard)
 
-    def merge_fn(self, w):
+    def merge_fn(self, w, donate=False):
         import jax.numpy as jnp
         import translate
 
-        key = (tuple(w.shape), str(w.dtype), str(w.sharding))
+        key = (tuple(w.shape), str(w.dtype), str(w.sharding), donate)
         if key not in self.fns:
             scale = self.scale
             self.fns[key] = self.jax.jit(
                 lambda w0, a, b: (w0.astype(jnp.float32) + translate.lora_delta(a, b, w0.shape, scale, jnp)).astype(
-                    w0.dtype), out_shardings=w.sharding)
+                    w0.dtype), out_shardings=w.sharding, donate_argnums=(0,) if donate else ())
         return self.fns[key]
+
+    def bake(self):
+        """Every module's kernel = itself + the one component's update (coefficient 1), its buffer donated to the merge
+        (addendum G4-6c.6d): one-way, nothing restores the base"""
+        import g4mix
+
+        np = self.np
+        for m in self.modules:
+            var = self.vars[m]
+            w = self.get(var)
+            a, b = g4mix.stack_module([f[m] for f in self.factors], [1.0])
+            put = [self.jax.make_array_from_callback(x.shape, self.replicated, lambda i, x=x: x[i])
+                   for x in (np.ascontiguousarray(a), np.ascontiguousarray(b))]
+            self.put(var, self.merge_fn(w, donate=True)(w, *put))
+            del w
 
     def apply(self, coefs):
         """Every module's kernel = W0 + its stacked update with these coefficients (all zero: W0 itself)"""
@@ -1043,7 +1071,8 @@ def main(argv=None):
                                                               dpo_opts["max_segments"], dpo_opts["end_tokens"])
                 ref_record[name] = {"file": path, "batches": n, "seconds": round(sum(secs), 1),
                                     "batch_s_median": round(statistics.median(secs), 3),
-                                    "ref_sum": float(np.sum(refs[name], dtype=np.float64))}
+                                    "ref_sum": float(np.sum(refs[name], dtype=np.float64)),
+                                    "device_gib": device_bytes()}
                 print(f"REF {json.dumps(ref_record[name] | {'set': name})}", flush=True)
         ref_s = time.time() - t_ref
         if main_process:

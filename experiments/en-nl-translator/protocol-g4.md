@@ -1356,3 +1356,18 @@ bestaande masker `targets_segmentation != 0`. Een voorkeursbatch zonder masker s
 4.096 opnieuw (nieuwe TAG, de mislukte run hernoemd naar `g4arm_G4-6c_s8-fail2`, de markers `cpuproof6` en
 `smoke-4096-memory` met `-g4h1120c`); G4-6c.6b's regel blijft: bij een volgende geheugenfout stopt de keten en beslist de
 hoofdsessie.
+
+*G4-6c.6d Aanvulling 20 nov 2026 ~20:15 (subagent op opdracht van de hoofdsessie; vóór elke trainingsstap van G4-6c).*
+Met G4-6c.6c paste de smoke-test bij 4.096 (keten `g4h1120d`: voorkeursevals op stap 0 gehaald, stap 1–8 10,39 s,
+piek 29,13 GiB; smoke-test geslaagd), maar de volle run `g4arm_G4-6c` liep na zijn referentiepass over 717 batches in
+dezelfde eerste voorkeurseval op stap 0 tegen `RESOURCE_EXHAUSTED` (21 MB gevraagd, 4,96 MB vrij; w1; 19:32, vóór de
+eerste stap). De eval zit dus op enkele tientallen MB van de grens. [Gevolgtrekking, niet gemeten] G4-6 (zonder
+ingebakken adapter) piekte op 25,18 GiB, G4-6b (met) op 29,13 GiB: ~3,9 GiB, ongeveer de bf16-kernels van de 410
+modules per chip; het samenvoegen van G4-4's adapter laat de oude kernels waarschijnlijk elders vastgehouden op het
+apparaat. Fix (code, geen methodewijziging): `bake_adapter` voegt elke kernel samen uit zichzelf en geeft zijn buffer op
+(`donate_argnums`), zodat de kernels van vóór het samenvoegen van het apparaat gaan, ook als iets anders ze nog
+vasthoudt; geen hostkopie meer (er wordt niets teruggezet). Dezelfde waarden als G4-6b.2 (W0 + 0,5 · A·B in float32,
+dan het eigen dtype). `BASE_ADAPTER` meldt het geheugen in gebruik vóór en na het samenvoegen, `REF` na de
+referentiepass. Gebruikt iets daarna toch een opgegeven kernel, dan stopt de run met een fout. CPU-proef, smoke-test en
+volle run opnieuw (nieuwe TAG; de mislukte volle run hernoemd naar `g4arm_G4-6c-fail1`, markers `cpuproof6`,
+`smoke6` en `train-g4arm_G4-6c_s8` met `-g4h1120d`); G4-6c.6b's regel blijft.

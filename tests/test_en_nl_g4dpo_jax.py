@@ -212,7 +212,8 @@ def test_bake_adapter_merges_into_the_base_kernels_and_the_reference_is_the_merg
     import sft_lora
 
     model = Toy(nnx.Rngs(0))
-    w0 = {m: np.asarray(getattr(model.decoder, m).kernel[...]) for m in ("mix", "out")}
+    # copies: a numpy view of a CPU array would keep its buffer from being donated (addendum G4-6c.6d)
+    w0 = {m: np.array(getattr(model.decoder, m).kernel[...], copy=True) for m in ("mix", "out")}
     rng = np.random.default_rng(1)
     adapter = {}
     for m in ("mix", "out"):
@@ -228,8 +229,11 @@ def test_bake_adapter_merges_into_the_base_kernels_and_the_reference_is_the_merg
         layer.kernel_lora_b[...] = jnp.asarray(adapter[f"decoder/{m}/kernel_lora_b"])
     mesh = jax.sharding.Mesh(np.array(jax.devices()[:1]), ("x",))
     base = sft_lora.base_adapter_arg(f"G4-4={tmp_path / 'adapter.npz'}")
+    held = {m: getattr(model.decoder, m).kernel.get_value() for m in ("mix", "out")}   # another holder of the kernels
     record = sft_lora.bake_adapter(model, mesh, base)
     assert (record["name"], record["modules"], record["keys"], record["scale"]) == ("G4-4", 2, 4, 0.5)
+    # addendum G4-6c.6d: the kernels from before the merge are donated, so no other holder keeps them on the device
+    assert {m: w.is_deleted() for m, w in held.items()} == {"mix": True, "out": True}
     for m in ("mix", "out"):
         want = w0[m] + 0.5 * adapter[f"decoder/{m}/kernel_lora_a"] @ adapter[f"decoder/{m}/kernel_lora_b"]
         assert np.allclose(np.asarray(getattr(model.decoder, m).kernel[...]), want, atol=1e-6)

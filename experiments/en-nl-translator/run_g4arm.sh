@@ -499,11 +499,13 @@ g46_train() {  # the runs of G4-6, G4-6b and G4-6c (amendments G4-6, G4-6b, G4-6
   local ARGS="--dpo $D/dpo.json --pref-train $D/$setfile"
   [ -n "$save" ] && ARGS="$ARGS --save-steps $save"
   if [ "$ARM" = G4-6b ] || [ "$ARM" = G4-6c ]; then
-    # amendment G4-6b.2: G4-4's final adapter merged into the base kernels before the first step (start and reference)
-    mkdir -p "$D/start"
-    gsutil -q cp "$G/G4-4/adapter.npz" "$G/G4-4/adapter.json" "$D/start/"
-    g45_check_adapter "$D/start/adapter.json"
-    ARGS="$ARGS --base-adapter G4-4=$D/start/adapter.npz"
+    # amendment G4-6b.2: G4-4's final adapter merged into the base kernels before the first step (start and reference);
+    # a reference run of G4-6c takes the copy of its run's data (one copy of ~1 GB on w0's /dev/shm per run)
+    local start=$G_SHM/data-$train_run/start
+    mkdir -p "$start"
+    gsutil -q cp "$G/G4-4/adapter.npz" "$G/G4-4/adapter.json" "$start/"
+    g45_check_adapter "$start/adapter.json"
+    ARGS="$ARGS --base-adapter G4-4=$start/adapter.npz"
   fi
   local evals="--eval-every $every"
   if [ -n "$ref_only" ]; then

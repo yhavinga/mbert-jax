@@ -588,7 +588,10 @@ def test_g46c_reference_runs_take_ref_only_and_the_runs_read_their_reference(tmp
         out, calls = run("train", ARM="G4-6c", RUN=name, PHASE="prep", TAG=f"t{name}", **({"STEPS": steps} if steps else {}))
         assert out.returncode == 0 and out.stdout.strip().splitlines()[-1] == f"prepared {name} on w0", out.stdout + out.stderr
         launch = (shm / f"translator/g4arm/data-{name}/launch.sh").read_text()
-        assert "--ref-only" in launch and "G4-4=" in launch and "--dpo" in launch
+        assert "--ref-only" in launch and "--dpo" in launch
+        # G4-4's adapter: the copy in its run's data (one per run on w0's /dev/shm)
+        assert f"G4-4={shm}/translator/g4arm/data-{name[:-4]}/start/adapter.npz" in launch
+        assert not (shm / f"translator/g4arm/data-{name}/start").exists()
         for absent in ("--eval", "--pref-eval", "--save-steps", "--ref-in"):
             assert absent not in launch, absent
         assert ("train-4096.parquet" if steps is None else "smoke-4096.parquet") in launch

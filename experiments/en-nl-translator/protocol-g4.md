@@ -1314,3 +1314,15 @@ ontbreekt), de controle van G4-6b's paren (`report.json` met het tekort van G4-6
 scoren van de drie checkpoints, texts, classify, `report6c` (keuze, beslisdeel, verslag), het blinde pakket alleen als
 (a1) en (b) gelden; `DONE`. Elke run eerst op alle vier workers klaargezet en dan op alle vier gestart. Faalt een stap,
 dan stopt de keten (`FAILED`). mbert-mix wordt niet gebruikt.
+
+*G4-6c.6a Aanvulling 20 nov 2026 ~15:15 (subagent op opdracht van de hoofdsessie; de CPU-proef van G4-6c.6 deed haar
+werk).* De CPU-proef van keten `g4h1120a` (w1, 15:03) faalde alleen op de controle (e): de bewaarde adapter "van stap 4"
+gaf `books` 12,9917 en `own` 12,9804 tegen (a)'s eval op stap 4 12,9879 en 12,9760 [gemeten:
+`~/logs/g4a_cpuproof6_g4h1120a.log` op w1]; alle andere controles (ook de eindtokens, de verliesopbouw 26,64655 tegen
+26,64655 en de echte paren op `<turn|>\n`) gehaald. Oorzaak [gelezen in Tunix' `peft_trainer.py` in de SFT-venv]: Tunix
+schrijft de metrics van een stap pas na de volgende stap en roept dan `on_train_step_end` aan, dus de hook "stap 4" zag het
+model na stap 5. Fix (code, geen methodewijziging): `sft_lora.py --save-steps` bewaart de adapter in de eval-ronde van die
+stap (Tunix' eval na stap k, vóór stap k + 1), dus precies het model van de eval op die stap; elke bewaarstap moet een
+eval-stap zijn (240 en 480 bij evals elke 240; 4 in de smoke-test en de CPU-proef). De controle (e) blijft ongewijzigd.
+Verlies, data, LR, stappen en de rest van §13 blijven. Vastgelegd vóór de herstart (nieuwe TAG); er was nog niets op de
+TPU gedaan (alleen setup, `ends6c` en de CPU-proef).

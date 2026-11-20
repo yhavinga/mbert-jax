@@ -158,12 +158,17 @@ def test_check_ends_holds_a_packed_file_to_its_runs_and_end_ids(tmp_path):
 
 # ---------------------------------------------------------------------------------------------------- sft_lora
 
-def test_save_steps_are_distinct_steps_before_the_last():
+def test_save_steps_are_distinct_eval_steps_before_the_last():
     assert sft_lora.save_steps_arg(None, 717) == []
-    assert sft_lora.save_steps_arg("480,240,240", 717) == [240, 480]
+    assert sft_lora.save_steps_arg("480,240,240", 717, 240) == [240, 480]
     for bad in ("0", "717", "a,b", ","):
         with pytest.raises(SystemExit, match="--save-steps"):
-            sft_lora.save_steps_arg(bad, 717)
+            sft_lora.save_steps_arg(bad, 717, 240)
+    # addendum G4-6c.6a: kept in the eval round of the step, so every step an eval step
+    for bad, every in (("240,480", 200), ("240", 0), ("4", 3)):
+        with pytest.raises(SystemExit, match="an eval step"):
+            sft_lora.save_steps_arg(bad, 717, every)
+    assert sft_lora.save_steps_arg("4", 8, 4) == [4]
 
 
 def test_sft_lora_with_end_tokens_checks_the_packed_files_before_jax(tmp_path, capsys):

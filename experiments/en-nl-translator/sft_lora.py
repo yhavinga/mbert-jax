@@ -61,7 +61,9 @@ starts at zero on that model, and the reference (the LoRA at zero) is that model
 Arm G4-6c (amendment G4-6c): a spec with end_tokens = n leaves the last n target tokens of every side out of the
 log-ratio (the reference pass too); before JAX each packed file is checked to hold every segment's targets as one run of
 more than n tokens (ENDS). --save-steps K1,K2,... keeps the LoRA parameters after those steps as
-DIR/adapter-step<K>.npz and .json (process 0; the same format as adapter.npz), and a line SAVED per step.
+DIR/adapter-step<K>.npz and .json (process 0; the same format as adapter.npz), and a line SAVED per step. Each K is an
+eval step (a multiple of --eval-every): the adapter is kept in that eval round, so it is the model of that eval (Tunix
+calls on_train_step_end for step K only after step K + 1, addendum G4-6c.6a).
 Writes to DIR (process 0): summary.json (configuration, times, throughput, memory per chip, loss per step), adapter.npz
 (the LoRA parameters in float32, keys as decoder/layers_0/self_attention/query/kernel_lora_a), adapter.json (rank,
 alpha, module regex, model, checkpoint, original dtype); MaxText's output (metrics file, tensorboard, Tunix's checkpoint
@@ -353,8 +355,9 @@ def dpo_args(args, evals_wanted):
     return opts, prefs
 
 
-def save_steps_arg(text, steps):
-    """--save-steps K1,K2,...: distinct steps in 1..steps-1 (the last step's adapter is adapter.npz), sorted"""
+def save_steps_arg(text, steps, eval_every=0):
+    """--save-steps K1,K2,...: distinct steps in 1..steps-1 (the last step's adapter is adapter.npz), sorted, each an eval
+    step (a multiple of --eval-every: the adapter is kept in that step's eval round)"""
     if not text:
         return []
     try:
@@ -363,6 +366,8 @@ def save_steps_arg(text, steps):
         raise SystemExit(f"--save-steps {text}: integers separated by commas") from None
     if not out or out[0] < 1 or out[-1] >= steps:
         raise SystemExit(f"--save-steps {text}: every step in 1..{steps - 1} (step {steps} is adapter.npz)")
+    if eval_every <= 0 or any(k % eval_every for k in out):
+        raise SystemExit(f"--save-steps {text}: every step an eval step (a multiple of --eval-every {eval_every})")
     return out
 
 
@@ -931,7 +936,7 @@ def main(argv=None):
         own_steps = choose_steps(args.steps, batches_per_process)
     # --resume-step: MaxText's steps (Tunix's max_steps) and the schedule count from the restored step
     steps = args.resume_step + own_steps
-    save_at = save_steps_arg(args.save_steps, steps)
+    save_at = save_steps_arg(args.save_steps, steps, args.eval_every if evals_wanted else 0)
     if save_at and (temps or combine_spec):
         raise SystemExit("--save-steps belongs to a training run (no --temperatures, no --combine)")
     print(f"EPOCH {json.dumps(count | {'requested': args.steps, 'steps': steps, 'own_steps': own_steps, 'resume_step': args.resume_step})}",
@@ -1077,27 +1082,27 @@ def main(argv=None):
 
     saved = {}
 
+    def keep_adapter(k):
+        # amendment G4-6c: the LoRA parameters after step k, in its eval round (the model that eval measures)
+        arrays, kinds = adapter_arrays(nnx.to_pure_dict(nnx.state(trainer.model, nnx.LoRAParam)))
+        lora_cfg = config.lora
+        meta = {"rank": lora_cfg.lora_rank, "alpha": lora_cfg.lora_alpha,
+                "scale": lora_cfg.lora_alpha / lora_cfg.lora_rank, "module_path": lora_utils._get_lora_module_path(config),  # noqa: SLF001
+                "model": config.model_name, "checkpoint": config.load_parameters_path,
+                "trained_dtype": sorted(kinds), "steps": k, "learning_rate": config.learning_rate,
+                "train_files": config.hf_train_files}
+        if main_process:
+            np.savez(out / f"adapter-step{k}.npz", **arrays)
+            (out / f"adapter-step{k}.json").write_text(json.dumps(meta, indent=1) + "\n")
+        saved[k] = {"keys": len(arrays), "sum_abs": float(sum(np.abs(v).sum(dtype=np.float64) for v in arrays.values())),
+                    "peak_gib": peak_gib()}
+        print(f"SAVED {json.dumps({'step': k, **saved[k]})}", flush=True)
+
     def step_end(ctx, train_step, train_loss, step_time=0.0):
         records.append({"step": int(train_step), "loss": float(np.asarray(train_loss)), "t": time.perf_counter()})
-        k = int(train_step)
-        if k == args.resume_step + 1:
-            # the peak after the first step (compile and step) shows a run that will not fit before its end
-            print(f"PEAK {json.dumps({'step': k, 'peak_gib': peak_gib()})}", flush=True)
-        if k in save_at:
-            # amendment G4-6c: the LoRA parameters after this step (the step's update is done: its loss was read)
-            arrays, kinds = adapter_arrays(nnx.to_pure_dict(nnx.state(trainer.model, nnx.LoRAParam)))
-            lora_cfg = config.lora
-            meta = {"rank": lora_cfg.lora_rank, "alpha": lora_cfg.lora_alpha,
-                    "scale": lora_cfg.lora_alpha / lora_cfg.lora_rank, "module_path": lora_utils._get_lora_module_path(config),  # noqa: SLF001
-                    "model": config.model_name, "checkpoint": config.load_parameters_path,
-                    "trained_dtype": sorted(kinds), "steps": k, "learning_rate": config.learning_rate,
-                    "train_files": config.hf_train_files}
-            if main_process:
-                np.savez(out / f"adapter-step{k}.npz", **arrays)
-                (out / f"adapter-step{k}.json").write_text(json.dumps(meta, indent=1) + "\n")
-            saved[k] = {"keys": len(arrays), "sum_abs": float(sum(np.abs(v).sum(dtype=np.float64) for v in arrays.values())),
-                        "peak_gib": peak_gib()}
-            print(f"SAVED {json.dumps({'step': k, **saved[k]})}", flush=True)
+        if int(train_step) == args.resume_step + 1:
+            # Tunix calls this for step 1 after step 2: the peak of the compiled step, before a run's end shows it
+            print(f"PEAK {json.dumps({'step': int(train_step), 'peak_gib': peak_gib()})}", flush=True)
         return on_step_end(ctx, train_step, train_loss, step_time)
 
     hooks.on_train_start, hooks.on_train_step_start, hooks.on_train_step_end = train_start, step_start, step_end
@@ -1177,6 +1182,8 @@ def main(argv=None):
             return out
 
         def run_eval(eval_ds, eval_step_fn):
+            if trainer.train_steps in save_at and trainer.train_steps not in saved:
+                keep_adapter(trainer.train_steps)
             evals.extend(run_files(list(eval_plan), eval_ds, eval_step_fn))
             if combine_spec and "result" not in combined:
                 combined["result"] = run_combine(

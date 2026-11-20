@@ -288,6 +288,9 @@ affected.
 
 ## Memorization test
 
+The training data is web text, with personal data and copyrighted text in it, so we measured whether the model gives
+back passages of the documents it was trained on.
+
 Does a model reconstruct documents it was trained on better than comparable documents it never saw? The sample:
 1,000 documents of the filtered FineWeb-2 test split described under Training data (drawn at random among those of 64
 to 1,022 tokens), and for each of them a document of the training data of dmbert-230m-fineweb2-optout with the same
@@ -316,6 +319,9 @@ p-value is below 0.05. dmbert-230m-culturax was not trained on these documents a
 own training data, CulturaX, was not tested this way. Both corpora come from Common Crawl, and we did not measure how
 many of these documents also occur in CulturaX. The test covers 1,000 documents and these two kinds of
 reconstruction; it does not show that no training text can be recovered from a model.
+
+**Conclusion:** on these measures this model reconstructs the documents it was trained on no better than documents it
+never saw. A difference of about 0.03 in MLM loss or 0.6 points in MLM accuracy would have shown up.
 
 ## Limitations
 

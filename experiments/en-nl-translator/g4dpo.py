@@ -38,11 +38,15 @@ MAX_SEGMENTS = 64         # segments a packed row may hold (32 pairs); the loss'
 REF_KEY = "ref_seg"       # amendment G4-6.4a: a batch's precomputed reference, [rows, max_segments] float32
 ROW_KEY = "row"           # the file's row index of each row of a batch (the reference pass only)
 LOSSES = ("sigmoid", "ipo")
+# end_tokens (amendment G4-6c): the target tokens at the end of each segment (the turn's end, <turn|>\n: 2) that the
+# log-ratio leaves out; the NLL term keeps them. 0: every target token in both (G4-6, G4-6b)
 DEFAULTS = {"loss": "sigmoid", "beta": 0.1, "label_smoothing": 0.0, "nll_alpha": 1.0, "length_norm": False,
-            "max_segments": MAX_SEGMENTS}
-# The sums dpo_terms gives per batch (aux "pref_<name>" in the training stack); a file's eval adds them over its batches
+            "max_segments": MAX_SEGMENTS, "end_tokens": 0}
+# The sums dpo_terms gives per batch (aux "pref_<name>" in the training stack); a file's eval adds them over its batches.
+# The log-probabilities and tokens are those of the log-ratio; the *_all ones those of every target token (the NLL term)
 SUMS = ("pairs", "dpo_sum", "correct", "margin_sum", "chosen_reward_sum", "rejected_reward_sum", "chosen_logp_sum",
-        "rejected_logp_sum", "ref_chosen_logp_sum", "ref_rejected_logp_sum", "chosen_tokens", "rejected_tokens")
+        "rejected_logp_sum", "ref_chosen_logp_sum", "ref_rejected_logp_sum", "chosen_tokens", "rejected_tokens",
+        "chosen_logp_all_sum", "rejected_logp_all_sum", "chosen_tokens_all", "rejected_tokens_all")
 
 
 def spec(**kw):
@@ -59,6 +63,8 @@ def spec(**kw):
         raise ValueError("label smoothing is a setting of the sigmoid loss")
     if out["max_segments"] < 2 or out["max_segments"] % 2:
         raise ValueError(f"max_segments {out['max_segments']}: even, at least 2")
+    if isinstance(out["end_tokens"], bool) or not isinstance(out["end_tokens"], int) or out["end_tokens"] < 0:
+        raise ValueError(f"end_tokens {out['end_tokens']!r}: an int >= 0")
     out["length_norm"] = bool(out["length_norm"])
     return out
 
@@ -241,28 +247,88 @@ def segment_sums(values, segmentation, max_segments, xp=np):
     return xp.einsum("bl,bls->bs", values.astype(xp.float32), onehot)
 
 
+def end_mask(segmentation, n, xp=np):
+    """[B, L] float32: 1 at the last n target tokens of each segment, else 0 (amendment G4-6c: the turn's end
+    <turn|>\n, n = 2). A segment's target tokens are one run (the completion of MaxText's SFT row after the shift;
+    check_ends checks a packed file), so a target token is among the last n of its segment exactly when the token n
+    places further is not of its segment."""
+    if n == 0:
+        return xp.zeros(segmentation.shape, xp.float32)
+    pad = xp.zeros((segmentation.shape[0], n), segmentation.dtype)
+    ahead = xp.concatenate([segmentation, pad], axis=1)[:, n:]
+    return ((segmentation > 0) & (ahead != segmentation)).astype(xp.float32)
+
+
+def check_ends(path, n, end_ids=None):
+    """Amendment G4-6c: in every row of a packed file each segment's target tokens are one run of more than n tokens
+    (so end_mask takes exactly its last n) and, with end_ids, its last n targets are end_ids. Returns {"rows",
+    "segments"}; SystemExit names the first row that does not hold."""
+    import pyarrow.parquet as pq
+
+    table = pq.read_table(path, columns=["targets", "targets_segmentation"])
+    rows = table.num_rows
+    seg = np.asarray(table.column("targets_segmentation").combine_chunks().flatten(), np.int32).reshape(rows, -1)
+    tgt = np.asarray(table.column("targets").combine_chunks().flatten(), np.int32).reshape(rows, -1)
+    mask = end_mask(seg, n)
+    segments = 0
+    for r in range(rows):
+        nz = np.flatnonzero(seg[r])
+        if not len(nz):
+            continue
+        ids = seg[r][nz]
+        cut = np.flatnonzero((np.diff(nz) != 1) | (np.diff(ids) != 0)) + 1
+        starts, stops = np.concatenate([[0], cut]), np.concatenate([cut, [len(nz)]])
+        if len(np.unique(ids[starts])) != len(starts):
+            raise SystemExit(f"{path} row {r}: a segment's target tokens are not one run")
+        if (stops - starts <= n).any():
+            raise SystemExit(f"{path} row {r}: a segment of {int((stops - starts).min())} target tokens, not more than {n}")
+        want = np.zeros(seg.shape[1], np.float32)
+        for a, b in zip(starts, stops):
+            want[nz[b - n:b]] = 1.0
+            if end_ids is not None and tgt[r][nz[b - n:b]].tolist() != list(end_ids):
+                raise SystemExit(f"{path} row {r} segment {int(ids[a])}: ends in {tgt[r][nz[b - n:b]].tolist()}, "
+                                 f"not {list(end_ids)}")
+        if not np.array_equal(mask[r], want):
+            raise SystemExit(f"{path} row {r}: end_mask is not the last {n} target tokens of each segment")
+        segments += len(starts)
+    return {"rows": rows, "segments": segments}
+
+
 def dpo_terms(logp, ref_logp, segmentation, opts, xp=np, ref_seg=None):
     """The preference loss of a batch and its sums (SUMS). logp and ref_logp: per-token log-probabilities of the
     targets [B, L] (0 where targets_segmentation is 0) under the policy and the reference; or, in place of ref_logp
     (then None), ref_seg: the reference's per-segment sums [B, max_segments] (segment_sums of its log-probabilities,
-    precomputed: amendment G4-6.4a); segmentation: targets_segmentation. A pair is segments 2j-1 (chosen) and 2j
+    precomputed: amendment G4-6.4a; with end_tokens, of the log-ratio's tokens as reference_sums gives them);
+    segmentation: targets_segmentation. A pair is segments 2j-1 (chosen) and 2j
     (rejected) of a row, both with target tokens; an unpaired or empty segment counts nowhere. Per pair h = (chosen - ref chosen) - (rejected - ref rejected) of the
     summed log-probabilities (each divided by its tokens with length_norm); sigmoid: -(1 - eps) log sigmoid(beta h) - eps
     log sigmoid(-beta h) (Tunix's dpo_loss_fn); ipo: (h - 1 / (2 beta))^2. The loss is the mean over the batch's pairs
     plus nll_alpha x the token-weighted NLL of the chosen sides (the SFT loss of G4-4 on them). Rewards beta x (logp -
-    ref); accuracy: chosen reward > rejected reward."""
+    ref); accuracy: chosen reward > rejected reward. With end_tokens = n (amendment G4-6c) the log-ratio, its rewards
+    and the sums without _all leave out the last n target tokens of every side; the NLL term takes every target token."""
     f32 = xp.float32
     s = int(opts["max_segments"])
+    n_end = int(opts.get("end_tokens", 0))
     if (ref_logp is None) == (ref_seg is None):
         raise ValueError("dpo_terms: either ref_logp or ref_seg")
-    pol = segment_sums(logp, segmentation, s, xp)
-    ref = segment_sums(ref_logp, segmentation, s, xp) if ref_seg is None else ref_seg.astype(f32)
+    pol_all = segment_sums(logp, segmentation, s, xp)
+    ntok_all = (segmentation[..., None] == xp.arange(1, s + 1)).astype(f32).sum(axis=1)
+    if n_end:
+        keep = 1.0 - end_mask(segmentation, n_end, xp)
+        pol = segment_sums(logp * keep, segmentation, s, xp)
+        ntok = segment_sums(keep * (segmentation != 0), segmentation, s, xp)
+    else:
+        keep, pol, ntok = None, pol_all, ntok_all
+    if ref_seg is None:
+        ref = segment_sums(ref_logp if keep is None else ref_logp * keep, segmentation, s, xp)
+    else:
+        ref = ref_seg.astype(f32)
     if ref.shape != pol.shape:
         raise ValueError(f"dpo_terms: the reference's sums are {ref.shape}, the policy's {pol.shape}")
-    ntok = (segmentation[..., None] == xp.arange(1, s + 1)).astype(f32).sum(axis=1)
     pc, pr, rc, rr = pol[:, 0::2], pol[:, 1::2], ref[:, 0::2], ref[:, 1::2]
     nc, nr = ntok[:, 0::2], ntok[:, 1::2]
-    valid = ((nc > 0) & (nr > 0)).astype(f32)
+    nc_all, nr_all = ntok_all[:, 0::2], ntok_all[:, 1::2]
+    valid = ((nc_all > 0) & (nr_all > 0)).astype(f32)
     if opts["length_norm"]:
         dc, dr = xp.maximum(nc, 1.0), xp.maximum(nr, 1.0)
         a, b, c, d = pc / dc, pr / dr, rc / dc, rr / dr
@@ -287,15 +353,22 @@ def dpo_terms(logp, ref_logp, segmentation, opts, xp=np, ref_seg=None):
             "chosen_logp_sum": (pc * valid).sum(), "rejected_logp_sum": (pr * valid).sum(),
             "ref_chosen_logp_sum": (rc * valid).sum(), "ref_rejected_logp_sum": (rr * valid).sum(),
             "chosen_tokens": chosen_tokens, "rejected_tokens": (nr * valid).sum()}
+    if n_end:
+        sums.update({"chosen_logp_all_sum": (pol_all[:, 0::2] * valid).sum(),
+                     "rejected_logp_all_sum": (pol_all[:, 1::2] * valid).sum(),
+                     "chosen_tokens_all": (nc_all * valid).sum(), "rejected_tokens_all": (nr_all * valid).sum()})
+    else:
+        sums.update({"chosen_logp_all_sum": sums["chosen_logp_sum"], "rejected_logp_all_sum": sums["rejected_logp_sum"],
+                     "chosen_tokens_all": chosen_tokens, "rejected_tokens_all": sums["rejected_tokens"]})
     loss = sums["dpo_sum"] / xp.maximum(pairs, 1.0) + float(opts["nll_alpha"]) * (
-        -sums["chosen_logp_sum"] / xp.maximum(chosen_tokens, 1.0))
+        -sums["chosen_logp_all_sum"] / xp.maximum(sums["chosen_tokens_all"], 1.0))
     return loss, sums
 
 
 def pref_record(name, step, parts, batches, seconds):
     """One preference file's eval at a step from the per-batch sums (dicts of SUMS): pairs, the mean loss, accuracy,
     margin and rewards per pair, and per token the policy's NLL of the chosen and of the rejected sides and the
-    reference's (at step 0 the same)"""
+    reference's (at step 0 the same), over the log-ratio's tokens; *_all: the policy's over every target token"""
     if len(parts) != batches:
         raise SystemExit(f"eval {name} at step {step}: {len(parts)} batches ran, {batches} planned")
     t = {k: float(sum(p[k] for p in parts)) for k in SUMS}
@@ -308,7 +381,10 @@ def pref_record(name, step, parts, batches, seconds):
             "chosen_nll": -t["chosen_logp_sum"] / ct, "rejected_nll": -t["rejected_logp_sum"] / rt,
             "ref_chosen_nll": -t["ref_chosen_logp_sum"] / ct, "ref_rejected_nll": -t["ref_rejected_logp_sum"] / rt,
             "chosen_tokens": int(round(t["chosen_tokens"])), "rejected_tokens": int(round(t["rejected_tokens"])),
-            "seconds": round(seconds, 1)}
+            "chosen_nll_all": -t["chosen_logp_all_sum"] / max(t["chosen_tokens_all"], 1.0),
+            "rejected_nll_all": -t["rejected_logp_all_sum"] / max(t["rejected_tokens_all"], 1.0),
+            "chosen_tokens_all": int(round(t["chosen_tokens_all"])),
+            "rejected_tokens_all": int(round(t["rejected_tokens_all"])), "seconds": round(seconds, 1)}
 
 
 def step_record(step, sums):
@@ -317,7 +393,8 @@ def step_record(step, sums):
     return {"step": step, "pairs": int(round(sums["pairs"])), "loss": sums["dpo_sum"] / n,
             "accuracy": sums["correct"] / n, "margin": sums["margin_sum"] / n,
             "chosen_nll": -sums["chosen_logp_sum"] / max(sums["chosen_tokens"], 1.0),
-            "rejected_nll": -sums["rejected_logp_sum"] / max(sums["rejected_tokens"], 1.0)}
+            "rejected_nll": -sums["rejected_logp_sum"] / max(sums["rejected_tokens"], 1.0),
+            "chosen_nll_all": -sums["chosen_logp_all_sum"] / max(sums["chosen_tokens_all"], 1.0)}
 
 
 # ---------------------------------------------------------------------------------------------------- JAX
@@ -384,15 +461,20 @@ def model_logp(model, config, data, dropout):
     return logp * (data["targets_segmentation"] != 0).astype(jnp.float32)
 
 
-def reference_sums(model, config, data, max_segments):
+def reference_sums(model, config, data, max_segments, end_tokens=0):
     """Amendment G4-6.4a: the reference's per-segment sums of log-probabilities [B, max_segments] of a batch, forward
     only: model_logp of the model before its first step (every LoRA B zero, which the caller checks: the LoRA term
     x A B is then exactly zero, so this is the model with its LoRA at zero) on the batch's eval rows, as the eval step's
-    policy pass computes them"""
+    policy pass computes them; with end_tokens (amendment G4-6c) without the last end_tokens target tokens of each
+    segment, the log-ratio's tokens of dpo_terms"""
     import jax.numpy as jnp
 
     data = {k: data[k][:config.micro_batch_size_to_eval_on] for k in KEYS}
-    return segment_sums(model_logp(model, config, data, False), data["targets_segmentation"], max_segments, jnp)
+    seg = data["targets_segmentation"]
+    logp = model_logp(model, config, data, False)
+    if end_tokens:
+        logp = logp * (1.0 - end_mask(seg, end_tokens, jnp))
+    return segment_sums(logp, seg, max_segments, jnp)
 
 
 def lora_b_zero(model):
@@ -412,21 +494,22 @@ def lora_b_zero(model):
 _REFERENCE_STEPS = {}
 
 
-def reference_step(config, max_segments):
+def reference_step(config, max_segments, end_tokens=0):
     """The jitted reference pass of a batch -> (reference_sums, the batch's ROW_KEY), one per run (every file the same
     batch shape, so it compiles once)"""
     from flax import nnx
 
-    key = (id(config), max_segments)
+    key = (id(config), max_segments, end_tokens)
     if key not in _REFERENCE_STEPS:
-        _REFERENCE_STEPS[key] = nnx.jit(lambda m, d: (reference_sums(m, config, d, max_segments), d[ROW_KEY]))
+        _REFERENCE_STEPS[key] = nnx.jit(lambda m, d: (reference_sums(m, config, d, max_segments, end_tokens), d[ROW_KEY]))
     return _REFERENCE_STEPS[key]
 
 
-def precompute_reference(model, config, path, mesh, rows, batches, max_segments):
+def precompute_reference(model, config, path, mesh, rows, batches, max_segments, end_tokens=0):
     """Amendment G4-6.4a: reference_sums of the first `batches` global batches of a packed file, one jitted forward
     step, gathered from every process: [batches x rows, max_segments] float32 in the file's row order (each row placed
-    by its ROW_KEY, so the mesh's order of the processes does not matter), and the seconds of each batch"""
+    by its ROW_KEY, so the mesh's order of the processes does not matter), and the seconds of each batch; with end_tokens
+    (amendment G4-6c) the sums leave out the last end_tokens target tokens of each segment, as dpo_terms does"""
     import time
 
     import jax
@@ -434,7 +517,7 @@ def precompute_reference(model, config, path, mesh, rows, batches, max_segments)
 
     if not lora_b_zero(model):
         raise SystemExit("--dpo: a LoRA B is not zero before the reference pass (the reference is the base model)")
-    step = reference_step(config, max_segments)
+    step = reference_step(config, max_segments, end_tokens)
     out = np.full((batches * rows, max_segments), np.nan, np.float32)
     seconds = []
     for batch in global_iterator(path, mesh, rows, batches, row_ids=True):

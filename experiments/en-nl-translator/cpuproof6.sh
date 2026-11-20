@@ -15,11 +15,19 @@
 # and checks: (c)'s step-0 losses of books and own = (d)'s (the merged model is the adapter's model) and not (b)'s (the
 # merge changed the model); at step 0 (c)'s policy is its reference (|pref loss - log 2| and |margin| <= 1e-4, G4-6.6's
 # bound as in addendum G4-6.6a; each NLL the reference's) and that reference is not (a)'s; at step 4 (c)'s reference is unchanged.
+# With SPEC=DPO6C and C6=1 (amendment G4-6c.6: G4-6c's loss, the turn's end outside the log-ratio, kept adapters) also:
+#   (a) keeps its adapter after step 4 (--save-steps 4); the real pairs packed here end every segment in <turn|>\n
+#   (e) plain SFT with (a)'s adapter of step 4 as --init-adapter, its evals at step 0
+# and checks: (e)'s step-0 losses of books and own = (a)'s at step 4 (the kept adapter is the model of that step);
+# every eval of pref_btval counts 2 tokens per side fewer in the log-ratio than in the NLL; (a)'s loss at step 1 = its
+# DPO term + nll_alpha x the chosen NLL over every target token; (a)'s spec is G4-6c's.
 # Started by run_g4arm.sh cpuproof6 (w1) with G, G6, H, PY (the SFT venv's python), TOK (Gemma 4's tokenizer), CODE
 # (the bundle) and X (the work directory) in the environment. Ends in CPU_PROOF6_OK or CPU_PROOF6_FAILED.
 set -euo pipefail
 : "${G:?}" "${G6:?}" "${H:?}" "${PY:?}" "${TOK:?}" "${CODE:?}" "${X:?}"
 BAKE=${BAKE:-0}
+SPEC=${SPEC:-DPO6}
+C6=${C6:-0}
 [ ! -e "$X" ] || { echo "$X exists"; exit 1; }
 P=$X/cpu
 mkdir -p $X/in $P
@@ -44,12 +52,18 @@ for name, part in (("train", train), ("pref_btval", pref)):
                             for p in tok], 4096, 4, pad_id=pad, bos_id=bos)
     g4dpo.write_rows(rows, f"$P/{name}.parquet")
     print("PACKED", name, len(rows), "rows", 1 + max(r["batch"] for r in rows), "batches", flush=True)
+    if "$C6" == "1":
+        # amendment G4-6c.6: in the real pairs every segment ends in the turn's end, the tokens the log-ratio leaves out
+        end_ids = counter.ids([g4arm.END6C])[0]
+        ends = g4dpo.check_ends(f"$P/{name}.parquet", g4arm.DPO6C["end_tokens"], end_ids)
+        print("ENDS_REAL", name, json.dumps({"end_ids": end_ids, **ends}), flush=True)
+        json.dump({"end_ids": end_ids, **ends}, open(f"$P/ends-{name}.json", "w"))
 assert 1 + max(r["batch"] for r in pq.read_table("$P/train.parquet").to_pylist()) >= 8
 pq.write_table(pa.Table.from_pylist([g4arm.messages_row(p["en"], p["chosen"]) for p in train]), "$P/train-chosen.parquet")
 for name in ("books", "own"):
     rows = pq.read_table(f"$X/in/eval-{name}.parquet").to_pylist()[:20]
     pq.write_table(pa.Table.from_pylist(rows), f"$P/eval-{name}.parquet")
-json.dump(g4dpo.spec(**g4arm.DPO6), open("$P/dpo.json", "w"))
+json.dump(g4dpo.spec(**getattr(g4arm, "$SPEC")), open("$P/dpo.json", "w"))
 EOF
 cp $X/in/template.jinja $P/template.jinja
 
@@ -66,9 +80,11 @@ MX=(model_name=gemma4-31b override_model_config=true base_num_decoder_layers=6 b
   skip_jax_distributed_system=true num_vocab_tiling=8 jax_cache_dir=$P/jax_cache per_device_batch_size=1
   weight_dtype=float32 dtype=float32 attention=dot_product hf_train_files=$P/train-chosen.parquet)
 EV=(--eval books=$P/eval-books.parquet --eval own=$P/eval-own.parquet)
+SAVE=()
+[ "$C6" = 1 ] && SAVE=(--save-steps 4)
 echo "$(date +%T) (a) --dpo, 8 steps"
 $PY -u $CODE/sft_lora.py --out $P/a --steps 8 "${EV[@]}" --eval-every 4 --warmup-steps 2 --decay-fraction 0 \
-  --dpo $P/dpo.json --pref-train $P/train.parquet --pref-eval pref_btval=$P/pref_btval.parquet \
+  --dpo $P/dpo.json --pref-train $P/train.parquet --pref-eval pref_btval=$P/pref_btval.parquet "${SAVE[@]}" \
   -- run_name=g4a6c_a "${MX[@]}"
 echo "$(date +%T) (b) plain SFT, the evals at step 0"
 $PY -u $CODE/sft_lora.py --out $P/b --steps 1 "${EV[@]}" --eval-every 1 -- run_name=g4a6c_b "${MX[@]}"
@@ -81,10 +97,15 @@ if [ "$BAKE" = 1 ]; then
   $PY -u $CODE/sft_lora.py --out $P/d --steps 1 "${EV[@]}" --eval-every 1 --init-adapter $P/a/adapter.npz \
     -- run_name=g4a6c_d "${MX[@]}"
 fi
+if [ "$C6" = 1 ]; then
+  echo "$(date +%T) (e) plain SFT with (a)'s adapter of step 4 as LoRA, the evals at step 0"
+  $PY -u $CODE/sft_lora.py --out $P/e --steps 1 "${EV[@]}" --eval-every 1 --init-adapter $P/a/adapter-step4.npz \
+    -- run_name=g4a6c_e "${MX[@]}"
+fi
 $PY - <<EOF
 import json, math, sys
 sys.path.insert(0, "$CODE")
-import g4dpo
+import g4arm, g4dpo
 import numpy as np
 a, b = (json.load(open(f"$P/{r}/summary.json")) for r in "ab")
 ev = lambda s, name, step: next(e for e in s["eval"] if e["set"] == name and e["step"] == step)
@@ -136,6 +157,31 @@ if "$BAKE" == "1":
          f"c: the reference is still the merged model at step 4 ({q0['ref_chosen_nll']} {q4['ref_chosen_nll']})")
     need(set(c["dpo"].get("ref") or {}) == {"train", "pref_btval"} and c["dpo"]["ref"]["train"]["batches"] == 4,
          f"c: the reference (the merged model) computed before the first step (amendment G4-6.4a) {c['dpo'].get('ref')}")
+if "$C6" == "1":
+    spec = g4dpo.spec(**g4arm.DPO6C)
+    need(a["dpo"]["spec"] == spec, f"c6: (a)'s spec is G4-6c's {a['dpo']['spec']}")
+    e = json.load(open("$P/e/summary.json"))
+    print("E_EVAL", json.dumps(e["eval"]))
+    meta = json.load(open("$P/a/adapter-step4.json"))
+    kept = (a.get("saved_adapters") or {}).get("4") or {}
+    need(meta["steps"] == 4 and (meta["rank"], meta["alpha"]) == (4, 2.0) and kept.get("sum_abs", 0) > 0
+         and kept["sum_abs"] != a.get("adapter_sum_abs"), f"c6: (a) kept its adapter of step 4 {meta} {kept}")
+    for name in ("books", "own"):
+        x, y = ev(e, name, 0)["loss"], ev(a, name, 4)["loss"]
+        need(abs(x - y) <= 1e-4 * max(1.0, abs(y)), f"c6: {name}: the kept adapter of step 4 = (a) at step 4 ({x} vs {y})")
+    n_end = spec["end_tokens"]
+    for step in (0, 4, 8):
+        q = ev(a, "pref_btval", step)
+        need(q["chosen_tokens_all"] - q["chosen_tokens"] == n_end * q["pairs"] and
+             q["rejected_tokens_all"] - q["rejected_tokens"] == n_end * q["pairs"],
+             f"c6: pref_btval at step {step}: the log-ratio {n_end} tokens per side short of the NLL {q}")
+    s1, l1 = a["dpo"]["steps"][0], a["loss"][0][1]
+    want = s1["loss"] + spec["nll_alpha"] * s1["chosen_nll_all"]
+    need(abs(l1 - want) <= g4arm.LOSS_MAX_DIFF6C * max(1.0, abs(l1)),
+         f"c6: step 1's loss = DPO term + {spec['nll_alpha']} x the chosen NLL over every target token ({l1} vs {want})")
+    for name in ("train", "pref_btval"):
+        ends = json.load(open(f"$P/ends-{name}.json"))
+        need(ends["segments"] > 0 and len(ends["end_ids"]) == n_end, f"c6: the real pairs of {name} end in <turn|>\\n {ends}")
 print("CPU_PROOF6_OK" if not bad else f"CPU_PROOF6_FAILED {bad}", flush=True)
 raise SystemExit(1 if bad else 0)
 EOF

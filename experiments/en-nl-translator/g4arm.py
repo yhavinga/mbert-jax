@@ -4041,6 +4041,21 @@ BASE_MAX_DIFF6B = 0.05    # step 0: an SFT eval file's loss against G4-4's own e
 OWN6B = "own4"            # G4-4's greedy held-out translations of the BT validation as targets (as own is G4-0's)
 COMPARE6B = ("candidates", "identical", "chrf_low", "chrf_high", "length_ratio", "kept", "drawn", "short_of_want")
 BANDS6 = ("chrf_low", "chrf_high", "length_ratio", "eval_13gram")
+# Arm G4-6c (amendment G4-6c): G4-6b's start model, reference and pairs with a milder loss: beta 0.5, NLL weight 2.0, the
+# turn's end (<turn|>\n, the last two target tokens of every side) outside the log-ratio; evals and kept adapters at
+# the checkpoints; the checkpoint chosen on the search part of G4-5's split (G4-5.6's rule), decided on its decision part
+ARM6C = "G4-6c"
+DPO6C = {"loss": "sigmoid", "beta": 0.5, "label_smoothing": 0.0, "nll_alpha": 2.0, "length_norm": False, "end_tokens": 2}
+END6C = g4lora.END
+EVAL_EVERY6C = 240
+SAVE_STEPS6C = (240, 480)
+SAVE_ARG6C = ",".join(map(str, SAVE_STEPS6C))
+SMOKE_SAVE6C = 4
+LOSS_MAX_DIFF6C = 1e-4    # step 1's loss against its DPO term + nll_alpha x the chosen NLL over every target token
+LONG6C = 1.5              # reported: the share of outputs longer than this times their reference's words
+CKPT6C = re.compile(r"^G4-6c-s([1-9][0-9]*)$")
+SPLIT_DIGEST6C = "f953c026597eedcb20ab56dab7d0b4389057697c01550017ba954ba6963440f3"   # G4-5.4's search and decision parts
+SFT_SETS6C = ("books", "btval", "own", "own4", "btlong", "novels")
 
 
 def english_of(user):
@@ -4551,11 +4566,14 @@ def last_evals(summary):
     return last
 
 
-def smoke6_verdict(summary, adapter, base_summary, seq, lora, arm_rows, base_rows, build_report, start=None):
+def smoke6_verdict(summary, adapter, base_summary, seq, lora, arm_rows, base_rows, build_report, start=None, arm=None,
+                   saved=None):
     """amendment G4-6.6: every check with its value and whether it holds. start (amendment G4-6b.6): the arm that the
     run starts from with its adapter merged (G4-4): step 0's SFT losses are then that arm's own eval at its last step
     (within BASE_MAX_DIFF6B), the run's base_adapter is that arm's, own4 is evaluated too, and the smoke translations'
-    base is that arm"""
+    base is that arm. arm G4-6c (amendment G4-6c.6): its spec and eval interval, and saved (the adapter.json the run
+    kept after step SMOKE_SAVE6C), the log-ratio's tokens and the loss's composition"""
+    spec = g4dpo.spec(**(DPO6C if arm == ARM6C else DPO6))
     checks = {}
     loss = summary.get("loss") or []
     checks["steps"] = {"value": summary.get("steps_done"), "holds": summary.get("steps_done") == SMOKE6_STEPS}
@@ -4570,12 +4588,12 @@ def smoke6_verdict(summary, adapter, base_summary, seq, lora, arm_rows, base_row
     checks["dpo_steps"] = {"value": [(s["pairs"], round(s["loss"], 5)) for s in steps],
                            "holds": len(steps) == SMOKE6_STEPS and all(s["pairs"] > 0 and math.isfinite(s["loss"])
                                                                         for s in steps)}
-    checks["dpo_spec"] = {"value": dpo.get("spec"), "holds": dpo.get("spec") == g4dpo.spec(**DPO6)}
+    checks["dpo_spec"] = {"value": dpo.get("spec"), "holds": dpo.get("spec") == spec}
     sft_sets = [s for s in EVAL_SETS4 if not (s == "btlong" and seq == SEQ6_FALLBACK)]
     names = sft_sets + list(PREF_SETS6) + ([OWN6B] if start else [])
     have = {(e["set"], e["step"]) for e in summary.get("eval") or []}
     checks["evals"] = {"value": sorted(have), "holds": all((n, s) in have for n in names for s in SMOKE6_EVAL_STEPS)}
-    expected = g4dpo.expected_step0(g4dpo.spec(**DPO6))
+    expected = g4dpo.expected_step0(spec)
     step0 = {}
     for name in PREF_SETS6:
         e = eval_at6(summary, name, 0) or {}
@@ -4612,7 +4630,29 @@ def smoke6_verdict(summary, adapter, base_summary, seq, lora, arm_rows, base_row
     if checks["metricx_arm"]["value"] is not None and checks["metricx_base"]["value"] is not None:
         delta = checks["metricx_arm"]["value"] - checks["metricx_base"]["value"]
     checks["qe_delta"] = {"value": delta, "holds": delta is not None and abs(delta) <= SMOKE_QE_MAX_DELTA}
-    estimate = smoke6_estimate(summary, build_report, seq)
+    if arm == ARM6C:
+        # amendment G4-6c.6: every side's log-ratio n_end tokens short of its NLL; step 1's loss = its DPO term +
+        # nll_alpha x the chosen NLL over every target token; the adapter of step SMOKE_SAVE6C kept, not the last one
+        n_end, ends = spec["end_tokens"], {}
+        for name in PREF_SETS6:
+            e = eval_at6(summary, name, 0) or {}
+            ends[name] = {"pairs": e.get("pairs"), "chosen": e.get("chosen_tokens_all", 0) - e.get("chosen_tokens", 0),
+                          "rejected": e.get("rejected_tokens_all", 0) - e.get("rejected_tokens", 0)}
+        checks["end_tokens"] = {"value": ends, "holds": all(
+            v["pairs"] and v["chosen"] == n_end * v["pairs"] and v["rejected"] == n_end * v["pairs"] for v in ends.values())}
+        first = steps[0] if steps else {}
+        got = loss[0][1] if loss else None
+        want = first.get("loss", math.nan) + spec["nll_alpha"] * first.get("chosen_nll_all", math.nan)
+        checks["loss_composition"] = {"value": {"loss": got, "dpo_plus_nll": want}, "holds": got is not None and
+                                      math.isfinite(want) and abs(got - want) <= LOSS_MAX_DIFF6C * max(1.0, abs(got))}
+        kept = (summary.get("saved_adapters") or {}).get(str(SMOKE_SAVE6C)) or {}
+        meta = {k: (saved or {}).get(k) for k in ("rank", "alpha", "scale", "steps")}
+        last_abs = summary.get("adapter_sum_abs")
+        checks["saved_adapter"] = {"value": {"saved": kept, "meta": meta, "last_sum_abs": last_abs},
+                                   "holds": (meta["rank"], meta["alpha"], meta["scale"], meta["steps"]) ==
+                                   (32, 16.0, 0.5, SMOKE_SAVE6C) and kept.get("sum_abs", 0) > 0 and
+                                   last_abs is not None and kept["sum_abs"] != last_abs}
+    estimate = smoke6_estimate(summary, build_report, seq, EVAL_EVERY6C if arm == ARM6C else EVAL_EVERY6)
     checks["estimate_hours"] = {"value": estimate["hours"], "holds": estimate["hours"] <= MAX_HOURS6}
     # reported: the rejected side of pref_btval is the start model's own translation of the BT validation, as the eval
     # set own (G4-0) or own4 (G4-4)
@@ -4623,15 +4663,15 @@ def smoke6_verdict(summary, adapter, base_summary, seq, lora, arm_rows, base_row
                                                 rej0 and rej0.get("rejected_nll")}}
 
 
-def smoke6_estimate(summary, build_report, seq):
+def smoke6_estimate(summary, build_report, seq, every=EVAL_EVERY6):
     """The full run's hours: every batch of the training file at the smoke run's median step time, an eval round
-    (every set, as long as the smoke run's at step 0) at step 0, every EVAL_EVERY6 steps and after the last, the
+    (every set, as long as the smoke run's at step 0) at step 0, every `every` steps and after the last, the
     smoke run's time to its first step, and the reference pass before it (amendment G4-6.4a: every training batch at
     the smoke run's median time per batch, and the preference eval files as in the smoke run)"""
     steps = build_report["packing"][str(seq)]["train"]["steps"]
     step_s = (summary.get("throughput") or {}).get("step_s_median")
     round_s = sum(e.get("seconds", 0.0) for e in summary.get("eval") or [] if e["step"] == 0)
-    rounds = 1 + steps // EVAL_EVERY6 + (0 if steps % EVAL_EVERY6 == 0 else 1)
+    rounds = 1 + steps // every + (0 if steps % every == 0 else 1)
     times = summary.get("times") or {}
     before = (times.get("python_to_setup_s") or 0) + (times.get("setup_s") or 0) + (times.get("compile_s_est") or 0)
     ref = (summary.get("dpo") or {}).get("ref") or {}
@@ -4656,14 +4696,18 @@ def smoke6(args):
         m = {r["id"]: r for r in read_rows(metricx)}
         rows[name] = [{**r, "metricx_qe": m.get(i, {}).get("qe_source_hypothesis")} for i, r in p.items()]
     start = getattr(args, "start", None)
+    arm = getattr(args, "arm", None) or ARM6
+    saved = json.loads(Path(args.saved_adapter).read_text()) if getattr(args, "saved_adapter", None) else None
+    if arm == ARM6C and saved is None:
+        raise SystemExit("smoke6 --arm G4-6c needs --saved-adapter (the adapter the smoke run kept, amendment G4-6c.6)")
     result = smoke6_verdict(summary, adapter, base_summary, args.seq, lora, rows["arm"], rows["base"], build_report,
-                            start=start)
+                            start=start, arm=arm, saved=saved)
     result["seq"] = args.seq
     result["eval"] = summary.get("eval")
     result["throughput"] = summary.get("throughput")
     Path(args.out).with_suffix(".json").write_text(json.dumps(result, indent=1, default=str) + "\n")
-    arm = getattr(args, "arm", None) or ARM6
-    L = [f"# Smoke-test {arm} (amendement {'G4-6b.6' if start else 'G4-6.6'}), rijen van {args.seq}"
+    amendment = "G4-6c.6" if arm == ARM6C else "G4-6b.6" if start else "G4-6.6"
+    L = [f"# Smoke-test {arm} (amendement {amendment}), rijen van {args.seq}"
          + (f"; startmodel {start} (ingebakken), basis van de vertalingen {start}" if start else ""), "",
          f"**{'Geslaagd' if result['passed'] else 'Niet geslaagd'}.** Schatting van de volle run: "
          f"{result['estimate']['hours']} u.", "", "| controle | waarde | gehaald |", "|---|---|---|"]
@@ -4686,6 +4730,8 @@ def pref_measure(summary):
         if e.get("kind") == "pref":
             out["sets"][e["set"]][e["step"]] = {k: e[k] for k in ("pairs", "loss", "accuracy", "margin", "chosen_nll",
                                                                   "rejected_nll", "ref_chosen_nll", "ref_rejected_nll")}
+            # amendment G4-6c: the NLL over every target token beside the log-ratio's (the same without end_tokens)
+            out["sets"][e["set"]][e["step"]].update({k: e[k] for k in ("chosen_nll_all", "rejected_nll_all") if k in e})
         elif e["set"] in ("own", OWN6B):
             out[e["set"]][e["step"]] = e["loss"]
     steps = (summary.get("dpo") or {}).get("steps") or []
@@ -4778,6 +4824,221 @@ def pairclass6(args):
         L.append(f"| {kind} | {c.get('n')} | {pct(c.get('original'))} | {pct(r.get('original'))} | {f3(diff, True)} |")
     Path(args.out).write_text("\n".join(L) + "\n", encoding="utf-8")
     print(f"PAIRCLASS6 {json.dumps(result)}", flush=True)
+
+
+# ---------------------------------------------------------------------------------------------------- G4-6c
+
+def ends6c(args):
+    """amendment G4-6c.3: every packed file of G4-6b's pairs (the training files, the smoke sets and the preference eval
+    files at both row lengths): each segment's target tokens one run of more than end_tokens tokens whose last
+    end_tokens are the ids of <turn|>\\n by Gemma 4's tokenizer, so the log-ratio leaves out exactly the turn's end"""
+    import transformers
+
+    n = DPO6C["end_tokens"]
+    ids = transformers.AutoTokenizer.from_pretrained(args.tokenizer)(END6C, add_special_tokens=False)["input_ids"]
+    if len(ids) != n:
+        raise SystemExit(f"{END6C!r} is {ids}, not {n} tokens")
+    d = Path(args.data)
+    want = [f"{k}-{seq}.parquet" for k in ("train", "smoke", *(f"eval-{x}" for x in PREF_SETS6))
+            for seq in (SEQ6, SEQ6_FALLBACK)]
+    missing = [f for f in want if not (d / f).is_file()]
+    if missing:
+        raise SystemExit(f"{d}: no {missing}")
+    files = {f: g4dpo.check_ends(d / f, n, ids) for f in sorted(want)}
+    print(f"ENDS6C {json.dumps({'end': END6C, 'end_ids': ids, 'end_tokens': n, 'files': files})}", flush=True)
+
+
+def ckpt_step6c(name):
+    m = CKPT6C.match(name)
+    if not m:
+        raise SystemExit(f"{name} is no checkpoint of G4-6c (G4-6c-s<step>)")
+    return int(m.group(1))
+
+
+def part_counts6c(scored, ids):
+    """Per model and set of a part: n, not finished, loop, English left, empty (armeval.counts), the mean QE, and with a
+    reference the median of output words per reference word and the share above LONG6C x the reference"""
+    import armeval
+
+    out = {}
+    for name, rows_by_id in scored.items():
+        out[name] = {}
+        for s, part in ids.items():
+            rows = [rows_by_id[i] for i in part]
+            lengths = armeval.length_ratios(rows)
+            with_ref = [r for r in rows if r.get("reference") and armeval.words(r["reference"])]
+            longer = (sum(armeval.words(r["hypothesis"]) > LONG6C * armeval.words(r["reference"]) for r in with_ref)
+                      / len(with_ref)) if with_ref else None
+            out[name][s] = {**armeval.counts(rows), "metricx_qe": mean(r["metricx_qe"] for r in rows),
+                            "out_per_ref": lengths and lengths["out_per_ref"], "over_1_5_ref": longer}
+    return out
+
+
+def training6c(summary, steps):
+    """The training's evals at step 0 and at the checkpoints: the SFT files' loss, and per preference file its pairs'
+    loss, accuracy, margin and the NLLs (the log-ratio's tokens and every target token) with the reference's"""
+    out = {}
+    for step in [0, *steps]:
+        sft = {n: (eval_at6(summary, n, step) or {}).get("loss") for n in SFT_SETS6C}
+        pref = {}
+        for n in PREF_SETS6:
+            e = eval_at6(summary, n, step)
+            if e is None:
+                raise SystemExit(f"the training has no eval of {n} at step {step}")
+            pref[n] = {k: e.get(k) for k in ("pairs", "loss", "accuracy", "margin", "chosen_nll", "chosen_nll_all",
+                                             "rejected_nll", "rejected_nll_all", "ref_chosen_nll", "ref_rejected_nll")}
+        missing = [n for n, v in sft.items() if v is None]
+        if missing:
+            raise SystemExit(f"the training has no eval of {missing} at step {step}")
+        out[step] = {"sft": sft, "pref": pref}
+    return out
+
+
+def report6c(args):
+    """amendment G4-6c.7-G4-6c.9: the checkpoint chosen on the search part (G4-5.6's rule, select5), the rule (a1) and
+    (b) against G4-0 on its decision part, and per checkpoint the failures, the length and the training's measures"""
+    import g4mix
+
+    evalsets = {r["id"]: r for r in read_rows(args.evalsets)}
+    split = json.loads(Path(args.split).read_text())
+    assign = split["assign"]
+    if g4mix.digest(assign) != split["digest"] or split["digest"] != SPLIT_DIGEST6C:
+        raise SystemExit(f"{args.split}: not the split of G4-5.4 (digest {split['digest']}, want {SPLIT_DIGEST6C})")
+    cands = [c.split("=", 1) for c in args.candidate]
+    names = [n for n, _ in cands]
+    steps = [ckpt_step6c(n) for n in names]
+    if steps != sorted(set(steps)):
+        raise SystemExit(f"the checkpoints {names}: not in the order of their steps")
+    refs = [c.split("=", 1) for c in args.reference or []]
+    scored = {name: scored_dir(d) for name, d in cands + [(BASE, args.base)] + refs}
+    for name, rows in scored.items():
+        if set(rows) != set(evalsets):
+            raise SystemExit(f"{name}: scores for {len(rows)} of {len(evalsets)} segments")
+    refqe = {r["id"]: r["qe_source_reference"] for r in read_rows(args.refqe)}
+    missing = [i for i, r in evalsets.items() if r["set"] in HUMAN_QE and refqe.get(i) is None]
+    if missing:
+        raise SystemExit(f"{args.refqe}: no QE of the human reference of {len(missing)} segments, e.g. {missing[:3]}")
+    check = {}
+    for s in HUMAN_QE:
+        ids = [i for i, r in evalsets.items() if r["set"] == s and not (s == "wmt24pp" and bad_source(r["meta"]))]
+        got = mean(refqe[i] for i in ids)
+        check[s] = {"again": got, "protocol": HUMAN_QE[s], "diff": got - HUMAN_QE[s]}
+        if abs(got - HUMAN_QE[s]) > REFQE_MAX_DIFF5:
+            raise SystemExit(f"the human references' QE of {s} again: {got:.4f}, the protocol's {HUMAN_QE[s]:.4f}")
+    predictions = read_rows(args.predictions)
+    part_ids = {p: part_ids5(evalsets, assign, p) for p in ("search", "decision")}
+    parts = {p: part_measures5(scored, predictions, refqe, part_ids[p], BASE) for p in ("search", "decision")}
+    # the choice reads the search part alone (amendment G4-6c.7)
+    chosen, why = select5(names, parts["search"])
+    d = parts["decision"]["models"][chosen]
+    summary = json.loads(Path(args.train_summary).read_text())
+    last = summary.get("steps_done")
+    if steps[-1] != last or steps[:-1] != list(SAVE_STEPS6C):
+        raise SystemExit(f"the checkpoints {steps}: not the kept steps {list(SAVE_STEPS6C)} and the last {last}")
+    result = {"arm": ARM6C, "base": BASE, "candidates": names, "steps": dict(zip(names, steps)), "selected": chosen,
+              "selection": why, "refqe_check": check,
+              "split": {k: split[k] for k in ("seed", "share", "sets", "digest")}, "parts": parts,
+              "a1": {"holds": d["a1"], "sets": d["a1_sets"]}, "b": {"holds": d["b"], "delta": d["b_delta"]},
+              "counts": {p: part_counts6c(scored, part_ids[p]) for p in ("search", "decision")},
+              "training": training6c(summary, steps), "spec": (summary.get("dpo") or {}).get("spec"),
+              "reference": (summary.get("base_adapter") or {}).get("name") or BASE,
+              "saved_adapters": summary.get("saved_adapters"), "references": [n for n, _ in refs]}
+    beside = {}
+    for spec in args.beside_summary or []:
+        name, path = spec.split("=", 1)
+        b = json.loads(Path(path).read_text())
+        bl = last_evals(b)
+        beside[name] = {"step": max((e["step"] for e in b.get("eval") or []), default=None),
+                        "sft": {n: bl[n]["loss"] for n in SFT_SETS6C if n in bl},
+                        "pref": {n: {k: bl[n].get(k) for k in ("loss", "accuracy", "margin", "chosen_nll", "rejected_nll")}
+                                 for n in PREF_SETS6 if n in bl},
+                        "spec": (b.get("dpo") or {}).get("spec")}
+    result["beside"] = beside
+    if args.tally:
+        t = json.loads(Path(args.tally).read_text())
+        if t.get("arm") != chosen:
+            raise SystemExit(f"{args.tally}: a tally of {t.get('arm')}, the selected checkpoint is {chosen}")
+        result["blind"], result["a2"], result["c"] = t, t["a2"], t["c"]
+    else:
+        result["blind"] = None
+    result["verdict"] = verdict(result)
+    Path(args.out).with_suffix(".json").write_text(json.dumps(result, indent=1, ensure_ascii=False, default=str) + "\n")
+    Path(args.out).write_text(report6c_text(result), encoding="utf-8")
+    print(f"REPORT6C {json.dumps({'selected': chosen, 'a1': d['a1'], 'b': d['b_delta'], 'b_holds': d['b'], 'verdict': result['verdict']})}",
+          flush=True)
+
+
+def report6c_text(r):
+    sets = list(HUMAN_QE)
+    L = [f"# Arm {r['arm']}: uitslag volgens amendement G4-6c (protocol-g4.md §13)", "",
+         "Gemaakt door `g4arm.py report6c`. Mildere DPO vanaf G4-4 (referentie G4-4) op de paren van G4-6b; drie "
+         "checkpoints, de keuze op het zoekdeel van G4-5.4 (regel van G4-5.6), het besluit met (a1) en (b) tegen G4-0 "
+         "op het beslisdeel.", "",
+         f"**Uitslag: {r['verdict']}.** Gekozen checkpoint: **{r['selected']}** ({r['selection']}).", "",
+         f"Verlies `{json.dumps(r['spec'])}`.", "",
+         "## Besluit op het beslisdeel", "",
+         "| set | n | " + r["selected"] + " | G4-0 | mens (zelfde segmenten) | (a1) |", "|---|---:|---:|---:|---:|---|"]
+    dec = r["parts"]["decision"]
+    m, base = dec["models"][r["selected"]], dec["models"][r["base"]]
+    for s in sets:
+        L.append(f"| {s} | {dec['n'][s]} | {f3(m['qe'][s])} | {f3(base['qe'][s])} | {f3(dec['human'][s])} | "
+                 f"{'ja' if m['a1_sets'][s] else 'nee'} |")
+    L += ["", f"(a1) **{'gehaald' if r['a1']['holds'] else 'niet gehaald'}**. (b): aandeel \"origineel\" "
+          f"{pct(m['share'])} tegen G4-0 {pct(base['share'])} (WMT24++ {dec['n']['wmt24pp']} + FLAN {dec['n']['flan']}), "
+          f"verschil {f3(m['b_delta'], True)} (grens +0,10) → **{'gehaald' if r['b']['holds'] else 'niet gehaald'}**.", ""]
+    if r.get("blind"):
+        b = r["blind"]
+        L += [f"Blind tegen G4-0: {b['arm_better']} beter, {b['base_better']} slechter, {b['equal']} gelijk; fouten "
+              f"{b['errors_arm']} tegen {b['errors_base']} → (a2) {'ja' if r['a2'] else 'nee'}, (c) "
+              f"{'ja' if r['c'] else 'nee'}.", ""]
+    else:
+        L += ["(a2) en (c): nog niet beoordeeld (alleen als (a1) en (b) gelden).", ""]
+    for part, title in (("search", "Zoekdeel (de keuze)"),
+                        ("decision", "Beslisdeel, alle modellen (na de keuze, rapporteren)")):
+        p = r["parts"][part]
+        L += [f"## {title}", "", "| model | " + " | ".join(f"QE {s}" for s in sets) + " | (a1) | max. QE-overschrijding | "
+              "origineel | verschil met G4-0 |", "|---|" + "---:|" * len(sets) + "---|---:|---:|---:|"]
+        L.append("| mens | " + " | ".join(f3(p["human"][s]) for s in sets) + " | | | | |")
+        for name, x in p["models"].items():
+            L.append(f"| {name} | " + " | ".join(f3(x["qe"][s]) for s in sets) +
+                     f" | {'ja' if x['a1'] else 'nee'} | {f3(x['excess'], True)} | {pct(x['share'])} | "
+                     f"{f3(x['b_delta'], True)} |")
+        L.append("")
+    L += ["## Per model: niet af, lussen, lengte (rapporteren, beslist niet)", "",
+          "Uitvoer / referentie: mediaan van de woorden van de uitvoer per woord van de referentie; > 1,5 × ref: aandeel "
+          "uitvoer met meer dan 1,5 keer de woorden van de referentie. FLAN heeft geen referentie.", "",
+          "| deel | model | set | n | QE | niet af | lus | Engels over | leeg | uitvoer / ref | > 1,5 × ref |",
+          "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|"]
+    for part, label in (("search", "zoek"), ("decision", "beslis")):
+        for name, per in r["counts"][part].items():
+            for s, c in per.items():
+                L.append(f"| {label} | {name} | {s} | {c['n']} | {f3(c['metricx_qe'])} | {c['not_ended']} | "
+                         f"{c['decode_loop']} | {c['english_left']} | {c['empty']} | {f3(c['out_per_ref'])} | "
+                         f"{pct(c['over_1_5_ref'])} |")
+    L += ["", f"## Per checkpoint: de training (referentie {r['reference']}; rapporteren, beslist niet)", "",
+          "Verlies per token (het Nederlands en `<turn|>\\n`) op de SFT-evalsets, op stap 0 (G4-4 ingebakken) en op de "
+          "checkpoints.", "", "| stap | " + " | ".join(SFT_SETS6C) + " |", "|---:|" + "---:|" * len(SFT_SETS6C)]
+    for step, t in r["training"].items():
+        L.append(f"| {step} | " + " | ".join(f3(t["sft"][n]) for n in SFT_SETS6C) + " |")
+    for name, b in (r.get("beside") or {}).items():
+        L.append(f"| {name} ({b['step']}) | " + " | ".join(f3(b["sft"].get(n)) for n in SFT_SETS6C) + " |")
+    L += ["", "Voorkeurssets: NLL per token van chosen en rejected over de tokens van de log-ratio (zonder `<turn|>\\n`) "
+          "en over alle doeltokens (de maat van G4-6b); ref = de referentie G4-4 over de log-ratio-tokens.", "",
+          "| set | stap | paren | verlies | nauwkeurigheid | marge | NLL chosen | NLL chosen (alle) | NLL rejected | "
+          "NLL rejected (alle) | ref chosen | ref rejected |", "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
+    for n in PREF_SETS6:
+        for step, t in r["training"].items():
+            v = t["pref"][n]
+            L.append(f"| {n} | {step} | {v['pairs']} | {f3(v['loss'])} | {f3(v['accuracy'])} | {f3(v['margin'])} | "
+                     f"{f3(v['chosen_nll'])} | {f3(v['chosen_nll_all'])} | {f3(v['rejected_nll'])} | "
+                     f"{f3(v['rejected_nll_all'])} | {f3(v['ref_chosen_nll'])} | {f3(v['ref_rejected_nll'])} |")
+        for name, b in (r.get("beside") or {}).items():
+            v = b["pref"].get(n) or {}
+            L.append(f"| {n} | {name} ({b['step']}) | | {f3(v.get('loss'))} | {f3(v.get('accuracy'))} | "
+                     f"{f3(v.get('margin'))} | – | {f3(v.get('chosen_nll'))} | – | {f3(v.get('rejected_nll'))} | – | – |")
+    L += ["", f"Bewaarde adapters: {json.dumps(r.get('saved_adapters'))}.", "",
+          f"Controle menselijke referenties (QE opnieuw, hele set): {json.dumps(r['refqe_check'])}", ""]
+    return "\n".join(L) + "\n"
 
 
 def main(argv=None):
@@ -5029,9 +5290,11 @@ def main(argv=None):
                  "base-pairs", "base-metricx", "out"):
         p.add_argument(f"--{name}", required=True)
     p.add_argument("--seq", type=int, default=SEQ6, choices=(SEQ6, SEQ6_FALLBACK))
-    p.add_argument("--arm", default=ARM6, choices=(ARM6, ARM6B))
+    p.add_argument("--arm", default=ARM6, choices=(ARM6, ARM6B, ARM6C))
     p.add_argument("--start", default=None, choices=(START6B,),
-                   help="G4-6b: the arm the run starts from (its adapter merged; --base-summary is its training)")
+                   help="G4-6b, G4-6c: the arm the run starts from (its adapter merged; --base-summary is its training)")
+    p.add_argument("--saved-adapter", default=None,
+                   help="G4-6c: the adapter.json the smoke run kept after step SMOKE_SAVE6C (amendment G4-6c.6)")
     p = sub.add_parser("pairtexts6")
     p.add_argument("--pairs", required=True, help="build6's pairs.parquet")
     p.add_argument("--out", required=True)
@@ -5040,6 +5303,16 @@ def main(argv=None):
     p.add_argument("--out", required=True)
     p.add_argument("--arm", default=ARM6, choices=(ARM6, ARM6B))
     p.add_argument("--rejected-model", default=BASE, choices=(BASE, START6B))
+    p = sub.add_parser("ends6c")
+    p.add_argument("--data", required=True, help="G4-6b's build6 directory (its packed files)")
+    p.add_argument("--tokenizer", required=True)
+    p = sub.add_parser("report6c")
+    for name in ("evalsets", "split", "refqe", "base", "predictions", "train-summary", "out"):
+        p.add_argument(f"--{name}", required=True)
+    p.add_argument("--candidate", action="append", required=True, help="G4-6c-s<step>=DIR, in the order of the steps")
+    p.add_argument("--reference", action="append", default=[], help="NAME=DIR, reported beside")
+    p.add_argument("--beside-summary", action="append", default=[], help="NAME=summary.json of another run, reported")
+    p.add_argument("--tally", default=None)
     args = parser.parse_args(argv)
     {"fetch": fetch, "build": build, "check": check, "evaldata": evaldata, "texts": texts, "report": report,
      "tally": tally, "smoke": smoke, "heldout": heldout, "own": own, "replay": replay_candidates, "build2": build2,
@@ -5047,7 +5320,8 @@ def main(argv=None):
      "smoke4": smoke4, "novels4": novels4, "build5": build5, "split5": split5, "smoke5": smoke5,
      "report5": report5, "temp5": temp5, "samples5": samples5_cli, "sampledata5": sampledata5, "best8": best8,
      "sample5": sample5, "samplejoin": samplejoin, "samplesplit": samplesplit, "cands6": cands6, "build6": build6,
-     "check6": check6, "smoke6": smoke6, "pairtexts6": pairtexts6, "pairclass6": pairclass6}[args.command](args)
+     "check6": check6, "smoke6": smoke6, "pairtexts6": pairtexts6, "pairclass6": pairclass6, "ends6c": ends6c,
+     "report6c": report6c}[args.command](args)
 
 
 if __name__ == "__main__":

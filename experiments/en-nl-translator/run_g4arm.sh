@@ -129,26 +129,36 @@
 #   RUN=g4arm_G4-6b train; adapter (G4-4's adapter and the run's stacked, to $G/G4-6b/; the run's alone in
 #   $G/G4-6b/delta/); MODEL=G4-6b translate and score; texts (G4-6b, G4-0, G4-4, G4-5c2, and G4-6 once its report is
 #   there; the list in $NAT/models.txt), classify, blind, report (G4-4 as the other arm, the rest beside)
+# Arm G4-6c (amendment G4-6c: a milder DPO from G4-4 on G4-6b's pairs: beta 0.5, NLL weight 2.0, the turn's end outside
+# the log-ratio, the adapter kept at steps 240 and 480), with ARM=G4-6c, G4-6b's pairs read only ($G/data/G4-6b/):
+#   bash run_g4arm.sh ends6c      w2 (CPU): g4arm.py ends6c (every packed file: each segment ends in <turn|>\n), to
+#                                 $G/data/ends-G4-6c.txt
+#   cpuproof6 (BAKE=1, G4-6c's spec, the saved adapter and the end tokens); RUN=g4arm_G4-6c_s8 train (SEQ6=2048:
+#   g4arm_G4-6c_s8_2048; the adapter of step 4 kept), MODEL=G4-6c|G4-4 smoke-translate and smoke-score, smoke6-report;
+#   RUN=g4arm_G4-6c train (the adapters of steps 240 and 480 kept); [CKPT=<step>] adapter (G4-4's adapter and each
+#   checkpoint's stacked, to $G/G4-6c-s240/, $G/G4-6c-s480/, $G/G4-6c-s717/, the checkpoint's alone in delta/); MODEL=G4-6c-s<k>
+#   translate and score (SET=eval); texts (the three, G4-0, G4-4, G4-6b), classify, report6c (w0: the checkpoint
+#   chosen on the search part of G4-5's split, the rule on its decision part); SELECTED=<report6c's choice> blind
 # The code is beside this script (a copy of $G/scripts/). TAG names the jobs of one chain.
 set -euo pipefail
-STAGE=${1:?a stage: fetchbt, build, check, evaldata, setup, train, adapter, translate, score, texts, classify, blind, report, smoke-translate, smoke-score, smoke-report, fetchval, heldout, own, smoke2-report, replay, build2, heldout3, build3, smoke3-report, build4, smoke4-report, novels4, build5, split5, refqe5, resume5, report5, smoke5-report, cands6, build6, check6, cpuproof6, smoke6-report, pairtexts6, pairclassify6, pairclass6}
+STAGE=${1:?a stage: fetchbt, build, check, evaldata, setup, train, adapter, translate, score, texts, classify, blind, report, smoke-translate, smoke-score, smoke-report, fetchval, heldout, own, smoke2-report, replay, build2, heldout3, build3, smoke3-report, build4, smoke4-report, novels4, build5, split5, refqe5, resume5, report5, smoke5-report, cands6, build6, check6, cpuproof6, smoke6-report, pairtexts6, pairclassify6, pairclass6, ends6c, report6c}
 R=gs://t5-dutch-english-usc2/mbert/translator
 S=$R/sft
 E=$R/eval
 G=$S/g4arm
 ARM=${ARM:-G4-1}
-case $ARM in G4-1|G4-2|G4-3|G4-4|G4-5|G4-6|G4-6b) ;; *) echo "ARM is G4-1, G4-2, G4-3, G4-4, G4-5, G4-6 or G4-6b, not $ARM"; exit 1 ;; esac
+case $ARM in G4-1|G4-2|G4-3|G4-4|G4-5|G4-6|G4-6b|G4-6c) ;; *) echo "ARM is G4-1, G4-2, G4-3, G4-4, G4-5, G4-6, G4-6b or G4-6c, not $ARM"; exit 1 ;; esac
 SMOKE_RUN=g4arm_${ARM}_s8
 FULL_RUN=g4arm_$ARM
 # G4-6 (draft amendment G4-6.4): rows of 4,096, or of 2,048 if the smoke test at 4,096 does not fit (its own smoke run)
 SEQ6=${SEQ6:-4096}
 case $SEQ6 in 4096|2048) ;; *) echo "SEQ6 is 4096 or 2048, not $SEQ6"; exit 1 ;; esac
 A6=0
-case $ARM in G4-6|G4-6b) A6=1 ;; esac
+case $ARM in G4-6|G4-6b|G4-6c) A6=1 ;; esac
 [ $A6 = 1 ] && [ "$SEQ6" = 2048 ] && SMOKE_RUN=g4arm_${ARM}_s8_2048
 SET=${SET:-eval}
 case $SET in eval|heldout|long|dpo) ;; *) echo "SET is eval, heldout, long or dpo, not $SET"; exit 1 ;; esac
-[ "$SET" != dpo ] || [ $A6 = 1 ] || { echo "SET=dpo is G4-6's and G4-6b's (the rejected run)"; exit 1; }
+[ "$SET" != dpo ] || { [ $A6 = 1 ] && [ "$ARM" != G4-6c ]; } || { echo "SET=dpo is G4-6's and G4-6b's (the rejected run)"; exit 1; }
 # G4-2's places (amendment G4-2.9)
 H=$G/data/heldout
 NAT=$G/naturalness
@@ -197,6 +207,15 @@ if [ "$ARM" = G4-6b ]; then
   G6=$G/data/G4-6b; G6NAT=$G/naturalness-G4-6b-pairs; REJ6=G4-4
   NAT=$G/naturalness-G4-6b; REP=$G/report-G4-6b; CHECK_TXT=$G/data/check-G4-6b.txt
 fi
+# G4-6c's places (amendment G4-6c): G4-6b's pairs, their check and own4 (read only), its own runs, checkpoints, reports
+if [ "$ARM" = G4-6c ]; then
+  G6=$G/data/G4-6b; REJ6=G4-4; CHECK_TXT=$G/data/check-G4-6b.txt
+  NAT=$G/naturalness-G4-6c; REP=$G/report-G4-6c
+  # the stages that make or rewrite G4-6b's data are G4-6b's
+  case $STAGE in cands6|build6|check6|own|pairtexts6|pairclassify6|pairclass6) echo "$STAGE writes G4-6b's data: not with ARM=G4-6c"; exit 1 ;; esac
+  [ "$STAGE" != report ] || { echo "G4-6c's report is report6c (amendment G4-6c.7)"; exit 1; }
+fi
+[ "$ARM" = G4-6c ] || case $STAGE in ends6c|report6c) echo "$STAGE is G4-6c's"; exit 1 ;; esac
 # The Gemma 4 FLAN-nl after its post step (flan_g4_full_run.sh), the replay's only source (amendment G4-2.3)
 FNL=gs://t5-dutch-english-usc2/mbert/flan-nl
 TRAIN_CKPT=$R/gemma4-ckpt/gemma-4-31b-it                       # run_sft.sh's gemma4-31b (MaxText 0.2.5 conversion)
@@ -324,6 +343,15 @@ g46b_stack() {  # g46b_stack RUN_DIR OUT: G4-4's adapter and a run's of G4-6b si
     --weights 1 --shared-coef 2 --out "$out"
 }
 
+g46c_stack() {  # g46c_stack DELTA_LOCAL OUT: G4-4's adapter and a G4-6c checkpoint's (a local copy), both with coefficient 1
+  local delta=$1 out=$2 g44=$G_SHM/g46b-start-$TAG
+  [ -s "$g44/adapter.npz" ] || adapter_local "$G/G4-4" "$g44"
+  g45_check_adapter "$g44/adapter.json"
+  g45_check_adapter "$delta/adapter.json"
+  [ -s "$out/adapter.npz" ] || $FPY -I "$CODE/g4mix.py" stack --component shared="$g44" --component dpo="$delta" \
+    --weights 1 --shared-coef 2 --out "$out"
+}
+
 g45_train() {  # the training runs of G4-5 (draft amendment G4-5): the warmup, the branches, the search, the smoke runs
   RUN=${RUN:?g4arm_G4-5_warmup, g4arm_G4-5_<branch>, $G5_SEARCH or a smoke run (g4arm_G4-5_s8, _b8, _c8)}
   tpu_free
@@ -426,16 +454,21 @@ g45_train() {  # the training runs of G4-5 (draft amendment G4-5): the warmup, t
   bash "$D/launch.sh"
 }
 
-g46_train() {  # the runs of G4-6 and G4-6b (amendments G4-6, G4-6b): the smoke runs at 4,096 and 2,048, the full run
+g46_train() {  # the runs of G4-6, G4-6b and G4-6c (amendments G4-6, G4-6b, G4-6c): the smoke runs at 4,096 and 2,048, the full run
   RUN=${RUN:?g4arm_${ARM}_s8, g4arm_${ARM}_s8_2048 or g4arm_$ARM}
   tpu_free
-  local seq setfile steps every n f
+  local seq setfile steps every n f spec=DPO6 save=""
   case $RUN in
     "g4arm_${ARM}_s8") seq=4096; setfile=smoke-4096.parquet; steps=$(g4a_const SMOKE6_STEPS); every=4 ;;
     "g4arm_${ARM}_s8_2048") seq=2048; setfile=smoke-2048.parquet; steps=$(g4a_const SMOKE6_STEPS); every=4 ;;
     "g4arm_$ARM") seq=$SEQ6; setfile=train-$SEQ6.parquet; steps=auto; every=$(g4a_const EVAL_EVERY6) ;;
     *) echo "RUN $RUN is no run of $ARM"; exit 1 ;;
   esac
+  if [ "$ARM" = G4-6c ]; then
+    # amendment G4-6c: its loss, evals at the checkpoints, the adapters of the checkpoints kept (the smoke runs: step 4)
+    spec=DPO6C
+    if [ "$RUN" = "g4arm_$ARM" ]; then every=$(g4a_const EVAL_EVERY6C); save=$(g4a_const SAVE_ARG6C); else save=$(g4a_const SMOKE_SAVE6C); fi
+  fi
   D=$G_SHM/data-$RUN
   # a launch never takes the arguments of an earlier or a refused preparation
   rm -f -- "$D/launch.sh"
@@ -446,17 +479,18 @@ g46_train() {  # the runs of G4-6 and G4-6b (amendments G4-6, G4-6b): the smoke 
   local sft="$H/eval-books.parquet $H/eval-btval.parquet $H/eval-own.parquet $H4/eval-novels.parquet"
   # amendment G4-6.4: the long validation rows only in rows of 4,096 (MaxText would cut them at 2,048)
   [ "$seq" = 4096 ] && sft="$sft $H3/eval-btlong.parquet"
-  # amendment G4-6b: also G4-4's own greedy held-out translations of the BT validation (own4)
-  [ "$ARM" = G4-6b ] && sft="$sft $G6/eval-own4.parquet"
+  # amendment G4-6b: also G4-4's own greedy held-out translations of the BT validation (own4); G4-6c: G4-6b's
+  case $ARM in G4-6b|G4-6c) sft="$sft $G6/eval-own4.parquet" ;; esac
   local prefs=""
   for n in pref_books pref_btval pref_novels; do prefs="$prefs $G6/eval-$n-$seq.parquet"; done
   for f in $sft $prefs; do gsutil -q stat "$f" || { echo "no $f"; exit 1; }; done
   gsutil -m -q cp "$G6/$setfile" "$G6/train-chosen.parquet" "$G6/template.jinja" $sft $prefs "$D/"
-  $SFT_PY -c "import json, sys; sys.path.insert(0, '$CODE'); import g4arm, g4dpo; print(json.dumps(g4dpo.spec(**g4arm.DPO6)))" > "$D/dpo.json"
+  $SFT_PY -c "import json, sys; sys.path.insert(0, '$CODE'); import g4arm, g4dpo; print(json.dumps(g4dpo.spec(**g4arm.$spec)))" > "$D/dpo.json"
   # MaxText's data hooks are made from DATA (the chosen sides as SFT examples) and never read: the batches are the
   # packed pairs of --pref-train
   local ARGS="--dpo $D/dpo.json --pref-train $D/$setfile"
-  if [ "$ARM" = G4-6b ]; then
+  [ -n "$save" ] && ARGS="$ARGS --save-steps $save"
+  if [ "$ARM" = G4-6b ] || [ "$ARM" = G4-6c ]; then
     # amendment G4-6b.2: G4-4's final adapter merged into the base kernels before the first step (start and reference)
     mkdir -p "$D/start"
     gsutil -q cp "$G/G4-4/adapter.npz" "$G/G4-4/adapter.json" "$D/start/"
@@ -688,7 +722,32 @@ adapter)
   gsutil -q cp "$RUN_DIR/adapter.json" "$G_SHM/adapter-$TAG.json"
   python3 -c "import json, sys; a = json.load(open(sys.argv[1])); assert (a['rank'], a['alpha'], a['scale']) == (32, 16.0, 0.5), a" \
     "$G_SHM/adapter-$TAG.json" || { echo "the adapter is not rank 32, alpha 16"; exit 1; }
-  if [ "$ARM" = G4-6b ]; then
+  if [ "$ARM" = G4-6c ]; then
+    # amendment G4-6c.5: every checkpoint (the steps of --save-steps and the last) as G4-4's adapter and the
+    # checkpoint's LoRA side by side, as G4-6b.7, to $G/G4-6c-s<step>/ (the checkpoint's alone in delta/)
+    gsutil -q cp "$RUN_DIR/summary.json" "$G_SHM/summary-$TAG.json"
+    last=$(json_key "$G_SHM/adapter-$TAG.json" steps)
+    for k in $(g4a_const SAVE_ARG6C | tr ',' ' ') "$last"; do
+      # CKPT=<step>: that checkpoint alone (each takes a few minutes: ~1 GB down, 2 GB stacked and up)
+      [ -z "${CKPT:-}" ] || [ "$k" = "$CKPT" ] || continue
+      m=G4-6c-s$k
+      d=$G_SHM/g46c-delta-$TAG-s$k
+      src=adapter-step$k
+      [ "$k" = "$last" ] && src=adapter
+      mkdir -p "$d"
+      gsutil -q cp "$RUN_DIR/$src.npz" "$d/adapter.npz"
+      gsutil -q cp "$RUN_DIR/$src.json" "$d/adapter.json"
+      [ "$(json_key "$d/adapter.json" steps)" = "$k" ] || { echo "$RUN_DIR/$src.json is not the adapter of step $k"; exit 1; }
+      g46c_stack "$d" "$G_SHM/adapter-stack-$TAG-$m"
+      gsutil -q cp "$d/adapter.npz" "$d/adapter.json" "$G/$m/delta/"
+      gsutil -q cp "$G_SHM/adapter-stack-$TAG-$m/adapter.npz" "$G_SHM/adapter-stack-$TAG-$m/adapter.json" "$G/$m/"
+      gsutil -q cp "$G_SHM/summary-$TAG.json" "$G/$m/summary.json"
+      echo "ADAPTER $m: $G/$m/ $(tr -d '\n ' < "$G_SHM/adapter-stack-$TAG-$m/adapter.json" | cut -c1-200)"
+      # this stage's own copies (3 GB per checkpoint; the bucket has them): w0's /dev/shm is short (29 GB, 20 Nov)
+      rm -rf -- "$d" "$G_SHM/adapter-stack-$TAG-$m"
+    done
+    exit 0
+  elif [ "$ARM" = G4-6b ]; then
     # amendment G4-6b.7: the run's LoRA was trained on G4-4 merged; translate.py --lora takes G4-4's adapter and the
     # run's side by side (g4mix.py stack, both with coefficient 1: shared 2 - weight 1, and weight 1; rank 64, scale 0.5)
     gsutil -q cp "$RUN_DIR/adapter.npz" "$RUN_DIR/adapter.json" "$RUN_DIR/summary.json" "$G/$ARM/delta/"
@@ -700,10 +759,13 @@ adapter)
   echo "ADAPTER $ARM: $G/$ARM/ $(tr -d '\n ' < "$G_SHM/adapter-$TAG.json" | cut -c1-300)"
   ;;
 translate|smoke-translate)
-  MODEL=${MODEL:?G4-1, G4-2, G4-3, G4-4, G4-5c<k>, G4-6, G4-6b or G4-0}
-  case $MODEL in G4-1|G4-2|G4-3|G4-4|G4-6|G4-6b|G4-0|G4-5c[1-9]) ;; *) echo "MODEL is G4-1, G4-2, G4-3, G4-4, G4-5c<k>, G4-6, G4-6b or G4-0, not $MODEL"; exit 1 ;; esac
+  MODEL=${MODEL:?G4-1, G4-2, G4-3, G4-4, G4-5c<k>, G4-6, G4-6b, G4-6c, G4-6c-s<step> or G4-0}
+  case $MODEL in G4-1|G4-2|G4-3|G4-4|G4-6|G4-6b|G4-6c|G4-0|G4-5c[1-9]|G4-6c-s[1-9]*) ;; *) echo "MODEL is G4-1, G4-2, G4-3, G4-4, G4-5c<k>, G4-6, G4-6b, G4-6c, G4-6c-s<step> or G4-0, not $MODEL"; exit 1 ;; esac
   [ "$SET" != dpo ] || [ "$MODEL" = "$REJ6" ] || { echo "SET=dpo with ARM=$ARM: $REJ6 only (the rejected side of its pairs)"; exit 1; }
   case $MODEL in G4-5c*) [ "$SET" = eval ] || { echo "$MODEL: SET=eval only"; exit 1; } ;; esac
+  case $MODEL in G4-6c-s*) [ "$SET" = eval ] && [ "$STAGE" = translate ] || { echo "$MODEL: SET=eval only"; exit 1; } ;; esac
+  # G4-6c: its smoke run's model only in the smoke test
+  [ "$MODEL" != G4-6c ] || [ "$STAGE" = smoke-translate ] || { echo "MODEL=G4-6c is the smoke run's (smoke-translate)"; exit 1; }
   tpu_free
   EVALDIR=$G/data/eval
   if [ "$SET" = dpo ]; then
@@ -734,8 +796,8 @@ translate|smoke-translate)
     only 0
     OUT=$G/smoke/$TAG/$MODEL/translations
     ADAPTER_DIR=$G/runs/$SMOKE_RUN
-    # amendment G4-6b.6: the smoke translations' base is G4-4 with its own adapter
-    [ "$ARM" = G4-6b ] && [ "$MODEL" = G4-4 ] && ADAPTER_DIR=$G/G4-4
+    # amendment G4-6b.6: the smoke translations' base is G4-4 with its own adapter (G4-6c: as G4-6b)
+    case $ARM in G4-6b|G4-6c) [ "$MODEL" = G4-4 ] && ADAPTER_DIR=$G/G4-4 ;; esac
     SEG=segments-smoke.parquet
     CLASSES=small
     NAME=g4a_smoke_translate_${MODEL}_$TAG
@@ -761,8 +823,8 @@ translate|smoke-translate)
     if [ "$STAGE" = smoke-translate ]; then META=$G/smoke/$TAG/$MODEL/adapter.json; else META=$G/eval/$MODEL/adapter.json; fi
     gsutil -q cp "$G_SHM/adapter-$NAME/adapter.json" "$META"
     EXTRA="--lora $G_SHM/adapter-$NAME"
-  elif [ "$MODEL" = G4-6b ] && [ "$STAGE" = smoke-translate ]; then
-    # amendment G4-6b.6: the smoke run's LoRA on G4-4, stacked as the full run's adapter stage does
+  elif { [ "$MODEL" = G4-6b ] || [ "$MODEL" = G4-6c ]; } && [ "$STAGE" = smoke-translate ]; then
+    # amendment G4-6b.6: the smoke run's LoRA on G4-4, stacked as the full run's adapter stage does (G4-6c.6: the same)
     g46b_stack "$ADAPTER_DIR" "$G_SHM/adapter-$NAME"
     gsutil -q cp "$G_SHM/adapter-$NAME/adapter.json" "$G/smoke/$TAG/$MODEL/adapter.json"
     EXTRA="--lora $G_SHM/adapter-$NAME"
@@ -783,13 +845,17 @@ translate|smoke-translate)
     for cls in $CLASSES; do
       echo "translate_class $G_SHM/seg-$TAG/$SET/$SEG $cls $OUT/$cls ~/logs/${NAME}_$cls.log $EXTRA || exit 1"
     done
+    # G4-6c: the job's own copy of a checkpoint's adapter (2 GB on every worker; the bucket has it)
+    case $MODEL in G4-6c-s*) echo "rm -rf -- $G_SHM/adapter-$NAME" ;; esac
     echo "echo \"TRANSLATED w$W $MODEL: $CLASSES\""
   } > ~/job_body_$NAME.sh
   detach "$NAME" bash ~/job_body_$NAME.sh
   ;;
 score|smoke-score)
-  MODEL=${MODEL:?G4-1, G4-2, G4-3, G4-4, G4-5c<k>, G4-6, G4-6b or G4-0}
-  case $MODEL in G4-1|G4-2|G4-3|G4-4|G4-6|G4-6b|G4-0|G4-5c[1-9]) ;; *) echo "MODEL is G4-1, G4-2, G4-3, G4-4, G4-5c<k>, G4-6, G4-6b or G4-0, not $MODEL"; exit 1 ;; esac
+  MODEL=${MODEL:?G4-1, G4-2, G4-3, G4-4, G4-5c<k>, G4-6, G4-6b, G4-6c, G4-6c-s<step> or G4-0}
+  case $MODEL in G4-1|G4-2|G4-3|G4-4|G4-6|G4-6b|G4-6c|G4-0|G4-5c[1-9]|G4-6c-s[1-9]*) ;; *) echo "MODEL is G4-1, G4-2, G4-3, G4-4, G4-5c<k>, G4-6, G4-6b, G4-6c, G4-6c-s<step> or G4-0, not $MODEL"; exit 1 ;; esac
+  case $MODEL in G4-6c-s*) [ "$SET" = eval ] && [ "$STAGE" = score ] || { echo "$MODEL: SET=eval only"; exit 1; } ;; esac
+  [ "$MODEL" != G4-6c ] || [ "$STAGE" = smoke-score ] || { echo "MODEL=G4-6c is the smoke run's (smoke-score)"; exit 1; }
   if [ "$SET" != eval ]; then
     # the held-out and the long segments, and G4-6's rejected run: collect only, on the CPU
     if [ "$SET" = long ]; then
@@ -880,6 +946,13 @@ texts)
     MODELS="G4-6b G4-0 G4-4 G4-5c2"
     if gsutil -q stat "$G/report-G4-6/report.json"; then MODELS="$MODELS G4-6"; fi
   fi
+  if [ "$ARM" = G4-6c ]; then
+    # amendment G4-6c.7: the checkpoints, G4-0, and G4-4 and G4-6b reported, in one classify run
+    for m in ${CANDIDATES:?the checkpoints, G4-6c-s240 ...}; do
+      case $m in G4-6c-s[1-9]*) ;; *) echo "CANDIDATES: $m is no checkpoint of G4-6c"; exit 1 ;; esac
+    done
+    MODELS="$CANDIDATES G4-0 G4-4 G4-6b"
+  fi
   PAIRS=""
   for m in $MODELS; do PAIRS="$PAIRS --pairs '$m=$T/$m/pairs-w*.parquet'"; done
   {
@@ -905,6 +978,11 @@ blind)
   # G4-5: the candidate report5 selected, under its own name (the key's and the tally's arm)
   BARM=$ARM
   [ "$ARM" = G4-5 ] && BARM=${SELECTED:?the candidate report5 selected, G4-5c<k>}
+  # G4-6c: the checkpoint report6c selected (amendment G4-6c.8)
+  if [ "$ARM" = G4-6c ]; then
+    BARM=${SELECTED:?the checkpoint report6c selected, G4-6c-s<step>}
+    case $BARM in G4-6c-s[1-9]*) ;; *) echo "SELECTED $BARM is no checkpoint of G4-6c"; exit 1 ;; esac
+  fi
   for d in "$S/blind/$ARM" "$S/blind/$ARM-tg"; do
     ! gsutil -q stat "$d/key.jsonl" || { echo "$d has a key.jsonl: the package stays as it is"; exit 1; }
   done
@@ -1641,23 +1719,29 @@ cpuproof6)
   [ -x "$SFT_PY" ] && [ -s "$TOK_SFT/tokenizer.json" ] || { echo "w$W: no SFT venv or tokenizer (SETUP=data setup)"; exit 1; }
   # on the worker's CPU, the TPU untouched; nothing written to the bucket but the log
   # amendment G4-6b.6: G4-6b's proof also merges an adapter into the base kernels (BAKE=1)
-  BAKE=0
+  BAKE=0 SPEC=DPO6 C6=0
   [ "$ARM" = G4-6b ] && BAKE=1
+  # amendment G4-6c.6: G4-6c's spec, the adapter kept after a step and the end tokens, besides G4-6b's merge
+  [ "$ARM" = G4-6c ] && BAKE=1 SPEC=DPO6C C6=1
   detach "g4a_cpuproof6_$TAG" env G=$G G6=$G6 H=$H PY=$SFT_PY TOK=$TOK_SFT CODE=$CODE X=$G_SHM/cpuproof6-$TAG BAKE=$BAKE \
-    nice -n 19 ionice -c3 bash "$CODE/cpuproof6.sh"
+    SPEC=$SPEC C6=$C6 nice -n 19 ionice -c3 bash "$CODE/cpuproof6.sh"
   ;;
 smoke6-report)
   only 0
   [ $A6 = 1 ] || { echo "smoke6-report is G4-6's and G4-6b's"; exit 1; }
   # amendment G4-6b.6: G4-6b starts from G4-4 merged; its smoke translations' base is G4-4
   START=""
-  [ "$ARM" = G4-6b ] && START="--start G4-4"
+  case $ARM in G4-6b|G4-6c) START="--start G4-4" ;; esac
+  # amendment G4-6c.6: the adapter the smoke run kept after its step SMOKE_SAVE6C
+  SAVED=""
+  [ "$ARM" = G4-6c ] && SAVED="adapter-step$(g4a_const SMOKE_SAVE6C).json"
   X=$G_SHM/smoke6-$TAG
   O=$G/smoke6/$TAG
   cat > ~/job_body_g4a_smoke6_report_$TAG.sh <<EOF
 set -uo pipefail
 mkdir -p $X
 gsutil -q cp $G/runs/$SMOKE_RUN/summary.json $G/runs/$SMOKE_RUN/adapter.json $X/ || exit 1
+${SAVED:+gsutil -q cp $G/runs/$SMOKE_RUN/$SAVED $X/saved-adapter.json || exit 1}
 gsutil -q cp $G/G4-4/summary.json $X/g4-4-summary.json || exit 1
 gsutil -q cp $G6/report.json $X/build-report.json || exit 1
 gsutil -q cp $G/smoke/$TAG/$ARM/pairs/pairs-w0.parquet $X/arm-pairs.parquet || exit 1
@@ -1668,7 +1752,7 @@ gsutil -q cp $G/logs/g4a_smoke_translate_${ARM}_${TAG}_small-w0.log $X/translate
 $FPY -I -u $CODE/g4arm.py smoke6 --summary $X/summary.json --adapter $X/adapter.json --base-summary $X/g4-4-summary.json \
   --build-report $X/build-report.json --translate-log $X/translate-arm.log --arm-pairs $X/arm-pairs.parquet \
   --arm-metricx $X/arm-metricx.parquet --base-pairs $X/base-pairs.parquet --base-metricx $X/base-metricx.parquet \
-  --seq $SEQ6 --arm $ARM $START --out $X/g4arm6-smoke.md
+  --seq $SEQ6 --arm $ARM $START ${SAVED:+--saved-adapter $X/saved-adapter.json} --out $X/g4arm6-smoke.md
 code=\$?
 gsutil -m -q cp $X/g4arm6-smoke.md $X/g4arm6-smoke.json $O/ || exit 1
 exit \$code
@@ -1708,6 +1792,50 @@ gsutil -m -q cp $X/pairclass.md $X/pairclass.json $REP/
 echo "PAIRCLASS6: $REP/pairclass.md"
 EOF
   detach "g4a_pairclass6_$TAG" bash ~/job_body_g4a_pairclass6_$TAG.sh
+  ;;
+ends6c)
+  only 2
+  gsutil -q stat "$G6/report.json" || { echo "no $G6/report.json (G4-6b's build6)"; exit 1; }
+  [ -s "$TOK_SFT/tokenizer.json" ] || { echo "w$W: no tokenizer in $TOK_SFT (setup)"; exit 1; }
+  D=$G_SHM/ends6c-$TAG
+  # amendment G4-6c.3: every packed file of G4-6b's pairs, each segment ending in <turn|>\n (the ids of the tokenizer)
+  cat > ~/job_body_g4a_ends6c_$TAG.sh <<EOF
+set -euo pipefail
+export OMP_NUM_THREADS=8 TOKENIZERS_PARALLELISM=true HF_HUB_OFFLINE=1 JAX_PLATFORMS=cpu
+mkdir -p $D/in
+gsutil -m -q cp '$G6/*.parquet' $D/in/
+$SFT_PY -u $CODE/g4arm.py ends6c --data $D/in --tokenizer $TOK_SFT | tee $D/ends.txt
+gsutil -q cp $D/ends.txt $G/data/ends-G4-6c.txt
+rm -rf -- $D/in
+EOF
+  detach "g4a_ends6c_$TAG" nice -n 19 ionice -c3 bash ~/job_body_g4a_ends6c_$TAG.sh
+  ;;
+report6c)
+  only 0
+  X=$G_SHM/report6c-$TAG
+  for m in ${CANDIDATES:?the checkpoints, G4-6c-s240 ...}; do
+    case $m in G4-6c-s[1-9]*) ;; *) echo "CANDIDATES: $m is no checkpoint of G4-6c"; exit 1 ;; esac
+  done
+  # amendment G4-6c.7: G4-4 and G4-6b reported beside (they are in the same classify run)
+  REFS6C="G4-4 G4-6b"
+  ARGS6C=""
+  for m in $CANDIDATES; do ARGS6C="$ARGS6C --candidate $m=$X/$m"; done
+  for m in $REFS6C; do ARGS6C="$ARGS6C --reference $m=$X/$m"; done
+  cat > ~/job_body_g4a_report6c_$TAG.sh <<EOF
+set -euo pipefail
+for m in $CANDIDATES G4-0 $REFS6C; do mkdir -p $X/\$m; gsutil -m -q rsync -r -x 'translations/.*' $G/eval/\$m $X/\$m; done
+gsutil -q cp $G/data/eval/evalsets.parquet $G5S/split.json $G5S/refqe.parquet $NAT/predictions.parquet $X/
+gsutil -q cp $G/runs/$FULL_RUN/summary.json $X/train-summary.json
+gsutil -q cp $G/G4-6b/summary.json $X/g4-6b-summary.json
+TALLY=""
+if gsutil -q stat $REP/tally.json; then gsutil -q cp $REP/tally.json $X/; TALLY="--tally $X/tally.json"; fi
+$FPY -I -u $CODE/g4arm.py report6c --evalsets $X/evalsets.parquet --split $X/split.json --refqe $X/refqe.parquet \
+  --base $X/G4-0 --predictions $X/predictions.parquet --train-summary $X/train-summary.json \
+  --beside-summary G4-6b=$X/g4-6b-summary.json $ARGS6C \$TALLY --out $X/report.md
+gsutil -m -q cp $X/report.md $X/report.json $REP/
+echo "REPORT6C_DONE $REP/report.md"
+EOF
+  detach "g4a_report6c_$TAG" bash ~/job_body_g4a_report6c_$TAG.sh
   ;;
 *)
   echo "unknown stage $STAGE"

@@ -295,6 +295,46 @@ def test_the_precomputed_reference_gives_the_in_step_references_loss_and_gradien
     assert not g4dpo.lora_b_zero(moved) and float(aux_a["pref_margin_sum"]) != 0.0
 
 
+def test_the_precomputed_reference_without_the_turns_end_gives_the_in_step_loss(maxtext_stub):
+    # amendment G4-6c.3: reference_sums with end_tokens leaves out the tokens dpo_terms leaves out of the log-ratio, so
+    # the precomputed reference gives the loss, sums and gradients of the reference in the step; at step 0 the loss is
+    # log 2 + nll_alpha x the chosen NLL over every target token (the turn's end included)
+    model = Toy(nnx.Rngs(6))
+    rng = np.random.default_rng(6)
+    pairs = [{"id": f"p{k}", "prompt": [2] + rng.integers(5, V, size=4).tolist(),
+              "chosen": rng.integers(5, V, size=int(rng.integers(3, 6))).tolist(),
+              "rejected": rng.integers(5, V, size=int(rng.integers(3, 6))).tolist()} for k in range(6)]
+    packed = g4dpo.pack_rows(pairs, 64, 4)
+    assert 1 + max(r["batch"] for r in packed) == 1
+    data = {k: jnp.asarray([r[k] for r in packed], jnp.int32) for k in g4dpo.KEYS}
+    opts = g4dpo.spec(beta=0.5, nll_alpha=2.0, end_tokens=2)
+    ref_seg = g4dpo.reference_sums(model, CONFIG, data, opts["max_segments"], opts["end_tokens"])
+    full = g4dpo.reference_sums(model, CONFIG, data, opts["max_segments"])
+    seg = np.asarray(data["targets_segmentation"])
+    logp = np.asarray(g4dpo.model_logp(model, CONFIG, data, False))
+    want = g4dpo.segment_sums(logp * (1.0 - g4dpo.end_mask(seg, 2)), seg, opts["max_segments"])
+    np.testing.assert_allclose(ref_seg, want, rtol=1e-6, atol=1e-6)
+    assert not np.allclose(ref_seg, full)
+    graphdef, lora, rest = nnx.split(model, nnx.LoRAParam, ...)
+    pre = peft_train_step(g4dpo.make_loss(CONFIG, opts, True), graphdef)
+    old = peft_train_step(in_step_loss(CONFIG, opts), graphdef)
+    with_ref = {**data, g4dpo.REF_KEY: ref_seg}
+    for step in range(4):
+        loss_a, aux_a, new_lora, new_rest, grads_a = pre(lora, rest, with_ref, 0.5)
+        loss_b, aux_b, _, _, grads_b = old(lora, rest, data, 0.5)
+        if step == 0:
+            nll = -float(aux_a["pref_chosen_logp_all_sum"]) / float(aux_a["pref_chosen_tokens_all"])
+            assert float(loss_a) == pytest.approx(math.log(2) + 2.0 * nll, rel=1e-5)
+            assert float(aux_a["pref_chosen_tokens_all"]) - float(aux_a["pref_chosen_tokens"]) == 2 * 6
+        assert float(loss_a) == pytest.approx(float(loss_b), rel=1e-5, abs=1e-6), step
+        for k in g4dpo.SUMS:
+            assert float(aux_a[f"pref_{k}"]) == pytest.approx(float(aux_b[f"pref_{k}"]), rel=1e-5, abs=1e-5), (step, k)
+        for x, y in zip(jax.tree_util.tree_leaves(grads_a), jax.tree_util.tree_leaves(grads_b)):
+            np.testing.assert_allclose(x, y, rtol=1e-4, atol=1e-6)
+        lora, rest = new_lora, new_rest
+    assert float(aux_a["pref_margin_sum"]) != 0.0
+
+
 def test_make_loss_needs_the_reference_in_training_and_gives_an_sft_files_loss_without_it(maxtext_stub):
     model = Toy(nnx.Rngs(5))
     data = toy_batch(5)

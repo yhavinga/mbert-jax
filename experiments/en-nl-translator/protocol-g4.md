@@ -1207,3 +1207,110 @@ van 3.200 (−181) en `bt:rechtspraak` 3.078 van 3.200 (−122), omdat G4-4's ve
 (`chrf_high` 1.452 en 1.353 van 4.480 kandidaten, tegen 569 en 140 bij G4-6); alle andere strata vol. Besluit: G4-6b
 traint op de 42.697 paren die er zijn (−0,7%), zonder de chrF-band te verschuiven en zonder de andere strata aan te
 vullen; de keten aanvaardt precies dit tekort (`ACCEPT_SHORT`) en stopt bij elk ander.
+
+## 13. Amendement G4-6c
+
+**Amendement 20 nov 2026 (tijdstip: de commit van deze sectie op branch `en-nl-g4arm6c`, vanaf `en-nl-g4arm6b` @
+`2797975`): arm G4-6c, een mildere DPO vanaf G4-4** [**Yeb koos optie 2, invulling door de hoofdsessie** (20 nov
+~13:50); uitwerking door een subagent; labels als in de kop]. Vastgelegd vóór de CPU-proef, de smoke-test, de eerste
+trainingsstap en elke uitslag van G4-6c. Waar deze sectie niets zegt, geldt §12 (amendement G4-6b met G4-6b.0a, G4-6b.4a
+en G4-6b.5a) met "G4-6c" in plaats van "G4-6b"; de beslisregel blijft tegen G4-0.
+
+*G4-6c.0 Keuzes* [Yeb koos optie 2, invulling door de hoofdsessie]: startmodel, referentie en data als G4-6b; β 0,5
+in plaats van 0,1; het eindetoken van de beurt telt niet mee in de log-ratio van de DPO-term, wel in de NLL-term;
+NLL-gewicht 2,0 in plaats van 1,0; LR 1e-5 en verder alles als G4-6b; de adapter bewaard op stap 240, 480 en 717;
+de drie checkpoints vertaald en gescoord zoals de kandidaten van G4-5; de keuze vooraf vastgelegd op het zoekdeel, het
+besluit op het beslisdeel. G4-6c draait op mbert-corpus.
+
+*G4-6c.1 Aanleiding* [gemeten: `mbert-ops/translator-sft/g4-6b-report.md`]. G4-6b (DPO vanaf G4-4, β 0,1, NLL-gewicht
+1,0) duwde de rejected-kant sterk weg (`own4` 0,169 → 0,512 per token op stap 400; marge op `pref_books` 11,2 op stap
+400), maar chosen steeg niet mee (NLL chosen op `pref_books` 0,859 → 0,865); 30–37% van de vertalingen was niet af, met
+lussen en uitvoer van 1,4–2,0 × de referentie; QE 8,4 / 9,0 / 9,8; (a1) en (b) niet gehaald. G4-6 (vanaf G4-0) bewoog
+(b) niet (−1,7 pp). [Gevolgtrekking] De log-ratio van G4-6b telde ook `<turn|>\n`, het einde van de beurt. Het
+wegduwen van de rejected-kant verlaagt dan ook de kans op het afsluiten van de beurt, wat bij de niet-afgemaakte
+vertalingen en lussen past. G4-6c toetst of een mildere DPO regel (b) kan bewegen zonder te ontsporen.
+
+*G4-6c.2 Startmodel, referentie en data.* Als G4-6b: G4-4's eindadapter ingebakken (G4-6b.2), dus de referentie is
+G4-4; de referentie vooraf berekend (G4-6b.5a); dezelfde 42.697 paren uit `$G/data/G4-6b/` (G4-6b.4 met het tekort van
+G4-6b.4a), dezelfde voorkeurssets, `own4` en dezelfde controle `$G/data/check-G4-6b.txt`. Geen nieuwe rejected-run en
+geen nieuwe `build6`; de keten controleert het tekort van G4-6b.4a opnieuw (`ACCEPT_SHORT`) en stopt bij elk ander.
+
+*G4-6c.3 Verlies.* Sigmoid-DPO met **β 0,5**, label smoothing 0, geen length-normalisatie, plus **2,0** × het
+token-gewogen NLL van chosen. **Het eindetoken van de beurt telt niet mee in de log-ratio**: per zijde (segment) vallen
+de laatste twee doeltokens weg, `<turn|>` en de `\n` die de completion afsluit (`g4lora.END = "<turn|>\n"`), bij het
+beleid én bij de referentie (die vooraf met hetzelfde masker wordt berekend). In de NLL-term tellen ze wel mee: alle
+doeltokens van chosen, zoals bij G4-4 en G4-6b. Spec `{"loss": "sigmoid", "beta": 0.5, "label_smoothing": 0.0,
+"nll_alpha": 2.0, "length_norm": false, "end_tokens": 2}`; `end_tokens` is het aantal doeltokens aan het eind van elk
+segment dat buiten de log-ratio valt (0 = G4-6 en G4-6b, ongewijzigd). Controle vóór de CPU-proef (stap `ends6c`, CPU
+van w2): in elk gepakt bestand van `$G/data/G4-6b/` zijn de doeltokens van elk segment aaneengesloten, meer dan twee,
+en zijn de laatste twee de ids van `<turn|>\n` volgens Gemma 4's tokenizer (`$G/data/ends-G4-6c.txt`); de run controleert
+aaneengeslotenheid en lengte opnieuw op de bestanden die hij leest. Een voorkeurseval rapporteert de NLL per token van
+chosen en rejected over de tokens van de log-ratio (zonder het eindetoken) én over alle doeltokens (de maat van G4-6b).
+[Gevolgtrekking, geen meting] Met β 0,5 verzadigt de sigmoid bij een vijf keer kleinere verschuiving van de log-ratio,
+dus de DPO-term trekt minder ver; het NLL-gewicht 2,0 houdt chosen sterker vast.
+
+*G4-6c.4 Training.* Als G4-6b.5: LR 1e-5 WSD (opwarming 3%, de laatste 10% lineair naar 1e-6), één epoch (717 stappen bij
+rijen van 4.096), rank 32 / alpha 16, 410 modules, rijen van 4.096 met de terugval naar 2.048 volgens G4-6.4. Run
+`g4arm_G4-6c` (smoke `g4arm_G4-6c_s8`, terugval `g4arm_G4-6c_s8_2048`). Evaluatie op stap 0, **240, 480** en na de
+laatste (717) op `books`, `btval`, `own`, `btlong`, `novels`, `own4`, `pref_books`, `pref_btval`, `pref_novels` [keuze
+subagent: elke 240 stappen in plaats van 200, zodat de evaluaties op de bewaarde checkpoints vallen; de evaluatie
+verandert de training niet].
+
+*G4-6c.5 Tussencheckpoints.* De DPO-LoRA wordt bewaard na stap 240 en 480 (`sft_lora.py --save-steps 240,480`:
+`adapter-step240.npz`/`.json` en `adapter-step480.npz`/`.json` in `$G/runs/g4arm_G4-6c/`) en na de laatste stap 717
+(`adapter.npz`). Elk checkpoint is als model G4-4's adapter en de DPO-LoRA van die stap naast elkaar (`g4mix.py stack`,
+beide coëfficiënt 1, rank 64, schaal 0,5; als G4-6b.7): **`G4-6c-s240`, `G4-6c-s480`, `G4-6c-s717`** in `$G/<naam>/`,
+de DPO-LoRA alleen in `$G/<naam>/delta/`.
+
+*G4-6c.6 CPU-proef en smoke-test.* De CPU-proef van G4-6b.6 (`BAKE=1`) met de spec van G4-6c, plus: (a) bewaart zijn
+adapter na stap 4 (`--save-steps 4`); (e) gewone SFT met die adapter als `--init-adapter` geeft op stap 0 dezelfde
+verliezen op `books` en `own` als (a)'s eval op stap 4 (≤ 1e-4 relatief): het bewaarde checkpoint is het model van die
+stap; in (a)'s voorkeurseval telt de log-ratio per zijde precies twee doeltokens minder dan het NLL (op elke stap);
+(a)'s trainingsverlies van stap 1 = de DPO-term + 2,0 × het NLL van chosen over alle doeltokens (≤ 1e-4 relatief); in de
+echte paren, gepakt met de tokenizer, zijn de weggelaten tokens van elk segment `<turn|>\n`. Smoke-test `g4arm_G4-6c_s8`
+met de controles van G4-6b.6 (de spec van G4-6c, `own4`, stap 0 binnen 0,05 van G4-4's eigen eval, `BASE_ADAPTER`),
+plus: de adapter van stap 4 bewaard (`--save-steps 4`; rank 32 / alpha 16) en verschillend van die van stap 8; de
+tokentelling van de log-ratio en de opbouw van het verlies als in de CPU-proef. De 50 smoke-vertalingen van G4-6c
+(G4-4's adapter en die van de smoke-run naast elkaar) tegen die van G4-4: |ΔQE| ≤ 0,5. De schatting telt vier
+evaluatierondes (stap 0, 240, 480, 717). Faalt een controle buiten de terugval van G4-6.4: stoppen vóór de training.
+
+*G4-6c.7 Keuze van het checkpoint (zoekdeel), vooraf vastgelegd.* De drie checkpoints worden vertaald en gescoord met
+dezelfde keten als de kandidaten van G4-5 (G4-5.5: fork `f4d8615`, `natural-v1`, greedy, de klassen tiny–xlong over de
+vier workers; MetricX-24-QE en -ref, COMET-22), op de hele evaluatieset; de classifier in één run over `G4-6c-s240`,
+`G4-6c-s480`, `G4-6c-s717`, G4-0, G4-4 en G4-6b (de laatste twee gerapporteerd). De keuze leest alleen het **zoekdeel**
+van G4-5.4 (`split5`, digest `f953c026597eedcb20ab56dab7d0b4389057697c01550017ba954ba6963440f3`; WMT24++, FLORES,
+NTREX, FLAN): van de checkpoints die (a1) op het zoekdeel halen (per set gemiddelde QE ≤ die van de menselijke referentie
+op dezelfde segmenten, `$G/data/G4-5-split/refqe.parquet`), het checkpoint met de grootste (b) ("origineel" − G4-0 op
+WMT24++ (goed) + FLAN van het zoekdeel); bij gelijkheid het eerdere checkpoint; haalt geen enkel checkpoint (a1), dan het
+checkpoint met de kleinste grootste QE-overschrijding (de regel en de code van G4-5.6, `select5`). [Keuze subagent: de
+hele set wordt vertaald, zoals bij de kandidaten van G4-5, zodat het gekozen checkpoint zijn beslisdeel al heeft; de
+beslisdeelcijfers van de andere twee checkpoints staan pas na de keuze in het verslag en beslissen niets.] Het verslag
+stopt bij een andere toewijzing van het zoek- en beslisdeel dan die van de digest.
+
+*G4-6c.8 Beslisregel (beslisdeel).* Voor het gekozen checkpoint met §5 tegen G4-0 op het **beslisdeel**, als G4-5.6:
+(a1) per set gemiddelde QE ≤ die van de menselijke referentie op dezelfde segmenten (de QE van de menselijke referenties
+over de hele set binnen 0,05 van §5's getallen); (b) "origineel" − G4-0 ≥ 0,10 op WMT24++ (goed) + FLAN van het
+beslisdeel. (a2) en (c) op de 100 blinde passages zoals §5, **alleen als (a1) en (b) gelden** (pakket `$S/blind/G4-6c/`
+en `$S/blind/G4-6c-tg/`, met de naam van het gekozen checkpoint als arm).
+
+*G4-6c.9 Rapportage* (beslist niets). Per checkpoint, op het zoekdeel en (na de keuze) op het beslisdeel: per set QE,
+het aandeel niet af, lussen, Engels over, leeg en de lengteverhouding (mediaan woorden uitvoer / referentie, aandeel
+> 1,5 × de referentie); uit de training op stap 240, 480 en 717: het verlies op `own4`, `own`, `books`, `btval`,
+`btlong`, `novels`, en per voorkeursset verlies, nauwkeurigheid, marge, NLL van chosen en rejected (over de log-ratio en
+over alle doeltokens) met die van de referentie G4-4; G4-4 en G4-6b ernaast. [Keuze subagent] G4-6c vertaalt de
+held-out sets en de lange rijen niet (de directe maat van G4-2.6 als chrF): de beslisregel gebruikt ze niet, en het
+teacher-forced verlies op `books`, `btval` en `btlong` komt uit de evaluaties van de training.
+
+*G4-6c.10 Uitvoer.* `$G/data/ends-G4-6c.txt`, `$G/runs/g4arm_G4-6c_s8[_2048]/`, `$G/smoke6/<tag>/`,
+`$G/runs/g4arm_G4-6c/` (met `adapter-step240.*` en `adapter-step480.*`), `$G/G4-6c-s240/`, `$G/G4-6c-s480/`,
+`$G/G4-6c-s717/` (elk met `delta/`), `$G/eval/G4-6c-s<k>/`, `$G/naturalness-G4-6c/`, `$S/blind/G4-6c/`,
+`$S/blind/G4-6c-tg/`, `$G/report-G4-6c/` (kopie `mbert-ops/translator-sft/g4-6c-report.md`), markers `$G/stages/g4-6c/`.
+
+*G4-6c.11 De keten* (`mbert-ops/scripts/g4arm6c_run.sh`, `VM=mbert-corpus`). Eigen lock; wacht (alleen lezend) tot de
+keten van G4-6b (`mbert-ops/logs/g4arm6b_run.log`) op een `EXIT`-regel eindigt (bij `EXIT` ≠ 0 doet hij niets); neemt
+`mbert-ops/final_run.lock` tot het eind; wacht tot de TPU op alle workers vrij is; dan in deze volgorde: setup (alleen wat
+ontbreekt), de controle van G4-6b's paren (`report.json` met het tekort van G4-6b.4a, `check-G4-6b.txt`,
+`eval-own4.parquet`), `ends6c`, de CPU-proef, de smoke-test (met de terugval), de training, de drie adapters, vertalen en
+scoren van de drie checkpoints, texts, classify, `report6c` (keuze, beslisdeel, verslag), het blinde pakket alleen als
+(a1) en (b) gelden; `DONE`. Elke run eerst op alle vier workers klaargezet en dan op alle vier gestart. Faalt een stap,
+dan stopt de keten (`FAILED`). mbert-mix wordt niet gebruikt.

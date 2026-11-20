@@ -433,3 +433,26 @@ def test_segment_columns_are_the_separate_segment_sums_in_one_contraction():
         np.testing.assert_allclose(got[k], want[k], rtol=1e-6, atol=1e-6)
     assert g4dpo.segment_columns(logp, seg, 0, 64).shape == (2, len(seg), 64)
     assert g4dpo.ratio_sums(got, 2)[0] is not None and np.array_equal(g4dpo.ratio_sums(got, 0)[0], got[0])
+
+
+def test_local_batches_carry_the_keep_mask_made_on_the_host_and_dpo_terms_takes_it():
+    # addendum G4-6c.6c: the log-ratio's tokens (1 - end_mask) travel with the batch; dpo_terms with them gives what
+    # it computes itself
+    packed = g4dpo.pack_rows(end_pairs(16, seed=10), 48, 4)
+    arrays = {k: np.asarray([r[k] for r in packed], np.int32) for k in g4dpo.KEYS}
+    n = len(packed) // 4
+    got = list(g4dpo.local_batches(arrays, 1, 2, rows=4, batches=n, padding=1, end_tokens=2))
+    for b, batch in enumerate(got[:n]):
+        lo = 4 * b + 2
+        want = (1 - g4dpo.end_mask(arrays["targets_segmentation"][lo:lo + 2], 2)).astype(np.int32)
+        assert batch[g4dpo.KEEP_KEY].dtype == np.int32 and np.array_equal(batch[g4dpo.KEEP_KEY], want)
+    assert got[n][g4dpo.KEEP_KEY].all() and got[n][g4dpo.KEEP_KEY].shape == (2, 48)
+    assert g4dpo.KEEP_KEY not in next(iter(g4dpo.local_batches(arrays, 0, 2, rows=4, batches=1)))
+    seg = arrays["targets_segmentation"]
+    rng = np.random.default_rng(10)
+    logp = np.where(seg != 0, -rng.uniform(0.1, 3.0, seg.shape), 0.0).astype(np.float32)
+    ref = np.where(seg != 0, -rng.uniform(0.1, 3.0, seg.shape), 0.0).astype(np.float32)
+    keep = (1 - g4dpo.end_mask(seg, 2)).astype(np.int32)
+    a, sa = g4dpo.dpo_terms(logp, ref, seg, OPTS6C)
+    b, sb = g4dpo.dpo_terms(logp, ref, seg, OPTS6C, keep=keep)
+    assert float(a) == float(b) and all(float(sa[k]) == float(sb[k]) for k in g4dpo.SUMS)

@@ -1341,3 +1341,18 @@ getallen zijn; verlies, data, LR, rijen en checkpoints blijven. De CPU-proef en 
 `smoke-4096-memory-g4h1120b`). **Valt de smoke-test bij 4.096 opnieuw buiten het geheugen, dan stopt de keten (geen
 terugval naar 2.048) en beslist de hoofdsessie** [keuze subagent, de veilige optie: bij 2.048 heeft de epoch 1.689 stappen
 en vallen de checkpoints 240 en 480 op 14% en 28% in plaats van op een en twee derde, wat niet de opdracht is].
+
+*G4-6c.6c Aanvulling 20 nov 2026 ~17:20 (subagent op opdracht van de hoofdsessie; vóór elke trainingsstap van G4-6c).*
+Ook met G4-6c.6b liep de smoke-test bij 4.096 (keten `g4h1120c`, 16:36–16:59) op dezelfde plek tegen
+`RESOURCE_EXHAUSTED` (eerste voorkeurseval op stap 0, w1 en w2); de keten stopte volgens G4-6c.6b zonder terugval. G4-6b
+had bij dezelfde stap 1,62 GiB over (piek 29,13 van 30,75 GiB [gemeten: zijn `summary.json`]), dus de eval van G4-6c vroeg
+meer dan 1,6 GiB extra; het aantal contracties was het niet. Wat G4-6c op het apparaat nieuw doet, is het verschuiven van
+de segmentatie langs de reeks (`end_mask`: aanvullen en afsnijden langs L) en het vermenigvuldigen van de log-kansen met
+dat masker [gevolgtrekking, niet gemeten: de sharding van het verschoven masker kan zich naar de berekening van de
+log-kansen voortzetten]. Fix (code, geen methodewijziging): het masker van de log-ratio (`1 − end_mask`) wordt op de host
+berekend en met elke batch meegegeven (`g4dpo.KEEP_KEY`, zoals de vooraf berekende referentie), voor de training, de
+voorkeursevals en de referentiepass; op het apparaat alleen nog een vermenigvuldiging met een invoer, zoals het
+bestaande masker `targets_segmentation != 0`. Een voorkeursbatch zonder masker stopt de run. CPU-proef en smoke-test bij
+4.096 opnieuw (nieuwe TAG, de mislukte run hernoemd naar `g4arm_G4-6c_s8-fail2`, de markers `cpuproof6` en
+`smoke-4096-memory` met `-g4h1120c`); G4-6c.6b's regel blijft: bij een volgende geheugenfout stopt de keten en beslist de
+hoofdsessie.

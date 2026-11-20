@@ -308,7 +308,11 @@ def test_the_precomputed_reference_without_the_turns_end_gives_the_in_step_loss(
     assert 1 + max(r["batch"] for r in packed) == 1
     data = {k: jnp.asarray([r[k] for r in packed], jnp.int32) for k in g4dpo.KEYS}
     opts = g4dpo.spec(beta=0.5, nll_alpha=2.0, end_tokens=2)
-    ref_seg = g4dpo.reference_sums(model, CONFIG, data, opts["max_segments"], opts["end_tokens"])
+    # addendum G4-6c.6c: the batches carry the log-ratio's tokens, made on the host
+    keep = jnp.asarray(1 - g4dpo.end_mask(np.asarray(data["targets_segmentation"]), 2), jnp.int32)
+    data_keep = {**data, g4dpo.KEEP_KEY: keep}
+    ref_seg = g4dpo.reference_sums(model, CONFIG, data_keep, opts["max_segments"], opts["end_tokens"])
+    np.testing.assert_array_equal(ref_seg, g4dpo.reference_sums(model, CONFIG, data, opts["max_segments"], 2))
     full = g4dpo.reference_sums(model, CONFIG, data, opts["max_segments"])
     seg = np.asarray(data["targets_segmentation"])
     logp = np.asarray(g4dpo.model_logp(model, CONFIG, data, False))
@@ -318,7 +322,9 @@ def test_the_precomputed_reference_without_the_turns_end_gives_the_in_step_loss(
     graphdef, lora, rest = nnx.split(model, nnx.LoRAParam, ...)
     pre = peft_train_step(g4dpo.make_loss(CONFIG, opts, True), graphdef)
     old = peft_train_step(in_step_loss(CONFIG, opts), graphdef)
-    with_ref = {**data, g4dpo.REF_KEY: ref_seg}
+    with pytest.raises(ValueError, match="without end_keep"):
+        pre(lora, rest, {**data, g4dpo.REF_KEY: ref_seg}, 0.5)
+    with_ref = {**data_keep, g4dpo.REF_KEY: ref_seg}
     for step in range(4):
         loss_a, aux_a, new_lora, new_rest, grads_a = pre(lora, rest, with_ref, 0.5)
         loss_b, aux_b, _, _, grads_b = old(lora, rest, data, 0.5)
@@ -364,7 +370,7 @@ def test_precompute_reference_places_each_row_by_its_index_and_refuses_a_moved_l
     batches = g4dpo.batch_count(batch, 4)
     assert batches >= 2
 
-    def fake_iterator(path, mesh, rows, n, padding=0, ref=None, row_ids=False):
+    def fake_iterator(path, mesh, rows, n, padding=0, ref=None, row_ids=False, end_tokens=0):
         for b in g4dpo.local_batches(arrays, 0, 1, rows, n, padding, ref, row_ids):
             yield {k: jnp.asarray(v[::-1]) for k, v in b.items()}
 

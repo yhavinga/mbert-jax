@@ -1055,7 +1055,8 @@ def main(argv=None):
             pq.write_table(pa.Table.from_pylist(rows_out), out / "dpo_ref.parquet")
         hooks_data = trainer.data_hooks
         close(hooks_data.train_data_iterator)
-        pref_iter = g4dpo.global_iterator(args.pref_train, mesh, pref_rows, own_steps, padding=1, ref=refs["train"])
+        pref_iter = g4dpo.global_iterator(args.pref_train, mesh, pref_rows, own_steps, padding=1, ref=refs["train"],
+                                          end_tokens=dpo_opts["end_tokens"])
         hooks_data.train_data_iterator = pref_iter
         hooks_data.train_data_loader.data_iterator = pref_iter
     if temps:
@@ -1152,7 +1153,8 @@ def main(argv=None):
                 plan = eval_plan[name]
                 pref = plan.get("kind") == "pref"
                 if pref:
-                    feed["iter"] = g4dpo.global_iterator(plan["path"], mesh, pref_rows, plan["batches"], ref=refs[name])
+                    feed["iter"] = g4dpo.global_iterator(plan["path"], mesh, pref_rows, plan["batches"], ref=refs[name],
+                                                         end_tokens=dpo_opts["end_tokens"])
                 else:
                     feed["iter"] = eval_iterator(plan["config"], mesh)
                 feed["left"], feed["parts"], feed["temps"], feed["prefs"] = plan["batches"], [], [], []

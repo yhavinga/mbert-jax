@@ -37,6 +37,7 @@ BOS_ID = 2                # Gemma 4's <bos>: ShiftData's second ignored id
 MAX_SEGMENTS = 64         # segments a packed row may hold (32 pairs); the loss's one-hot over the segment ids
 REF_KEY = "ref_seg"       # amendment G4-6.4a: a batch's precomputed reference, [rows, max_segments] float32
 ROW_KEY = "row"           # the file's row index of each row of a batch (the reference pass only)
+KEEP_KEY = "end_keep"     # addendum G4-6c.6c: a batch's log-ratio tokens, 1 - end_mask, computed on the host [rows, L]
 LOSSES = ("sigmoid", "ipo")
 # end_tokens (amendment G4-6c): the target tokens at the end of each segment (the turn's end, <turn|>\n: 2) that the
 # log-ratio leaves out; the NLL term keeps them. 0: every target token in both (G4-6, G4-6b)
@@ -182,12 +183,14 @@ def batch_count(batch, rows):
     return n // rows
 
 
-def local_batches(arrays, process, processes, rows, batches, padding=0, ref=None, row_ids=False):
+def local_batches(arrays, process, processes, rows, batches, padding=0, ref=None, row_ids=False, end_tokens=0):
     """This process's part of each global batch (rows / processes consecutive rows), the first `batches` of the file,
     then `padding` all-zero batches: Tunix loads the next batch before it checks max_steps, so a run of every batch
     still finds one (every process the same, so that none leaves the loop another way). With ref (the reference's
     per-segment sums of the file's rows, [rows, max_segments]) each batch carries its rows' REF_KEY (a padding batch
-    zeros); with row_ids each batch carries ROW_KEY, its rows' indices in the file (the reference pass)."""
+    zeros); with row_ids each batch carries ROW_KEY, its rows' indices in the file (the reference pass). With end_tokens
+    (addendum G4-6c.6c) each batch carries KEEP_KEY, 1 - end_mask of its rows (int32), so that the device computes no
+    shift along the sequence."""
     if rows % processes:
         raise SystemExit(f"{rows} rows per batch over {processes} processes")
     local = rows // processes
@@ -201,15 +204,19 @@ def local_batches(arrays, process, processes, rows, batches, padding=0, ref=None
             out[REF_KEY] = np.asarray(ref[lo:lo + local], np.float32)
         if row_ids:
             out[ROW_KEY] = np.arange(lo, lo + local, dtype=np.int32)
+        if end_tokens:
+            out[KEEP_KEY] = (1.0 - end_mask(out["targets_segmentation"], end_tokens)).astype(np.int32)
         yield out
     for _ in range(padding):
         out = {k: np.zeros((local, seq), np.int32) for k in KEYS}
         if ref is not None:
             out[REF_KEY] = np.zeros((local, ref.shape[1]), np.float32)
+        if end_tokens:
+            out[KEEP_KEY] = np.ones((local, seq), np.int32)
         yield out
 
 
-def global_iterator(path, mesh, rows, batches, padding=0, ref=None, row_ids=False):
+def global_iterator(path, mesh, rows, batches, padding=0, ref=None, row_ids=False, end_tokens=0):
     """MaxText's multi-host iterator over a packed file: each process puts its rows of a batch on its devices"""
     import jax
     from maxtext.input_pipeline.multihost_dataloading import MultiHostDataLoadIterator
@@ -218,7 +225,8 @@ def global_iterator(path, mesh, rows, batches, padding=0, ref=None, row_ids=Fals
     have = batch_count(batch, rows)
     if batches > have:
         raise SystemExit(f"{path}: {have} batches, {batches} wanted")
-    gen = list(local_batches(arrays, jax.process_index(), jax.process_count(), rows, batches, padding, ref, row_ids))
+    gen = list(local_batches(arrays, jax.process_index(), jax.process_count(), rows, batches, padding, ref, row_ids,
+                             end_tokens))
     return MultiHostDataLoadIterator(gen, mesh)
 
 
@@ -259,17 +267,18 @@ def end_mask(segmentation, n, xp=np):
     return ((segmentation > 0) & (ahead != segmentation)).astype(xp.float32)
 
 
-def segment_columns(logp, segmentation, n_end, max_segments, xp=np):
+def segment_columns(logp, segmentation, n_end, max_segments, xp=np, keep=None):
     """[K, B, max_segments] float32: per row and segment, in one contraction with one one-hot of the segment ids, the
     sums of the log-probabilities and of the target tokens and, with n_end, the same without the last n_end target
     tokens of every segment (K = 4; else K = 2). Addendum G4-6c.6b: separate sums took the eval step at 4,096 past a v4
     chip's memory. The policy's sums (dpo_terms) and the reference's (reference_sums) come from this one function, so
-    that at step 0 they are the same numbers."""
+    that at step 0 they are the same numbers. keep: the batch's KEEP_KEY (addendum G4-6c.6c, 1 - end_mask made on the
+    host); without it end_mask here."""
     f32 = xp.float32
     target = (segmentation != 0).astype(f32)
     cols = [logp.astype(f32), target]
     if n_end:
-        keep = 1.0 - end_mask(segmentation, n_end, xp)
+        keep = (1.0 - end_mask(segmentation, n_end, xp)) if keep is None else keep.astype(f32)
         cols += [cols[0] * keep, target * keep]
     onehot = (segmentation[..., None] == xp.arange(1, max_segments + 1)).astype(f32)
     return xp.einsum("blk,bls->kbs", xp.stack(cols, axis=-1), onehot)
@@ -315,7 +324,7 @@ def check_ends(path, n, end_ids=None):
     return {"rows": rows, "segments": segments}
 
 
-def dpo_terms(logp, ref_logp, segmentation, opts, xp=np, ref_seg=None):
+def dpo_terms(logp, ref_logp, segmentation, opts, xp=np, ref_seg=None, keep=None):
     """The preference loss of a batch and its sums (SUMS). logp and ref_logp: per-token log-probabilities of the
     targets [B, L] (0 where targets_segmentation is 0) under the policy and the reference; or, in place of ref_logp
     (then None), ref_seg: the reference's per-segment sums [B, max_segments] (segment_sums of its log-probabilities,
@@ -332,11 +341,11 @@ def dpo_terms(logp, ref_logp, segmentation, opts, xp=np, ref_seg=None):
     n_end = int(opts.get("end_tokens", 0))
     if (ref_logp is None) == (ref_seg is None):
         raise ValueError("dpo_terms: either ref_logp or ref_seg")
-    summed = segment_columns(logp, segmentation, n_end, s, xp)
+    summed = segment_columns(logp, segmentation, n_end, s, xp, keep)
     pol_all, ntok_all = summed[0], summed[1]
     pol, ntok = ratio_sums(summed, n_end)
     if ref_seg is None:
-        ref = ratio_sums(segment_columns(ref_logp, segmentation, n_end, s, xp), n_end)[0]
+        ref = ratio_sums(segment_columns(ref_logp, segmentation, n_end, s, xp, keep), n_end)[0]
     else:
         ref = ref_seg.astype(f32)
     if ref.shape != pol.shape:
@@ -485,10 +494,12 @@ def reference_sums(model, config, data, max_segments, end_tokens=0):
     segment, the log-ratio's tokens of dpo_terms"""
     import jax.numpy as jnp
 
-    data = {k: data[k][:config.micro_batch_size_to_eval_on] for k in KEYS}
+    micro = config.micro_batch_size_to_eval_on
+    keep = data[KEEP_KEY][:micro] if end_tokens and KEEP_KEY in data else None
+    data = {k: data[k][:micro] for k in KEYS}
     seg = data["targets_segmentation"]
     logp = model_logp(model, config, data, False)
-    return ratio_sums(segment_columns(logp, seg, end_tokens, max_segments, jnp), end_tokens)[0]
+    return ratio_sums(segment_columns(logp, seg, end_tokens, max_segments, jnp, keep), end_tokens)[0]
 
 
 def lora_b_zero(model):
@@ -534,7 +545,7 @@ def precompute_reference(model, config, path, mesh, rows, batches, max_segments,
     step = reference_step(config, max_segments, end_tokens)
     out = np.full((batches * rows, max_segments), np.nan, np.float32)
     seconds = []
-    for batch in global_iterator(path, mesh, rows, batches, row_ids=True):
+    for batch in global_iterator(path, mesh, rows, batches, row_ids=True, end_tokens=end_tokens):
         t0 = time.perf_counter()
         sums, ids = jax.block_until_ready(step(model, batch))
         sums = np.asarray(multihost_utils.process_allgather(sums, tiled=True), np.float32)
@@ -573,7 +584,7 @@ def make_loss(config, opts, is_train):
     dropout = bool(config.enable_dropout) if is_train else False
 
     def loss_func(model, inputs, inputs_position, inputs_segmentation, targets, targets_position,
-                  targets_segmentation, ref_seg=None):
+                  targets_segmentation, ref_seg=None, end_keep=None):
         data = {"inputs": inputs, "inputs_position": inputs_position, "inputs_segmentation": inputs_segmentation,
                 "targets": targets, "targets_position": targets_position,
                 "targets_segmentation": targets_segmentation}
@@ -584,7 +595,10 @@ def make_loss(config, opts, is_train):
             if is_train:
                 raise ValueError(f"--dpo: a training batch without {REF_KEY} (the precomputed reference)")
             return aux["xent_sum"] / jnp.maximum(aux["total_weights"], 1), aux
-        loss, sums = dpo_terms(logp, None, data["targets_segmentation"], opts, jnp, ref_seg=ref_seg[:micro])
+        if opts["end_tokens"] and end_keep is None:
+            raise ValueError(f"--dpo with end_tokens: a preference batch without {KEEP_KEY} (addendum G4-6c.6c)")
+        loss, sums = dpo_terms(logp, None, data["targets_segmentation"], opts, jnp, ref_seg=ref_seg[:micro],
+                               keep=None if end_keep is None else end_keep[:micro])
         return loss, {**aux, **{f"pref_{k}": v for k, v in sums.items()}}
 
     return loss_func

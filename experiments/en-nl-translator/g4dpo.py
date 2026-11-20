@@ -259,6 +259,27 @@ def end_mask(segmentation, n, xp=np):
     return ((segmentation > 0) & (ahead != segmentation)).astype(xp.float32)
 
 
+def segment_columns(logp, segmentation, n_end, max_segments, xp=np):
+    """[K, B, max_segments] float32: per row and segment, in one contraction with one one-hot of the segment ids, the
+    sums of the log-probabilities and of the target tokens and, with n_end, the same without the last n_end target
+    tokens of every segment (K = 4; else K = 2). Addendum G4-6c.6b: separate sums took the eval step at 4,096 past a v4
+    chip's memory. The policy's sums (dpo_terms) and the reference's (reference_sums) come from this one function, so
+    that at step 0 they are the same numbers."""
+    f32 = xp.float32
+    target = (segmentation != 0).astype(f32)
+    cols = [logp.astype(f32), target]
+    if n_end:
+        keep = 1.0 - end_mask(segmentation, n_end, xp)
+        cols += [cols[0] * keep, target * keep]
+    onehot = (segmentation[..., None] == xp.arange(1, max_segments + 1)).astype(f32)
+    return xp.einsum("blk,bls->kbs", xp.stack(cols, axis=-1), onehot)
+
+
+def ratio_sums(summed, n_end):
+    """The log-ratio's per-segment sums of log-probabilities and tokens of segment_columns' output"""
+    return (summed[2], summed[3]) if n_end else (summed[0], summed[1])
+
+
 def check_ends(path, n, end_ids=None):
     """Amendment G4-6c: in every row of a packed file each segment's target tokens are one run of more than n tokens
     (so end_mask takes exactly its last n) and, with end_ids, its last n targets are end_ids. Returns {"rows",
@@ -311,16 +332,11 @@ def dpo_terms(logp, ref_logp, segmentation, opts, xp=np, ref_seg=None):
     n_end = int(opts.get("end_tokens", 0))
     if (ref_logp is None) == (ref_seg is None):
         raise ValueError("dpo_terms: either ref_logp or ref_seg")
-    pol_all = segment_sums(logp, segmentation, s, xp)
-    ntok_all = (segmentation[..., None] == xp.arange(1, s + 1)).astype(f32).sum(axis=1)
-    if n_end:
-        keep = 1.0 - end_mask(segmentation, n_end, xp)
-        pol = segment_sums(logp * keep, segmentation, s, xp)
-        ntok = segment_sums(keep * (segmentation != 0), segmentation, s, xp)
-    else:
-        keep, pol, ntok = None, pol_all, ntok_all
+    summed = segment_columns(logp, segmentation, n_end, s, xp)
+    pol_all, ntok_all = summed[0], summed[1]
+    pol, ntok = ratio_sums(summed, n_end)
     if ref_seg is None:
-        ref = segment_sums(ref_logp if keep is None else ref_logp * keep, segmentation, s, xp)
+        ref = ratio_sums(segment_columns(ref_logp, segmentation, n_end, s, xp), n_end)[0]
     else:
         ref = ref_seg.astype(f32)
     if ref.shape != pol.shape:
@@ -472,9 +488,7 @@ def reference_sums(model, config, data, max_segments, end_tokens=0):
     data = {k: data[k][:config.micro_batch_size_to_eval_on] for k in KEYS}
     seg = data["targets_segmentation"]
     logp = model_logp(model, config, data, False)
-    if end_tokens:
-        logp = logp * (1.0 - end_mask(seg, end_tokens, jnp))
-    return segment_sums(logp, seg, max_segments, jnp)
+    return ratio_sums(segment_columns(logp, seg, end_tokens, max_segments, jnp), end_tokens)[0]
 
 
 def lora_b_zero(model):

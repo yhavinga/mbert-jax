@@ -418,3 +418,18 @@ def test_g46c_translates_a_checkpoint_and_removes_its_own_adapter_copy_after(tmp
     assert body.index("translate_class ") < body.index(f"rm -rf -- {copy}") < body.index("TRANSLATED")
     out, _ = run("translate", ARM="G4-6b", MODEL="G4-6b", TAG="t8")
     assert out.returncode == 0 and "rm -rf" not in (home / "job_body_g4a_translate_G4-6b_t8.sh").read_text()
+
+
+def test_segment_columns_are_the_separate_segment_sums_in_one_contraction():
+    # addendum G4-6c.6b: one one-hot for every sum; the same numbers as segment_sums of each column
+    batch, _ = batch_of(end_pairs(9, seed=9), seq=40, rows=3)
+    seg = batch["targets_segmentation"]
+    logp = np.where(seg != 0, -np.random.default_rng(9).uniform(0.1, 3.0, seg.shape), 0.0).astype(np.float32)
+    keep = 1.0 - g4dpo.end_mask(seg, 2)
+    got = g4dpo.segment_columns(logp, seg, 2, 64)
+    want = [g4dpo.segment_sums(x, seg, 64) for x in (logp, (seg != 0), logp * keep, (seg != 0) * keep)]
+    assert got.shape == (4, len(seg), 64)
+    for k in range(4):
+        np.testing.assert_allclose(got[k], want[k], rtol=1e-6, atol=1e-6)
+    assert g4dpo.segment_columns(logp, seg, 0, 64).shape == (2, len(seg), 64)
+    assert g4dpo.ratio_sums(got, 2)[0] is not None and np.array_equal(g4dpo.ratio_sums(got, 0)[0], got[0])

@@ -1326,3 +1326,18 @@ stap (Tunix' eval na stap k, vóór stap k + 1), dus precies het model van de ev
 eval-stap zijn (240 en 480 bij evals elke 240; 4 in de smoke-test en de CPU-proef). De controle (e) blijft ongewijzigd.
 Verlies, data, LR, stappen en de rest van §13 blijven. Vastgelegd vóór de herstart (nieuwe TAG); er was nog niets op de
 TPU gedaan (alleen setup, `ends6c` en de CPU-proef).
+
+*G4-6c.6b Aanvulling 20 nov 2026 ~16:15 (subagent op opdracht van de hoofdsessie; vóór elke trainingsstap van G4-6c).*
+De smoke-test van keten `g4h1120b` bij 4.096 (`g4arm_G4-6c_s8`, 20 nov 15:31–15:54) stopte in de eerste voorkeurseval op
+stap 0 (`pref_books`) met `RESOURCE_EXHAUSTED` ("Attempting to allocate 21.00M … There are 5.00M free") op w1 en w2
+[gemeten: `~/logs/g4arm_G4-6c_s8.log`]; de referentiepass en de SFT-evals waren klaar. G4-6b's smoke-test met dezelfde
+stap paste (piek 29,13 GiB): de eval zat al op de rand, en de afzonderlijke sommen voor `end_tokens` (drie contracties
+met een one-hot van de segmenten in plaats van één) duwden haar erover [gevolgtrekking]. De keten viel volgens G4-6.4
+terug op 2.048; die smoke-run is gestopt (keten `kill -- -2767740`, de vier `sft_lora.py`-processen bij PID) vóór zijn
+eerste stap. Fix (code, geen methodewijziging): alle sommen per segment in één contractie met één one-hot
+(`g4dpo.segment_columns`), voor het beleid en de vooraf berekende referentie dezelfde functie, zodat ze op stap 0 dezelfde
+getallen zijn; verlies, data, LR, rijen en checkpoints blijven. De CPU-proef en de smoke-test bij 4.096 draaien opnieuw
+(nieuwe TAG; de mislukte runs hernoemd naar `…-fail1`, de marker `smoke-4096-memory` naar
+`smoke-4096-memory-g4h1120b`). **Valt de smoke-test bij 4.096 opnieuw buiten het geheugen, dan stopt de keten (geen
+terugval naar 2.048) en beslist de hoofdsessie** [keuze subagent, de veilige optie: bij 2.048 heeft de epoch 1.689 stappen
+en vallen de checkpoints 240 en 480 op 14% en 28% in plaats van op een en twee derde, wat niet de opdracht is].

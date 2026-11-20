@@ -1372,7 +1372,7 @@ referentiepass. Gebruikt iets daarna toch een opgegeven kernel, dan stopt de run
 volle run opnieuw (nieuwe TAG; de mislukte volle run hernoemd naar `g4arm_G4-6c-fail1`, markers `cpuproof6`,
 `smoke6` en `train-g4arm_G4-6c_s8` met `-g4h1120d`); G4-6c.6b's regel blijft.
 
-*G4-6c.6e Amendement 20 nov 2026 ~23:00 (besluit van de hoofdsessie 20 nov 22:15, optie 1 van de overdracht; Yeb liet
+*G4-6c.6e Amendement 20 nov 2026 ~22:30 (besluit van de hoofdsessie 20 nov 22:15, optie 1 van de overdracht; Yeb liet
 de DPO-armen aan de hoofdsessie; uitgewerkt door een subagent; vóór elke stap op een worker).* Ook met G4-6c.6d liep de
 volle run `g4arm_G4-6c` (keten `g4h1120e`, 21:04–22:10) na zijn referentiepass over 717 batches (2.810 s, geheugen in
 gebruik daarna 9,98 GiB) in de eerste voorkeurseval op stap 0 tegen `RESOURCE_EXHAUSTED` (21 MB gevraagd, 4,96 MB vrij;

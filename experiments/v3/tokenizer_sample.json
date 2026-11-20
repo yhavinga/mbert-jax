@@ -1,0 +1,27 @@
+{
+ "repo": "uonlp/CulturaX",
+ "revision": "6a8734bc",
+ "tokenizer": "/tmp/claude-1000/-home-yeb-Developer-yhavinga-hammond/aa9b793f-95b6-410b-908b-2e8a2f50ac0c/scratchpad/tok/v3a",
+ "files": {
+  "nl_part_00005": {
+   "row_group": 6,
+   "documents": 40000
+  },
+  "nl_part_00064": {
+   "row_group": 6,
+   "documents": 40000
+  },
+  "nl_part_00121": {
+   "row_group": 6,
+   "documents": 40000
+  }
+ },
+ "documents": 120000,
+ "tokens": 83085408,
+ "train_different": 0,
+ "default_different": 0,
+ "default_different_without_literal": 0,
+ "with_literal": 0,
+ "examples": [],
+ "passed": true
+}

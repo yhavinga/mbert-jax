@@ -273,3 +273,50 @@ venv, tokenizer (a) met de sha256 van co1), staging, per arm smoke-test en 100.0
   bij langer trainen veranderen.
 - Eén pretraining per vorm; A2 meet de ruis alleen voor A.
 - Eén LR voor alle vormen; een diepe, smalle vorm kan een andere LR willen.
+
+## Bijlage: tokenizer (a) (`scripts/build_tokenizer_v3.py`)
+
+Gebouwd uit `yhavinga/dutch-llama-tokenizer` @ `d6a3a55a4ddf51a05d98d6a07f170f61a3c7c1ff`; sha256 van de uitvoer:
+`tokenizer.json` `860167d4…`, `tokenizer_config.json` `61409e01…`, `special_tokens_map.json` `3cc0f281…`. Woordenschat,
+normalizer (Prepend ▁ + spaties → ▁), BPE-model en decoder blijven gelijk; alleen toegevoegde tokens, post-processor en
+config veranderen.
+
+| token | id | v2 | (a) |
+|---|---:|---|---|
+| `<unk>`, `<s>`, `</s>` | 0, 1, 2 | ongewijzigd | ongewijzigd |
+| `<pad>` (woordenschat) | 20.277 | padding-token | blijft een special token op zijn id, niet meer de padding |
+| `<mask>` | 32.000 | special, niet genormaliseerd | special, **genormaliseerd** |
+| `<\|pad\|>` | 32.001 | `<unused0>` | **eigen padding-token** |
+| `<unused1>`–`<unused126>` | 32.002–32.127 | gewone toegevoegde tokens | special (blijven tekst in de modus van de trainer) |
+
+- **`<mask>`.** Een genormaliseerd toegevoegd token wordt gezocht ná de normalizer, die de hele tekst één keer
+  normaliseert: het patroon is `▁<mask>`, zodat de spatie ervóór bij het masker hoort (zoals de spatie van `▁hoofdstad`
+  in de pretraining) en de tekst erna geen extra `▁` krijgt. "de <mask> van" en "kopje <mask>." geven de ids van de
+  pretraining. Niet gekozen: de Metaspace-pre-tokenizer met `prepend_scheme=first` (voorstel van 14 nov, hf-release
+  `bf4c368`), omdat die een tekst die met witruimte begint anders tokeniseert dan v2. Gevolg: de schrijfwijze zonder
+  spaties van de v2-kaart (`de<mask>van`) vindt het masker niet meer (de fill-mask-pipeline meldt dan dat er geen masker
+  is).
+- **`<|pad|>`.** De inhoud `<pad>` staat al in de woordenschat (id 20.277) en zou altijd dat id krijgen; daarom een
+  eigen naam.
+- **CLS/SEP: `<s>` en `</s>`, bewust.** Eén tekst wordt `<s> A </s>`, een paar `<s> A </s> B </s>` (v2: `<s> A` en
+  `<s> A <s> B`, zonder scheiding aan het eind van A). Beide tokens zijn in de pretraining getraind (elk stuk begint met
+  `<s>`, een document eindigt met `</s>`); nieuwe CLS/SEP-tokens in ongebruikte slots zouden ongetraind aan het
+  fine-tunen beginnen. De vorm volgt ModernBERT's `[CLS] A [SEP] B [SEP]`.
+- **`PreTrainedTokenizerFast`** in plaats van `LlamaTokenizer`: een Llama-klasse bouwt de post-processor opnieuw uit
+  `add_bos_token`/`add_eos_token` (en in transformers 5 ook de pre-tokenizer uit `legacy`); zo geldt `tokenizer.json`
+  zoals het is. `model_input_names` zonder `token_type_ids` (ModernBERT neemt die niet). `truncation_side` blijft
+  `left`, zoals v2 (DBRD@512 houdt dus de laatste tokens; bij elk model gelijk).
+
+**Getest [gemeten]:**
+- CulturaX-nl (`6a8734bc`; `nl_part_00005`, `00064`, `00121`, elk 40.000 documenten uit de middelste row group):
+  120.000 documenten, 83.085.408 tokens, **0 documenten met andere ids**, in de modus van de trainer
+  (`add_special_tokens=False`, `split_special_tokens=True`) en in de standaardmodus (`experiments/v3/tokenizer_sample.json`).
+- Unit-tests (`tests/test_tokenizer_v3.py`, 36): gewone tekst (ook met witruimte vooraan, tabs, emoji, harde spatie)
+  gelijke ids en offsets in beide modi; letterlijke `<s>`, `<pad>`, `<mask>`, `<|pad|>`, `<unused5>` in de modus van de
+  trainer als tekst, zoals in v2; de gepackte stukken van de trainer (`TokenizeTransform`) gelijk aan die van v2;
+  maskernotaties; sjablonen en padding.
+- transformers 5.23.0: dezelfde ids als de trainer van v2 (transformers 4.57.1) op de testteksten, ook het masker.
+  (v2's eigen tokenizer geeft in transformers 5 andere ids voor tekst met witruimte vooraan.)
+- Export naar HF (`tests/test_v3_export.py`, venv van hf-release): een model met (a), globale attention elke 2e en
+  elke 3e laag, laadt als `ModernBertForMaskedLM`; logits gelijk aan JAX (≤ 1e-3 relatief, top-1 overal gelijk), ook
+  voorbij het lokale venster en met padding op 32.001.

@@ -1371,3 +1371,41 @@ dan het eigen dtype). `BASE_ADAPTER` meldt het geheugen in gebruik vóór en na 
 referentiepass. Gebruikt iets daarna toch een opgegeven kernel, dan stopt de run met een fout. CPU-proef, smoke-test en
 volle run opnieuw (nieuwe TAG; de mislukte volle run hernoemd naar `g4arm_G4-6c-fail1`, markers `cpuproof6`,
 `smoke6` en `train-g4arm_G4-6c_s8` met `-g4h1120d`); G4-6c.6b's regel blijft.
+
+*G4-6c.6e Amendement 20 nov 2026 ~23:00 (besluit van de hoofdsessie 20 nov 22:15, optie 1 van de overdracht; Yeb liet
+de DPO-armen aan de hoofdsessie; uitgewerkt door een subagent; vóór elke stap op een worker).* Ook met G4-6c.6d liep de
+volle run `g4arm_G4-6c` (keten `g4h1120e`, 21:04–22:10) na zijn referentiepass over 717 batches (2.810 s, geheugen in
+gebruik daarna 9,98 GiB) in de eerste voorkeurseval op stap 0 tegen `RESOURCE_EXHAUSTED` (21 MB gevraagd, 4,96 MB vrij;
+w1, w2), vóór stap 1; de smoke-test met dezelfde eval (referentiepass over 8 batches) paste [gemeten: de worker-logs,
+`HANDOVER-g4arm6c.md` §0]. De oorzaak is niet gevonden. **Wijziging.** De referentie van de trainingsbatches wordt in een
+eigen run berekend: `<run>_ref` (`sft_lora.py --dpo … --ref-only`, met G4-4's adapter ingebakken, hetzelfde model en
+dezelfde MaxText-config als de training, geen eval, geen stap) doet de referentiepass over de batches die `<run>` traint
+en schrijft ze weg als `ref-train.npy` (float32, [batches × rijen, max_segments], zoals de pass ze geeft) en
+`ref-train.json` (waarvan het de referentie is: sha256 van het gepakte bestand en van G4-4's adapter, batches, rijen,
+`max_segments`, `end_tokens`, de config van de voorwaartse pass, de vorm van de LoRA en de apparaten; de sha256 van het
+array). `<run>` leest ze in (`--ref-in`), controleert vóór het opzetten van het model dat alles daarvan gelijk is aan de
+eigen run (anders stopt hij), en doet zelf geen referentiepass over zijn trainingsdata; de referentie van de drie
+voorkeurs-evalbestanden (32 batches) berekent hij zoals voorheen vóór de eerste stap, zoals de smoke-test die paste.
+Zo ook de smoke-test: `g4arm_G4-6c_s8_ref`, dan `g4arm_G4-6c_s8`; daarna `g4arm_G4-6c_ref`, dan `g4arm_G4-6c`.
+**Ongewijzigd:** β 0,5, NLL-gewicht 2,0, `<turn|>\n` buiten de log-ratio, rijen van 4.096, LR en schema, checkpoints
+240/480/717, de keuze op het zoekdeel (G4-6c.7) en het besluit op het beslisdeel (G4-6c.8); G4-6c.6b's regel blijft
+(bij een geheugenfout geen terugval naar 2.048, de keten stopt en de hoofdsessie beslist), ook voor de volle run.
+**Dezelfde getallen, aangetoond in de CPU-proef** (`cpuproof6.sh` met `REFIN=1`, naast (a)–(e)): (f) `--ref-only` met
+(c)'s ingebakken adapter over (c)'s 4 trainingsbatches; (g) (c) opnieuw met `--ref-in` van (f); (h) `--ref-in` van (f)
+in een run zonder de ingebakken adapter. Eisen: de referentie van (f) is per paar (gekozen en afgewezen som) gelijk aan
+die welke (c) in zijn eigen proces vóór zijn eerste stap berekende, binnen `REF_MAX_DIFF6E` = 1e-6 relatief
+(t.o.v. max(1, |x|)), en de proef meldt of ze bitgelijk is; (g) las die referentie (sha256) en deed geen pass over zijn
+trainingsbatches; (g)'s training is gelijk aan (c)'s (elke stap zijn voorkeursmaten, elke eval, de eindadapter) binnen
+dezelfde grens; (h) wordt geweigerd vóór het opzetten van het model. [Keuze subagent] De grens 1e-6 is ~16 ulp van
+float32: een referentie van andere rijen of een ander model wijkt ordes meer af. **Smoke-test, extra controle `ref_in`:**
+de run las zijn referentie (record met `ref_in` en sha256, geen eigen pass) en op stap 1, waar het beleid nog de
+referentie is, liggen de DPO-term en de marge binnen `STEP1_MAX_DIFF6E` = 1e-3 van log 2 en 0 [keuze subagent; gemeten
+in de smoke-test van `g4h1120e` met de referentie in hetzelfde proces: 7,5e-5 en 1,5e-4]; de keten toetst hetzelfde
+voor de volle run na zijn einde. De schatting van de smoke-test telt geen referentiepass over de trainingsbatches meer
+(die is een eigen run, ~50 min). [Gevolgtrekking, niet gemeten] De volle run doet zo vóór zijn eerste eval wat de
+smoke-test deed (geen 717 referentiestappen); of de eval dan past, blijkt pas in de volle run. **Keten:** wacht op
+`final_run.lock` (de v3-ablatiearmen c en d op mbert-corpus) tot 36 u, dan CPU-proef, smoke-test bij 4.096 met de
+ingelezen referentie, de referentierun, de volle run en het vervolg als G4-6c.11. Uitvoer erbij:
+`$G/runs/g4arm_G4-6c_s8_ref/` en `$G/runs/g4arm_G4-6c_ref/` (`ref-train.npy`, `ref-train.json`, `summary.json`,
+`dpo_ref.parquet`). De markers `cpuproof6`, `smoke6` en `train-g4arm_G4-6c_s8` van code `20904d4` hernoemd met
+`-g4h1120e`, de smoke-run van `g4h1120e` naar `g4arm_G4-6c_s8-g4h1120e`; nieuwe TAG.

@@ -64,6 +64,14 @@ more than n tokens (ENDS). --save-steps K1,K2,... keeps the LoRA parameters afte
 DIR/adapter-step<K>.npz and .json (process 0; the same format as adapter.npz), and a line SAVED per step. Each K is an
 eval step (a multiple of --eval-every): the adapter is kept in that eval round, so it is the model of that eval (Tunix
 calls on_train_step_end for step K only after step K + 1, addendum G4-6c.6a).
+Addendum G4-6c.6e: with --dpo and --ref-only the run is the reference alone: the reference pass over the --pref-train
+batches it would train on (after --base-adapter's merge), written as DIR/ref-train.npy (float32, [batches x rows,
+max_segments], as the pass gives it) and DIR/ref-train.json (its identity: the packed file's and the merged adapter's
+sha256, the batches, the rows, the spec's max_segments and end_tokens, the forward pass's config and devices; the pass's
+record; the array's sha256), with summary.json and dpo_ref.parquet; no eval, no step, no adapter. With --ref-in FILE (a
+--ref-only run's ref-train.npy) a training run takes the training batches' reference from that file, checked against
+its own identity before the model is set up, and runs no reference pass over the training data (the --pref-eval files'
+references are still computed before the first step).
 Writes to DIR (process 0): summary.json (configuration, times, throughput, memory per chip, loss per step), adapter.npz
 (the LoRA parameters in float32, keys as decoder/layers_0/self_attention/query/kernel_lora_a), adapter.json (rank,
 alpha, module regex, model, checkpoint, original dtype); MaxText's output (metrics file, tensorboard, Tunix's checkpoint
@@ -337,11 +345,18 @@ def device_bytes():
 
 def dpo_args(args, evals_wanted):
     """--dpo's spec and its preference eval files {name: file}, checked before JAX: a measurement of its own (no
-    --combine, --temperatures, --resume-step, --init-adapter), names apart from the --eval files"""
+    --combine, --temperatures, --resume-step, --init-adapter), names apart from the --eval files; --ref-only alone
+    (no --eval, --pref-eval, --save-steps or --ref-in), --ref-in an existing file (addendum G4-6c.6e)"""
+    ref_only, ref_in = getattr(args, "ref_only", False), getattr(args, "ref_in", None)
     if not args.dpo:
-        if args.pref_train or args.pref_eval or args.base_adapter:
-            raise SystemExit("--pref-train, --pref-eval and --base-adapter belong to --dpo")
+        if args.pref_train or args.pref_eval or args.base_adapter or ref_only or ref_in:
+            raise SystemExit("--pref-train, --pref-eval, --base-adapter, --ref-only and --ref-in belong to --dpo")
         return None, {}
+    if ref_only and (ref_in or args.pref_eval or evals_wanted or getattr(args, "save_steps", None)):
+        raise SystemExit("--ref-only is the reference of the training batches alone: no --ref-in, --eval, --pref-eval "
+                         "or --save-steps")
+    if ref_in and not Path(ref_in).is_file():
+        raise SystemExit(f"--ref-in {ref_in}: no such file")
     import g4dpo
 
     if not args.pref_train:
@@ -364,6 +379,33 @@ def dpo_args(args, evals_wanted):
             print(f"ENDS {json.dumps({'set': name, 'end_tokens': opts['end_tokens'], **g4dpo.check_ends(path, opts['end_tokens'])})}",
                   flush=True)
     return opts, prefs
+
+
+# addendum G4-6c.6e: the config of the forward pass that a reference of the training batches belongs to
+REF_CONFIG_KEYS = ("model_name", "load_parameters_path", "max_target_length", "per_device_batch_size",
+                   "global_batch_size_to_train_on", "global_batch_size_to_load_eval", "micro_batch_size_to_eval_on",
+                   "dtype", "weight_dtype", "matmul_precision", "num_vocab_tiling", "attention", "scan_layers",
+                   "remat_policy", "ici_fsdp_parallelism", "ici_tensor_parallelism", "dcn_data_parallelism",
+                   "dcn_fsdp_parallelism", "logits_dot_in_fp32", "packing")
+
+
+def ref_identity(pref_train, batches, rows, opts, base_spec, config, lora_path, devices):
+    """Addendum G4-6c.6e: what a reference of the training batches is the reference of: the packed file (sha256), its
+    first `batches` global batches of `rows` rows, the spec's max_segments and end_tokens, the adapter merged before it
+    (sha256, scale), the forward pass's config (REF_CONFIG_KEYS, the LoRA's shape) and the devices
+    {count, processes, kind}; a --ref-only run writes it, a --ref-in run must have the same"""
+    import g4dpo
+
+    base = None
+    if base_spec:
+        base = {"name": base_spec["name"], "sha256": g4dpo.file_sha256(base_spec["path"]),
+                "scale": base_spec["meta"]["scale"]}
+    return g4dpo.as_json({
+        "pref_train_sha256": g4dpo.file_sha256(pref_train), "batches": batches, "rows": rows,
+        "max_segments": opts["max_segments"], "end_tokens": opts["end_tokens"], "base_adapter": base,
+        "config": {k: getattr(config, k, None) for k in REF_CONFIG_KEYS},
+        "lora": {"rank": config.lora.lora_rank, "alpha": config.lora.lora_alpha, "module_path": lora_path},
+        "devices": devices})
 
 
 def save_steps_arg(text, steps, eval_every=0):
@@ -855,6 +897,12 @@ def main(argv=None):
                              "the first step (the start model and the reference; arm G4-6b)")
     parser.add_argument("--save-steps", default=None,
                         help="K1,K2,...: the LoRA parameters after these steps as adapter-step<K>.npz/.json (arm G4-6c)")
+    parser.add_argument("--ref-only", action="store_true",
+                        help="with --dpo: only the reference of the training batches, to ref-train.npy and "
+                             "ref-train.json; no eval, no step (addendum G4-6c.6e)")
+    parser.add_argument("--ref-in", default=None,
+                        help="with --dpo: the training batches' reference from a --ref-only run's ref-train.npy (its "
+                             "ref-train.json beside it, checked); no reference pass over them (addendum G4-6c.6e)")
     args = parser.parse_args(own)
     if args.resume_step < 0 or bool(args.resume_step) != bool(args.resume_adapter):
         raise SystemExit("--resume-step N (> 0) and --resume-adapter go together")
@@ -1018,6 +1066,18 @@ def main(argv=None):
         eval_plan[name] = {"path": path, "batches": info["batches"], "kind": "pref", "pairs": info["pairs"],
                            "batches_per_process": [info["batches"]] * jax.process_count(), "end": "packed file"}
         print(f"EVAL_PLAN {json.dumps(eval_plan[name] | {'set': name})}", flush=True)
+    identity, ref_in = None, None
+    if dpo_opts and (args.ref_only or args.ref_in):
+        # addendum G4-6c.6e: --ref-in's file checked before the model is set up, so that another run's reference
+        # costs nothing
+        identity = ref_identity(args.pref_train, own_steps, pref_rows, dpo_opts, base_spec, config,
+                                lora_utils._get_lora_module_path(config),  # noqa: SLF001
+                                {"count": jax.device_count(), "processes": jax.process_count(),
+                                 "kind": jax.devices()[0].device_kind})
+        if args.ref_in:
+            ref_in = g4dpo.read_reference(args.ref_in, identity)
+            print(f"REF_IN {json.dumps({'file': args.ref_in, 'sha256': ref_in[1]['sha256'], 'shape': ref_in[1]['shape']})}",
+                  flush=True)
 
     t_setup = time.time()
     trainer, mesh = train_sft.setup_trainer_state(config)
@@ -1065,8 +1125,17 @@ def main(argv=None):
         t_ref = time.time()
         ref_files = [("train", args.pref_train, own_steps)] + [(k, v, eval_plan[k]["batches"])
                                                                 for k, v in prefs_wanted.items()]
+        if ref_in:
+            # addendum G4-6c.6e: the training batches' reference from a --ref-only run; no pass over them here
+            refs["train"] = ref_in[0]
+            ref_record["train"] = {"file": args.pref_train, "batches": own_steps,
+                                   "ref_sum": float(np.sum(refs["train"], dtype=np.float64)), "ref_in": args.ref_in,
+                                   "sha256": ref_in[1]["sha256"], "ref_only_record": ref_in[1]["record"]}
+            print(f"REF {json.dumps(ref_record['train'] | {'set': 'train'})}", flush=True)
         with jax.set_mesh(mesh), logical_axis_rules(config.logical_axis_rules):
             for name, path, n in ref_files:
+                if name in refs:
+                    continue
                 refs[name], secs = g4dpo.precompute_reference(trainer.model, config, path, mesh, pref_rows, n,
                                                               dpo_opts["max_segments"], dpo_opts["end_tokens"])
                 ref_record[name] = {"file": path, "batches": n, "seconds": round(sum(secs), 1),
@@ -1082,6 +1151,26 @@ def main(argv=None):
             rows_out = [{"set": name, **r} for name, path, n in ref_files
                         for r in g4dpo.reference_rows(path, refs[name], n, pref_rows)]
             pq.write_table(pa.Table.from_pylist(rows_out), out / "dpo_ref.parquet")
+        if args.ref_only:
+            # addendum G4-6c.6e: the reference alone; no eval, no step, no adapter
+            summary = {"ref_only": True, "model": config.model_name, "checkpoint": config.load_parameters_path,
+                       "devices": jax.device_count(), "processes": jax.process_count(),
+                       "device_kind": jax.devices()[0].device_kind, "epoch": count, "own_steps": own_steps,
+                       "times": {"python_to_setup_s": round(t_setup - started, 1), "setup_s": round(setup_s, 1),
+                                 "ref_s": round(ref_s, 1)},
+                       "peak_gib_max": peak_gib(), "base_adapter": base_adapter,
+                       "dpo": {"spec": dpo_opts, "train": count, "ref": ref_record, "identity": identity}}
+            if main_process:
+                meta = g4dpo.write_reference(out, refs["train"], identity, ref_record["train"])
+                summary["dpo"]["ref_file"] = {"file": str(out / g4dpo.REF_FILE), "sha256": meta["sha256"],
+                                              "shape": meta["shape"]}
+                (out / "summary.json").write_text(json.dumps(summary, indent=1, default=str) + "\n")
+                print(f"REF_ONLY {json.dumps(summary['dpo']['ref_file'])}", flush=True)
+            if jax.process_count() > 1:
+                from jax.experimental import multihost_utils
+
+                multihost_utils.sync_global_devices("sft_lora files written")
+            return
         hooks_data = trainer.data_hooks
         close(hooks_data.train_data_iterator)
         pref_iter = g4dpo.global_iterator(args.pref_train, mesh, pref_rows, own_steps, padding=1, ref=refs["train"],

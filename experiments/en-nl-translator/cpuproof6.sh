@@ -21,6 +21,14 @@
 # and checks: (e)'s step-0 losses of books and own = (a)'s at step 4 (the kept adapter is the model of that step);
 # every eval of pref_btval counts 2 tokens per side fewer in the log-ratio than in the NLL; (a)'s loss at step 1 = its
 # DPO term + nll_alpha x the chosen NLL over every target token; (a)'s spec is G4-6c's.
+# With REFIN=1 (addendum G4-6c.6e: the reference of the training batches from a run of its own; needs BAKE=1) also:
+#   (f) --ref-only with (c)'s merged adapter over (c)'s 4 training batches (ref-train.npy, ref-train.json)
+#   (g) (c) again with --ref-in (f)'s file: no reference pass over its training batches
+#   (h) --ref-in (f)'s file in a run without the merged adapter (another model)
+# and checks: (f) is the reference alone (4 batches, no adapter); (f)'s reference = (c)'s, computed in (c)'s own process
+# before its first step, for every pair's chosen and rejected sum (within REF_MAX_DIFF6E relative, bitwise reported);
+# (g) read it and computed no pass over its training batches; (g)'s training = (c)'s (every step's preference measures,
+# every eval, the final adapter; within REF_MAX_DIFF6E); (h) is refused before its model is set up.
 # Started by run_g4arm.sh cpuproof6 (w1) with G, G6, H, PY (the SFT venv's python), TOK (Gemma 4's tokenizer), CODE
 # (the bundle) and X (the work directory) in the environment. Ends in CPU_PROOF6_OK or CPU_PROOF6_FAILED.
 set -euo pipefail
@@ -28,6 +36,8 @@ set -euo pipefail
 BAKE=${BAKE:-0}
 SPEC=${SPEC:-DPO6}
 C6=${C6:-0}
+REFIN=${REFIN:-0}
+[ "$REFIN" = 0 ] || [ "$BAKE" = 1 ] || { echo "REFIN=1 needs BAKE=1 (the reference of (c))"; exit 1; }
 [ ! -e "$X" ] || { echo "$X exists"; exit 1; }
 P=$X/cpu
 mkdir -p $X/in $P
@@ -96,6 +106,20 @@ if [ "$BAKE" = 1 ]; then
   echo "$(date +%T) (d) plain SFT with (a)'s adapter as LoRA, the evals at step 0"
   $PY -u $CODE/sft_lora.py --out $P/d --steps 1 "${EV[@]}" --eval-every 1 --init-adapter $P/a/adapter.npz \
     -- run_name=g4a6c_d "${MX[@]}"
+fi
+if [ "$REFIN" = 1 ]; then
+  echo "$(date +%T) (f) --ref-only with (a)'s adapter merged, (c)'s 4 training batches"
+  $PY -u $CODE/sft_lora.py --out $P/f --steps 4 --warmup-steps 1 --decay-fraction 0 --dpo $P/dpo.json \
+    --pref-train $P/train.parquet --ref-only --base-adapter tiny=$P/a/adapter.npz -- run_name=g4a6c_f "${MX[@]}"
+  echo "$(date +%T) (g) (c) with --ref-in (f)'s reference"
+  $PY -u $CODE/sft_lora.py --out $P/g --steps 4 "${EV[@]}" --eval-every 4 --warmup-steps 1 --decay-fraction 0 \
+    --dpo $P/dpo.json --pref-train $P/train.parquet --pref-eval pref_btval=$P/pref_btval.parquet \
+    --base-adapter tiny=$P/a/adapter.npz --ref-in $P/f/ref-train.npy -- run_name=g4a6c_g "${MX[@]}"
+  echo "$(date +%T) (h) --ref-in (f)'s reference without the merged adapter: refused"
+  if $PY -u $CODE/sft_lora.py --out $P/h --steps 4 "${EV[@]}" --eval-every 4 --warmup-steps 1 --decay-fraction 0 \
+    --dpo $P/dpo.json --pref-train $P/train.parquet --pref-eval pref_btval=$P/pref_btval.parquet \
+    --ref-in $P/f/ref-train.npy -- run_name=g4a6c_h "${MX[@]}" > $P/h.log 2>&1; then echo "H_EXIT 0"; else echo "H_EXIT $?"; fi
+  tail -n 3 $P/h.log
 fi
 if [ "$C6" = 1 ]; then
   echo "$(date +%T) (e) plain SFT with (a)'s adapter of step 4 as LoRA, the evals at step 0"
@@ -182,6 +206,59 @@ if "$C6" == "1":
     for name in ("train", "pref_btval"):
         ends = json.load(open(f"$P/ends-{name}.json"))
         need(ends["segments"] > 0 and len(ends["end_ids"]) == n_end, f"c6: the real pairs of {name} end in <turn|>\\n {ends}")
+if "$REFIN" == "1":
+    import os
+
+    import pyarrow.parquet as pq
+
+    bound = g4arm.REF_MAX_DIFF6E
+    f, g = (json.load(open(f"$P/{r}/summary.json")) for r in "fg")
+    print("F_REF", json.dumps(f["dpo"]["ref"]))
+    print("G_REF", json.dumps(g["dpo"]["ref"]))
+    print("G_EVAL", json.dumps(g["eval"]))
+    need(f.get("ref_only") is True and set(f["dpo"]["ref"]) == {"train"} and f["dpo"]["ref"]["train"]["batches"] == 4
+         and not os.path.exists("$P/f/adapter.npz"), f"e6: (f) is the reference alone, 4 batches, no adapter {f['dpo']['ref']}")
+    ref_f, meta_f = np.load("$P/f/ref-train.npy"), json.load(open("$P/f/ref-train.json"))
+    # (c)'s reference rows (dpo_ref.parquet: every pair's chosen and rejected sum, from (c)'s own pass) against the
+    # same rows made from (f)'s file
+    rows_c = [{k: v for k, v in r.items() if k != "set"}
+              for r in pq.read_table("$P/c/dpo_ref.parquet").to_pylist() if r["set"] == "train"]
+    rows_f = g4dpo.reference_rows("$P/train.parquet", ref_f, 4, 4)
+    ids = lambda rows: [(r["file"], r["batch"], r["row"], r["pair"]) for r in rows]
+    vals = [(a[k], b[k]) for a, b in zip(rows_c, rows_f) for k in ("ref_chosen_logp", "ref_rejected_logp")]
+    diff = max(abs(a - b) / max(1.0, abs(a)) for a, b in vals) if vals else math.inf
+    bitwise = bool(vals) and all(a == b for a, b in vals)
+    print("E6_REF", json.dumps({"pairs": len(rows_c), "values": len(vals), "max_rel_diff": diff, "bitwise": bitwise,
+                                "bound": bound, "ref_sum_c": c["dpo"]["ref"]["train"]["ref_sum"],
+                                "ref_sum_f": f["dpo"]["ref"]["train"]["ref_sum"]}))
+    need(len(rows_c) > 0 and ids(rows_c) == ids(rows_f) and diff <= bound,
+         f"e6: (f)'s reference = (c)'s from its own process, every pair ({len(rows_c)} pairs, max relative diff {diff}, bitwise {bitwise})")
+    rg = (g["dpo"]["ref"] or {}).get("train") or {}
+    need(rg.get("ref_in") == "$P/f/ref-train.npy" and rg.get("sha256") == meta_f["sha256"] and "seconds" not in rg
+         and rg.get("ref_sum") == f["dpo"]["ref"]["train"]["ref_sum"] and set(g["dpo"]["ref"]) == {"train", "pref_btval"},
+         f"e6: (g) read (f)'s reference and ran no pass over its training batches {rg}")
+    rows_g = [{k: v for k, v in r.items() if k != "set"}
+              for r in pq.read_table("$P/g/dpo_ref.parquet").to_pylist() if r["set"] == "train"]
+    need(rows_g == rows_f, "e6: (g)'s reference rows = those of (f)'s file")
+    def num(x):
+        return isinstance(x, (int, float)) and not isinstance(x, bool)
+    pairs = [(f"step {a['step']} {k}", a[k], b[k]) for a, b in zip(c["dpo"]["steps"], g["dpo"]["steps"]) for k in a if num(a[k])]
+    key = lambda e: (e["set"], e["step"])
+    ec, eg = sorted(c["eval"], key=key), sorted(g["eval"], key=key)
+    pairs += [(f"eval {a['set']} {a['step']} {k}", a[k], b.get(k)) for a, b in zip(ec, eg) for k in a
+              if num(a[k]) and k != "seconds"]
+    with np.load("$P/c/adapter.npz") as zc, np.load("$P/g/adapter.npz") as zg:
+        same_keys = set(zc.files) == set(zg.files)
+        ad = max(float(np.max(np.abs(zc[k] - zg[k]))) for k in zc.files) if same_keys else math.inf
+    tdiff = max([abs(x - y) / max(1.0, abs(x)) if num(y) else math.inf for _, x, y in pairs] + [ad])
+    worst = max(pairs, key=lambda t: abs(t[1] - t[2]) if num(t[2]) else math.inf, default=None)
+    print("E6_TRAIN", json.dumps({"values": len(pairs), "max_rel_diff": tdiff, "adapter_max_abs_diff": ad,
+                                  "bitwise": all(x == y for _, x, y in pairs) and ad == 0.0, "worst": worst}))
+    need(len(c["dpo"]["steps"]) == len(g["dpo"]["steps"]) == 4 and [key(e) for e in ec] == [key(e) for e in eg]
+         and tdiff <= bound, f"e6: (g)'s training = (c)'s (steps, evals, adapter; max relative diff {tdiff})")
+    h_log = open("$P/h.log").read()
+    need("not this run's reference" in h_log and "base_adapter" in h_log and not os.path.exists("$P/h/summary.json"),
+         "e6: (h) refused (f)'s reference for a model without the merged adapter")
 print("CPU_PROOF6_OK" if not bad else f"CPU_PROOF6_FAILED {bad}", flush=True)
 raise SystemExit(1 if bad else 0)
 EOF

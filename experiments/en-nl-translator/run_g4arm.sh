@@ -133,9 +133,11 @@
 # the log-ratio, the adapter kept at steps 240 and 480), with ARM=G4-6c, G4-6b's pairs read only ($G/data/G4-6b/):
 #   bash run_g4arm.sh ends6c      w2 (CPU): g4arm.py ends6c (every packed file: each segment ends in <turn|>\n), to
 #                                 $G/data/ends-G4-6c.txt
-#   cpuproof6 (BAKE=1, G4-6c's spec, the saved adapter and the end tokens); RUN=g4arm_G4-6c_s8 train (SEQ6=2048:
-#   g4arm_G4-6c_s8_2048; the adapter of step 4 kept), MODEL=G4-6c|G4-4 smoke-translate and smoke-score, smoke6-report;
-#   RUN=g4arm_G4-6c train (the adapters of steps 240 and 480 kept); [CKPT=<step>] adapter (G4-4's adapter and each
+#   cpuproof6 (BAKE=1, G4-6c's spec, the saved adapter and the end tokens, REFIN=1: the reference read in);
+#   RUN=g4arm_G4-6c_s8_ref train, then RUN=g4arm_G4-6c_s8 train (SEQ6=2048: g4arm_G4-6c_s8_2048[_ref]; the adapter of
+#   step 4 kept), MODEL=G4-6c|G4-4 smoke-translate and smoke-score, smoke6-report; RUN=g4arm_G4-6c_ref train, then
+#   RUN=g4arm_G4-6c train (the adapters of steps 240 and 480 kept). Addendum G4-6c.6e: a run <run>_ref is the
+#   reference of <run>'s training batches alone (sft_lora.py --ref-only), which <run> reads (--ref-in); [CKPT=<step>] adapter (G4-4's adapter and each
 #   checkpoint's stacked, to $G/G4-6c-s240/, $G/G4-6c-s480/, $G/G4-6c-s717/, the checkpoint's alone in delta/); MODEL=G4-6c-s<k>
 #   translate and score (SET=eval); texts (the three, G4-0, G4-4, G4-6b), classify, report6c (w0: the checkpoint
 #   chosen on the search part of G4-5's split, the rule on its decision part); SELECTED=<report6c's choice> blind
@@ -457,8 +459,11 @@ g45_train() {  # the training runs of G4-5 (draft amendment G4-5): the warmup, t
 g46_train() {  # the runs of G4-6, G4-6b and G4-6c (amendments G4-6, G4-6b, G4-6c): the smoke runs at 4,096 and 2,048, the full run
   RUN=${RUN:?g4arm_${ARM}_s8, g4arm_${ARM}_s8_2048 or g4arm_$ARM}
   tpu_free
-  local seq setfile steps every n f spec=DPO6 save=""
-  case $RUN in
+  local seq setfile steps every n f spec=DPO6 save="" ref_only="" train_run=$RUN
+  # addendum G4-6c.6e: G4-6c's reference of a run's training batches is a run of its own, <run>_ref (sft_lora.py
+  # --ref-only, the same model and config), which the run then reads (--ref-in)
+  if [ "$ARM" = G4-6c ] && [[ $RUN == *_ref ]]; then ref_only=1; train_run=${RUN%_ref}; fi
+  case $train_run in
     "g4arm_${ARM}_s8") seq=4096; setfile=smoke-4096.parquet; steps=$(g4a_const SMOKE6_STEPS); every=4 ;;
     "g4arm_${ARM}_s8_2048") seq=2048; setfile=smoke-2048.parquet; steps=$(g4a_const SMOKE6_STEPS); every=4 ;;
     "g4arm_$ARM") seq=$SEQ6; setfile=train-$SEQ6.parquet; steps=auto; every=$(g4a_const EVAL_EVERY6) ;;
@@ -467,7 +472,8 @@ g46_train() {  # the runs of G4-6, G4-6b and G4-6c (amendments G4-6, G4-6b, G4-6
   if [ "$ARM" = G4-6c ]; then
     # amendment G4-6c: its loss, evals at the checkpoints, the adapters of the checkpoints kept (the smoke runs: step 4)
     spec=DPO6C
-    if [ "$RUN" = "g4arm_$ARM" ]; then every=$(g4a_const EVAL_EVERY6C); save=$(g4a_const SAVE_ARG6C); else save=$(g4a_const SMOKE_SAVE6C); fi
+    if [ "$train_run" = "g4arm_$ARM" ]; then every=$(g4a_const EVAL_EVERY6C); save=$(g4a_const SAVE_ARG6C); else save=$(g4a_const SMOKE_SAVE6C); fi
+    [ -z "$ref_only" ] || save=""
   fi
   D=$G_SHM/data-$RUN
   # a launch never takes the arguments of an earlier or a refused preparation
@@ -484,6 +490,8 @@ g46_train() {  # the runs of G4-6, G4-6b and G4-6c (amendments G4-6, G4-6b, G4-6
   local prefs=""
   for n in pref_books pref_btval pref_novels; do prefs="$prefs $G6/eval-$n-$seq.parquet"; done
   for f in $sft $prefs; do gsutil -q stat "$f" || { echo "no $f"; exit 1; }; done
+  # a reference run reads only the training file (no evals)
+  [ -n "$ref_only" ] && sft="" prefs=""
   gsutil -m -q cp "$G6/$setfile" "$G6/train-chosen.parquet" "$G6/template.jinja" $sft $prefs "$D/"
   $SFT_PY -c "import json, sys; sys.path.insert(0, '$CODE'); import g4arm, g4dpo; print(json.dumps(g4dpo.spec(**g4arm.$spec)))" > "$D/dpo.json"
   # MaxText's data hooks are made from DATA (the chosen sides as SFT examples) and never read: the batches are the
@@ -497,11 +505,27 @@ g46_train() {  # the runs of G4-6, G4-6b and G4-6c (amendments G4-6, G4-6b, G4-6
     g45_check_adapter "$D/start/adapter.json"
     ARGS="$ARGS --base-adapter G4-4=$D/start/adapter.npz"
   fi
-  for n in pref_books pref_btval pref_novels; do ARGS="$ARGS --pref-eval $n=$D/eval-$n-$seq.parquet"; done
-  for f in $sft; do n=$(basename "$f" .parquet); ARGS="$ARGS --eval ${n#eval-}=$D/$(basename "$f")"; done
+  local evals="--eval-every $every"
+  if [ -n "$ref_only" ]; then
+    # addendum G4-6c.6e: the reference alone (after G4-4's merge): no eval, no kept adapter
+    ARGS="$ARGS --ref-only"
+    evals=""
+  else
+    for n in pref_books pref_btval pref_novels; do ARGS="$ARGS --pref-eval $n=$D/eval-$n-$seq.parquet"; done
+    for f in $sft; do n=$(basename "$f" .parquet); ARGS="$ARGS --eval ${n#eval-}=$D/$(basename "$f")"; done
+  fi
+  if [ "$ARM" = G4-6c ] && [ -z "$ref_only" ]; then
+    # addendum G4-6c.6e: the training batches' reference from the run <run>_ref (sft_lora.py checks it is this run's)
+    for f in ref-train.npy ref-train.json; do
+      gsutil -q stat "$G/runs/${RUN}_ref/$f" || { echo "no $G/runs/${RUN}_ref/$f: the reference run ${RUN}_ref first (addendum G4-6c.6e)"; exit 1; }
+    done
+    mkdir -p "$D/ref"
+    gsutil -m -q cp "$G/runs/${RUN}_ref/ref-train.npy" "$G/runs/${RUN}_ref/ref-train.json" "$D/ref/"
+    ARGS="$ARGS --ref-in $D/ref/ref-train.npy"
+  fi
   # PHASE=prep stops here and PHASE=launch starts run_sft.sh from this file, as G4-5's runs: the processes of the
   # multi-host job meet in jax.distributed.initialize within a timeout, so a chain prepares every worker first
-  printf '%q ' env SFT_ARGS="$ARGS --eval-every $every" MULTIHOST=1 NAME="$RUN" MODEL=gemma4-31b \
+  printf '%q ' env SFT_ARGS="$ARGS${evals:+ $evals}" MULTIHOST=1 NAME="$RUN" MODEL=gemma4-31b \
     DATA="$D/train-chosen.parquet" TEMPLATE="$D/template.jinja" ROOT="$G" STEPS="$steps" bash "$CODE/run_sft.sh" \
     per_device_batch_size=1 max_target_length="$seq" lora.lora_rank=32 lora.lora_alpha=16.0 \
     learning_rate="$(g4a_const LR6)" lr_schedule_type=wsd warmup_steps_fraction=0.03 wsd_decay_steps_fraction=0.1 \
@@ -1721,10 +1745,12 @@ cpuproof6)
   # amendment G4-6b.6: G4-6b's proof also merges an adapter into the base kernels (BAKE=1)
   BAKE=0 SPEC=DPO6 C6=0
   [ "$ARM" = G4-6b ] && BAKE=1
-  # amendment G4-6c.6: G4-6c's spec, the adapter kept after a step and the end tokens, besides G4-6b's merge
-  [ "$ARM" = G4-6c ] && BAKE=1 SPEC=DPO6C C6=1
+  # amendment G4-6c.6: G4-6c's spec, the adapter kept after a step and the end tokens, besides G4-6b's merge;
+  # addendum G4-6c.6e: the reference of a --ref-only run read in (REFIN=1)
+  REFIN=0
+  [ "$ARM" = G4-6c ] && BAKE=1 SPEC=DPO6C C6=1 REFIN=1
   detach "g4a_cpuproof6_$TAG" env G=$G G6=$G6 H=$H PY=$SFT_PY TOK=$TOK_SFT CODE=$CODE X=$G_SHM/cpuproof6-$TAG BAKE=$BAKE \
-    SPEC=$SPEC C6=$C6 nice -n 19 ionice -c3 bash "$CODE/cpuproof6.sh"
+    SPEC=$SPEC C6=$C6 REFIN=$REFIN nice -n 19 ionice -c3 bash "$CODE/cpuproof6.sh"
   ;;
 smoke6-report)
   only 0

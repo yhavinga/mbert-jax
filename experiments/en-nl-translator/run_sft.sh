@@ -97,7 +97,9 @@ EOS
 COPY="gsutil -q cp ~/logs/$NAME.log $ROOT/runs/$NAME/$NAME-w$WORKER.log"
 # sft_lora.py writes its files on the job's process 0: this worker alone, or worker 0 of a multi-host job
 if [ "$MULTIHOST" != 1 ] || [ "$WORKER" = 0 ]; then
-  COPY="$COPY; gsutil -m -q cp $OUT/summary.json $OUT/adapter.json $OUT/adapter.npz $OUT/metrics.txt $ROOT/runs/$NAME/"
+  # sft_lora.py --ref-only (addendum G4-6c.6e) writes no adapter and no metrics: its summary, then its reference
+  COPY="$COPY; if [ -s $OUT/adapter.npz ]; then gsutil -m -q cp $OUT/summary.json $OUT/adapter.json $OUT/adapter.npz $OUT/metrics.txt $ROOT/runs/$NAME/; else gsutil -q cp $OUT/summary.json $ROOT/runs/$NAME/; fi"
+  COPY="$COPY; if [ -s $OUT/ref-train.npy ]; then gsutil -m -q cp $OUT/ref-train.npy $OUT/ref-train.json $ROOT/runs/$NAME/; fi"
   # sft_lora.py --dpo: the reference's sums per pair (amendment G4-6.4a)
   COPY="$COPY; if [ -s $OUT/dpo_ref.parquet ]; then gsutil -q cp $OUT/dpo_ref.parquet $ROOT/runs/$NAME/; fi"
   # sft_lora.py --save-steps: the adapters after those steps (amendment G4-6c)

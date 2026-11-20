@@ -199,6 +199,11 @@ def smoke6c_summary(**over):
                       "rejected_tokens_all": 10000, "chosen_nll_all": 1.9, "rejected_nll_all": 0.12})
     s["dpo"]["steps"] = [dict(x, chosen_nll_all=0.6) for x in s["dpo"]["steps"]]
     s["loss"] = [[k, 0.69 + 2.0 * 0.6] for k in range(1, 9)]
+    # addendum G4-6c.6e: the run read its training batches' reference; at step 1 the policy is still the reference
+    s["dpo"]["steps"][0].update(loss=0.69305, margin=0.0002)
+    s["loss"][0][1] = 0.69305 + 2.0 * 0.6
+    s["dpo"]["ref"] = {"train": {"file": "smoke-4096.parquet", "batches": 8, "ref_sum": -105054.0,
+                                 "ref_in": "/x/ref/ref-train.npy", "sha256": "ab" * 32, "ref_only_record": {}}}
     s["saved_adapters"] = {"4": {"keys": 820, "sum_abs": 12.5, "peak_gib": 29.1}}
     s["adapter_sum_abs"] = 13.0
     s.update(over)
@@ -351,8 +356,17 @@ def test_report6c_refuses_another_split_or_checkpoints(tmp_path, monkeypatch):
 
 # ---------------------------------------------------------------------------------------------------- run_g4arm.sh
 
+def ref_runs(g, *runs):
+    """the reference runs' files in the fake bucket (addendum G4-6c.6e)"""
+    for run in runs:
+        for f in ("ref-train.npy", "ref-train.json"):
+            (g / "runs" / run).mkdir(parents=True, exist_ok=True)
+            (g / "runs" / run / f).write_text("x")
+
+
 def test_g46c_train_takes_its_spec_evals_at_the_checkpoints_and_keeps_their_adapters(tmp_path):
     run, shm, home, g = t6.g46b_world(tmp_path)
+    ref_runs(g, "g4arm_G4-6c_ref", "g4arm_G4-6c_s8_ref")
     out, calls = run("train", ARM="G4-6c", RUN="g4arm_G4-6c", PHASE="prep")
     assert out.returncode == 0 and out.stdout.strip().splitlines()[-1] == "prepared g4arm_G4-6c on w0", out.stdout + out.stderr
     d = shm / "translator/g4arm/data-g4arm_G4-6c"
@@ -456,3 +470,141 @@ def test_local_batches_carry_the_keep_mask_made_on_the_host_and_dpo_terms_takes_
     a, sa = g4dpo.dpo_terms(logp, ref, seg, OPTS6C)
     b, sb = g4dpo.dpo_terms(logp, ref, seg, OPTS6C, keep=keep)
     assert float(a) == float(b) and all(float(sa[k]) == float(sb[k]) for k in g4dpo.SUMS)
+
+
+# ---------------------------------------------------------------------------------------------------- addendum G4-6c.6e
+
+def identity(**over):
+    return {"pref_train_sha256": "aa" * 32, "batches": 3, "rows": 4, "max_segments": 8, "end_tokens": 2,
+            "base_adapter": {"name": "G4-4", "sha256": "bb" * 32, "scale": 0.5},
+            "config": {"model_name": "gemma4-31b", "dtype": "bfloat16", "num_vocab_tiling": 8},
+            "lora": {"rank": 32, "alpha": 16.0, "module_path": "decoder/.*"},
+            "devices": {"count": 16, "processes": 4, "kind": "TPU v4"}, **over}
+
+
+def test_a_written_reference_reads_back_bitwise_and_only_for_its_own_run(tmp_path):
+    rng = np.random.default_rng(0)
+    ref = (rng.standard_normal((12, 8)) * 100).astype(np.float32)
+    meta = g4dpo.write_reference(tmp_path, ref, identity(), {"batches": 3, "seconds": 1.5})
+    assert (tmp_path / g4dpo.REF_FILE).is_file() and meta["shape"] == [12, 8]
+    back, m = g4dpo.read_reference(tmp_path / g4dpo.REF_FILE, identity())
+    assert back.dtype == np.float32 and back.tobytes() == ref.tobytes() and m["sha256"] == meta["sha256"]
+    assert m["record"] == {"batches": 3, "seconds": 1.5}
+    # another run's identity: every differing key is named
+    for over, key in (({"batches": 4}, "batches"), ({"end_tokens": 0}, "end_tokens"),
+                      ({"base_adapter": None}, "base_adapter"), ({"devices": {"count": 4, "processes": 1, "kind": "cpu"}}, "devices"),
+                      ({"config": {"model_name": "gemma4-31b", "dtype": "float32", "num_vocab_tiling": 8}}, "config")):
+        with pytest.raises(SystemExit, match=f"not this run's reference, it differs in \\['{key}'\\]"):
+            g4dpo.read_reference(tmp_path / g4dpo.REF_FILE, identity(**over))
+    # tuples and objects compare as they read back from json
+    g4dpo.read_reference(tmp_path / g4dpo.REF_FILE, identity(lora=dict(identity()["lora"], rank=32)))
+    # a changed file, a missing meta, a reference that is not finite
+    other = tmp_path / "other"
+    other.mkdir()
+    g4dpo.write_reference(other, ref, identity(), {})
+    np.save(other / g4dpo.REF_FILE, ref + 1)
+    with pytest.raises(SystemExit, match="sha256"):
+        g4dpo.read_reference(other / g4dpo.REF_FILE, identity())
+    (other / g4dpo.REF_META).unlink()
+    with pytest.raises(SystemExit, match="no such file or no"):
+        g4dpo.read_reference(other / g4dpo.REF_FILE, identity())
+    bad = ref.copy()
+    bad[5, 2] = np.nan
+    g4dpo.write_reference(other, bad, identity(), {})
+    with pytest.raises(SystemExit, match="1 rows not finite"):
+        g4dpo.read_reference(other / g4dpo.REF_FILE, identity())
+    # the shape is the identity's batches x rows by max_segments
+    g4dpo.write_reference(other, ref[:8], identity(), {})
+    with pytest.raises(SystemExit, match=r"not float32 \(12, 8\)"):
+        g4dpo.read_reference(other / g4dpo.REF_FILE, identity())
+
+
+def test_ref_identity_names_the_packed_file_the_merged_adapter_the_config_and_the_devices(tmp_path):
+    from types import SimpleNamespace
+
+    (tmp_path / "train.parquet").write_bytes(b"pairs")
+    (tmp_path / "adapter.npz").write_bytes(b"g4-4")
+    config = SimpleNamespace(model_name="gemma4-31b", max_target_length=4096, dtype="bfloat16", num_vocab_tiling=8,
+                             lora=SimpleNamespace(lora_rank=32, lora_alpha=16.0))
+    base = {"name": "G4-4", "path": str(tmp_path / "adapter.npz"), "meta": {"scale": 0.5}}
+    devices = {"count": 16, "processes": 4, "kind": "TPU v4"}
+    a = sft_lora.ref_identity(tmp_path / "train.parquet", 717, 16, OPTS6C, base, config, "decoder/.*", devices)
+    assert a["pref_train_sha256"] == g4dpo.file_sha256(tmp_path / "train.parquet")
+    assert a["base_adapter"] == {"name": "G4-4", "sha256": g4dpo.file_sha256(tmp_path / "adapter.npz"), "scale": 0.5}
+    assert (a["batches"], a["rows"], a["max_segments"], a["end_tokens"]) == (717, 16, 64, 2)
+    assert set(a["config"]) == set(sft_lora.REF_CONFIG_KEYS) and a["config"]["num_vocab_tiling"] == 8
+    assert a["config"]["attention"] is None            # a key the config lacks is None on both sides
+    assert a["lora"] == {"rank": 32, "alpha": 16.0, "module_path": "decoder/.*"} and a["devices"] == devices
+    assert a == g4dpo.as_json(a)
+    (tmp_path / "adapter.npz").write_bytes(b"other")
+    b = sft_lora.ref_identity(tmp_path / "train.parquet", 717, 16, OPTS6C, base, config, "decoder/.*", devices)
+    assert b["base_adapter"]["sha256"] != a["base_adapter"]["sha256"]
+    assert sft_lora.ref_identity(tmp_path / "train.parquet", 717, 16, OPTS6C, None, config, "decoder/.*",
+                                 devices)["base_adapter"] is None
+
+
+def test_sft_lora_ref_only_and_ref_in_are_checked_before_jax(tmp_path):
+    spec = tmp_path / "dpo.json"
+    spec.write_text(json.dumps(g4arm.DPO6))
+    base = ["--out", str(tmp_path / "o")]
+    dpo = [*base, "--dpo", str(spec), "--pref-train", "x"]
+    for argv, msg in (([*base, "--ref-only"], "belong to --dpo"),
+                      ([*base, "--ref-in", "x"], "belong to --dpo"),
+                      ([*dpo, "--ref-only", "--ref-in", "x"], "the reference of the training batches alone"),
+                      ([*dpo, "--ref-only", "--eval", "a=y", "--eval-every", "1"], "the reference of the training batches alone"),
+                      ([*dpo, "--ref-only", "--pref-eval", "a=y"], "the reference of the training batches alone"),
+                      ([*dpo, "--ref-only", "--save-steps", "4"], "the reference of the training batches alone"),
+                      ([*dpo, "--ref-in", str(tmp_path / "missing.npy")], "no such file")):
+        with pytest.raises(SystemExit, match=msg):
+            sft_lora.main(argv)
+
+
+def test_smoke6_of_g4_6c_needs_the_reference_read_in_and_step_1_at_the_reference():
+    adapter = {"rank": 32, "alpha": 16.0, "scale": 0.5}
+    build = {"packing": {"4096": {"train": {"steps": 717}}}}
+    args = (adapter, t6.G44_RUN, 4096, t6.LORA, t6.smoke_rows(), t6.smoke_rows(qe=2.25), build)
+    ok = g4arm.smoke6_verdict(smoke6c_summary(), *args, start="G4-4", arm="G4-6c", saved=SAVED4)
+    assert ok["passed"] and ok["checks"]["ref_in"]["holds"], ok["checks"]["ref_in"]
+    # the reference's pass in the run's own process (G4-6c before addendum G4-6c.6e), no record, or a step 1 off the
+    # reference (a reference of other rows)
+    own = smoke6c_summary()
+    own["dpo"]["ref"]["train"] = {"file": "smoke-4096.parquet", "batches": 8, "seconds": 180.2, "batch_s_median": 3.97,
+                                  "ref_sum": -105054.0}
+    off = smoke6c_summary()
+    off["dpo"]["steps"][0]["margin"] = 0.0021
+    none = smoke6c_summary()
+    none["dpo"].pop("ref")
+    for s in (own, off, none):
+        v = g4arm.smoke6_verdict(s, *args, start="G4-4", arm="G4-6c", saved=SAVED4)
+        assert {k for k, c in v["checks"].items() if not c["holds"]} == {"ref_in"}, v["checks"]["ref_in"]
+    # a run that read its reference: the estimate of the full run (which reads its own) counts no pass over its batches
+    assert ok["estimate"]["ref_s"] == 0.0
+    assert g4arm.smoke6_verdict(own, *args, start="G4-4", arm="G4-6c", saved=SAVED4)["estimate"]["ref_s"] == round(717 * 3.97, 1)
+
+
+def test_g46c_reference_runs_take_ref_only_and_the_runs_read_their_reference(tmp_path):
+    run, shm, home, g = t6.g46b_world(tmp_path)
+    for name, steps in (("g4arm_G4-6c_ref", None), ("g4arm_G4-6c_s8_ref", "8")):
+        out, calls = run("train", ARM="G4-6c", RUN=name, PHASE="prep", TAG=f"t{name}", **({"STEPS": steps} if steps else {}))
+        assert out.returncode == 0 and out.stdout.strip().splitlines()[-1] == f"prepared {name} on w0", out.stdout + out.stderr
+        launch = (shm / f"translator/g4arm/data-{name}/launch.sh").read_text()
+        assert "--ref-only" in launch and "G4-4=" in launch and "--dpo" in launch
+        for absent in ("--eval", "--pref-eval", "--save-steps", "--ref-in"):
+            assert absent not in launch, absent
+        assert ("train-4096.parquet" if steps is None else "smoke-4096.parquet") in launch
+        assert f"STEPS={steps or 'auto'}" in launch and "NAME=" + name in launch
+        assert not any("eval-pref_books" in c for c in calls if c.startswith("gsutil -m -q cp"))
+    # the training run refuses to prepare before its reference run's files are there, then reads them
+    out, _ = run("train", ARM="G4-6c", RUN="g4arm_G4-6c", PHASE="prep", TAG="t9")
+    assert out.returncode != 0 and "the reference run g4arm_G4-6c_ref first" in out.stdout
+    ref_runs(g, "g4arm_G4-6c_ref")
+    out, calls = run("train", ARM="G4-6c", RUN="g4arm_G4-6c", PHASE="prep", TAG="t10")
+    assert out.returncode == 0, out.stdout + out.stderr
+    d = shm / "translator/g4arm/data-g4arm_G4-6c"
+    launch = (d / "launch.sh").read_text()
+    assert f"--ref-in\\ {d}/ref/ref-train.npy" in launch and "--ref-only" not in launch
+    assert (d / "ref" / "ref-train.npy").is_file() and (d / "ref" / "ref-train.json").is_file()
+    assert "--save-steps\\ 240\\,480\\ " in launch and "--pref-eval" in launch
+    # a reference run of a run that is no run of G4-6c
+    out, _ = run("train", ARM="G4-6c", RUN="g4arm_G4-6b_ref", PHASE="prep", TAG="t11")
+    assert out.returncode != 0 and "no run of G4-6c" in out.stdout

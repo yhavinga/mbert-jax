@@ -38,6 +38,8 @@ MAX_SEGMENTS = 64         # segments a packed row may hold (32 pairs); the loss'
 REF_KEY = "ref_seg"       # amendment G4-6.4a: a batch's precomputed reference, [rows, max_segments] float32
 ROW_KEY = "row"           # the file's row index of each row of a batch (the reference pass only)
 KEEP_KEY = "end_keep"     # addendum G4-6c.6c: a batch's log-ratio tokens, 1 - end_mask, computed on the host [rows, L]
+REF_FILE = "ref-train.npy"     # addendum G4-6c.6e: a --ref-only run's reference of the training batches, beside it
+REF_META = "ref-train.json"    # what it is the reference of, its pass and its sha256
 LOSSES = ("sigmoid", "ipo")
 # end_tokens (amendment G4-6c): the target tokens at the end of each segment (the turn's end, <turn|>\n: 2) that the
 # log-ratio leaves out; the NLL term keeps them. 0: every target token in both (G4-6, G4-6b)
@@ -557,6 +559,60 @@ def precompute_reference(model, config, path, mesh, rows, batches, max_segments,
     if np.isnan(out).any():
         raise SystemExit(f"{path}: {int(np.isnan(out).any(axis=1).sum())} rows without a reference (or a NaN)")
     return out, seconds
+
+
+def file_sha256(path):
+    import hashlib
+
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def as_json(value):
+    """value as it reads back from json (tuples as lists, objects as their str), so that a written and a computed
+    identity compare equal"""
+    return json.loads(json.dumps(value, sort_keys=True, default=str))
+
+
+def write_reference(out_dir, ref, identity, record):
+    """Addendum G4-6c.6e: a --ref-only run's reference of the training batches ([batches x rows, max_segments] float32,
+    precompute_reference's array) as DIR/REF_FILE, and DIR/REF_META: what it is the reference of (identity), the record
+    of its pass, its shape and the file's sha256 -> the meta"""
+    out_dir = Path(out_dir)
+    ref = np.ascontiguousarray(ref, np.float32)
+    np.save(out_dir / REF_FILE, ref)
+    meta = {"identity": as_json(identity), "record": as_json(record), "shape": list(ref.shape),
+            "sha256": file_sha256(out_dir / REF_FILE)}
+    (out_dir / REF_META).write_text(json.dumps(meta, indent=1, sort_keys=True) + "\n")
+    return meta
+
+
+def read_reference(path, identity):
+    """Addendum G4-6c.6e: --ref-in's reference, a --ref-only run's REF_FILE with its REF_META beside it, refused unless
+    the meta's identity is this run's (every key), the file is the one the meta names (sha256), and it holds float32
+    rows of the identity's batches x rows by max_segments, all finite -> (the array, the meta)"""
+    npy = Path(path)
+    meta_path = npy.parent / REF_META
+    if not npy.is_file() or not meta_path.is_file():
+        raise SystemExit(f"--ref-in {path}: no such file or no {meta_path} beside it")
+    meta = json.loads(meta_path.read_text())
+    have, want = meta.get("identity") or {}, as_json(identity)
+    differ = sorted(k for k in set(have) | set(want) if have.get(k) != want.get(k))
+    if differ:
+        raise SystemExit(f"--ref-in {path}: not this run's reference, it differs in {differ}: "
+                         f"{json.dumps({k: [have.get(k), want.get(k)] for k in differ}, default=str)[:600]}")
+    if file_sha256(npy) != meta.get("sha256"):
+        raise SystemExit(f"--ref-in {path}: its sha256 is not the one {meta_path} names")
+    ref = np.load(npy)
+    shape = (want["batches"] * want["rows"], want["max_segments"])
+    if ref.dtype != np.float32 or ref.shape != shape:
+        raise SystemExit(f"--ref-in {path}: {ref.dtype} {ref.shape}, not float32 {shape}")
+    if not np.isfinite(ref).all():
+        raise SystemExit(f"--ref-in {path}: {int((~np.isfinite(ref)).any(axis=1).sum())} rows not finite")
+    return ref, meta
 
 
 def reference_rows(path, ref, batches, rows):

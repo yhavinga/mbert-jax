@@ -4052,6 +4052,14 @@ SAVE_STEPS6C = (240, 480)
 SAVE_ARG6C = ",".join(map(str, SAVE_STEPS6C))
 SMOKE_SAVE6C = 4
 LOSS_MAX_DIFF6C = 1e-4    # step 1's loss against its DPO term + nll_alpha x the chosen NLL over every target token
+# Addendum G4-6c.6e: the reference of the training batches from a run of its own (sft_lora.py --ref-only), read in by
+# the training run (--ref-in). The CPU proof: the reference read in against the one computed in the training's own
+# process, and the training with it against the training without it, each value within this relative bound
+# (max(1, |x|)); whether bitwise is reported. The smoke test (and the full run, in the chain): the run read its reference
+# and its step 1, where the policy is still the reference, has |DPO term - log 2| and |margin| within STEP1_MAX_DIFF6E
+# (G4-6c's smoke test with the reference in its own process, chain g4h1120e: 7.5e-5 and 1.5e-4)
+REF_MAX_DIFF6E = 1e-6
+STEP1_MAX_DIFF6E = 1e-3
 LONG6C = 1.5              # reported: the share of outputs longer than this times their reference's words
 CKPT6C = re.compile(r"^G4-6c-s([1-9][0-9]*)$")
 SPLIT_DIGEST6C = "f953c026597eedcb20ab56dab7d0b4389057697c01550017ba954ba6963440f3"   # G4-5.4's search and decision parts
@@ -4652,6 +4660,9 @@ def smoke6_verdict(summary, adapter, base_summary, seq, lora, arm_rows, base_row
                                    "holds": (meta["rank"], meta["alpha"], meta["scale"], meta["steps"]) ==
                                    (32, 16.0, 0.5, SMOKE_SAVE6C) and kept.get("sum_abs", 0) > 0 and
                                    last_abs is not None and kept["sum_abs"] != last_abs}
+        # addendum G4-6c.6e: the run read the reference of its training batches (--ref-in) and that reference is the
+        # policy's at step 1
+        checks["ref_in"] = ref_in_check(summary, spec)
     estimate = smoke6_estimate(summary, build_report, seq, EVAL_EVERY6C if arm == ARM6C else EVAL_EVERY6)
     checks["estimate_hours"] = {"value": estimate["hours"], "holds": estimate["hours"] <= MAX_HOURS6}
     # reported: the rejected side of pref_btval is the start model's own translation of the BT validation, as the eval
@@ -4661,6 +4672,20 @@ def smoke6_verdict(summary, adapter, base_summary, seq, lora, arm_rows, base_row
     return {"checks": checks, "passed": all(c["holds"] for c in checks.values()), "estimate": estimate,
             "own_against_pref_btval_rejected": {own_set: own0 and own0["loss"], "pref_btval_rejected_nll":
                                                 rej0 and rej0.get("rejected_nll")}}
+
+
+def ref_in_check(summary, spec):
+    """Addendum G4-6c.6e: {value, holds} of a G4-6c run that read its training batches' reference (--ref-in): the
+    record of it (no pass of its own over them), and step 1's DPO term and margin, where the policy is still the
+    reference, within STEP1_MAX_DIFF6E of log 2 and 0"""
+    train = ((summary.get("dpo") or {}).get("ref") or {}).get("train") or {}
+    steps = (summary.get("dpo") or {}).get("steps") or []
+    first = steps[0] if steps else {}
+    expected = g4dpo.expected_step0(spec)
+    diffs = {"loss": abs(first.get("loss", math.inf) - expected["loss"]), "margin": abs(first.get("margin", math.inf))}
+    return {"value": {"ref_in": train.get("ref_in"), "sha256": train.get("sha256"), "step": first.get("step"), **diffs},
+            "holds": bool(train.get("ref_in")) and bool(train.get("sha256")) and "seconds" not in train
+            and first.get("step") == 1 and all(v <= STEP1_MAX_DIFF6E for v in diffs.values())}
 
 
 def smoke6_estimate(summary, build_report, seq, every=EVAL_EVERY6):

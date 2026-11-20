@@ -1,0 +1,140 @@
+# dmbert v3: protocol
+
+Opgesteld 20 november 2026 (subagent, opdracht van de hoofdsessie na Yebs besluiten van 20 nov ~10:45). Deel 1 (de
+replay-toets van de stabiliteitsfix) is gecommit en gepusht vóór de start van de replay; de keten pint die commit.
+Deel 2 (de vormablatie) volgt in een latere commit en wordt niet gestart zonder Yebs akkoord.
+
+Markering: **[citaat]** letterlijk uit de bron, **[parafrase]** samengevat uit de bron, **[gemeten]** door mij gemeten
+in deze opdracht, **[afgeleid]** eigen gevolgtrekking.
+
+## Deel 1: replay-toets van de stabiliteitsfix (vastgelegd vóór de start)
+
+### Vraag
+
+Blijft het recept van dmbert v2 (T2's recept op de opt-out-FineWeb-2) in bf16 stabiel over het stuk 250.000–350.000,
+waar v2 in bf16 drie bursts van niet-eindige stappen had, als (1) query, key, RoPE en de attention-logits in float32
+rekenen en (2) een z-loss van 1e-4 op de MLM-logits meetelt? En kost dat MLM-verlies?
+
+### Achtergrond: de bursts van v2 [gemeten, trainerlog van v2 `gs://…/mbert/v2-fw2optout-230m/logs/w0.log`]
+
+| stuk van v2 | precisie | gestart vanaf | niet-eindige stappen |
+|---|---|---|---|
+| 0 → 255.200 | bf16 | 0 | 31 tot 250.000 (losse en clusters bij 196.680–196.960 en 238.440–238.860); burst vanaf 251.220/252.620, tot 780 in 1.000 stappen, 30 op rij |
+| 250.000 → 270.000 | float32 | checkpoint 250.000 | 0 |
+| 270.000 → 286.200 | bf16 | checkpoint 270.000 | cluster bij 275.560; burst vanaf 281.530, tot 694 in 1.000 stappen, 38 op rij |
+| 280.000 → 320.000 | float32 | checkpoint 280.000 | 0 |
+| 320.000 → 345.000 | bf16 | checkpoint 320.000 | 12 in 70 stappen bij 340.220; burst vanaf 344.170, tot 567 in 1.000 stappen |
+| 340.000 → 1.306.000 | float32 | 340.000, daarna 350.000 | 0 |
+
+Staptijd (mediaan van de Step-regels, 250k–350k): bf16 0,220 s, float32 0,301–0,308 s.
+
+### Wat de fix verandert [afgeleid uit de code van `final-v2` @ `494d4d9`]
+
+In v2's bf16-pad was al float32: de LayerNorms (en dus de residual stream), de softmax van de attention (de logits
+werden na de einsum naar float32 gecast, de maskers zijn float32), de som van de values, de MLM-logits en de loss.
+In bf16 rekenden: de qkv-projectie, de RoPE-cos/sin (bf16 bewaard, de rotatie zelf in float32 en daarna terug naar
+bf16), de einsum query·key met bf16-uitvoer, de schaal 1/√d, de out-projectie, de MLP en de dense-laag van de head.
+
+- `--attention-float32` (`MMBertConfig.attention_float32`): query en key gaan direct na de qkv-projectie naar
+  float32, de RoPE-cache is float32, de einsum query·key en de schaal rekenen in float32. De qkv-projectie zelf, de
+  out-projectie en de MLP blijven bf16. De matmul-precisie blijft de standaard van JAX op TPU (`DEFAULT`, bf16-passes
+  met float32-accumulatie), net als in v2's float32-stukken, die stabiel waren. **[gemeten, CPU]** Op één
+  attention-laag met exacte bf16-query en -key en logits tot 266 is de grootste fout in de kansen 0,067 zonder en
+  2,4·10⁻⁶ met de vlag (gelijk aan het float32-model); in het hele model (4 lagen, query/key-gewichten ×10, ×40, ×100)
+  daalt de gemiddelde fout van de kansen per laag met 14–59% (`tests/test_v3_flags.py`).
+- `--z-loss 1e-4`: het doel wordt MLM-verlies + 1e-4 · gemiddelde over de gemaskeerde posities van log²Z, met Z de
+  noemer van de softmax over de 32.128 MLM-logits. De gelogde `Loss` blijft het MLM-verlies; de Step-regel krijgt
+  `| Z: <gemiddelde log²Z>` erachter.
+  - **Waarom 1e-4.** PaLM, Chowdhery et al. 2022, *PaLM: Scaling Language Modeling with Pathways*, arXiv:2204.02311,
+    §5 "Training Setup", punt "Loss function" **[citaat]**: "We additionally use an auxiliary loss of z_loss =
+    10−4 · log2 Z to encourage the softmax normalizer log(Z) to be close to 0, which we found increases the stability
+    of training." Wortsman et al. 2023, *Small-scale proxies for large-scale Transformer training instabilities*,
+    arXiv:2309.14322, figuur 3 en 4 **[parafrase]**: met z-loss-coëfficiënt 1e-4 verdwijnt de instabiliteit door
+    "output logit divergence" in kleine modellen bij hoge LR. **[afgeleid]** De term kost het MLM-verlies vrijwel
+    niets: de decoder-bias kan alle logits samen verschuiven, wat log Z verandert zonder de softmax te veranderen.
+    Is log²Z bij stap 250.000 ~100, dan is de term ~0,01 (1% van het verlies) en zijn gradiënt ~0,3% van die van de
+    cross-entropy. Een grotere coëfficiënt is niet nodig om het effect te zien en zou meer afwijken van het recept.
+- `--nonfinite-diagnostics` (alleen diagnose): na elke `NONFINITE`-regel een regel `NONFINITE_GROUPS` met de
+  laagtypen (lm_head, final_layer_norm, `encoder_<i>_ffn`, `encoder_<i>_attention`, embeddings) waarvan een gradiënt
+  NaN/inf was, van de loss terug geordend. **[gemeten, CPU]** Verandert geen update (bit voor bit gelijk aan v2).
+- Zonder deze vlaggen zijn model en trainstap bit voor bit die van v2 (fixture gemaakt met de code van `final-v2`
+  @ `494d4d9`, `tests/fixtures/v2_reference.npz`; logits, metrics en parameters na twee stappen, in float32 en bf16).
+
+### Startpunt
+
+v2's checkpoint 250.000 stond niet meer in `ckpt/` (rotatie van de laatste drie, 16 nov 14:33 UTC) en niet in
+`ckpt_keep/` (alleen elke 100.000e). Het stond in de soft delete van de bucket (bewaartermijn 7 dagen, tot 23 nov
+14:33 UTC). **[gemeten]** Hersteld op 20 nov met `gcloud storage restore`: van elk van de 29 objecten de laatste
+generatie (die bij de rotatie werd verwijderd), op zijn oude plek `gs://…/mbert/v2-fw2optout-230m/ckpt/250000/`
+(daar stond niets meer, dus niets overschreven); grootte en md5 gelijk aan de verwijderde generaties. De datastand
+`ckpt_data_state/250000/` stond er nog. De keten kopieert beide naar elke run-map van de replay en verandert niets in
+de map van v2.
+
+### Armen (alle op mbert-mix, met v2's data, staging en trainercommando)
+
+Elke arm is het commando van `experiments/final-v2/start_v2.sh main` (bf16, WSD tot 1.306.000, constante LR 4,8e-4
+over dit hele stuk, `--skip-nonfinite-updates`, dezelfde bestanden per host, `--url-blocklist hebban.nl`, EVAL elke
+25.000 stappen op `kept/test`), met alleen de genoemde vlaggen, een `--stop-at-step` en eigen namen. Run-mappen onder
+`gs://t5-dutch-english-usc2/mbert/v3-replay/<run>/`.
+
+1. **smoke** (`v3-replay-smoke-<TAG>`): fix aan, 250.000 → 250.300. Eisen: hervat op 250.000 met de datastand op elk
+   proces; Step-regels 250.050–250.300 eindig, geen `NONFINITE`; per Step-regel het verlies binnen 0,02 en gemiddeld
+   binnen 0,01 van v2's float32-stuk op dezelfde stap (zelfde batches, zie hieronder); `Z` gelogd; mediane staptijd
+   ≤ 0,35 s; eindcheckpoint 250.300 geschreven. Faalt een eis, dan stopt de keten (`FAILED`) en start niets.
+2. **zf** (`v3-replay-zf`): fix aan (`--attention-float32 --z-loss 1e-4 --nonfinite-diagnostics`), in drie stukken:
+   250.000 → 270.000, 270.000 → 320.000, 320.000 → 350.000.
+   - **Waarom hervatten op 270.000 en 320.000.** De trainer seedt de maskering bij elke start met 42 + procesindex
+     (`np.random.seed(42 + process_idx)`), en de datastand legt vast welke documenten volgen. **[afgeleid]** Een start
+     vanaf dezelfde stap geeft dus dezelfde batches (documenten én maskers) zolang de koppeling host → procesindex
+     gelijk is. Daarmee ziet zf: op 250k–270k exact de batches van v2's float32-stuk; op 270k–320k exact die van
+     v2's bf16-stuk vanaf 270.000 (burst 2 bij 281.530); op 320k–350k exact die van v2's bf16-stuk vanaf 320.000
+     (cluster 340.220, burst 3 bij 344.170). Burst 1 (252.620) kwam in een doorlopende run met andere maskers; die
+     batches zijn niet terug te halen. De koppeling bij v2 was w0 → 0, w1 → 3, w2 → 1, w3 → 2 (de VM is sinds
+     2 nov niet herstart); de smoke-test controleert haar, een afwijking wordt gemeld en geldt als verstoring.
+3. **bf16** (controle, `v3-replay-bf16`): zonder fix (wel `--nonfinite-diagnostics`), 250.000 → 256.000, na zf. Laat
+   zien of gewoon bf16 op deze batches (die van v2's float32-stuk) bij ~252.600 ontspoort, en in welke laagtypen de
+   eerste niet-eindige gradiënten zitten. Beslist niet mee.
+
+### Criteria (vooraf vastgelegd; `experiments/v3/replay_verdict.py`)
+
+Geslaagd = S1 én S2 én S3.
+
+- **S1 stabiliteit**, over de optimizer-stappen 250.001–350.000 van zf: geen zelfstop (50 op rij), hoogstens 2
+  overgeslagen stappen op rij, minder dan 10 in elk venster van 1.000 stappen, hoogstens 10 in totaal, en stap
+  350.000 bereikt. (Ter vergelijking: v2's clusters vóór de bursts hadden 10 in 280 stappen en 12 in 70; de bursts
+  567–780 per 1.000.)
+- **S2 verlies**, per blok van 10.000 stappen dat v2 in float32 draaide (250–260k, 260–270k, 280–290k, 290–300k,
+  300–310k, 310–320k, 340–350k): het gemiddelde gelogde MLM-verlies van zf (Step-regels, elk het gemiddelde van 10
+  stappen, elke 50 stappen) hoogstens **0,010** boven dat van v2 op dezelfde stappen. Eenzijdig: lager is geen
+  bezwaar. 0,010 is ~1% van het verlies; bf16 tegen float32 op dezelfde batches scheelde bij v2 0,0006.
+- **S3 held-out**, EVAL-verlies op 275.000, 300.000, 325.000 en 350.000: zf hoogstens **0,010** boven v2 op dezelfde
+  stap (v2 was daar in bf16, float32, bf16, float32).
+
+v2's referentie **[gemeten]**: S2-blokken 0,9741 / 0,9585 / 0,9519 / 0,9468 / 0,9405 / 0,9534 / 0,9389; EVAL 0,94703 /
+0,94305 / 0,93619 / 0,93193.
+
+Gerapporteerd, beslist niet: zf tegen v2's bf16 op de exact gelijke batches (270.000–281.700 en 320.000–344.200),
+de gemiddelde log²Z per 10.000 stappen, de staptijd tegen v2's bf16 (0,220 s) en float32 (~0,30 s), de
+`NONFINITE_GROUPS`-regels, en de controle.
+
+### Uitvoering
+
+Keten `mbert-ops/scripts/v3_replay_run.sh` op co1 (lock `final_eval_mix.lock` tot het eind; log
+`mbert-ops/logs/v3_replay.log`, laatste regels `DONE …` of `FAILED: …` en `EXIT n`). Volgorde: setup van `~/mbert-v3`
+op de gepinde commit, checkpoints kopiëren, smoke, zf (drie stukken), controle, uitslag. De bewaking stopt zf zodra S1
+geschonden is (de trainers met `kill -9` van hun eigen pids), draait dan nog de controle en de uitslag, en eindigt op
+`DONE … niet geslaagd`. Een reboot of preemptie: hervatten van hetzelfde stuk, hoogstens 3 keer. Een `FAILED` is een
+fout van de keten of een gezakte smoke-test, geen uitslag. De keten verwijdert niets.
+
+### Als de toets niet slaagt
+
+QK-norm valt af (het model moet een gewone `ModernBertForMaskedLM` blijven). Dan beslist Yeb; de uitslag en de
+`NONFINITE_GROUPS` van zf en van de controle zeggen in welk laagtype de niet-eindige gradiënten ontstaan. Opties die
+binnen een gewone ModernBERT blijven (genoteerd, niet gekozen): het hele model in float32 (v2's stukken: stabiel,
++38% staptijd), alleen de MLP of de head in float32, een lagere piek-LR, of een grotere z-loss.
+
+### Wat deze toets niet zegt
+
+Eén run per arm, vanaf één checkpoint van v2: geen variantie over seeds. Of de fix ook vanaf stap 0 en op CulturaX
+stabiel is, blijkt pas in de ablatie (deel 2). Het model van zf is na 250.000 een ander model dan v2; "zelfde
+batches" betekent zelfde invoer, niet zelfde toestand.

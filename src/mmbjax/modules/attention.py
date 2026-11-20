@@ -130,7 +130,11 @@ class ModernBertAttention(nn.Module):
         key = qkv[:, :, :, 1, :]
         value = qkv[:, :, :, 2, :]
 
-        cache = get_rotary_cache(self.head_dim, self.theta, dtype=self.dtype)
+        rope_dtype = self.dtype
+        if self.config.attention_float32:
+            # In bf16 the rotation's cos/sin and the logits einsum's output were bf16; the softmax was float32 already
+            query, key, rope_dtype = query.astype(jnp.float32), key.astype(jnp.float32), jnp.float32
+        cache = get_rotary_cache(self.head_dim, self.theta, dtype=rope_dtype)
         cos, sin = cache.get(self.config.max_position_embeddings)
         cos_slice = cos if position_ids is not None else cos[:seq_len]
         sin_slice = sin if position_ids is not None else sin[:seq_len]

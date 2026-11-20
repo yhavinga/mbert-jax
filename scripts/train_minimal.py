@@ -9,6 +9,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 import argparse
+import functools
 import gc
 import os
 import json
@@ -584,6 +585,28 @@ def parse_args():
         help="Dtype for computations (default: bfloat16 on TPU, float32 on GPU/CPU)"
     )
     parser.add_argument(
+        "--attention-float32",
+        action="store_true",
+        help="Query, key, RoPE and the attention logits in float32 whatever --compute-dtype is (the softmax and the "
+             "weighted sum of the values are float32 already); without it the bf16 path of dmbert v2"
+    )
+    parser.add_argument(
+        "--z-loss",
+        type=float,
+        nargs="?",
+        const=1e-4,
+        default=0.0,
+        help="Add this coefficient times the mean log(Z)^2 of the MLM logits at the masked positions to the loss; "
+             "the flag alone is 1e-4, PaLM's (Chowdhery et al. 2022, arXiv:2204.02311, section 5). The logged Loss stays "
+             "the MLM loss (default: 0, off)"
+    )
+    parser.add_argument(
+        "--nonfinite-diagnostics",
+        action="store_true",
+        help="With --skip-nonfinite-updates: after a NONFINITE line a NONFINITE_GROUPS line with the layer types whose "
+             "gradients were NaN or inf in that log window, from the loss backwards; changes no update"
+    )
+    parser.add_argument(
         "--param-dtype",
         type=str,
         choices=["float32", "bfloat16", "float16"],
@@ -761,6 +784,10 @@ def parse_args():
             parser.error(str(error))
     if args.max_consecutive_nonfinite < 1:
         parser.error("--max-consecutive-nonfinite must be at least 1")
+    if args.z_loss < 0:
+        parser.error("--z-loss must be at least 0")
+    if args.nonfinite_diagnostics and not args.skip_nonfinite_updates:
+        parser.error("--nonfinite-diagnostics needs --skip-nonfinite-updates: without it a NaN step ends the run")
     return args
 
 
@@ -885,6 +912,14 @@ def compute_mlm_loss_and_accuracy(logits, labels):
     return loss, accuracy, perplexity
 
 
+def compute_z_loss(logits, labels):
+    """Mean of log(Z)^2 over the masked positions, Z the softmax normalizer of the MLM logits (PaLM's z-loss)."""
+    logits = logits.astype(jnp.float32)
+    log_z = jax.nn.logsumexp(logits.reshape(-1, logits.shape[-1]), axis=-1)
+    mask = labels.reshape(-1) != -100
+    return jnp.sum(jnp.square(log_z) * mask) / jnp.maximum(jnp.sum(mask), 1)
+
+
 def compute_gradient_norm(gradients):
     """Compute global L2 norm of gradients."""
     leaves = jax.tree_util.tree_leaves(gradients)
@@ -912,6 +947,22 @@ def compute_update_ratio(gradients, params, learning_rate):
     return ratio
 
 
+def gradient_group(path):
+    """The layer-type name of a parameter path: encoder_<i>_attention, encoder_<i>_ffn, embeddings, ..."""
+    layer = next((part for part in path if re.fullmatch(r"layers_\d+", part)), None)
+    if layer is not None:
+        index = layer.removeprefix("layers_")
+        sublayer = "attention" if any(part.startswith("attention") for part in path) else "ffn"
+        return f"encoder_{index}_{sublayer}"
+    if "embeddings" in path:
+        return "embeddings"
+    if "final_layer_norm" in path:
+        return "final_layer_norm"
+    if "prediction_head" in path or "decoder" in path:
+        return "lm_head"
+    return "other"
+
+
 def compute_per_layer_gradient_norms(gradients):
     """Compute gradient norms for each layer type, from the module names in the parameter tree."""
     squares = {}
@@ -920,21 +971,30 @@ def compute_per_layer_gradient_norms(gradients):
         squares[name] = squares.get(name, 0.0) + jnp.sum(jnp.square(grad))
 
     for path, grad in traverse_util.flatten_dict(gradients).items():
-        layer = next((part for part in path if re.fullmatch(r"layers_\d+", part)), None)
-        if layer is not None:
-            index = layer.removeprefix("layers_")
-            sublayer = "attention" if any(part.startswith("attention") for part in path) else "ffn"
-            add(f"encoder_{index}_{sublayer}", grad)
-        elif "embeddings" in path:
-            add("embeddings", grad)
-        elif "final_layer_norm" in path:
-            add("final_layer_norm", grad)
-        elif "prediction_head" in path or "decoder" in path:
-            add("lm_head", grad)
-        else:
-            add("other", grad)
+        add(gradient_group(path), grad)
 
     return {name: jnp.sqrt(square) for name, square in squares.items()}
+
+
+def nonfinite_gradient_groups(gradients):
+    """Per layer type of gradient_group: True when one of its gradients is NaN or inf."""
+    bad = {}
+    for path, grad in traverse_util.flatten_dict(gradients).items():
+        name = gradient_group(path)
+        bad[name] = jnp.logical_or(bad.get(name, False), jnp.logical_not(jnp.all(jnp.isfinite(grad))))
+    return bad
+
+
+def order_from_output(names):
+    """Layer-type names from the loss backwards: lm_head, final_layer_norm, the last layer's ffn and attention, ...
+    A non-finite value made in the backward pass reaches every group after it in this order, so the first one is
+    where it arose (or a group without a path to the others)."""
+    def key(name):
+        found = re.fullmatch(r"encoder_(\d+)_(attention|ffn)", name)
+        if found:
+            return (2, -int(found.group(1)), 0 if found.group(2) == "ffn" else 1)
+        return ({"lm_head": 0, "final_layer_norm": 1, "embeddings": 3}.get(name, 4), 0, 0)
+    return sorted(names, key=key)
 
 
 # max_consecutive_errors of apply_if_finite: past it optax would apply a non-finite update. Far above any
@@ -1235,8 +1295,13 @@ def wants_per_layer_norms(optimizer_step, micro_step, gradient_accumulation_step
     return (optimizer_step + 1) % every == 0 and (micro_step + 1) % gradient_accumulation_steps == 0
 
 
-def train_step(state, batch, dropout_rng, learning_rate, compute_per_layer=False):
-    """Single training step with proper RNG handling and comprehensive metrics."""
+def train_step(state, batch, dropout_rng, learning_rate, compute_per_layer=False, z_loss_coef=0.0,
+               nonfinite_diagnostics=False):
+    """Single training step with proper RNG handling and comprehensive metrics.
+
+    z_loss_coef > 0 adds z_loss_coef * compute_z_loss to the objective; the metric loss stays the MLM loss. At 0 the
+    step is that of dmbert v2 op for op. nonfinite_diagnostics adds the metric nonfinite_groups (only metrics).
+    """
     dropout_rng, new_dropout_rng = jax.random.split(dropout_rng)
 
     def loss_fn(params):
@@ -1267,9 +1332,15 @@ def train_step(state, batch, dropout_rng, learning_rate, compute_per_layer=False
         logits_has_nan = jnp.any(jnp.isnan(logits))
         logits_has_inf = jnp.any(jnp.isinf(logits))
         
-        return loss, (logits, accuracy, perplexity, logits_min, logits_max, logits_has_nan, logits_has_inf)
+        aux = (logits, accuracy, perplexity, logits_min, logits_max, logits_has_nan, logits_has_inf)
+        if not z_loss_coef:
+            return loss, aux
+        z_loss = compute_z_loss(logits, batch["labels"])
+        return loss + z_loss_coef * z_loss, aux + (loss, z_loss)
 
-    (loss, (logits, accuracy, perplexity, logits_min, logits_max, logits_has_nan, logits_has_inf)), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
+    (objective, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
+    logits, accuracy, perplexity, logits_min, logits_max, logits_has_nan, logits_has_inf = aux[:7]
+    loss = aux[7] if z_loss_coef else objective
 
     # Check for NaN in gradients
     grad_leaves = jax.tree_util.tree_leaves(grads)
@@ -1303,6 +1374,10 @@ def train_step(state, batch, dropout_rng, learning_rate, compute_per_layer=False
         "logits_has_inf": logits_has_inf,
         "grads_has_nan": grads_has_nan,
     }
+    if z_loss_coef:
+        metrics["z_loss"] = aux[8]
+    if nonfinite_diagnostics:
+        metrics["nonfinite_groups"] = nonfinite_gradient_groups(grads)
 
     # Optionally compute per-layer gradient norms
     if compute_per_layer:
@@ -1534,6 +1609,7 @@ def main(args):
         eos_token_id=tokenizer.eos_token_id,
         compute_dtype=compute_dtype_str,
         param_dtype=param_dtype_str,
+        attention_float32=args.attention_float32,
     )
     if is_coordinator():
         print(f"\nModel config:")
@@ -1546,6 +1622,8 @@ def main(args):
         print(f"  Max pos embeddings: {config.max_position_embeddings}")
         print(f"  Compute dtype: {compute_dtype_str}")
         print(f"  Param dtype: {param_dtype_str}")
+        print(f"  Attention logits: {'float32' if config.attention_float32 else compute_dtype_str}")
+        print(f"  Z-loss: {args.z_loss:g}" + (" (off)" if not args.z_loss else " x mean log(Z)^2 of the MLM logits"))
 
     # Check for existing checkpoints early to determine if we're resuming
     # Only coordinator checks - W&B run ID recovery happens after checkpoint_manager is created
@@ -1930,7 +2008,9 @@ def main(args):
     # JIT compile with static argnums for compute_per_layer
     # out_shardings: state must stay replicated for the checkpoints and the next step, and
     # metrics must stay readable by float() on each host
-    train_step_jit = jax.jit(train_step, static_argnums=(4,), out_shardings=replicated_sharding)
+    train_step_jit = jax.jit(functools.partial(train_step, z_loss_coef=args.z_loss,
+                                               nonfinite_diagnostics=args.nonfinite_diagnostics),
+                             static_argnums=(4,), out_shardings=replicated_sharding)
 
     eval_batches = None
     if args.eval_file:
@@ -2196,6 +2276,11 @@ def main(args):
                                 print(f"NONFINITE step={optimizer_step} skipped={skipped} in_a_row={in_a_row}: "
                                       f"{skipped - skipped_steps} step(s) with non-finite gradients left the "
                                       f"parameters and optimizer state unchanged", flush=True)
+                                if args.nonfinite_diagnostics:
+                                    groups = {name for m in window_metrics for name, bad in m["nonfinite_groups"].items() if bool(bad)}
+                                    logits_bad = any(bool(m["logits_has_nan"]) or bool(m["logits_has_inf"]) for m in window_metrics)
+                                    print(f"NONFINITE_GROUPS step={optimizer_step} logits_nonfinite={logits_bad} "
+                                          f"groups={','.join(order_from_output(groups))}", flush=True)
                             skipped_steps = skipped
                             if in_a_row >= args.max_consecutive_nonfinite:
                                 raise RuntimeError(
@@ -2215,6 +2300,7 @@ def main(args):
                         grad_norm_value = window_mean("grad_norm")
                         param_norm_value = window_mean("param_norm")
                         update_ratio_value = window_mean("update_ratio")
+                        z_loss_value = window_mean("z_loss") if args.z_loss else None
 
                         lr_value = current_lr
                         with jax.default_device(cpu_device):
@@ -2260,7 +2346,8 @@ def main(args):
                                   f"PPL: {perplexity_value:.1f} | LR: {lr_value:.2e} | "
                                   f"Grad: {grad_norm_value:.2f} | Ratio: {update_ratio_value:.2e} | "
                                   f"Tok/s: {tokens_per_sec:.0f} | Step: {step_seconds:.3f}s | Input: {input_seconds_per_step:.3f}s"
-                                  + (f" | Skipped: {skipped_steps}" if args.skip_nonfinite_updates else ""), flush=True)
+                                  + (f" | Skipped: {skipped_steps}" if args.skip_nonfinite_updates else "")
+                                  + (f" | Z: {z_loss_value:.4f}" if args.z_loss else ""), flush=True)
 
                         if wandb is not None:
                             wandb_log = {
@@ -2285,6 +2372,8 @@ def main(args):
                                 wandb_log["train/layer_norm_lr"] = ln_lr_value
                             if args.skip_nonfinite_updates:
                                 wandb_log["train/skipped_steps"] = skipped_steps
+                            if args.z_loss:
+                                wandb_log["train/z_loss"] = z_loss_value
 
                             # Add per-layer gradient norms if available
                             if "layer_grad_norms" in metrics:

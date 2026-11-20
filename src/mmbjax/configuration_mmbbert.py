@@ -66,6 +66,9 @@ class MMBertConfig:
     # Mixed precision configuration
     compute_dtype: str = "float32"  # Dtype for computations: "float32", "bfloat16", "float16"
     param_dtype: str = "float32"     # Dtype for parameter storage: "float32", "bfloat16", "float16"
+    # Query, key, RoPE and the attention logits in float32 whatever compute_dtype is: in bf16 the logits were
+    # rounded to bf16 before the (float32) softmax. Off keeps the bf16 path of dmbert v2 op for op
+    attention_float32: bool = False
 
     # Non-HF helpers
     model_type: str = field(default="modernbert", init=False)

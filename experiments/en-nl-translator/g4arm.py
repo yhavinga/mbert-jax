@@ -4508,7 +4508,8 @@ def check6(args):
 
     cache, rows_checked = {}, 0
     for f in sorted(d.glob("*.parquet")):
-        if f.name in ("pairs.parquet", "train-chosen.parquet"):
+        # eval-own4 is an SFT eval file (G4-4's held-out translations as targets), not packed pairs
+        if f.name in ("pairs.parquet", "train-chosen.parquet", f"eval-{OWN6B}.parquet"):
             continue
         seq = int(f.stem.rsplit("-", 1)[1])
         for row in read_rows(f):

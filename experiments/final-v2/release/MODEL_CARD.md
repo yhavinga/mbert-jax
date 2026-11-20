@@ -315,9 +315,10 @@ resamples) in brackets and a two-sided sign-flip permutation p-value (10,000 per
 | | difference | +0.0012 [−0.0266, +0.0291], p 0.93 | +0.0004 [−0.0054, +0.0064], p 0.88 | −0.0062 [−0.0130, +0.0009], p 0.09 | +0.0007 [0, +0.0017], p 0.50 |
 
 For this model none of the four differences is distinguishable from chance: every 95% interval contains 0, and no
-p-value is below 0.05. dmbert-230m-culturax was not trained on these documents as a set, so its row is a control; its
-own training data, CulturaX, was not tested this way. Both corpora come from Common Crawl, and we did not measure how
-many of these documents also occur in CulturaX. The test covers 1,000 documents and these two kinds of
+p-value is below 0.05. dmbert-230m-culturax was trained on other data (CulturaX), so for it both groups are documents it
+did not train on: its row shows what the test gives without memorization. Some of these documents may also occur in
+CulturaX, since both corpora come from Common Crawl; we did not measure how many. Whether dmbert-230m-culturax
+memorized its own training data was not tested. The test covers 1,000 documents and these two kinds of
 reconstruction; it does not show that no training text can be recovered from a model.
 
 **Conclusion:** on these measures this model reconstructs the documents it was trained on no better than documents it

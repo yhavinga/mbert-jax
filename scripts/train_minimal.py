@@ -258,6 +258,9 @@ def data_state_identity(args, rows_per_host, data_files, masking="uniform15"):
     # Only when it isn't the default: data states saved before --masking existed have no such key
     if masking != "uniform15":
         identity["masking"] = masking
+    # Likewise --seed, which orders the data: a resume with another seed would read other documents
+    if getattr(args, "seed", 42) != 42:
+        identity["seed"] = args.seed
     if getattr(args, "url_blocklist", None):
         identity["url_blocklist"] = list(parse_blocklist(args.url_blocklist))
     return identity
@@ -605,6 +608,14 @@ def parse_args():
         action="store_true",
         help="With --skip-nonfinite-updates: after a NONFINITE line a NONFINITE_GROUPS line with the layer types whose "
              "gradients were NaN or inf in that log window, from the loss backwards; changes no update"
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Seed of the initialization, the data order (with --use-packing) and the masking (plus the process "
+             "index); the held-out masks keep their own. Another seed is another pretraining run of the same recipe "
+             "(default: 42, that of every earlier run)"
     )
     parser.add_argument(
         "--param-dtype",
@@ -1756,7 +1767,7 @@ def main(args):
     )
     
     # Init params
-    rng = jax.random.PRNGKey(42)
+    rng = jax.random.PRNGKey(args.seed)
     init_rng, dropout_rng = jax.random.split(rng)
     
     dummy_input = jnp.ones((1, max_length), dtype=jnp.int32)
@@ -1981,7 +1992,7 @@ def main(args):
             num_workers=0,  # JAX compatible
             shard_index=jax.process_index(),
             shard_count=jax.process_count(),
-            seed=42,
+            seed=args.seed,
             num_epochs=args.num_epochs,
             dataset_configs=dataset_configs,
             shuffle_buffer_size=args.shuffle_buffer_size,
@@ -2051,7 +2062,7 @@ def main(args):
                 wandb.log({"eval/loss": loss, "eval/accuracy": accuracy, "eval/perplexity": perplexity}, step=step)
 
     # Masking draws from NumPy's global RNG; seeded so runs differ by what they change only
-    np.random.seed(42 + process_idx)
+    np.random.seed(args.seed + process_idx)
 
     # Not on the TPU: it would wait for the running step, and the next batch can be prepared during that step
     cpu_device = jax.local_devices(backend="cpu")[0]

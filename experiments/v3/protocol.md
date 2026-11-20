@@ -138,3 +138,138 @@ binnen een gewone ModernBERT blijven (genoteerd, niet gekozen): het hele model i
 Eén run per arm, vanaf één checkpoint van v2: geen variantie over seeds. Of de fix ook vanaf stap 0 en op CulturaX
 stabiel is, blijkt pas in de ablatie (deel 2). Het model van zf is na 250.000 een ander model dan v2; "zelfde
 batches" betekent zelfde invoer, niet zelfde toestand.
+
+### Aantekening na de start (20 nov 11:23; verandert geen criterium)
+
+**[gemeten]** In de smoke-test (250.000 → 250.300, zelfde batches als v2's float32-stuk) was de gemiddelde log²Z
+317 → 290 (|log Z| ≈ 17), niet de ~100 van het rekenvoorbeeld hierboven: de z-loss-term is bij de start dus ~0,03
+(~3% van het verlies). Verlies per Step-regel 0,0014–0,0034 boven v2's float32, staptijd 0,260–0,273 s (v2 bf16
+0,220 s, float32 ~0,30 s). Koppeling host → procesindex gelijk aan v2's.
+
+## Deel 2: vormablatie (vastgelegd vóór de start; niet starten zonder Yebs akkoord)
+
+### Vraag
+
+Welke vorm van ~230M parameters geeft, met het recept van T2 en v3's stabiliteitsfix, na 100.000 stappen op
+CulturaX de beste fine-tune-uitslagen? De uitkomst kiest de vorm van dmbert v3; ze zegt niets over v3 tegen T2.
+
+### Vormen [gemeten: parametertelling met de modelcode, `jax.eval_shape` van `ModernBertForMaskedLM`]
+
+Inclusief de embedding (32.128 × hidden, gekoppeld aan de decoder), de norms, de MLM-head (dense + norm) en de
+decoder-bias. Head-dimensie overal 64.
+
+| arm | lagen × hidden | heads | GeGLU (intermediate) | globaal | globale lagen | parameters | t.o.v. A | waarvan embedding |
+|---|---|---:|---:|---|---:|---:|---:|---:|
+| A | 22 × 1024 | 16 | 1536 | elke 3e | 8 | 230.110.592 | 0 | 32.899.072 |
+| B | 29 × 768 | 12 | 2048 | elke 3e | 10 | 230.601.088 | +0,21% | 24.674.304 |
+| C | 16 × 1024 | 16 | 2560 | elke 3e | 6 | 226.952.576 | −1,37% | 32.899.072 |
+| D | 22 × 1024 | 16 | 1536 | elke 2e | 11 | 230.110.592 | 0 | 32.899.072 |
+| A2 | als A, `--seed 43` | | | | | 230.110.592 | 0 | |
+
+**Afstemming.** Yebs schets: B ~30 × 768 met GeGLU ~2048, C ~18 × 1024 met GeGLU ~2560. Regel: de MLP-breedte
+van de schets houden (die maakt het verschil tussen de vormen) en het aantal lagen kiezen dat het dichtst bij A's
+parameters komt. Bekeken en niet gekozen: B 30 × 768 × 2048 (+3,29%), B 30 × 768 × 1920 (−0,56%), C 18 × 1024 × 2560
+(+9,11%, buiten ±5%), C 18 × 1024 × 2176 (−0,12%, maar MLP-verhouding 2,1 in plaats van 2,5), C 17 × 1024 × 2560
+(+3,87%). Alle gekozen vormen liggen binnen ±1,5% van A.
+
+**A2** (voorstel van mij, niet van Yeb): A met een andere seed voor initialisatie, datavolgorde en maskering
+(`--seed`, nieuw in deze branch; standaard 42 zoals elke eerdere run). Eén pretraining per vorm laat niet zien
+hoeveel van een verschil ruis van de pretraining is; |A − A2| maakt die ruis zichtbaar en gaat in de drempel. Zonder
+A2 (op Yebs woord) is de drempel alleen de seed-range van de fine-tunes (`decide_v3.py --without-a2`).
+
+**[afgeleid uit de code]** De lokale attention rekent in deze code de volle 1.024 × 1.024 logits en maskeert daarna;
+D kost dus evenveel rekenwerk per stap als A (in een implementatie met een echte sliding-window-kernel is D duurder).
+
+### Data, tokens, stappen, schema
+
+- **Data:** CulturaX-nl op T2's revisie `6a8734bc`, `--url-blocklist hebban.nl`. Per worker de eerste 8 van zijn 32
+  bestanden van de eindrun (`gs://…/mbert/final/staging/culturax_nl_files-w<N>.txt`, sha256 tegen
+  `culturax-w<N>.tsv`): 32 van de 128 bestanden, 12,2 GiB per worker, ~20 mld tokens **[afgeleid: 25% van 80,7
+  mld]**. Zelfde bestanden op dezelfde workers en seed 42 voor de data: A, B, C en D zien exact dezelfde batches; A2
+  een andere volgorde van dezelfde bestanden. `nl_part_00097` (T2's held-out-slice voor de EVAL in de trainer) zit niet
+  in deze 32: hier is die EVAL echt held-out (bij T2 niet).
+- **Tokens:** 100.000 stappen × 128 × 1.024 = 13,1 mld posities, ~12,4 mld echte tokens (94,6%); ~0,6 doorgang over
+  de 32 bestanden, geen document twee keer.
+- **Schema (WSD):** warmup 1.250 stappen naar 4,8e-4, constant tot 80.000, 1-sqrt-cooldown over 20.000 stappen (20%,
+  T2: 20,37%) naar 1e-6.
+- **Verder als T2:** 15% losse tokens, packing, 1.024 tokens, batch 128 (8 per chip × 16), AdamW, weight decay 0,01,
+  layer-norm-LR-factor 1,0, `--skip-nonfinite-updates`; bf16 met `--attention-float32 --z-loss 1e-4`
+  (`--nonfinite-diagnostics` alleen diagnose). Dezelfde LR voor elke vorm (niet per vorm afgesteld).
+- **Tokenizer (a)** in de pretraining (`scripts/build_tokenizer_v3.py`, `--tokenizer ~/mbert-v3-tokenizer`). Voor
+  tekst geeft hij in de modus van de trainer dezelfde ids als v2's tokenizer (getest, zie hieronder); alleen het
+  padding-id verschilt (32.001 in plaats van 20.277), en padding is gemaskeerd. De pretraining is daarmee die van v2's
+  tokenizer.
+- **Smoke-test per vorm** (niet voor A2): 200 stappen onder een eigen naam: eindig verlies op 200, geen `NONFINITE`,
+  EVAL op 200, staptijd gelogd.
+
+### Evaluaties
+
+Per arm op checkpoint 100.000, `experiments/v3/eval_v3.sh` (= v2's `eval_v2.sh` met de vorm als parameter), seeds
+42, 43 en 44, de instellingen van v2's evaluatie:
+
+| taak | script | instellingen |
+|---|---|---|
+| SICK-NL | finetune.py | max-length 512, update 256, LR 5e-5 constant, 3 epochs |
+| DBRD@512 | finetune.py | max-length 512, update 192, padding tot 128, LR 5e-5, 3 epochs |
+| SQuAD-NL v1.1 F1 | finetune_extra.py | 384, doc-stride 128, update 32, LR 5e-5 lineair naar 0, 3 epochs |
+| CoNLL-2002 entity-F1, POS LassySmall, POS Alpino | finetune_extra.py | 512, update 32, LR 5e-5 lineair, 3 epochs |
+| BLiMP-NL | eval_blimp_nl.py | PLL-word-l2r over 8.400 paren, float32, één meting |
+
+18 fine-tunes en BLiMP-NL per arm. Code mbert-jax `dumb-extra` @ `ae11478`, de venv's van v2's evaluatie
+(vingerafdruk `91a3c3a5f544`), alleen op mbert-mix. De fine-tunes gebruiken v2's tokenizer
+(`yhavinga/dutch-llama-tokenizer`; voor tekst dezelfde ids als (a)): de evaluatie meet de vorm, voor elke arm gelijk.
+Wat tokenizer (a)'s sjablonen (`<s> A </s> B </s>`) bij fine-tunen doen, meet deze ablatie niet.
+
+### Beslisregel (`experiments/v3/decide_v3.py`, exact op tellingen)
+
+Elke kandidaat X ∈ {B, C, D} tegen A, per taak:
+
+1. **Drempel:** de grootste seed-range van X en A (zoals `decide_v2`/dumb-extra); met A2 ook |gemiddelde A −
+   gemiddelde A2|; BLiMP-NL 0,5 punt (of |A − A2| als dat groter is).
+2. **Uitslag per taak:** "beter" of "slechter" als het verschil van de gemiddelden groter is dan de drempel, anders
+   "gelijk".
+3. **Oordeel** (T2's `primary_rule`) op SICK-NL en DBRD@512: "schaadt" als X op een van beide slechter is, anders
+   "helpt" als X op SICK-NL beter is, anders "geen verschil".
+4. **X voldoet** als X "helpt" en op geen extra taak (SQuAD-NL F1, CoNLL-2002, POS LassySmall, POS Alpino, BLiMP-NL)
+   slechter is, of als X "geen verschil" geeft, op minstens één extra taak beter is en op geen enkele slechter.
+5. **Uitkomst:** voldoet geen kandidaat, dan blijft A (de vorm van T2 en v2). Voldoet er één, dan die. Voldoen er
+   meer, dan die met de meeste "beter" over alle zeven taken; staan die gelijk, dan beslist Yeb.
+
+Gerapporteerd, beslist niet: staptijd per vorm, EVAL-curve (held-out CulturaX), niet-eindige stappen per arm.
+
+### Rekentijd
+
+- **Per run [gemeten voor A, geschat voor B en C]:** A met de fix 0,260–0,273 s per stap (smoke-test van deel 1):
+  100.000 stappen ≈ 7,3 u, met checkpoints en EVAL ~7,5 u, plus ~10 min smoke-test. D als A (zie boven). B en C
+  hebben evenveel parameters en dus ongeveer evenveel FLOPs per token **[afgeleid]**; B's smallere matmuls (768)
+  benutten de MXU slechter, C heeft minder lagen: geschat binnen ±20% van A, gemeten in hun smoke-test.
+- **Evaluatie per arm:** ~45–90 min (v2: 22 taken in ~50 min; een nieuwe vorm compileert opnieuw).
+- **Staging:** ~15–30 min per VM (8 × 1,6 GB per worker van Hugging Face).
+- **Eén VM (mbert-mix), vijf armen na elkaar:** 5 × ~7,7 u + 5 × ~1 u + 0,5 u ≈ **44 u** (zonder A2 ~35 u).
+- **Twee VM's:** mbert-mix A, B, A2 en de evaluatie van alle vijf (3 × 7,7 + 5 × 1 ≈ 28 u), mbert-corpus C en D
+  (2 × 7,7 + staging ≈ 16 u): **~28 u** doorlooptijd (zonder A2 ~20 u). mbert-corpus pas na G4-6b; of zijn venv de
+  vingerafdruk van de trainer heeft en of daar nog CulturaX-bestanden staan, is niet bekeken (die VM is niet
+  aangeraakt); de keten controleert het en stopt anders.
+
+### Voorwaarden voor de start
+
+1. De replay-toets van deel 1 is geslaagd; de keten leest het oordeel in `gs://…/mbert/v3-replay/verdict/`. Is hij niet
+   geslaagd, dan valt QK-norm af en beslist Yeb: bijvoorbeeld `PRECISION=float32` (de armen helemaal in float32 zonder
+   de fix, ~0,30 s per stap, +15% tijd) of een andere fix (dan eerst een nieuw protocol).
+2. Yebs akkoord op dit deel: vormen, A2, de 32 bestanden, de regel.
+3. Schijf: per worker 12,2 GiB + 1 GiB. Op mbert-mix had w2 op 20 nov 17 GB vrij naast v2's `~/fw2optout` (~25 GB):
+   dat past. De staging stopt zelf bij te weinig ruimte en verwijdert niets.
+
+### Ketenscript
+
+`mbert-ops/scripts/v3_ablation_run.sh` (co1): lock van de VM, code-controle, oordeel van de replay, setup (code,
+venv, tokenizer (a) met de sha256 van co1), staging, per arm smoke-test en 100.000 stappen (een zelfstop of fout is
+`FAILED`: dan beslist Yeb), evaluatie, `decide_v3.py`. Startcommando's in de kop van het script en in
+`mbert-ops/HANDOVER-dmbert-v3.md`.
+
+### Wat de ablatie niet zegt
+
+- 100.000 stappen (~12 mld tokens) is ~8% van een volledige run van 1.306.000 stappen: de volgorde van de vormen kan
+  bij langer trainen veranderen.
+- Eén pretraining per vorm; A2 meet de ruis alleen voor A.
+- Eén LR voor alle vormen; een diepe, smalle vorm kan een andere LR willen.

@@ -223,3 +223,15 @@ def test_nonfinite_diagnostics_need_the_step_skip(tm):
         tm.parse_args()
     with mock.patch.object(sys, "argv", ["train_minimal.py", "--nonfinite-diagnostics", "--skip-nonfinite-updates"]):
         assert tm.parse_args().nonfinite_diagnostics is True
+
+
+def test_seed_flag_defaults_to_42_and_another_seed_is_another_data_identity(tm):
+    with mock.patch.object(sys, "argv", ["train_minimal.py"]):
+        default = tm.parse_args()
+    with mock.patch.object(sys, "argv", ["train_minimal.py", "--seed", "43"]):
+        other = tm.parse_args()
+    assert default.seed == 42 and other.seed == 43
+    with mock.patch.object(tm.jax, "process_count", return_value=4):
+        a = tm.data_state_identity(default, 32, ["f.parquet"])
+        b = tm.data_state_identity(other, 32, ["f.parquet"])
+    assert "seed" not in a and b == {**a, "seed": 43}

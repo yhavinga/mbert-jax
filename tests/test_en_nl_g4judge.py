@@ -420,3 +420,30 @@ def test_c2_scorer_is_naturalness_classify_with_the_logit(tmp_path):
     r = subprocess.run([sys.executable, str(script), str(ROOT), str(tmp_path)], capture_output=True, text=True,
                        env=env, timeout=600)
     assert r.returncode == 0 and "C2_SCORER_OK" in r.stdout, r.stdout[-3000:] + r.stderr[-3000:]
+
+
+def test_run_script_stages_dry(tmp_path):
+    """run_g4arm7_judges.sh with DRY=1: each stage's job, with C1's training command on v2 and the judges' flags"""
+    def dry(stage, **env):
+        e = dict(os.environ, HOME=str(tmp_path), DRY="1", TAG="t1", **env)
+        r = subprocess.run(["bash", str(CODE / "run_g4arm7_judges.sh"), stage], capture_output=True, text=True, env=e)
+        assert r.returncode == 0, r.stdout + r.stderr
+        return r.stdout
+
+    conv = dry("convert")
+    assert "--checkpoint gs://t5-dutch-english-usc2/mbert/v2-fw2optout-230m/ckpt_keep/1306000 --params-only" in conv
+    train = dry("train")
+    assert ("naturalness.py classifier --dumb-code" in train and "--checkpoint /dev/shm/translator/g4arm7/v2" in train
+            and "--max-length 1024 --epochs 3 --learning-rate 5e-5 --seed 42 --batch-size 8" in train)
+    assert "g4c2.py data7 --bt" in dry("data") and "--bt-validation" in dry("data")
+    texts = dry("texts", CALIB="G4-6c=gs://b/t.parquet:gs://b/p.parquet")
+    assert "gsutil -q cp gs://b/t.parquet" in texts and "gsutil -q cp gs://b/p.parquet" in texts
+    assert "--calib G4-6c=" in texts and "g4c2.py cal7-texts" in texts
+    assert "naturalness.py classify --dumb-code" in dry("classify")
+    cal = dry("cal", CALIB="G4-6c=gs://b/t.parquet:gs://b/p.parquet")
+    assert "g4c2.py cal7 --results" in cal and "--c1 G4-6c=" in cal
+    mx = dry("serve", ROLE="metricx", PART="1")
+    assert "g4judge.py serve --rl gs://t5-dutch-english-usc2/mbert/translator/sft/g4arm/rl/G4-7 --role metricx" in mx
+    assert "--part 1 --root /dev/shm/translator/metricx" in mx and "--writers val=3" in mx
+    c2 = dry("serve", ROLE="c2")
+    assert "g4judge.py serve" in c2 and "--role c2" in c2 and "--dumb-code" in c2

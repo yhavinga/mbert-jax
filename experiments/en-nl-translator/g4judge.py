@@ -34,6 +34,8 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # metricx_qe.py, naturalness.py beside it (also under -I)
+
 ROLES = ("metricx", "c2")
 SAMPLE_COLUMNS = ("uid", "id", "j", "source", "hypothesis", "token_ids", "sampler_logp", "ended", "decode_loop",
                   "english_left", "empty", "tokens_out")

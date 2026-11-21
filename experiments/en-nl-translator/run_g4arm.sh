@@ -141,15 +141,30 @@
 #   checkpoint's stacked, to $G/G4-6c-s240/, $G/G4-6c-s480/, $G/G4-6c-s717/, the checkpoint's alone in delta/); MODEL=G4-6c-s<k>
 #   translate and score (SET=eval); texts (the three, G4-0, G4-4, G4-6b), classify, report6c (w0: the checkpoint
 #   chosen on the search part of G4-5's split, the rule on its decision part); SELECTED=<report6c's choice> blind
+# Arm G4-7 (amendment G4-7, protocol-g4.md §14: online RL, GRPO with LoRA from G4-0), with ARM=G4-7, what comes after
+# the RL (g4arm7_run.sh and run_g4arm7.sh train; the chain puts the adapter after n iterations in $G/G4-7-i<n>/); only
+# setup and these stages, SET=eval:
+#   MODEL=G4-7-i<n> bash run_g4arm.sh translate|score   every worker: a candidate (n = 1..30), its LoRA merged (rank 32 /
+#                                 alpha 16, checked; the job's own copy removed after), to $G/eval/G4-7-i<n>/
+#   CANDIDATES="G4-7-i5 ..." bash run_g4arm.sh texts   w0 (CPU): the candidates, G4-0 and G4-4 (reported), one classify run
+#   bash run_g4arm.sh classify     w0 (its TPU): C1, run_arms.sh classify with NAT=$G/naturalness-G4-7 (unchanged)
+#   bash run_g4arm.sh classify-c2  w0 (its TPU): C2 ($RL/c2/model/) on the same texts, naturalness.py classify as C1 and
+#                                 as the judge side runs it (--max-length 1024), to $NAT/predictions-c2.parquet
+#   bash run_g4arm.sh pll          w0 (its TPU): naturalness.py pll (S @ 653k, as run_arms.sh pll) on the same texts, to
+#                                 $NAT/pll.parquet (reported; without it report7 says "niet gemeten")
+#   CANDIDATES="G4-7-i5 ..." bash run_g4arm.sh report7  w0 (CPU): g4arm.py report7 (the choice on the search part, (a1),
+#                                 (a3), (b) on the decision part, C2 beside C1, the training per iteration from the
+#                                 chain's $REP/records.json), to $G/report-G4-7/
+#   SELECTED=<report7's choice> bash run_g4arm.sh blind   w0 (CPU): only if (a1), (a3) and (b) hold (G4-7.8)
 # The code is beside this script (a copy of $G/scripts/). TAG names the jobs of one chain.
 set -euo pipefail
-STAGE=${1:?a stage: fetchbt, build, check, evaldata, setup, train, adapter, translate, score, texts, classify, blind, report, smoke-translate, smoke-score, smoke-report, fetchval, heldout, own, smoke2-report, replay, build2, heldout3, build3, smoke3-report, build4, smoke4-report, novels4, build5, split5, refqe5, resume5, report5, smoke5-report, cands6, build6, check6, cpuproof6, smoke6-report, pairtexts6, pairclassify6, pairclass6, ends6c, report6c}
+STAGE=${1:?a stage: fetchbt, build, check, evaldata, setup, train, adapter, translate, score, texts, classify, blind, report, smoke-translate, smoke-score, smoke-report, fetchval, heldout, own, smoke2-report, replay, build2, heldout3, build3, smoke3-report, build4, smoke4-report, novels4, build5, split5, refqe5, resume5, report5, smoke5-report, cands6, build6, check6, cpuproof6, smoke6-report, pairtexts6, pairclassify6, pairclass6, ends6c, report6c, classify-c2, pll, report7}
 R=gs://t5-dutch-english-usc2/mbert/translator
 S=$R/sft
 E=$R/eval
 G=$S/g4arm
 ARM=${ARM:-G4-1}
-case $ARM in G4-1|G4-2|G4-3|G4-4|G4-5|G4-6|G4-6b|G4-6c) ;; *) echo "ARM is G4-1, G4-2, G4-3, G4-4, G4-5, G4-6, G4-6b or G4-6c, not $ARM"; exit 1 ;; esac
+case $ARM in G4-1|G4-2|G4-3|G4-4|G4-5|G4-6|G4-6b|G4-6c|G4-7) ;; *) echo "ARM is G4-1, G4-2, G4-3, G4-4, G4-5, G4-6, G4-6b, G4-6c or G4-7, not $ARM"; exit 1 ;; esac
 SMOKE_RUN=g4arm_${ARM}_s8
 FULL_RUN=g4arm_$ARM
 # G4-6 (draft amendment G4-6.4): rows of 4,096, or of 2,048 if the smoke test at 4,096 does not fit (its own smoke run)
@@ -218,6 +233,21 @@ if [ "$ARM" = G4-6c ]; then
   [ "$STAGE" != report ] || { echo "G4-6c's report is report6c (amendment G4-6c.7)"; exit 1; }
 fi
 [ "$ARM" = G4-6c ] || case $STAGE in ends6c|report6c) echo "$STAGE is G4-6c's"; exit 1 ;; esac
+# G4-7's places (amendment G4-7.11): its RL directory (C2's model), its candidates' classify run and report. The RL
+# itself (the samples, the judges, the training, the adapters $G/G4-7-i<n>/) is g4arm7_run.sh's and run_g4arm7.sh's
+RL=$G/rl/G4-7
+cand7() {  # cand7 NAME: a candidate of G4-7, the adapter after n = 1..30 iterations (g4rl.ITERATIONS7)
+  case $1 in G4-7-i[1-9]|G4-7-i[12][0-9]|G4-7-i30) return 0 ;; *) return 1 ;; esac
+}
+if [ "$ARM" = G4-7 ]; then
+  NAT=$G/naturalness-G4-7; REP=$G/report-G4-7
+  case $STAGE in
+    setup|translate|score|texts|classify|classify-c2|pll|blind|report7) ;;
+    *) echo "$STAGE is no stage of G4-7 (setup, translate, score, texts, classify, classify-c2, pll, blind, report7)"; exit 1 ;;
+  esac
+  [ "$SET" = eval ] || { echo "ARM=G4-7: SET=eval only"; exit 1; }
+fi
+[ "$ARM" = G4-7 ] || case $STAGE in classify-c2|pll|report7) echo "$STAGE is G4-7's"; exit 1 ;; esac
 # The Gemma 4 FLAN-nl after its post step (flan_g4_full_run.sh), the replay's only source (amendment G4-2.3)
 FNL=gs://t5-dutch-english-usc2/mbert/flan-nl
 TRAIN_CKPT=$R/gemma4-ckpt/gemma-4-31b-it                       # run_sft.sh's gemma4-31b (MaxText 0.2.5 conversion)
@@ -263,6 +293,19 @@ only() {  # only WORKER: the stage runs on that worker alone
 ONE_HOST="export TPU_CHIPS_PER_PROCESS_BOUNDS=2,2,1 TPU_PROCESS_BOUNDS=1,1,1 TPU_VISIBLE_CHIPS=0,1,2,3 TPU_PROCESS_PORT=8476
 export TPU_PROCESS_ADDRESSES=localhost:8476 CLOUD_TPU_TASK_ID=0 ALLOW_MULTIPLE_LIBTPU_LOAD=1
 export XLA_FLAGS=--xla_dump_hlo_as_text=false TPU_LOG_DIR=$SHM/tpu_logs TOKENIZERS_PARALLELISM=false HF_HUB_OFFLINE=1 HF_HUB_DISABLE_PROGRESS_BARS=1"
+# G4-7's C2 and PLL: the DUMB rounds' venv and checkout as run_arms.sh's classify and pll (C1), with its host variables
+DPY=$HOME/mbert-dumb/.venv/bin/python
+DUMB=$HOME/mbert-dumbx
+DUMB_COMMIT=ae114789bf2eae153e4e3bea579299a617dcd417
+S653=gs://t5-dutch-english-usc2/mbert/culturax-nl-230m-chunk1024/ckpt_keep/653000
+ONE_HOST_DUMB="export TPU_CHIPS_PER_PROCESS_BOUNDS=2,2,1 TPU_PROCESS_BOUNDS=1,1,1 TPU_VISIBLE_CHIPS=0,1,2,3 TPU_PROCESS_PORT=8476
+export TPU_PROCESS_ADDRESSES=localhost:8476 CLOUD_TPU_TASK_ID=0 ALLOW_MULTIPLE_LIBTPU_LOAD=1
+export XLA_FLAGS=--xla_dump_hlo_as_text=false TPU_LOG_DIR=$SHM/tpu_logs TOKENIZERS_PARALLELISM=false"
+dumb_ready() {
+  [ -x "$DPY" ] || { echo "w$W: no $DPY"; exit 1; }
+  [ "$(git -C "$DUMB" rev-parse HEAD 2> /dev/null)" = "$DUMB_COMMIT" ] || { echo "w$W: $DUMB is not at $DUMB_COMMIT"; exit 1; }
+  [ -z "$(git -C "$DUMB" status --porcelain --untracked-files=no)" ] || { echo "w$W: $DUMB has changes"; exit 1; }
+}
 PREFLIGHT="timeout 600 $FPY -c \"import jax; assert (jax.device_count(), jax.process_count()) == (4, 1), (jax.device_count(), jax.process_count()); print('devices', jax.devices())\" || { echo 'preflight failed: not 4 chips of one process'; exit 2; }"
 
 # translate_class SEGMENTS CLASS OUT LOG [EXTRA...]: one class through translate.py; out of memory: again with half
@@ -785,8 +828,11 @@ adapter)
   echo "ADAPTER $ARM: $G/$ARM/ $(tr -d '\n ' < "$G_SHM/adapter-$TAG.json" | cut -c1-300)"
   ;;
 translate|smoke-translate)
-  MODEL=${MODEL:?G4-1, G4-2, G4-3, G4-4, G4-5c<k>, G4-6, G4-6b, G4-6c, G4-6c-s<step> or G4-0}
-  case $MODEL in G4-1|G4-2|G4-3|G4-4|G4-6|G4-6b|G4-6c|G4-0|G4-5c[1-9]|G4-6c-s[1-9]*) ;; *) echo "MODEL is G4-1, G4-2, G4-3, G4-4, G4-5c<k>, G4-6, G4-6b, G4-6c, G4-6c-s<step> or G4-0, not $MODEL"; exit 1 ;; esac
+  MODEL=${MODEL:?G4-1, G4-2, G4-3, G4-4, G4-5c<k>, G4-6, G4-6b, G4-6c, G4-6c-s<step>, G4-7-i<n> or G4-0}
+  case $MODEL in G4-1|G4-2|G4-3|G4-4|G4-6|G4-6b|G4-6c|G4-0|G4-5c[1-9]|G4-6c-s[1-9]*) ;; *) cand7 "$MODEL" || { echo "MODEL is G4-1, G4-2, G4-3, G4-4, G4-5c<k>, G4-6, G4-6b, G4-6c, G4-6c-s<step>, G4-7-i<n> (n = 1..30) or G4-0, not $MODEL"; exit 1; } ;; esac
+  # amendment G4-7: its candidates only with ARM=G4-7, and ARM=G4-7 translates and scores its candidates only
+  if cand7 "$MODEL"; then [ "$ARM" = G4-7 ] || { echo "$MODEL is G4-7's (ARM=G4-7)"; exit 1; }; fi
+  [ "$ARM" != G4-7 ] || cand7 "$MODEL" || { echo "ARM=G4-7: MODEL is a candidate G4-7-i<n> (n = 1..30), not $MODEL"; exit 1; }
   [ "$SET" != dpo ] || [ "$MODEL" = "$REJ6" ] || { echo "SET=dpo with ARM=$ARM: $REJ6 only (the rejected side of its pairs)"; exit 1; }
   case $MODEL in G4-5c*) [ "$SET" = eval ] || { echo "$MODEL: SET=eval only"; exit 1; } ;; esac
   case $MODEL in G4-6c-s*) [ "$SET" = eval ] && [ "$STAGE" = translate ] || { echo "$MODEL: SET=eval only"; exit 1; } ;; esac
@@ -857,6 +903,13 @@ translate|smoke-translate)
   elif [ "$MODEL" != G4-0 ]; then
     adapter_local "$ADAPTER_DIR" "$G_SHM/adapter-$NAME"
     EXTRA="--lora $G_SHM/adapter-$NAME"
+    # amendment G4-7.4: a candidate's LoRA is rank 32 / alpha 16 from G4-0 (nothing stacked)
+    if cand7 "$MODEL" && ! python3 -c "import json, sys; a = json.load(open(sys.argv[1])); assert (a['rank'], a['alpha'], a['scale']) == (32, 16.0, 0.5), a" \
+        "$G_SHM/adapter-$NAME/adapter.json"; then
+      rm -rf -- "$G_SHM/adapter-$NAME"
+      echo "$ADAPTER_DIR/adapter.json is not rank 32, alpha 16"
+      exit 1
+    fi
   fi
   {
     echo "set -uo pipefail"
@@ -871,15 +924,18 @@ translate|smoke-translate)
     for cls in $CLASSES; do
       echo "translate_class $G_SHM/seg-$TAG/$SET/$SEG $cls $OUT/$cls ~/logs/${NAME}_$cls.log $EXTRA || exit 1"
     done
-    # G4-6c: the job's own copy of a checkpoint's adapter (2 GB on every worker; the bucket has it)
-    case $MODEL in G4-6c-s*) echo "rm -rf -- $G_SHM/adapter-$NAME" ;; esac
+    # G4-6c: the job's own copy of a checkpoint's adapter (2 GB on every worker; the bucket has it); G4-7: a candidate's
+    case $MODEL in G4-6c-s*|G4-7-i*) echo "rm -rf -- $G_SHM/adapter-$NAME" ;; esac
     echo "echo \"TRANSLATED w$W $MODEL: $CLASSES\""
   } > ~/job_body_$NAME.sh
   detach "$NAME" bash ~/job_body_$NAME.sh
   ;;
 score|smoke-score)
-  MODEL=${MODEL:?G4-1, G4-2, G4-3, G4-4, G4-5c<k>, G4-6, G4-6b, G4-6c, G4-6c-s<step> or G4-0}
-  case $MODEL in G4-1|G4-2|G4-3|G4-4|G4-6|G4-6b|G4-6c|G4-0|G4-5c[1-9]|G4-6c-s[1-9]*) ;; *) echo "MODEL is G4-1, G4-2, G4-3, G4-4, G4-5c<k>, G4-6, G4-6b, G4-6c, G4-6c-s<step> or G4-0, not $MODEL"; exit 1 ;; esac
+  MODEL=${MODEL:?G4-1, G4-2, G4-3, G4-4, G4-5c<k>, G4-6, G4-6b, G4-6c, G4-6c-s<step>, G4-7-i<n> or G4-0}
+  case $MODEL in G4-1|G4-2|G4-3|G4-4|G4-6|G4-6b|G4-6c|G4-0|G4-5c[1-9]|G4-6c-s[1-9]*) ;; *) cand7 "$MODEL" || { echo "MODEL is G4-1, G4-2, G4-3, G4-4, G4-5c<k>, G4-6, G4-6b, G4-6c, G4-6c-s<step>, G4-7-i<n> (n = 1..30) or G4-0, not $MODEL"; exit 1; } ;; esac
+  # amendment G4-7: its candidates only with ARM=G4-7, and ARM=G4-7 translates and scores its candidates only
+  if cand7 "$MODEL"; then [ "$ARM" = G4-7 ] || { echo "$MODEL is G4-7's (ARM=G4-7)"; exit 1; }; fi
+  [ "$ARM" != G4-7 ] || cand7 "$MODEL" || { echo "ARM=G4-7: MODEL is a candidate G4-7-i<n> (n = 1..30), not $MODEL"; exit 1; }
   case $MODEL in G4-6c-s*) [ "$SET" = eval ] && [ "$STAGE" = score ] || { echo "$MODEL: SET=eval only"; exit 1; } ;; esac
   [ "$MODEL" != G4-6c ] || [ "$STAGE" = smoke-score ] || { echo "MODEL=G4-6c is the smoke run's (smoke-score)"; exit 1; }
   if [ "$SET" != eval ]; then
@@ -979,6 +1035,14 @@ texts)
     done
     MODELS="$CANDIDATES G4-0 G4-4 G4-6b"
   fi
+  if [ "$ARM" = G4-7 ]; then
+    # amendment G4-7.7 (spec §6.5): the candidates, G4-0, and G4-4 reported, in one classify run of C1; classify-c2 runs
+    # C2 on the same texts
+    for m in ${CANDIDATES:?the candidates, G4-7-i5 ...}; do
+      cand7 "$m" || { echo "CANDIDATES: $m is no candidate of G4-7"; exit 1; }
+    done
+    MODELS="$CANDIDATES G4-0 G4-4"
+  fi
   PAIRS=""
   for m in $MODELS; do PAIRS="$PAIRS --pairs '$m=$T/$m/pairs-w*.parquet'"; done
   {
@@ -1008,6 +1072,13 @@ blind)
   if [ "$ARM" = G4-6c ]; then
     BARM=${SELECTED:?the checkpoint report6c selected, G4-6c-s<step>}
     case $BARM in G4-6c-s[1-9]*) ;; *) echo "SELECTED $BARM is no checkpoint of G4-6c"; exit 1 ;; esac
+  fi
+  # G4-7: the candidate report7 selected (amendment G4-7.8: only if (a1), (a3) and (b) hold)
+  if [ "$ARM" = G4-7 ]; then
+    BARM=${SELECTED:?the candidate report7 selected, G4-7-i<n>}
+    cand7 "$BARM" || { echo "SELECTED $BARM is no candidate of G4-7"; exit 1; }
+    gsutil cat "$REP/report.json" | python3 -c "import json, sys; r = json.load(sys.stdin); assert r['selected'] == sys.argv[1] and r['blind_due'], (r['selected'], r['blind_due'])" "$BARM" \
+      || { echo "$REP/report.json: $BARM is not report7's choice with (a1), (a3) and (b) holding"; exit 1; }
   fi
   for d in "$S/blind/$ARM" "$S/blind/$ARM-tg"; do
     ! gsutil -q stat "$d/key.jsonl" || { echo "$d has a key.jsonl: the package stays as it is"; exit 1; }
@@ -1864,6 +1935,86 @@ gsutil -m -q cp $X/report.md $X/report.json $REP/
 echo "REPORT6C_DONE $REP/report.md"
 EOF
   detach "g4a_report6c_$TAG" bash ~/job_body_g4a_report6c_$TAG.sh
+  ;;
+classify-c2)
+  only 0
+  tpu_free
+  dumb_ready
+  # amendment G4-7.8 and G4-7.10: C2, the reward classifier ($RL/c2/model/), on the texts of C1's classify run, in C1's
+  # venv and checkout (run_arms.sh classify) and as the judge side runs C2 (run_g4arm7_judges.sh classify: --max-length
+  # 1024); reported beside C1, decides nothing
+  for f in "$RL/c2/model/params.pkl" "$RL/c2/model/config.json" "$NAT/texts.parquet"; do
+    gsutil -q stat "$f" || { echo "no $f (C2's model: run_g4arm7_judges.sh train; the texts: texts)"; exit 1; }
+  done
+  X=$G_SHM/classify-c2-$TAG
+  cat > ~/job_body_g4a_classify_c2_$TAG.sh <<EOF
+set -euo pipefail
+$ONE_HOST_DUMB
+export JAX_COMPILATION_CACHE_DIR=$G_SHM/jax_cache_dumb PYTHONPATH=src
+cd $DUMB
+mkdir -p $X/model $G_SHM/jax_cache_dumb
+gsutil -m -q cp $RL/c2/model/params.pkl $RL/c2/model/config.json $X/model/
+gsutil -q cp $NAT/texts.parquet $X/texts.parquet
+$DPY -u $CODE/naturalness.py classify --dumb-code $DUMB --model $X/model --texts $X/texts.parquet --max-length 1024 --out $X/predictions-c2.parquet
+gsutil -q cp $X/predictions-c2.parquet $NAT/predictions-c2.parquet
+echo "CLASSIFIED_C2: $NAT/predictions-c2.parquet"
+EOF
+  detach "g4a_classify_c2_$TAG" bash ~/job_body_g4a_classify_c2_$TAG.sh
+  ;;
+pll)
+  only 0
+  tpu_free
+  dumb_ready
+  # amendment G4-7.10 (spec §5.4, protocol.md §4.2.3): PLL-word-l2r under S @ 653k on the classify run's texts, as
+  # run_arms.sh pll (whose places are the arms'); reported, decides nothing
+  gsutil -q stat "$NAT/texts.parquet" || { echo "no $NAT/texts.parquet (texts)"; exit 1; }
+  X=$G_SHM/pll-$TAG
+  cat > ~/job_body_g4a_pll_$TAG.sh <<EOF
+set -euo pipefail
+$ONE_HOST_DUMB
+export JAX_COMPILATION_CACHE_DIR=$G_SHM/jax_cache_dumb PYTHONPATH=src
+cd $DUMB
+mkdir -p $X $G_SHM/jax_cache_dumb
+gsutil -q cp $NAT/texts.parquet $X/texts.parquet
+$DPY -u $CODE/naturalness.py pll --dumb-code $DUMB --checkpoint $S653 --texts $X/texts.parquet --out $X/pll.parquet
+gsutil -q cp $X/pll.parquet $NAT/pll.parquet
+echo "PLL: $NAT/pll.parquet"
+EOF
+  detach "g4a_pll_$TAG" bash ~/job_body_g4a_pll_$TAG.sh
+  ;;
+report7)
+  only 0
+  for m in ${CANDIDATES:?the candidates, G4-7-i5 ...}; do
+    cand7 "$m" || { echo "CANDIDATES: $m is no candidate of G4-7"; exit 1; }
+  done
+  # records.json: the chain's list of the RL run's records (gs:// paths; g4arm.py records7)
+  for f in "$REP/records.json" "$NAT/predictions.parquet" "$NAT/predictions-c2.parquet" "$G5S/split.json" "$G5S/refqe.parquet"; do
+    gsutil -q stat "$f" || { echo "no $f (records.json: the chain; classify; classify-c2; split5; refqe5)"; exit 1; }
+  done
+  X=$G_SHM/report7-$TAG
+  # amendment G4-7.7: G4-4 reported beside (in the same classify run)
+  ARGS7=""
+  for m in $CANDIDATES; do ARGS7="$ARGS7 --candidate $m=$X/$m"; done
+  ARGS7="$ARGS7 --reference G4-4=$X/G4-4"
+  cat > ~/job_body_g4a_report7_$TAG.sh <<EOF
+set -euo pipefail
+for m in $CANDIDATES G4-0 G4-4; do mkdir -p $X/\$m; gsutil -m -q rsync -r -x 'translations/.*' $G/eval/\$m $X/\$m; done
+gsutil -q cp $G/data/eval/evalsets.parquet $G5S/split.json $G5S/refqe.parquet $NAT/predictions.parquet $NAT/predictions-c2.parquet $REP/records.json $X/
+# the RL run's records in report7's layout: every iteration's report.json, stop.json and summary.json, cal7.json,
+# smoke7.json, and stopped.json (written by records7 from the list)
+$FPY -I -u $CODE/g4arm.py records7 --list $X/records.json --out $X/records > $X/records-copies.txt
+while read -r src dst; do gsutil -q cp "\$src" "\$dst"; done < $X/records-copies.txt
+EXTRA7=""
+if [ -f $X/records/smoke7.json ]; then EXTRA7="--smoke $X/records/smoke7.json"; fi
+if gsutil -q stat $NAT/pll.parquet; then gsutil -q cp $NAT/pll.parquet $X/; EXTRA7="\$EXTRA7 --pll $X/pll.parquet"; fi
+if gsutil -q stat $REP/tally.json; then gsutil -q cp $REP/tally.json $X/; EXTRA7="\$EXTRA7 --tally $X/tally.json"; fi
+$FPY -I -u $CODE/g4arm.py report7 --evalsets $X/evalsets.parquet --split $X/split.json --refqe $X/refqe.parquet \
+  --base $X/G4-0 --predictions $X/predictions.parquet --predictions-c2 $X/predictions-c2.parquet --records $X/records \
+  --stopped $X/records/stopped.json --cal7 $X/records/cal7.json$ARGS7 \$EXTRA7 --out $X/report.md
+gsutil -m -q cp $X/report.md $X/report.json $REP/
+echo "REPORT7_DONE $REP/report.md"
+EOF
+  detach "g4a_report7_$TAG" bash ~/job_body_g4a_report7_$TAG.sh
   ;;
 *)
   echo "unknown stage $STAGE"

@@ -467,10 +467,10 @@ onder de 32 GiB van een v4-chip. De smoke-test meet het; grens 30 GiB (§8).
    eerst vragen?
 3. **Een andere `EXIT` dan 0 van G4-7** (§9.2): de keten neemt mbert-corpus na 60 minuten, tenzij `t3.corpus-hold`
    bestaat. Liever alleen bij `EXIT 0` of het overridebestand?
-5. **Vervangen vraagt winst** (§11): anders dan v2's regel is "geen verschil" zonder extra winst hier "niet
-   publiceren", omdat T3 groter is. Akkoord?
 4. **DBRD@1024** heeft geen ruismaat uit de ablatie; ik neem die van DBRD@512 (0,016 punt, in de praktijk telt dan de
    seed-range).
+5. **Vervangen vraagt winst** (§11): anders dan v2's regel is "geen verschil" zonder extra winst hier "niet
+   publiceren", omdat T3 groter is. Akkoord?
 
 ## Amendementen
 

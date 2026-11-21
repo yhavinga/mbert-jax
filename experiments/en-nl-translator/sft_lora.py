@@ -1098,7 +1098,12 @@ def main(argv=None):
           flush=True)
     if args.warmup_steps is not None:
         decay = int(args.decay_fraction * own_steps)
-        base = base + schedule_overrides(steps, args.warmup_steps, decay)
+        # G4-7.4g: a schedule shorter than the warmup (G4-7's smoke test, 2 + 2 steps; a first RL iteration with few
+        # groups that carry signal) warms up over all its steps instead of failing; longer schedules are unchanged
+        warmup = min(args.warmup_steps, steps - decay)
+        if warmup != args.warmup_steps:
+            print(f"WARMUP {args.warmup_steps} steps clipped to {warmup}: the schedule has {steps} steps", flush=True)
+        base = base + schedule_overrides(steps, warmup, decay)
     config = pyconfig.initialize_pydantic(base + [f"steps={steps}"])
     if temps and (config.num_vocab_tiling != 1 or config.z_loss_multiplier != 0):
         # the wrapped cross entropy must see the full logits at the top of the loss (no tiles in a scan), and the

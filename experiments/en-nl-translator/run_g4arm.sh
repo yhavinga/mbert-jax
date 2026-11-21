@@ -141,6 +141,8 @@
 #   checkpoint's stacked, to $G/G4-6c-s240/, $G/G4-6c-s480/, $G/G4-6c-s717/, the checkpoint's alone in delta/); MODEL=G4-6c-s<k>
 #   translate and score (SET=eval); texts (the three, G4-0, G4-4, G4-6b), classify, report6c (w0: the checkpoint
 #   chosen on the search part of G4-5's split, the rule on its decision part); SELECTED=<report6c's choice> blind
+#   Amendment G4-6c.6f: SEQ6=2048 for every run and for adapter and report6c: the LR, the evals and the kept steps of
+#   rows of 2,048 (g4arm.lr6c, eval_every6c, save_steps6c: 565 and 1130 of 1689, checkpoints G4-6c-s565 ...)
 # The code is beside this script (a copy of $G/scripts/). TAG names the jobs of one chain.
 set -euo pipefail
 STAGE=${1:?a stage: fetchbt, build, check, evaldata, setup, train, adapter, translate, score, texts, classify, blind, report, smoke-translate, smoke-score, smoke-report, fetchval, heldout, own, smoke2-report, replay, build2, heldout3, build3, smoke3-report, build4, smoke4-report, novels4, build5, split5, refqe5, resume5, report5, smoke5-report, cands6, build6, check6, cpuproof6, smoke6-report, pairtexts6, pairclassify6, pairclass6, ends6c, report6c}
@@ -459,7 +461,7 @@ g45_train() {  # the training runs of G4-5 (draft amendment G4-5): the warmup, t
 g46_train() {  # the runs of G4-6, G4-6b and G4-6c (amendments G4-6, G4-6b, G4-6c): the smoke runs at 4,096 and 2,048, the full run
   RUN=${RUN:?g4arm_${ARM}_s8, g4arm_${ARM}_s8_2048 or g4arm_$ARM}
   tpu_free
-  local seq setfile steps every n f spec=DPO6 save="" ref_only="" train_run=$RUN
+  local seq setfile steps every n f spec=DPO6 save="" ref_only="" train_run=$RUN lr
   # addendum G4-6c.6e: G4-6c's reference of a run's training batches is a run of its own, <run>_ref (sft_lora.py
   # --ref-only, the same model and config), which the run then reads (--ref-in)
   if [ "$ARM" = G4-6c ] && [[ $RUN == *_ref ]]; then ref_only=1; train_run=${RUN%_ref}; fi
@@ -469,10 +471,13 @@ g46_train() {  # the runs of G4-6, G4-6b and G4-6c (amendments G4-6, G4-6b, G4-6
     "g4arm_$ARM") seq=$SEQ6; setfile=train-$SEQ6.parquet; steps=auto; every=$(g4a_const EVAL_EVERY6) ;;
     *) echo "RUN $RUN is no run of $ARM"; exit 1 ;;
   esac
+  lr=$(g4a_const LR6)
   if [ "$ARM" = G4-6c ]; then
-    # amendment G4-6c: its loss, evals at the checkpoints, the adapters of the checkpoints kept (the smoke runs: step 4)
+    # amendment G4-6c: its loss, evals at the checkpoints, the adapters of the checkpoints kept (the smoke runs: step 4);
+    # amendment G4-6c.6f: the evals, the kept steps and the LR (also the smoke runs') by the run's rows
     spec=DPO6C
-    if [ "$train_run" = "g4arm_$ARM" ]; then every=$(g4a_const EVAL_EVERY6C); save=$(g4a_const SAVE_ARG6C); else save=$(g4a_const SMOKE_SAVE6C); fi
+    lr=$(g4a_const "lr6c($seq)")
+    if [ "$train_run" = "g4arm_$ARM" ]; then every=$(g4a_const "eval_every6c($seq)"); save=$(g4a_const "save_arg6c($seq)"); else save=$(g4a_const SMOKE_SAVE6C); fi
     [ -z "$ref_only" ] || save=""
   fi
   D=$G_SHM/data-$RUN
@@ -482,6 +487,12 @@ g46_train() {  # the runs of G4-6, G4-6b and G4-6c (amendments G4-6, G4-6b, G4-6
   gsutil -q stat "$G6/report.json" || { echo "no $G6/report.json (build6)"; exit 1; }
   gsutil -q stat "$CHECK_TXT" || { echo "no $CHECK_TXT: the pairs are not checked (check6)"; exit 1; }
   mkdir -p "$D"
+  if [ "$ARM" = G4-6c ] && [ "$train_run" = "g4arm_$ARM" ]; then
+    # amendment G4-6c.6f: the LR and the kept steps are those of build6's epoch at these rows
+    gsutil -q cp "$G6/report.json" "$D/build6-report.json"
+    n=$(python3 -c "import json, sys; print(json.load(open(sys.argv[1]))['packing'][sys.argv[2]]['train']['steps'])" "$D/build6-report.json" "$seq")
+    [ "$n" = "$(g4a_const "STEPS6C[$seq]")" ] || { echo "build6's epoch at $seq is $n steps, not g4arm.STEPS6C[$seq] (amendment G4-6c.6f)"; exit 1; }
+  fi
   local sft="$H/eval-books.parquet $H/eval-btval.parquet $H/eval-own.parquet $H4/eval-novels.parquet"
   # amendment G4-6.4: the long validation rows only in rows of 4,096 (MaxText would cut them at 2,048)
   [ "$seq" = 4096 ] && sft="$sft $H3/eval-btlong.parquet"
@@ -530,7 +541,7 @@ g46_train() {  # the runs of G4-6, G4-6b and G4-6c (amendments G4-6, G4-6b, G4-6
   printf '%q ' env SFT_ARGS="$ARGS${evals:+ $evals}" MULTIHOST=1 NAME="$RUN" MODEL=gemma4-31b \
     DATA="$D/train-chosen.parquet" TEMPLATE="$D/template.jinja" ROOT="$G" STEPS="$steps" bash "$CODE/run_sft.sh" \
     per_device_batch_size=1 max_target_length="$seq" lora.lora_rank=32 lora.lora_alpha=16.0 \
-    learning_rate="$(g4a_const LR6)" lr_schedule_type=wsd warmup_steps_fraction=0.03 wsd_decay_steps_fraction=0.1 \
+    learning_rate="$lr" lr_schedule_type=wsd warmup_steps_fraction=0.03 wsd_decay_steps_fraction=0.1 \
     wsd_decay_style=linear learning_rate_final_fraction=0.1 > "$D/launch.sh.new"
   mv "$D/launch.sh.new" "$D/launch.sh"
   if [ "${PHASE:-}" = prep ]; then
@@ -753,7 +764,9 @@ adapter)
     # checkpoint's LoRA side by side, as G4-6b.7, to $G/G4-6c-s<step>/ (the checkpoint's alone in delta/)
     gsutil -q cp "$RUN_DIR/summary.json" "$G_SHM/summary-$TAG.json"
     last=$(json_key "$G_SHM/adapter-$TAG.json" steps)
-    for k in $(g4a_const SAVE_ARG6C | tr ',' ' ') "$last"; do
+    # amendment G4-6c.6f: the checkpoints of the run's rows (SEQ6)
+    [ "$last" = "$(g4a_const "STEPS6C[$SEQ6]")" ] || { echo "$RUN_DIR's last step $last is not the epoch at $SEQ6 (SEQ6=2048 for rows of 2,048)"; exit 1; }
+    for k in $(g4a_const "save_arg6c($SEQ6)" | tr ',' ' ') "$last"; do
       # CKPT=<step>: that checkpoint alone (each takes a few minutes: ~1 GB down, 2 GB stacked and up)
       [ -z "${CKPT:-}" ] || [ "$k" = "$CKPT" ] || continue
       m=G4-6c-s$k
@@ -1859,7 +1872,7 @@ TALLY=""
 if gsutil -q stat $REP/tally.json; then gsutil -q cp $REP/tally.json $X/; TALLY="--tally $X/tally.json"; fi
 $FPY -I -u $CODE/g4arm.py report6c --evalsets $X/evalsets.parquet --split $X/split.json --refqe $X/refqe.parquet \
   --base $X/G4-0 --predictions $X/predictions.parquet --train-summary $X/train-summary.json \
-  --beside-summary G4-6b=$X/g4-6b-summary.json $ARGS6C \$TALLY --out $X/report.md
+  --beside-summary G4-6b=$X/g4-6b-summary.json $ARGS6C \$TALLY --seq $SEQ6 --out $X/report.md
 gsutil -m -q cp $X/report.md $X/report.json $REP/
 echo "REPORT6C_DONE $REP/report.md"
 EOF

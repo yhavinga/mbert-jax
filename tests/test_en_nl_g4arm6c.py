@@ -239,10 +239,11 @@ def test_smoke6_of_g4_6c_checks_its_spec_the_end_tokens_the_loss_and_the_kept_ad
 
 # ---------------------------------------------------------------------------------------------------- report6c
 
-def report6c_world(tmp_path, monkeypatch, qe, share):
+def report6c_world(tmp_path, monkeypatch, qe, share, steps=(240, 480, 717), seq=4096):
     """evalsets of the four rules' sets (2 search, 2 decision segments each), G4-6c's checkpoints, G4-0 and G4-4
     scored with a QE per (model, part); share: per (model, part) how many of the part's 4 classifier texts (WMT24++ 2,
-    FLAN 2) are "original"; the split, the references' QE"""
+    FLAN 2) are "original"; the split, the references' QE; steps: the checkpoints, the last the training's end; seq:
+    the training's rows (amendment G4-6c.6f)"""
     import g4mix
 
     monkeypatch.setattr(g4arm, "HUMAN_QE", {"wmt24pp": 2.0, "flores": 2.0, "ntrex": 2.0})
@@ -266,9 +267,10 @@ def report6c_world(tmp_path, monkeypatch, qe, share):
         rows = []
         for r in evalsets:
             part = assign.get(r["id"], "search")
-            hyp = "een twee drie vier vijf zes zeven" if name == "G4-6c-s717" else "een twee drie vier"
+            last = name == f"G4-6c-s{steps[-1]}"
+            hyp = "een twee drie vier vijf zes zeven" if last else "een twee drie vier"
             rows.append({"id": r["id"], "set": r["set"], "source": r["source"], "hypothesis": hyp,
-                         "reference": r["reference"], "ended": not (name == "G4-6c-s717" and r["id"].endswith("0")),
+                         "reference": r["reference"], "ended": not (last and r["id"].endswith("0")),
                          "decode_loop": False, "english_left": False, "empty": False, "qe": qe[name][part]})
         write([{k: v for k, v in x.items() if k != "qe"} for x in rows], d / "pairs" / "pairs-w0.parquet")
         write([{"id": x["id"], "qe_source_hypothesis": x["qe"],
@@ -284,24 +286,25 @@ def report6c_world(tmp_path, monkeypatch, qe, share):
                 seen[part] += 1
     write(preds, tmp_path / "pred.parquet")
     evals = []
-    for step in (0, 240, 480, 717):
+    for step in (0, *steps):
         evals += [{"step": step, "set": n, "loss": 0.5 + step / 1e4} for n in g4arm.SFT_SETS6C]
         evals += [{"step": step, "set": n, "kind": "pref", "pairs": 500, "loss": 0.6, "accuracy": 0.7, "margin": 1.0,
                    "chosen_nll": 0.8, "chosen_nll_all": 0.75, "rejected_nll": 0.3, "rejected_nll_all": 0.28,
                    "ref_chosen_nll": 0.8, "ref_rejected_nll": 0.2} for n in g4arm.PREF_SETS6]
-    summary = {"steps_done": 717, "eval": evals, "dpo": {"spec": OPTS6C}, "base_adapter": {"name": "G4-4"},
-               "saved_adapters": {"240": {"sum_abs": 1.0}, "480": {"sum_abs": 2.0}}}
+    summary = {"steps_done": steps[-1], "eval": evals, "dpo": {"spec": OPTS6C}, "base_adapter": {"name": "G4-4"},
+               "saved_adapters": {str(k): {"sum_abs": 1.0 + i} for i, k in enumerate(steps[:-1])}}
     (tmp_path / "train.json").write_text(json.dumps(summary))
     beside = {"eval": [{"step": 717, "set": "books", "loss": 0.86},
                        {"step": 717, "set": "pref_books", "kind": "pref", "loss": 0.001, "accuracy": 1.0, "margin": 13.6,
                         "chosen_nll": 0.858, "rejected_nll": 0.746}], "dpo": {"spec": g4dpo.spec(**g4arm.DPO6)}}
     (tmp_path / "beside.json").write_text(json.dumps(beside))
-    names = ["G4-6c-s240", "G4-6c-s480", "G4-6c-s717"]
+    names = [f"G4-6c-s{k}" for k in steps]
     return ns(evalsets=str(tmp_path / "evalsets.parquet"), split=str(tmp_path / "split.json"),
               refqe=str(tmp_path / "refqe.parquet"), base=str(tmp_path / "G4-0"),
               predictions=str(tmp_path / "pred.parquet"), train_summary=str(tmp_path / "train.json"),
               candidate=[f"{n}={tmp_path / n}" for n in names], reference=[f"G4-4={tmp_path / 'G4-4'}"],
-              beside_summary=[f"G4-6b={tmp_path / 'beside.json'}"], tally=None, out=str(tmp_path / "report.md"))
+              beside_summary=[f"G4-6b={tmp_path / 'beside.json'}"], tally=None, out=str(tmp_path / "report.md"),
+              seq=seq)
 
 
 def test_report6c_chooses_on_the_search_part_and_decides_on_the_decision_part(tmp_path, monkeypatch):
@@ -611,3 +614,102 @@ def test_g46c_reference_runs_take_ref_only_and_the_runs_read_their_reference(tmp
     # a reference run of a run that is no run of G4-6c
     out, _ = run("train", ARM="G4-6c", RUN="g4arm_G4-6b_ref", PHASE="prep", TAG="t11")
     assert out.returncode != 0 and "no run of G4-6c" in out.stdout
+
+
+# ---------------------------------------------------------------------------------------------------- amendment G4-6c.6f
+
+def test_rows_of_2048_scale_the_lr_by_the_epoch_and_keep_the_checkpoints_at_its_fractions():
+    # build6's packing of G4-6b's pairs: 717 steps at 4,096, 1,689 at 2,048
+    assert g4arm.STEPS6C == {4096: 717, 2048: 1689}
+    # at 4,096 amendment G4-6c.4 unchanged
+    assert (g4arm.lr6c(4096), g4arm.eval_every6c(4096), g4arm.save_steps6c(4096)) == (1e-5, 240, (240, 480))
+    assert g4arm.save_arg6c(4096) == g4arm.SAVE_ARG6C == "240,480"
+    # at 2,048: the LR's sum over the run that of 1e-5 over 717 steps, evals and kept steps at 240 and 480 of 717
+    assert g4arm.lr6c(2048) == pytest.approx(4.2451e-6, rel=1e-4)
+    assert g4arm.lr6c(2048) * 1689 == pytest.approx(1e-5 * 717, rel=1e-12)
+    assert (g4arm.eval_every6c(2048), g4arm.save_steps6c(2048), g4arm.save_arg6c(2048)) == (565, (565, 1130), "565,1130")
+    for k, f in zip(g4arm.save_steps6c(2048), (240 / 717, 480 / 717)):
+        assert abs(k / 1689 - f) < 1 / 1689
+
+
+def test_report6c_at_2048_takes_the_checkpoints_565_1130_and_1689_only(tmp_path, monkeypatch):
+    qe = {n: {"search": 1.0, "decision": 1.0} for n in ("G4-6c-s565", "G4-6c-s1130", "G4-6c-s1689", "G4-0", "G4-4")}
+    share = {n: {"search": 2, "decision": 2} for n in qe}
+    g4arm.report6c(report6c_world(tmp_path, monkeypatch, qe, share, steps=(565, 1130, 1689), seq=2048))
+    r = json.loads((tmp_path / "report.json").read_text())
+    assert r["candidates"] == ["G4-6c-s565", "G4-6c-s1130", "G4-6c-s1689"]
+    assert list(r["training"]) == ["0", "565", "1130", "1689"]
+    # the checkpoints of 2,048 read as rows of 4,096, and those of 4,096 as rows of 2,048
+    args = report6c_world(tmp_path / "b", monkeypatch, qe, share, steps=(565, 1130, 1689), seq=4096)
+    with pytest.raises(SystemExit, match="not the kept steps"):
+        g4arm.report6c(args)
+    qe4 = {n: {"search": 1.0, "decision": 1.0} for n in ("G4-6c-s240", "G4-6c-s480", "G4-6c-s717", "G4-0", "G4-4")}
+    args = report6c_world(tmp_path / "c", monkeypatch, qe4, share={n: {"search": 2, "decision": 2} for n in qe4},
+                          seq=2048)
+    with pytest.raises(SystemExit, match="not the kept steps"):
+        g4arm.report6c(args)
+
+
+def test_smoke6_estimate_of_g4_6c_at_2048_counts_four_eval_rounds():
+    adapter = {"rank": 32, "alpha": 16.0, "scale": 0.5}
+    build = {"packing": {"2048": {"train": {"steps": 1689}}}}
+    args = (adapter, t6.G44_RUN, 2048, t6.LORA, t6.smoke_rows(), t6.smoke_rows(qe=2.25), build)
+    e = g4arm.smoke6_verdict(smoke6c_summary(), *args, start="G4-4", arm="G4-6c", saved=SAVED4)["estimate"]
+    # step 0, 565, 1130 and after the last (1689)
+    assert (e["steps"], e["rounds"]) == (1689, 4)
+
+
+def test_g46c_runs_at_2048_take_the_scaled_lr_the_evals_and_kept_steps_and_check_the_epoch(tmp_path):
+    run, shm, home, g = t6.g46b_world(tmp_path)
+    (g / "data/G4-6b/train-2048.parquet").write_text("x")
+    ref_runs(g, "g4arm_G4-6c_ref", "g4arm_G4-6c_s8_2048_ref")
+    lr = f"learning_rate={g4arm.lr6c(2048)!r}"
+    out, calls = run("train", ARM="G4-6c", RUN="g4arm_G4-6c", SEQ6="2048", PHASE="prep")
+    assert out.returncode == 0, out.stdout + out.stderr
+    d = shm / "translator/g4arm/data-g4arm_G4-6c"
+    launch = (d / "launch.sh").read_text()
+    assert "--save-steps\\ 565\\,1130\\ " in launch and "--eval-every\\ 565" in launch
+    assert lr in launch and "max_target_length=2048" in launch and "learning_rate=1e-05" not in launch
+    assert f"--pref-train\\ {d}/train-2048.parquet" in launch and "eval-pref_books-2048.parquet" in launch
+    assert "btlong" not in launch
+    # the smoke run and its reference run at 2,048 take the same LR; the smoke run keeps step 4
+    for name, extra in (("g4arm_G4-6c_s8_2048", "--save-steps\\ 4"), ("g4arm_G4-6c_s8_2048_ref", "--ref-only")):
+        out, _ = run("train", ARM="G4-6c", RUN=name, STEPS="8", SEQ6="2048", PHASE="prep", TAG=f"t{name}")
+        assert out.returncode == 0, out.stdout + out.stderr
+        launch = (shm / f"translator/g4arm/data-{name}/launch.sh").read_text()
+        assert lr in launch and extra in launch and "smoke-2048.parquet" in launch
+    # at 4,096 the LR of amendment G4-6c.4
+    out, _ = run("train", ARM="G4-6c", RUN="g4arm_G4-6c", PHASE="prep", TAG="t4")
+    assert out.returncode == 0 and "learning_rate=1e-05" in (d / "launch.sh").read_text(), out.stdout + out.stderr
+    # build6's epoch is not the one the LR and the kept steps assume: no run
+    rep = json.loads((g / "data/G4-6b/report.json").read_text())
+    rep["packing"]["2048"]["train"]["steps"] = 1690
+    (g / "data/G4-6b/report.json").write_text(json.dumps(rep))
+    out, _ = run("train", ARM="G4-6c", RUN="g4arm_G4-6c", SEQ6="2048", PHASE="prep", TAG="t5")
+    assert out.returncode != 0 and "build6's epoch at 2048 is 1690 steps" in out.stdout
+
+
+def test_g46c_adapter_at_2048_stacks_the_checkpoints_565_1130_and_1689(tmp_path):
+    run, shm, home, g = t6.g46b_world(tmp_path)
+    r = g / "runs/g4arm_G4-6c"
+    r.mkdir(parents=True)
+    meta = {"rank": 32, "alpha": 16.0, "scale": 0.5}
+    for src, step in (("adapter", 1689), ("adapter-step565", 565), ("adapter-step1130", 1130)):
+        (r / f"{src}.npz").write_text("x")
+        (r / f"{src}.json").write_text(json.dumps({**meta, "steps": step}))
+    (r / "summary.json").write_text("{}")
+    # g4mix.py stack in the fork's venv: a fake that writes the stacked adapter
+    fpy = shm / "translate-generic/venv-fork-f4d8615f4/bin/python"
+    fpy.parent.mkdir(parents=True)
+    fpy.write_text('#!/bin/bash\nwhile [ $# -gt 0 ]; do [ "$1" = --out ] && out=$2; shift; done\n'
+                   'mkdir -p "$out" && echo x > "$out/adapter.npz" && echo "{}" > "$out/adapter.json"\n')
+    fpy.chmod(0o755)
+    out, _ = run("adapter", ARM="G4-6c", SEQ6="2048", TAG="t1")
+    assert out.returncode == 0, out.stdout + out.stderr
+    assert [x.split(":")[0] for x in out.stdout.splitlines() if x.startswith("ADAPTER ")] == \
+        ["ADAPTER G4-6c-s565", "ADAPTER G4-6c-s1130", "ADAPTER G4-6c-s1689"]
+    for k in (565, 1130, 1689):
+        assert json.loads((g / f"G4-6c-s{k}/delta/adapter.json").read_text())["steps"] == k
+    # the same run read as rows of 4,096: its last step is not that epoch
+    out, _ = run("adapter", ARM="G4-6c", TAG="t2")
+    assert out.returncode != 0 and "is not the epoch at 4096" in out.stdout, out.stdout + out.stderr

@@ -4060,7 +4060,29 @@ LOSS_MAX_DIFF6C = 1e-4    # step 1's loss against its DPO term + nll_alpha x the
 # (G4-6c's smoke test with the reference in its own process, chain g4h1120e: 7.5e-5 and 1.5e-4)
 REF_MAX_DIFF6E = 1e-6
 STEP1_MAX_DIFF6E = 1e-3
-LONG6C = 1.5              # reported: the share of outputs longer than this times their reference's words
+# Amendment G4-6c.6f: rows of 2,048 after five memory failures at 4,096. One epoch of G4-6b's pairs (build6's packing)
+# per row length; the LR scaled by the epoch's steps so that its sum over the run stays that of 1e-5 at 4,096 (the WSD
+# fractions scale with the run), and the evals and kept adapters at the same fractions of the epoch as 240 and 480 of 717
+STEPS6C = {SEQ6: 717, SEQ6_FALLBACK: 1689}
+
+
+def lr6c(seq):
+    return LR6 * STEPS6C[SEQ6] / STEPS6C[seq]
+
+
+def eval_every6c(seq):
+    return round(EVAL_EVERY6C * STEPS6C[seq] / STEPS6C[SEQ6])
+
+
+def save_steps6c(seq):
+    return tuple(k // EVAL_EVERY6C * eval_every6c(seq) for k in SAVE_STEPS6C)
+
+
+def save_arg6c(seq):
+    return ",".join(map(str, save_steps6c(seq)))
+
+
+LONG6C = 1.5             # reported: the share of outputs longer than this times their reference's words
 CKPT6C = re.compile(r"^G4-6c-s([1-9][0-9]*)$")
 SPLIT_DIGEST6C = "f953c026597eedcb20ab56dab7d0b4389057697c01550017ba954ba6963440f3"   # G4-5.4's search and decision parts
 SFT_SETS6C = ("books", "btval", "own", "own4", "btlong", "novels")
@@ -4663,7 +4685,7 @@ def smoke6_verdict(summary, adapter, base_summary, seq, lora, arm_rows, base_row
         # addendum G4-6c.6e: the run read the reference of its training batches (--ref-in) and that reference is the
         # policy's at step 1
         checks["ref_in"] = ref_in_check(summary, spec)
-    estimate = smoke6_estimate(summary, build_report, seq, EVAL_EVERY6C if arm == ARM6C else EVAL_EVERY6)
+    estimate = smoke6_estimate(summary, build_report, seq, eval_every6c(seq) if arm == ARM6C else EVAL_EVERY6)
     checks["estimate_hours"] = {"value": estimate["hours"], "holds": estimate["hours"] <= MAX_HOURS6}
     # reported: the rejected side of pref_btval is the start model's own translation of the BT validation, as the eval
     # set own (G4-0) or own4 (G4-4)
@@ -4958,8 +4980,11 @@ def report6c(args):
     d = parts["decision"]["models"][chosen]
     summary = json.loads(Path(args.train_summary).read_text())
     last = summary.get("steps_done")
-    if steps[-1] != last or steps[:-1] != list(SAVE_STEPS6C):
-        raise SystemExit(f"the checkpoints {steps}: not the kept steps {list(SAVE_STEPS6C)} and the last {last}")
+    # amendment G4-6c.6f: the kept steps and the epoch of the run's rows
+    kept = list(save_steps6c(args.seq))
+    if steps[-1] != last or last != STEPS6C[args.seq] or steps[:-1] != kept:
+        raise SystemExit(f"the checkpoints {steps}: not the kept steps {kept} and the last {last} of an epoch of "
+                         f"{STEPS6C[args.seq]} at {args.seq}")
     result = {"arm": ARM6C, "base": BASE, "candidates": names, "steps": dict(zip(names, steps)), "selected": chosen,
               "selection": why, "refqe_check": check,
               "split": {k: split[k] for k in ("seed", "share", "sets", "digest")}, "parts": parts,
@@ -5338,6 +5363,8 @@ def main(argv=None):
     p.add_argument("--reference", action="append", default=[], help="NAME=DIR, reported beside")
     p.add_argument("--beside-summary", action="append", default=[], help="NAME=summary.json of another run, reported")
     p.add_argument("--tally", default=None)
+    p.add_argument("--seq", type=int, default=SEQ6, choices=(SEQ6, SEQ6_FALLBACK),
+                   help="the training's rows (amendment G4-6c.6f: its epoch and kept steps)")
     args = parser.parse_args(argv)
     {"fetch": fetch, "build": build, "check": check, "evaldata": evaldata, "texts": texts, "report": report,
      "tally": tally, "smoke": smoke, "heldout": heldout, "own": own, "replay": replay_candidates, "build2": build2,

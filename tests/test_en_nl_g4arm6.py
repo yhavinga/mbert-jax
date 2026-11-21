@@ -867,7 +867,9 @@ def g46b_world(tmp_path):
     fake = tmp_path / "bin" / "gsutil"
     fake.write_text(t5.FAKE_GSUTIL.replace('  *) echo "fake gsutil', '  cat) cat "$(map "${args[1]}")" ;;\n  *) echo "fake gsutil'))
     g = tmp_path / "gs/t5-dutch-english-usc2/mbert/translator/sft/g4arm"
-    files = {"data/check-G4-6b.txt": "x", "data/G4-6b/report.json": "{}", "data/G4-6b/eval-own4.parquet": "x",
+    # build6's packing of G4-6b's pairs (amendment G4-6c.6f: G4-6c's full run checks its epoch against it)
+    packing = json.dumps({"packing": {"4096": {"train": {"steps": 717}}, "2048": {"train": {"steps": 1689}}}})
+    files = {"data/check-G4-6b.txt": "x", "data/G4-6b/report.json": packing, "data/G4-6b/eval-own4.parquet": "x",
              "G4-4/adapter.npz": "x", "G4-4/adapter.json": json.dumps({"rank": 32, "alpha": 16.0, "scale": 0.5}),
              "data/G4-6/rejected-in/segments-w0.parquet": "x", "data/G4-6/rejected-in/classes-w0.txt": "tiny small\n"}
     files.update({f"data/G4-6b/{n}": "x" for n in ("smoke-4096.parquet", "smoke-2048.parquet", "train-4096.parquet",

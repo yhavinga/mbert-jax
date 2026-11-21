@@ -1410,7 +1410,7 @@ ingelezen referentie, de referentierun, de volle run en het vervolg als G4-6c.11
 `dpo_ref.parquet`). De markers `cpuproof6`, `smoke6` en `train-g4arm_G4-6c_s8` van code `20904d4` hernoemd met
 `-g4h1120e`, de smoke-run van `g4h1120e` naar `g4arm_G4-6c_s8-g4h1120e`; nieuwe TAG.
 
-*G4-6c.6f Amendement 21 nov 2026 ~14:30 (besluit van de hoofdsessie 21 nov 14:10, optie 4 van §0a van de overdracht;
+*G4-6c.6f Amendement 21 nov 2026 14:11 (commit `b12b11d`; besluit van de hoofdsessie 21 nov 14:10, optie 4 van §0a van de overdracht;
 Yeb liet de DPO-armen aan de hoofdsessie; uitgewerkt door een subagent; vóór elke stap op een worker).* **Aanleiding.**
 Bij rijen van 4.096 liep G4-6c vijf keer op dezelfde plek tegen `RESOURCE_EXHAUSTED`: in de eerste voorkeurseval op
 stap 0 (`pref_books`, direct na de SFT-evals, vóór stap 1), elke keer "Attempting to allocate 21.00M" [gemeten: de

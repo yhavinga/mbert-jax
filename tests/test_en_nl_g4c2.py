@@ -74,7 +74,9 @@ def test_doc_key():
         "fineweb:<urn:uuid:0000600d-ca05-4aa2-98ab-ab2727c32d6b>"
     assert g4c2.doc_key("handelingen:h-tk-19941995-100-6089-6103:t11:0") == "handelingen:h-tk-19941995-100-6089-6103"
     assert g4c2.doc_key("raad:0001a1a0-4250-5cf8-adf7-1b07dbd67baf:d:19") == "raad:0001a1a0-4250-5cf8-adf7-1b07dbd67baf"
-    for bad in ("raad:abc", "raad:abc:x:1", "heldout:btlong:3"):
+    # a long passage of G4-3's revisions (paragraphs 4..9 of the document)
+    assert g4c2.doc_key("rechtspraak:ECLI:NL:RBAMS:2019:1234:d:p4-9") == "rechtspraak:ECLI:NL:RBAMS:2019:1234"
+    for bad in ("raad:abc", "raad:abc:x:1", "heldout:btlong:3", "raad:abc:d:p4", "raad:abc:d:p4-"):
         with pytest.raises(SystemExit):
             g4c2.doc_key(bad)
 

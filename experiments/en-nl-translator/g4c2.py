@@ -51,7 +51,8 @@ TEST_PER_SOURCE = 100
 C2_MAX_TOKENS = 1022  # Yeb 21 Nov
 DEFAULT_TOKENIZER = "yhavinga/dutch-llama-tokenizer"  # finetune.load_pretrained_params' default, as naturalness.py
 BT_EXTRA = ("nl_back", "back_ended", "back_decode_loop", "back_english_left")
-DOC_RE = re.compile(r"^(?P<doc>[a-z]+:.+):(?:d|t\d+):\d+$")
+# the last field is the passage: k, or p<a>-<b> for the long passages of G4-3's revisions (paragraphs a..b)
+DOC_RE = re.compile(r"^(?P<doc>[a-z]+:.+):(?:d|t\d+):(?:\d+|p\d+-\d+)$")
 # the bounds of c2cal7 (spec §5.3.3, Yeb 21 Nov: agreed)
 ACCURACY_MIN = 0.75
 EUROPARL_MIN = 0.75
@@ -66,10 +67,10 @@ N_EUROPARL = g4arm.FOUR_SETS["europarl"]
 
 
 def doc_key(pid):
-    """<source>:<document> of a passage id <source>:<document>:<d|t<n>>:<k>"""
+    """<source>:<document> of a passage id <source>:<document>:<d|t<n>>:<k> (a long passage: <k> = p<a>-<b>)"""
     m = DOC_RE.match(pid or "")
     if not m:
-        raise SystemExit(f"{pid!r}: not <source>:<document>:<d|t<n>>:<k>")
+        raise SystemExit(f"{pid!r}: not <source>:<document>:<d|t<n>>:<k or p<a>-<b>>")
     return m.group("doc")
 
 

@@ -21,7 +21,7 @@ NAME=$1; CKPT=$2; shift 2
 COMMIT=${COMMIT:?set COMMIT to the dumb-extra code commit}
 M=${M:-gs://t5-dutch-english-usc2/mbert}
 OUT=${OUT:-$M/v3-ablation}
-SHAPE=${SHAPE:?set SHAPE to the trainer's shape flags}
+SHAPE=${SHAPE:?set SHAPE to the shape flags of the trainer}
 [[ "$SHAPE" =~ ^--hidden-size\ [0-9]+\ --num-layers\ [0-9]+\ --num-heads\ [0-9]+\ --intermediate-size\ [0-9]+\ --global-attn-every-n-layers\ [0-9]+$ ]] || { echo "SHAPE is not the five shape flags in order: $SHAPE"; exit 1; }
 GLOBAL=${SHAPE##* }
 DATA=${DATA:-$M/dumb-extra/data}

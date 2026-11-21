@@ -172,7 +172,7 @@ gsutil -q cp $preds $X/calib/$name-c1.parquet"
   f=$(body c2_texts_$TAG <<EOF
 set -euo pipefail
 mkdir -p $X/sampling $X/g40 $X/calib $X/c2-config
-gsutil -q cp $E/data/evalsets.parquet $X/evalsets.parquet
+gsutil -q cp $G/data/eval/evalsets.parquet $X/evalsets.parquet
 gsutil -m -q cp '$G/eval/G4-0/pairs/pairs-w*.parquet' '$G/eval/G4-0/scores/metricx-w*.parquet' $X/g40/
 mkdir -p $X/sampling/G4-0 && gsutil -m -q rsync -r -x '.*comet.*' $G/sampling/G4-0 $X/sampling/G4-0
 mkdir -p $X/sampling/G4-4 && gsutil -m -q rsync -r -x '.*comet.*' $G/sampling/G4-4 $X/sampling/G4-4

@@ -124,8 +124,8 @@ data)
 set -euo pipefail
 [ -f $C2_W/v2/config.json ] || { echo "no $C2_W/v2: run the stage convert first"; exit 1; }
 mkdir -p $X/in
-gsutil -m -q rsync -r $G/input/bt3 $X/in/bt3
-gsutil -m -q rsync -r $G/input/bt3-val $X/in/bt3-val
+mkdir -p $X/in/bt3 && gsutil -m -q rsync -r $G/input/bt3 $X/in/bt3
+mkdir -p $X/in/bt3-val && gsutil -m -q rsync -r $G/input/bt3-val $X/in/bt3-val
 gsutil -q cp $C1_DATA $E/data/evalsets.parquet $BLIND $FLAN_EVAL $X/in/
 nice -n 19 $DPY -I -u $CODE/g4c2.py data7 --bt $X/in/bt3 --bt-validation $X/in/bt3-val --c1-data $X/in/classifier.parquet --evalsets $X/in/evalsets.parquet --blind $X/in/blind100.jsonl --flan-eval $X/in/eval-rows.parquet --checkpoint $C2_W/v2 --out $X/out
 gsutil -q cp $X/out/classifier.parquet $X/out/docs.txt $X/out/report.json $RL/c2/data/
@@ -174,8 +174,8 @@ set -euo pipefail
 mkdir -p $X/sampling $X/g40 $X/calib $X/c2-config
 gsutil -q cp $E/data/evalsets.parquet $X/evalsets.parquet
 gsutil -m -q cp '$G/eval/G4-0/pairs/pairs-w*.parquet' '$G/eval/G4-0/scores/metricx-w*.parquet' $X/g40/
-gsutil -m -q rsync -r -x '.*comet.*' $G/sampling/G4-0 $X/sampling/G4-0
-gsutil -m -q rsync -r -x '.*comet.*' $G/sampling/G4-4 $X/sampling/G4-4
+mkdir -p $X/sampling/G4-0 && gsutil -m -q rsync -r -x '.*comet.*' $G/sampling/G4-0 $X/sampling/G4-0
+mkdir -p $X/sampling/G4-4 && gsutil -m -q rsync -r -x '.*comet.*' $G/sampling/G4-4 $X/sampling/G4-4
 gsutil -q cp $RL/c2/data/classifier.parquet $X/c2-data.parquet
 gsutil -q cp $RL/c2/model/config.json $X/c2-config/config.json
 $calib_fetch

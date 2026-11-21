@@ -141,7 +141,7 @@ gsutil -m -q cp '$FNL/nl-g4b/w[0-3].parquet' $X/in/flan/nl-g4b/
 gsutil -m -q cp $FNL/nl-g4b/checks/build/build_report.json $R/mainset/flan-eval/eval-rows.parquet $X/in/
 gsutil -m -q cp $S/data/books-b1/b1-selected.parquet $G/data/report-G4-4.json $X/in/novels/
 gsutil -q cp $G/data/heldout4/manifest.json $X/in/novels/heldout4-manifest.json
-gsutil -m -q rsync -r $G/input/bt3 $X/in/bt3
+mkdir -p $X/in/bt3 && gsutil -m -q rsync -r $G/input/bt3 $X/in/bt3
 nice -n 19 ionice -c3 $SFT_PY -I -u $CODE/g4rl.py cands7 --flan-plan $X/in/flan/plan2 --flan-kept $X/in/flan/nl-g4b --flan-build-report $X/in/build_report.json --flan-eval $X/in/eval-rows.parquet --novels $X/in/novels/b1-selected.parquet --novels-report $X/in/novels/report-G4-4.json --novels-eval $X/in/novels/heldout4-manifest.json --bt $X/in/bt3 --tokenizer $TOK_SFT --out $X/out
 gsutil -m -q cp $X/out/cands-flan.parquet $X/out/cands-novels.parquet $X/out/cands-bt.parquet $X/out/cands.json $RL/data/cands/
 # this job's own copies of the inputs (~2.4 GB; the bucket has them)
@@ -273,8 +273,8 @@ set -euo pipefail
 $CPU
 mkdir -p $X/out
 gsutil -q cp $RL/data/pool/pool.parquet $X/pool.parquet
-gsutil -m -q rsync -r $RL/anchor/samples $X/samples
-gsutil -m -q rsync -r $RL/anchor/scores $X/scores
+mkdir -p $X/samples && gsutil -m -q rsync -r $RL/anchor/samples $X/samples
+mkdir -p $X/scores && gsutil -m -q rsync -r $RL/anchor/scores $X/scores
 mkdir -p $X/pool && mv $X/pool.parquet $X/pool/pool.parquet
 nice -n 19 $SFT_PY -I -u $CODE/g4rl.py plan7 --pool $X/pool --anchor-samples $X/samples --anchor-scores $X/scores --out $X/out
 gsutil -m -q cp $X/out/plan.parquet $X/out/plan.json $RL/data/plan/
@@ -293,8 +293,8 @@ set -euo pipefail
 $CPU
 mkdir -p $X/out
 gsutil -q cp $PLAN $X/plan.parquet
-gsutil -m -q rsync -r $RL/iter/$I/samples $X/samples
-gsutil -m -q rsync -r $RL/iter/$I/scores $X/scores
+mkdir -p $X/samples && gsutil -m -q rsync -r $RL/iter/$I/samples $X/samples
+mkdir -p $X/scores && gsutil -m -q rsync -r $RL/iter/$I/scores $X/scores
 nice -n 19 $SFT_PY -I -u $CODE/g4rl.py iter7 --plan $X/plan.parquet --iteration $I --samples $X/samples --scores $X/scores --tokenizer $TOK_SFT --out $X/out
 gsutil -m -q cp $X/out/train.parquet $X/out/samples.parquet $X/out/report.json $RL/iter/$I/train/
 echo "ITER7_DONE $RL/iter/$I/train/"
@@ -403,8 +403,8 @@ set -euo pipefail
 $CPU
 mkdir -p $X
 gsutil -q cp $PLAN $X/plan.parquet
-gsutil -m -q rsync -r $RL/$VAL/samples $X/val-samples
-gsutil -m -q rsync -r $RL/$VAL/scores $X/val-scores
+mkdir -p $X/val-samples && gsutil -m -q rsync -r $RL/$VAL/samples $X/val-samples
+mkdir -p $X/val-scores && gsutil -m -q rsync -r $RL/$VAL/scores $X/val-scores
 gsutil -q cp $RL/iter/$ITER/train/report.json $X/iter-report.json
 gsutil -q cp $SUMMARY $X/summary.json
 if [ -n "${PREV_STOP:-}" ]; then gsutil -q cp ${PREV_STOP:-} $X/previous.json; fi
@@ -471,7 +471,7 @@ export JAX_COMPILATION_CACHE_DIR=$G_SHM/jax_cache_metricx
 mkdir -p $L/data $L/translations $L/out
 gsutil -q cp $G/data/eval/evalsets.parquet $L/data/
 gsutil -q cp $G/data/eval/segments-smoke.parquet $L/data/segments-w0.parquet
-gsutil -m -q rsync -r $O/translations $L/translations
+mkdir -p $L/translations && gsutil -m -q rsync -r $O/translations $L/translations
 $FPY -I $CODE/evalsets.py collect --data $L/data --worker 0 --shards $L/translations --out $L/out/pairs-w0.parquet
 timeout 600 $FPY -c "import jax; assert (jax.device_count(), jax.process_count()) == (4, 1), (jax.device_count(), jax.process_count())"
 $FPY -I -u $CODE/metricx_qe.py score --pairs $L/out/pairs-w0.parquet --pair source:hypothesis:reference --pair source:hypothesis --model xxl --root $MX_ROOT --empty-candidates --out $L/out/metricx-w0.parquet
@@ -491,7 +491,7 @@ smoke7-loose)
   f=$(body g4a7_smoke7_loose_$TAG <<EOF
 set -euo pipefail
 mkdir -p $X/loose $X/c2model
-gsutil -m -q rsync -r $RL/iter/$I/samples $X/samples
+mkdir -p $X/samples && gsutil -m -q rsync -r $RL/iter/$I/samples $X/samples
 gsutil -m -q cp $RL/c2/model/params.pkl $RL/c2/model/config.json $X/c2model/
 JAX_PLATFORMS=cpu nice -n 19 $SFT_PY -I -u $CODE/g4rl.py smoke7-loose --samples $X/samples --out $X/loose
 # MetricX-24 hybrid XXL in QE mode on the same rows as the judges (no --empty-candidates, as g4judge.py)
@@ -521,7 +521,7 @@ set -euo pipefail
 $CPU
 mkdir -p $X/train
 gsutil -m -q cp $RL/iter/$I/train/train.parquet $RL/iter/$I/train/samples.parquet $X/train/
-gsutil -m -q rsync -r $RL/iter/$I/samples $X/samples
+mkdir -p $X/samples && gsutil -m -q rsync -r $RL/iter/$I/samples $X/samples
 nice -n 19 $SFT_PY -I -u $CODE/g4rl.py check7 --train $X/train/train.parquet --samples $X/samples --tokenizer $TOK_SFT --out $X/check.json
 gsutil -q cp $X/check.json $RL/smoke7/$STAG/check7-$AB.json
 echo "CHECK7_DONE $AB"
@@ -542,9 +542,9 @@ mkdir -p $D/iter-A $D/iter-B $D/train-1 $D/train-2 $D/logs $D/translate $D/val $
 gsutil -q cp $SM/plan.parquet $D/plan.parquet
 for ab in A:$NA B:$NB; do
   d=$D/iter-\${ab%%:*}; i=\${ab#*:}
-  gsutil -m -q rsync -r $RL/iter/\$i/samples \$d/samples
-  gsutil -m -q rsync -r $RL/iter/\$i/scores \$d/scores
-  gsutil -m -q rsync -r $RL/iter/\$i/train \$d/train
+  mkdir -p \$d/samples && gsutil -m -q rsync -r $RL/iter/\$i/samples \$d/samples
+  mkdir -p \$d/scores && gsutil -m -q rsync -r $RL/iter/\$i/scores \$d/scores
+  mkdir -p \$d/train && gsutil -m -q rsync -r $RL/iter/\$i/train \$d/train
 done
 gsutil -q cp $SM/check7-A.json $SM/check7-B.json $D/
 gsutil -m -q cp "$SM/loose/*" $D/loose/

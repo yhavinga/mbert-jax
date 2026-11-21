@@ -30,10 +30,11 @@ Pure parts (numpy, no JAX):
 JAX parts (sft_lora.py --grpo): logp_passes (the reference, the model with its LoRA at zero, and the old policy, the model
 as loaded, in one jitted forward per batch), make_grpo_loss (MaxText's SFT loss signature).
 
-The bucket protocol (spec §3.4; RL = gs://.../g4arm/rl/G4-7): iter/<i>/samples/w<k>/shard-<n>.parquet (SAMPLE_COLUMNS,
-written by translate.py --copies) and its DONE ({"rows", "shards", "sha256": {shard: digest}}); iter/<i>/scores/<role>/
-w<m>/shard-<k>-<n>.parquet (SCORE_COLUMNS[role]) and DONE-<k> (the rows scored of generation worker k), role metricx or
-c2. RL-val and the anchor take the same layout under val/<i>/ and data/anchor/.
+The bucket protocol (amendment G4-7.4a; RL = gs://.../g4arm/rl/G4-7), per job (iter/<i>, val/<i>, anchor):
+<job>/samples/w<k>/shard-<n>.parquet (SAMPLE_COLUMNS, written by translate.py --copies) and, last, its DONE ({"rows",
+"shards": {shard: {"rows", "sha256"}}}); <job>/scores/<role>/w<m>/shard-<k>-<n>.parquet (SCORE_COLUMNS[role]; qe null
+for an empty hypothesis, p_c2 and logit_c2 null with c2_overflow) and DONE-<k> ({"rows", "shards": {shard: {"rows",
+"samples_sha256"}}}), role metricx (w0, w2: the halves of the uids) or c2 (w1). The readers here check all of it.
 """
 
 import argparse
@@ -89,7 +90,7 @@ S3_MAX = 0.30
 S4_BAND = (0.85, 1.15)
 S6_MAX = 0.10
 # the bucket protocol (spec §3.4)
-SAMPLE_COLUMNS = ("uid", "source_id", "j", "source", "hypothesis", "token_ids", "sampler_logp", "ended", "decode_loop",
+SAMPLE_COLUMNS = ("uid", "id", "j", "source", "hypothesis", "token_ids", "sampler_logp", "ended", "decode_loop",
                   "english_left", "empty", "tokens_out")
 SCORE_COLUMNS = {"metricx": ("uid", "qe"), "c2": ("uid", "p_c2", "logit_c2", "c2_tokens", "c2_overflow")}
 DONE = "DONE"
@@ -238,23 +239,37 @@ def schema(fields):
     return pa.schema([(name, getattr(pa, kind)()) for name, kind in fields])
 
 
-def pool7(args, counter=None):
-    import g4arm
+def read_docs(path):
+    return {line.strip() for line in Path(path).read_text().splitlines() if line.strip()}
 
+
+def pool7(args, counter=None):
+    """The pool (G4-7.2): C2's documents ($RL/c2/data/docs.txt, <source>:<document> as g4c2.doc_key makes them) out of the
+    BT part, which must hold some of them (else its doc keys are not C2's); 13-grams of the evaluation sets, the FLAN
+    evaluation rows and the blind passages out"""
+    import g4arm
+    import sft_build
+
+    if not Path(args.c2_docs).is_file():
+        raise SystemExit(f"pool7: no {args.c2_docs} (g4c2.py data7 runs before pool7, G4-7.2)")
     counter = counter or g4arm.TokenCounter(args.tokenizer)
-    blocked = g4arm.blocked_grams(read_rows(args.evalsets), g4arm.read_jsonl(args.blind))
-    excluded = set()
+    blocked = g4arm.checked_blocked(args.evalsets, args.blind)
+    blocked |= sft_build.flan_eval_ngrams(read_rows(args.flan_eval, columns=["inputs", "targets"]))
+    c2_docs = read_docs(args.c2_docs)
+    excluded = set(c2_docs)
     for path in args.exclude_docs or []:
-        excluded |= {line.strip() for line in Path(path).read_text().splitlines() if line.strip()}
-    cands, report = {}, {"arm": ARM7, "seed": SEED7, "parts": {}, "excluded_docs": len(excluded)}
+        excluded |= read_docs(path)
+    cands, report = {}, {"arm": ARM7, "seed": SEED7, "parts": {}, "c2_docs": len(c2_docs), "excluded_docs": len(excluded)}
     for part in PARTS7:
         rows = read_rows(Path(args.cands) / f"cands-{part}.parquet")
         missing = sorted({"id", "en", "doc"} - set(rows[0] if rows else {}))
         if missing or len({r["id"] for r in rows}) != len(rows):
             raise SystemExit(f"pool7: cands-{part}.parquet needs unique ids and the columns id, en, doc (missing {missing})")
+        if part == "bt" and not {r["doc"] for r in rows} & c2_docs:
+            raise SystemExit("pool7: no BT candidate is of a document of C2: the doc keys are not <source>:<document>")
         cands[part], drops = candidate_filter(rows, counter, blocked, excluded)
         report["parts"][part] = {"candidates": len(rows), "kept": len(cands[part]), "drops": drops}
-    rows = draw_pool(cands, args.iterations, args.per_iter)
+    rows = draw_pool(cands, args.iterations, args.per_iter, args.rlval)
     out = Path(args.out)
     write_parquet([{k: (r.get(k) or "") if k == "stratum" else r[k] for k, _ in POOL_SCHEMA} for r in rows],
                   out / "pool.parquet", schema(POOL_SCHEMA))
@@ -268,8 +283,8 @@ def pool7(args, counter=None):
 
 
 def anchor_rows(samples, scores):
-    """{source id: anchor} from the anchor's translations (the bucket protocol, one sample #0 per source, greedy) and
-    their scores: the flags, l0 (tokens_out), qe0, C2's logit"""
+    """{source id: anchor} from the anchor's translations (the job anchor, one sample #0 per source, greedy) and their
+    scores: the flags, l0 (tokens_out), qe0 (null for an empty one), C2's logit (null with c2_overflow)"""
     by_uid = {r["uid"]: r for r in samples}
     out = {}
     for u, r in by_uid.items():
@@ -278,7 +293,7 @@ def anchor_rows(samples, scores):
             raise SystemExit(f"anchor: {u} is not one greedy translation #0 per source")
         out[source_id] = {"ended": bool(r["ended"]), "decode_loop": bool(r["decode_loop"]), "empty": bool(r["empty"]),
                           "english_left": bool(r["english_left"]), "l0": int(r["tokens_out"]),
-                          "qe0": float(scores["metricx"][u]["qe"]), "logit_c2_0": float(scores["c2"][u]["logit_c2"]),
+                          "qe0": scores["metricx"][u]["qe"], "logit_c2_0": scores["c2"][u]["logit_c2"],
                           "hypothesis0": r["hypothesis"]}
     return out
 
@@ -333,9 +348,9 @@ PLAN_SCHEMA = (("id", "string"), ("part", "string"), ("stratum", "string"), ("do
 def plan7(args):
     pool = read_rows(Path(args.pool) / "pool.parquet")
     samples = read_samples(args.anchor_samples)
-    scores = read_scores(args.anchor_scores, {r["uid"] for r in samples})
+    scores = read_scores(args.anchor_scores, {r["uid"] for r in samples}, sample_dones(args.anchor_samples))
     anchors = anchor_rows(samples, scores)
-    plan, report = plan_sources(pool, anchors, args.iterations, args.per_iter)
+    plan, report = plan_sources(pool, anchors, args.iterations, args.per_iter, args.rlval)
     write_parquet(plan, Path(args.out) / "plan.parquet", schema(PLAN_SCHEMA))
     report["sources"] = {"rlval": sum(r["iteration"] < 0 for r in plan), "pool": sum(r["iteration"] >= 0 for r in plan)}
     (Path(args.out) / "plan.json").write_text(json.dumps(report, indent=1) + "\n")
@@ -369,63 +384,71 @@ def segments7(args):
 # ---------------------------------------------------------------------------------------------------- the bucket protocol
 
 def samples_done(shards):
-    """A samples DONE marker: {"rows", "shards", "sha256": {name: digest}} of {name: (rows, digest)}"""
-    return {"rows": int(sum(n for n, _ in shards.values())), "shards": len(shards),
-            "sha256": {name: digest for name, (_, digest) in sorted(shards.items())}}
+    """A samples DONE marker (G4-7.4a): {"rows", "shards": {name: {"rows", "sha256"}}} of {name: (rows, digest)}"""
+    return {"rows": int(sum(n for n, _ in shards.values())),
+            "shards": {name: {"rows": int(n), "sha256": digest} for name, (n, digest) in sorted(shards.items())}}
+
+
+def sample_dones(root):
+    """{k: the DONE of samples/w<k>} under root (the job's samples directory)"""
+    out = {}
+    for d in sorted(p for p in Path(root).glob("w*") if p.is_dir()):
+        if not (d / DONE).is_file():
+            raise SystemExit(f"{d}: no {DONE} marker (the generation is not done)")
+        out[d.name[1:]] = json.loads((d / DONE).read_text())
+    return out
 
 
 def read_samples(root):
-    """Every sample of the w<k> directories under root (bucket protocol): each directory's DONE names its shards with
-    their sha256 and the rows; exactly those shards, unchanged; the columns SAMPLE_COLUMNS; uids unique and of the form
-    <source id>#<j>, each row's source_id and j its uid's. Each row gets "worker"."""
+    """Every sample of the w<k> directories under root (a job's samples): each directory's DONE names its shards with
+    their rows and sha256; exactly those shards, unchanged; the columns SAMPLE_COLUMNS; uids unique and <id>#<j> of each
+    row's id and j. Each row gets "source_id" (its id as a string) and "worker"."""
     import pyarrow.parquet as pq
 
     root = Path(root)
     dirs = sorted(p for p in root.glob("w*") if p.is_dir())
     if not dirs:
         raise SystemExit(f"{root}: no w<k> directory of samples")
+    dones = sample_dones(root)
     rows, seen = [], set()
     for d in dirs:
-        if not (d / DONE).is_file():
-            raise SystemExit(f"{d}: no {DONE} marker (the generation is not done)")
-        done = json.loads((d / DONE).read_text())
+        done = dones[d.name[1:]]
         names = sorted(p.name for p in d.glob("*.parquet"))
-        if names != sorted(done["sha256"]) or len(names) != done["shards"]:
-            raise SystemExit(f"{d}: shards {names[:3]}... ({len(names)}) are not the {done['shards']} of {DONE}")
+        if names != sorted(done["shards"]):
+            raise SystemExit(f"{d}: shards {names[:3]}... ({len(names)}) are not the {len(done['shards'])} of {DONE}")
         n = 0
         for name in names:
-            if file_sha256(d / name) != done["sha256"][name]:
+            if file_sha256(d / name) != done["shards"][name]["sha256"]:
                 raise SystemExit(f"{d / name}: its sha256 is not the one {DONE} names")
             table = pq.read_table(d / name)
             lacking = sorted(set(SAMPLE_COLUMNS) - set(table.column_names))
             if lacking:
                 raise SystemExit(f"{d / name}: no columns {lacking}")
-            for r in table.to_pylist():
+            shard_rows = table.to_pylist()
+            if len(shard_rows) != done["shards"][name]["rows"]:
+                raise SystemExit(f"{d / name}: {len(shard_rows)} rows, {DONE} says {done['shards'][name]['rows']}")
+            for r in shard_rows:
                 if r["uid"] in seen:
                     raise SystemExit(f"{d / name}: {r['uid']} twice")
-                if split_uid(r["uid"]) != (str(r["source_id"]), int(r["j"])):
-                    raise SystemExit(f"{d / name}: uid {r['uid']} is not source_id {r['source_id']} # j {r['j']}")
+                if split_uid(r["uid"]) != (str(r["id"]), int(r["j"])):
+                    raise SystemExit(f"{d / name}: uid {r['uid']} is not id {r['id']} # j {r['j']}")
                 if len(r["token_ids"]) != len(r["sampler_logp"]) or len(r["token_ids"]) != r["tokens_out"]:
                     raise SystemExit(f"{d / name}: {r['uid']} has {len(r['token_ids'])} token ids, "
                                      f"{len(r['sampler_logp'])} log-probabilities, tokens_out {r['tokens_out']}")
                 seen.add(r["uid"])
-                rows.append({**r, "source_id": str(r["source_id"]), "worker": d.name})
+                rows.append({**r, "source_id": str(r["id"]), "worker": d.name})
                 n += 1
         if n != done["rows"]:
             raise SystemExit(f"{d}: {n} rows, {DONE} says {done['rows']}")
     return rows
 
 
-def done_rows(path):
-    """The rows a judge's DONE-<k> counts: a json object with "rows", or a bare number"""
-    value = json.loads(Path(path).read_text())
-    return int(value["rows"] if isinstance(value, dict) else value)
-
-
-def read_scores(root, uids):
-    """{role: {uid: row}} of the judges' score shards under root/<role>/w<m>/ (bucket protocol), every role of
-    SCORE_COLUMNS: each judge directory has a DONE-<k> for every generation worker k whose shards it holds, with its row
-    count; no uid twice in a role; each role's uids exactly the samples' (spec §3.4: else FAILED with the missing)"""
+def read_scores(root, uids, dones):
+    """{role: {uid: row}} of the judges' score shards under root/<role>/w<m>/ (G4-7.4a), every role of SCORE_COLUMNS:
+    each judge directory has a DONE-<k> for every generation worker k of `dones` (the samples' DONE per k), naming exactly
+    that DONE's shards with the sha256 the judge read (= the DONE's) and the rows it scored; no uid twice in a role; each
+    role's uids exactly the samples' (else FAILED with the missing). A score is finite or null: qe null only for an
+    empty hypothesis, p_c2 and logit_c2 null only with c2_overflow (checked against the samples by the reward)."""
     import pyarrow.parquet as pq
 
     out = {}
@@ -447,17 +470,28 @@ def read_scores(root, uids):
                         raise SystemExit(f"{role}: {r['uid']} scored twice ({path})")
                     got[r["uid"]] = r
                     per_worker[k] = per_worker.get(k, 0) + 1
-            markers = {p.name[len("DONE-"):]: done_rows(p) for p in d.glob("DONE-*")}
-            if set(per_worker) - set(markers) or any(markers[k] != per_worker.get(k, 0) for k in markers):
-                raise SystemExit(f"{d}: scored rows per generation worker {per_worker}, markers {markers}")
+            for k, done in dones.items():
+                marker = d / f"DONE-{k}"
+                if not marker.is_file():
+                    raise SystemExit(f"{marker}: missing (the judge has not scored every shard of w{k})")
+                m = json.loads(marker.read_text())
+                if set(m["shards"]) != set(done["shards"]) or any(
+                        m["shards"][s]["samples_sha256"] != done["shards"][s]["sha256"] for s in done["shards"]):
+                    raise SystemExit(f"{marker}: its shards or their sha256 are not those of samples/w{k}/{DONE}")
+                if m["rows"] != per_worker.get(k, 0):
+                    raise SystemExit(f"{marker}: {m['rows']} rows, {d} has {per_worker.get(k, 0)} of w{k}")
+            if set(per_worker) - set(dones):
+                raise SystemExit(f"{d}: scores of generation workers {sorted(set(per_worker) - set(dones))} without samples")
         missing, extra = sorted(set(uids) - set(got)), sorted(set(got) - set(uids))
         if missing or extra:
             raise SystemExit(f"{role}: {len(missing)} samples without a score (e.g. {missing[:5]}), {len(extra)} scores "
                              f"of no sample (e.g. {extra[:5]})")
         for u, r in got.items():
-            values = [v for k, v in r.items() if k not in ("uid", "c2_overflow")]
-            if any(v is None or not math.isfinite(float(v)) for v in values):
+            values = [v for k, v in r.items() if k not in ("uid", "c2_overflow") and v is not None]
+            if any(not math.isfinite(float(v)) for v in values):
                 raise SystemExit(f"{role}: {u} has a score that is not finite: {r}")
+            if role == "c2" and (r["c2_tokens"] is None or r["c2_overflow"] is None):
+                raise SystemExit(f"c2: {u} has no c2_tokens or c2_overflow: {r}")
         out[role] = got
     return out
 
@@ -469,13 +503,17 @@ def reward7(sample, qe, c2, anchor):
     2 max(0, QE - QE0) - 2 max(0, |ln(l / l0)| - ln 1.15), with l and l0 the tokens_out of the sample and of the anchor
     (G4-0's greedy translation of the source). Returns {"reward", "fail": [reasons], "logit", "qe_pen", "len_pen",
     "ratio"}"""
+    if qe is None and not sample["empty"]:
+        raise SystemExit(f"{sample.get('uid')}: no QE, and its hypothesis is not empty")
+    if c2["logit_c2"] is None and not c2["c2_overflow"]:
+        raise SystemExit(f"{sample.get('uid')}: no logit of C2, and no c2_overflow")
     ratio = sample["tokens_out"] / anchor["l0"]
     checks = {"not_ended": not sample["ended"], "decode_loop": bool(sample["decode_loop"]), "empty": bool(sample["empty"]),
               "english_left": bool(sample["english_left"]), "length": not LEN_BAND[0] <= ratio <= LEN_BAND[1],
-              "qe": qe > QE_FAIL, "c2_overflow": bool(c2["c2_overflow"])}
+              "qe": qe is not None and qe > QE_FAIL, "c2_overflow": bool(c2["c2_overflow"])}
     fail = [k for k in FAILS if checks[k]]
-    logit = min(max(float(c2["logit_c2"]), -LOGIT_CLIP), LOGIT_CLIP)
-    qe_pen = QE_WEIGHT * max(0.0, qe - anchor["qe0"])
+    logit = None if c2["logit_c2"] is None else min(max(float(c2["logit_c2"]), -LOGIT_CLIP), LOGIT_CLIP)
+    qe_pen = None if qe is None else QE_WEIGHT * max(0.0, qe - anchor["qe0"])
     len_pen = LEN_WEIGHT * max(0.0, abs(math.log(ratio)) - LEN_FREE)
     reward = FAIL_REWARD if fail else logit - qe_pen - len_pen
     return {"reward": reward, "fail": fail, "logit": logit, "qe_pen": qe_pen, "len_pen": len_pen, "ratio": ratio}
@@ -659,16 +697,15 @@ def iteration_samples(samples, scores, plan, iteration, g=G7):
         src = sources[sid]
         if any(s["source"] != src["en"] for s in groups[sid]):
             raise SystemExit(f"{sid}: a sample's source is not the plan's English")
-        terms = [reward7(s, float(scores["metricx"][s["uid"]]["qe"]), scores["c2"][s["uid"]], src) for s in groups[sid]]
+        terms = [reward7(s, scores["metricx"][s["uid"]]["qe"], scores["c2"][s["uid"]], src) for s in groups[sid]]
         adv, signal = advantages7([t["reward"] for t in terms])
         flat += not signal
         for s, t, a in zip(groups[sid], terms, adv):
             out.append({"uid": s["uid"], "source_id": sid, "j": int(s["j"]), "part": src["part"], "worker": s["worker"],
                         "reward": t["reward"], "adv": float(a), "signal": signal, "fail": t["fail"],
                         "logit": t["logit"], "qe_pen": t["qe_pen"], "len_pen": t["len_pen"], "ratio": t["ratio"],
-                        "qe": float(scores["metricx"][s["uid"]]["qe"]),
-                        "logit_c2": float(scores["c2"][s["uid"]]["logit_c2"]),
-                        "p_c2": float(scores["c2"][s["uid"]]["p_c2"]), "c2_tokens": int(scores["c2"][s["uid"]]["c2_tokens"]),
+                        "qe": scores["metricx"][s["uid"]]["qe"], "logit_c2": scores["c2"][s["uid"]]["logit_c2"],
+                        "p_c2": scores["c2"][s["uid"]]["p_c2"], "c2_tokens": int(scores["c2"][s["uid"]]["c2_tokens"]),
                         "tokens_out": int(s["tokens_out"]), "ended": bool(s["ended"])})
     return out, {"sources": len(groups), "samples": len(out), "groups_without_signal": flat}
 
@@ -682,8 +719,9 @@ def iteration_report(rows):
             "fails": {k: sum(k in r["fail"] for r in rows) for k in FAILS},
             "reward_mean": mean(r["reward"] for r in rows), "reward_mean_ok": mean(r["reward"] for r in ok),
             "logit_mean_ok": mean(r["logit"] for r in ok), "qe_pen_mean_ok": mean(r["qe_pen"] for r in ok),
-            "len_pen_mean_ok": mean(r["len_pen"] for r in ok), "qe_mean": mean(r["qe"] for r in rows),
-            "p_c2_mean": mean(r["p_c2"] for r in rows), "origineel_share": sum(r["p_c2"] >= 0.5 for r in rows) / n,
+            "len_pen_mean_ok": mean(r["len_pen"] for r in ok), "qe_mean": mean(r["qe"] for r in rows if r["qe"] is not None),
+            "p_c2_mean": mean(r["p_c2"] for r in rows if r["p_c2"] is not None),
+            "origineel_share": sum(r["p_c2"] is not None and r["p_c2"] >= 0.5 for r in rows) / n,
             "ratio_median": median(r["ratio"] for r in rows), "adv_abs_mean": mean(abs(r["adv"]) for r in rows),
             "c2_tokens_max": max(r["c2_tokens"] for r in rows)}
 
@@ -701,7 +739,7 @@ def iter7(args, counter=None):
     counter = counter or g4arm.TokenCounter(args.tokenizer)
     plan = read_rows(args.plan)
     samples = read_samples(args.samples)
-    scores = read_scores(args.scores, {s["uid"] for s in samples})
+    scores = read_scores(args.scores, {s["uid"] for s in samples}, sample_dones(args.samples))
     rows, report = iteration_samples(samples, scores, plan, args.iteration)
     report.update({"iteration": args.iteration, **iteration_report(rows)})
     bad = [s["uid"] for s in samples if not decoded_ok(counter, s)]
@@ -829,13 +867,17 @@ def validation_measures(samples, scores, plan):
         raise SystemExit(f"RL-val: translations of {len(groups)} sources, the plan has {len(sources)}")
     rows = [(groups[k][0], sources[k]) for k in sorted(groups)]
     failed = [s for s, _ in rows if not s["ended"] or s["decode_loop"] or s["empty"] or s["english_left"]]
-    qe = [float(scores["metricx"][s["uid"]]["qe"]) for s, _ in rows]
-    return {"sources": len(rows), "failed": len(failed), "fail_share": len(failed) / len(rows),
-            "qe_mean": mean(qe), "qe0_mean": mean(a["qe0"] for _, a in rows),
-            "qe_delta": mean(qe) - mean(a["qe0"] for _, a in rows),
+    # S2 over the sources whose translation has a QE (an empty one has none, and counts in S1)
+    scored = [(float(scores["metricx"][s["uid"]]["qe"]), a["qe0"]) for s, a in rows
+              if scores["metricx"][s["uid"]]["qe"] is not None]
+    p = [scores["c2"][s["uid"]]["p_c2"] for s, _ in rows]
+    return {"sources": len(rows), "failed": len(failed), "fail_share": len(failed) / len(rows), "qe_sources": len(scored),
+            "qe_mean": mean(q for q, _ in scored), "qe0_mean": mean(q0 for _, q0 in scored),
+            "qe_delta": mean(q - q0 for q, q0 in scored),
             "ratio_median": median(s["tokens_out"] / a["l0"] for s, a in rows),
-            "p_c2_mean": mean(float(scores["c2"][s["uid"]]["p_c2"]) for s, _ in rows),
-            "c2_origineel_share": mean(float(float(scores["c2"][s["uid"]]["p_c2"]) >= 0.5) for s, _ in rows)}
+            "c2_overflow": sum(bool(scores["c2"][s["uid"]]["c2_overflow"]) for s, _ in rows),
+            "p_c2_mean": mean(x for x in p if x is not None),
+            "c2_origineel_share": mean(float(x >= 0.5) for x in p if x is not None)}
 
 
 def stop_rules7(val, iteration_fail_share, k1_old_ref, previous=None):
@@ -860,7 +902,7 @@ def stop_rules7(val, iteration_fail_share, k1_old_ref, previous=None):
 def stop7(args):
     plan = read_rows(args.plan)
     samples = read_samples(args.val_samples)
-    scores = read_scores(args.val_scores, {s["uid"] for s in samples})
+    scores = read_scores(args.val_scores, {s["uid"] for s in samples}, sample_dones(args.val_samples))
     val = validation_measures(samples, scores, plan)
     report = json.loads(Path(args.iter_report).read_text())
     summary = json.loads(Path(args.train_summary).read_text())
@@ -1004,17 +1046,22 @@ def main(argv=None):
                                                    "doc, optionally stratum)")
     p.add_argument("--evalsets", required=True, help="$E/data/evalsets.parquet (13-grams)")
     p.add_argument("--blind", required=True, help="blind100.jsonl (13-grams)")
-    p.add_argument("--exclude-docs", action="append", default=[], help="a text file of documents to leave out")
+    p.add_argument("--c2-docs", required=True, help="$RL/c2/data/docs.txt (g4c2.py data7): C2's documents, out of the pool")
+    p.add_argument("--flan-eval", required=True, help="FLAN's evaluation rows (inputs, targets): their 13-grams out")
+    p.add_argument("--exclude-docs", action="append", default=[],
+                   help="a text file of further documents to leave out (one per line)")
     p.add_argument("--tokenizer", required=True)
     p.add_argument("--iterations", type=int, default=ITERATIONS7)
     p.add_argument("--per-iter", type=int, default=SOURCES7)
+    p.add_argument("--rlval", type=int, default=RLVAL_PER_PART7, help="RL-val's sources per part")
     p.add_argument("--out", required=True)
     p = sub.add_parser("plan7")
     p.add_argument("--pool", required=True, help="pool7's directory")
-    p.add_argument("--anchor-samples", required=True, help="the anchor's translations (w<k>/ shards and DONE)")
-    p.add_argument("--anchor-scores", required=True, help="the anchor's scores (<role>/w<m>/ shards and DONE-<k>)")
+    p.add_argument("--anchor-samples", required=True, help="the job anchor's samples/ (w<k>/ shards and DONE)")
+    p.add_argument("--anchor-scores", required=True, help="the job anchor's scores/ (<role>/w<m>/ shards and DONE-<k>)")
     p.add_argument("--iterations", type=int, default=ITERATIONS7)
     p.add_argument("--per-iter", type=int, default=SOURCES7)
+    p.add_argument("--rlval", type=int, default=RLVAL_PER_PART7, help="RL-val's sources per part")
     p.add_argument("--out", required=True)
     p = sub.add_parser("segments7")
     p.add_argument("--plan", required=True, help="plan7's plan.parquet")

@@ -217,22 +217,31 @@ def write_samples(root, rows, shard_size=8):
         (d / "DONE").write_text(json.dumps(tr.done_marker(list(digests), digests)))
 
 
-def write_scores(root, samples, qe, c2, judges=("w0", "w2")):
-    """Score shards of both roles: MetricX split over two judges by uid, C2 on one"""
+def write_scores(root, samples_root, qe, c2, judges=("w0", "w2")):
+    """Score shards of both roles as g4judge.py writes them (G4-7.4a): per sample shard a score shard, MetricX split over
+    two judges on the parity of sha256(uid), C2 on one; DONE-<k> with the samples' sha256 as the judge read it"""
     for role, names in (("metricx", judges), ("c2", ("w1",))):
         for m, judge in enumerate(names):
             d = Path(root) / role / judge
             d.mkdir(parents=True)
-            per = {}
-            for s in samples:
-                if role == "metricx" and int(hashlib.md5(s["uid"].encode()).hexdigest(), 16) % len(names) != m:
-                    continue
-                k = s["worker"][1:]
-                row = {"uid": s["uid"], "qe": qe[s["uid"]]} if role == "metricx" else {"uid": s["uid"], **c2[s["uid"]]}
-                per.setdefault(k, []).append(row)
-            for k, rows in per.items():
-                pq.write_table(pa.Table.from_pylist(rows), d / f"shard-{k}-0.parquet")
-                (d / f"DONE-{k}").write_text(json.dumps({"rows": len(rows)}))
+            for wdir in sorted(Path(samples_root).glob("w*")):
+                k = wdir.name[1:]
+                marker = {"rows": 0, "shards": {}}
+                for shard in sorted(wdir.glob("shard-*.parquet")):
+                    n = int(shard.name[len("shard-"):-len(".parquet")])
+                    rows = []
+                    for s in pq.read_table(shard).to_pylist():
+                        if role == "metricx" and int(hashlib.sha256(s["uid"].encode()).hexdigest()[:8], 16) % 2 != m:
+                            continue
+                        rows.append({"uid": s["uid"], "qe": qe[s["uid"]]} if role == "metricx"
+                                    else {"uid": s["uid"], **c2[s["uid"]]})
+                    pq.write_table(pa.Table.from_pylist(rows, schema=pa.schema(
+                        [(c, {"uid": pa.string(), "c2_tokens": pa.int64(), "c2_overflow": pa.bool_()}.get(c, pa.float64()))
+                         for c in g4rl.SCORE_COLUMNS[role]])), d / f"shard-{k}-{n}.parquet")
+                    marker["shards"][shard.name] = {"rows": len(rows), "samples_sha256":
+                                                    hashlib.sha256(shard.read_bytes()).hexdigest()}
+                    marker["rows"] += len(rows)
+                (d / f"DONE-{k}").write_text(json.dumps(marker))
 
 
 def make_iteration(tmp_path, counter, plan, iteration, g=4, seed=0):
@@ -245,7 +254,7 @@ def make_iteration(tmp_path, counter, plan, iteration, g=4, seed=0):
             hyp = sentence(rng, NL, rng.randint(15, 25))
             ids = counter.ids([hyp])[0] + [1]                   # the stop token (id 1 < 10: a special token)
             u = g4rl.uid(src["id"], j)
-            samples.append({"uid": u, "source_id": src["id"], "j": j, "source": src["en"], "hypothesis": hyp,
+            samples.append({"uid": u, "id": src["id"], "j": j, "source": src["en"], "hypothesis": hyp,
                             "token_ids": ids, "sampler_logp": [-rng.uniform(0.01, 3.0) for _ in ids], "ended": True,
                             "decode_loop": False, "english_left": False, "empty": False, "tokens_out": len(ids),
                             "tokens_in": len(counter.ids([g4rl_prompt(src["en"])])[0]), "worker": f"w{n % 2}"})
@@ -254,7 +263,7 @@ def make_iteration(tmp_path, counter, plan, iteration, g=4, seed=0):
             c2[u] = {"p_c2": 1 / (1 + math.exp(-logit)), "logit_c2": logit, "c2_tokens": len(ids), "c2_overflow": False}
     root = tmp_path / f"iter{iteration}"
     write_samples(root / "samples", samples)
-    write_scores(root / "scores", samples, qe, c2)
+    write_scores(root / "scores", root / "samples", qe, c2)
     return samples, qe, c2
 
 
@@ -292,19 +301,25 @@ def test_read_scores_needs_every_samples_score_once_and_the_markers(tmp_path):
     counter = FakeCounter7()
     samples, _, _ = make_iteration(tmp_path, counter, small_plan(), 0)
     uids = {s["uid"] for s in samples}
-    scores = g4rl.read_scores(tmp_path / "iter0" / "scores", uids)
+    dones = g4rl.sample_dones(tmp_path / "iter0" / "samples")
+    scores = g4rl.read_scores(tmp_path / "iter0" / "scores", uids, dones)
     assert set(scores["metricx"]) == uids and set(scores["c2"]) == uids
     with pytest.raises(SystemExit, match="1 scores of no sample"):
-        g4rl.read_scores(tmp_path / "iter0" / "scores", uids - {sorted(uids)[0]})
+        g4rl.read_scores(tmp_path / "iter0" / "scores", uids - {sorted(uids)[0]}, dones)
     with pytest.raises(SystemExit, match="1 samples without a score"):
-        g4rl.read_scores(tmp_path / "iter0" / "scores", uids | {"s9#0"})
+        g4rl.read_scores(tmp_path / "iter0" / "scores", uids | {"s9#0"}, dones)
     marker = next((tmp_path / "iter0" / "scores" / "c2" / "w1").glob("DONE-*"))
-    marker.write_text("1")
-    with pytest.raises(SystemExit, match="markers"):
-        g4rl.read_scores(tmp_path / "iter0" / "scores", uids)
+    good = json.loads(marker.read_text())
+    bad = {**good, "shards": {k: {**v, "samples_sha256": "0" * 64} for k, v in good["shards"].items()}}
+    marker.write_text(json.dumps(bad))
+    with pytest.raises(SystemExit, match="sha256 are not those"):
+        g4rl.read_scores(tmp_path / "iter0" / "scores", uids, dones)
+    marker.write_text(json.dumps({**good, "rows": good["rows"] + 1}))
+    with pytest.raises(SystemExit, match="rows"):
+        g4rl.read_scores(tmp_path / "iter0" / "scores", uids, dones)
     marker.unlink()
-    with pytest.raises(SystemExit, match="markers"):
-        g4rl.read_scores(tmp_path / "iter0" / "scores", uids)
+    with pytest.raises(SystemExit, match="missing"):
+        g4rl.read_scores(tmp_path / "iter0" / "scores", uids, dones)
 
 
 # ---------------------------------------------------------------------------------------------------- packing
@@ -425,7 +440,7 @@ def test_iter7_turns_samples_and_scores_into_rewards_advantages_and_a_packed_fil
     pq.write_table(pa.Table.from_pylist(plan), tmp_path / "plan.parquet")
     samples, qe, c2 = make_iteration(tmp_path, counter, plan, 0, g=8)
     # one group without signal: all eight fail
-    flat = [s for s in samples if s["source_id"] == "s1"]
+    flat = [s for s in samples if s["id"] == "s1"]
     monkeypatch.setattr(g4arm, "TokenCounter", lambda path: counter)
     args = ns(plan=str(tmp_path / "plan.parquet"), iteration=0, samples=str(tmp_path / "iter0" / "samples"),
               scores=str(tmp_path / "iter0" / "scores"), tokenizer="x", seq=256, rows=4, out=str(tmp_path / "out"))
@@ -434,7 +449,7 @@ def test_iter7_turns_samples_and_scores_into_rewards_advantages_and_a_packed_fil
     import shutil
 
     shutil.rmtree(tmp_path / "iter0" / "scores")
-    write_scores(tmp_path / "iter0" / "scores", samples, qe, c2)
+    write_scores(tmp_path / "iter0" / "scores", tmp_path / "iter0" / "samples", qe, c2)
     report = g4rl.iter7(args, counter)
     assert report["sources"] == 6 and report["samples"] == 48 and report["groups_without_signal"] == 1
     assert report["fails"]["qe"] == 8 and report["fail_share"] == pytest.approx(8 / 48)
@@ -470,10 +485,13 @@ def test_iter7_turns_samples_and_scores_into_rewards_advantages_and_a_packed_fil
     rows0[0]["hypothesis"] = "iets anders"
     pq.write_table(pa.Table.from_pylist(rows0), shard)
     done = json.loads((bad_root / "samples" / "w0" / "DONE").read_text())
-    done["sha256"][shard.name] = hashlib.sha256(shard.read_bytes()).hexdigest()
+    done["shards"][shard.name]["sha256"] = hashlib.sha256(shard.read_bytes()).hexdigest()
     (bad_root / "samples" / "w0" / "DONE").write_text(json.dumps(done))
+    shutil.rmtree(bad_root / "scores")
+    write_scores(bad_root / "scores", bad_root / "samples", qe, c2)
     with pytest.raises(SystemExit, match="do not decode"):
-        g4rl.iter7(ns(**{**vars(args), "samples": str(bad_root / "samples"), "out": str(tmp_path / "o2")}), counter)
+        g4rl.iter7(ns(**{**vars(args), "samples": str(bad_root / "samples"), "scores": str(bad_root / "scores"),
+                         "out": str(tmp_path / "o2")}), counter)
     # samples of another iteration's sources are refused
     with pytest.raises(SystemExit, match="the plan has 3"):
         g4rl.iter7(ns(**{**vars(args), "iteration": 1, "out": str(tmp_path / "o3")}), counter)
@@ -505,7 +523,8 @@ def test_validation_measures_against_the_anchor(tmp_path):
     plan = small_plan(n=4, iteration=-1, l0=10)
     samples, qe, c2 = make_iteration(tmp_path, counter, plan, -1, g=1)
     got = g4rl.read_samples(tmp_path / "iter-1" / "samples")
-    scores = g4rl.read_scores(tmp_path / "iter-1" / "scores", {s["uid"] for s in got})
+    scores = g4rl.read_scores(tmp_path / "iter-1" / "scores", {s["uid"] for s in got},
+                              g4rl.sample_dones(tmp_path / "iter-1" / "samples"))
     v = g4rl.validation_measures(got, scores, plan)
     assert v["sources"] == 4 and v["fail_share"] == 0.0
     assert v["qe_delta"] == pytest.approx(np.mean(list(qe.values())) - 2.5)
@@ -655,11 +674,12 @@ def test_copies_and_protocol_rows_make_the_bucket_protocols_sample_shard():
             "tokens_out": [3, 2], "token_ids": [[11, 12, 106], [5, 5]], "sampler_logp": [[-0.1, -0.2, -0.3], [-1, -2]]}
     out = tr.protocol_rows(rows, dict(zip(uids, texts)))
     assert tuple(out) == tr.PROTOCOL_COLUMNS and set(g4rl.SAMPLE_COLUMNS) <= set(out)
-    assert out["source_id"] == ["s1", "7"] and out["j"] == [0, 2] and out["source"] == ["the house", "the river"]
+    assert out["id"] == ["s1", "7"] and out["j"] == [0, 2] and out["source"] == ["the house", "the river"]
     assert out["empty"] == [False, True] and out["decode_loop"] == [False, False]
     assert out["english_left"] == [False, False]
     marker = tr.done_marker(["b", "a"], {"a": (3, "x"), "b": (2, "y")})
-    assert marker == {"rows": 5, "shards": 2, "sha256": {"a": "x", "b": "y"}}
+    assert marker == {"rows": 5, "shards": {"a": {"rows": 3, "sha256": "x"}, "b": {"rows": 2, "sha256": "y"}}}
+    assert marker == g4rl.samples_done({"a": (3, "x"), "b": (2, "y")})
     with pytest.raises(RuntimeError, match="no digest"):
         tr.done_marker(["c"], {})
 
@@ -698,3 +718,62 @@ def test_gemma4s_token_ids_decode_to_the_text_in_both_tokenizer_libraries():
             continue
         hf = AutoTokenizer.from_pretrained(str(GEMMA4))
         assert hf.decode(ids[:-1], skip_special_tokens=True).strip() == hyp
+
+
+def test_a_null_score_is_allowed_only_where_the_protocol_has_one():
+    # G4-7.4a: qe null for an empty hypothesis, p_c2 and logit_c2 null with c2_overflow; both are failures anyway
+    t = g4rl.reward7(sample(empty=True), None, C2, ANCHOR)
+    assert t["fail"] == ["empty"] and t["reward"] == -10.0 and t["qe_pen"] is None
+    t = g4rl.reward7(sample(), 2.0, {"logit_c2": None, "c2_overflow": True}, ANCHOR)
+    assert t["fail"] == ["c2_overflow"] and t["logit"] is None
+    with pytest.raises(SystemExit, match="no QE"):
+        g4rl.reward7(sample(), None, C2, ANCHOR)
+    with pytest.raises(SystemExit, match="no logit"):
+        g4rl.reward7(sample(), 2.0, {"logit_c2": None, "c2_overflow": False}, ANCHOR)
+
+
+def test_the_judges_read_what_translate_writes(tmp_path):
+    """The boundary of G4-7.4a: g4judge.py reads translate.py --copies's sample shard and DONE"""
+    import g4judge
+
+    uids, texts = tr.copies_of(["s1"], ["the house"], 2)
+    rows = {"id": uids, "text_nl": ["het huis", ""], "ended": [True, True], "tokens_in": [9, 9], "tokens_out": [3, 1],
+            "token_ids": [[11, 12, 106], [106]], "sampler_logp": [[-0.1, -0.2, -0.3], [-1.0]]}
+    d = tmp_path / "iter" / "0" / "samples" / "w2"
+    d.mkdir(parents=True)
+    pq.write_table(pa.table(tr.protocol_rows(rows, dict(zip(uids, texts)))), d / "shard-00003.parquet")
+    got = g4judge.read_samples((d / "shard-00003.parquet").read_bytes(), "shard-00003.parquet")
+    assert [r["uid"] for r in got] == ["s1#0", "s1#1"] and got[1]["hypothesis"] == ""
+    digests = {"shard-00003.parquet": (2, tr.file_digest(d / "shard-00003.parquet"))}
+    (d / "DONE").write_text(json.dumps(tr.done_marker(list(digests), digests)))
+    store = g4judge.LocalStore(tmp_path)
+    assert g4judge.job_samples(store, "iter/0")[2]["done"] == "iter/0/samples/w2/DONE"
+    assert g4judge.read_done(store, "iter/0/samples/w2/DONE")["rows"] == 2
+    assert [r["uid"] for r in g4rl.read_samples(tmp_path / "iter" / "0" / "samples")] == ["s1#0", "s1#1"]
+
+
+def test_pool7_needs_c2s_documents_and_keeps_them_out(tmp_path, monkeypatch):
+    import g4arm
+
+    counter = FakeCounter7()
+    monkeypatch.setattr(g4arm, "checked_blocked", lambda evalsets, blind: set())
+    rng = random.Random(4)
+    for part in g4rl.PARTS7:
+        rows = [{"id": f"{part}:{k}", "en": f"{sentence(rng, EN, 6)} {part} {k}",
+                 "doc": f"bt:{k // 2}" if part == "bt" else f"{part}:{k}"} for k in range(160)]
+        pq.write_table(pa.Table.from_pylist(rows), tmp_path / f"cands-{part}.parquet")
+    pq.write_table(pa.Table.from_pylist([{"inputs": "x", "targets": "y"}]), tmp_path / "flan_eval.parquet")
+    args = ns(cands=str(tmp_path), evalsets="e", blind="b", flan_eval=str(tmp_path / "flan_eval.parquet"),
+              c2_docs=str(tmp_path / "docs.txt"), exclude_docs=[], tokenizer="t", iterations=2, per_iter=40, rlval=5,
+              out=str(tmp_path / "out"))
+    with pytest.raises(SystemExit, match="data7 runs before pool7"):
+        g4rl.pool7(args, counter)
+    (tmp_path / "docs.txt").write_text("other:1\n")
+    with pytest.raises(SystemExit, match="doc keys"):
+        g4rl.pool7(args, counter)
+    (tmp_path / "docs.txt").write_text("".join(f"bt:{k}\n" for k in range(0, 80, 4)))
+    report = g4rl.pool7(ns(**{**vars(args), "per_iter": 20}), counter)
+    pool = pq.read_table(tmp_path / "out" / "pool.parquet").to_pylist()
+    assert report["parts"]["bt"]["drops"]["excluded_doc"] == 40
+    assert not {r["doc"] for r in pool} & {f"bt:{k}" for k in range(0, 80, 4)}
+    assert report["pool"] == {p: math.ceil(2 * n * 1.03) for p, n in g4rl.part_counts(20).items()}

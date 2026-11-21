@@ -23,13 +23,14 @@ The prompt is a setting of the model. TranslateGemma's (prompt translategemma) i
 nl, text} (the defaults of --source-lang and --target-lang), which the template turns into "You are a professional
 English (en) to Dutch (nl) translator. ... Please translate the following English text into Dutch:\n\n\n<text>".
 Other models get TranslateGemma's words (prompt chat-v1, user_text) in one user turn of their own chat format.
-Arm G4-7 (experiments/en-nl-translator/g4rl.py, the bucket protocol of its spec §3.4): with --copies G every segment is
-translated G times (uids <id>#<j>, j = 0 .. G-1; with --sample each copy its own sample), the class takes every segment
-up to its max_source (one engine for the iteration's sources), the engine returns the log-probability of every token it
-chose (return_log_prob), and a shard holds per copy uid, source_id, j, source, hypothesis, token_ids (every token
-decoded, the stop token included when it ended), sampler_logp (one per token id), ended, decode_loop, english_left,
-empty (FLAN-nl's detectors, as evalsets.py collect), tokens_in and tokens_out; after the last shard of a setting --out
-gets DONE, {"rows", "shards", "sha256": {shard: digest}} of every shard there.
+Arm G4-7 (experiments/en-nl-translator/g4rl.py; the bucket protocol of protocol-g4.md amendment G4-7.4a): with
+--copies G every segment is translated G times (uids <id>#<j>, j = 0 .. G-1; with --sample each copy its own sample), the
+class takes every segment up to its max_source (one engine for the iteration's sources), the engine returns the
+log-probability of every token it chose (return_log_prob), and a shard holds per copy uid, id (the segment's, a
+string), j, source, hypothesis, token_ids (every token decoded, the stop token included when it ended), sampler_logp
+(one per token id), ended, decode_loop, english_left, empty (FLAN-nl's detectors, as evalsets.py collect), tokens_out,
+and tokens_in (beyond G4-7.4a's columns: g4rl.py iter7 checks the prompt's length with it); after the last shard of a
+setting --out gets DONE, {"rows", "shards": {shard: {"rows", "sha256"}}} of every shard there.
 A segment with context (a column `context` of the segments: a list of {label, source, translation}, the earlier turns
 of its conversation, and optionally a column `label`, the speaker of the segment) gets the model's context_prompt,
 which puts the earlier turns before the current turn; only the current turn is translated.
@@ -658,8 +659,8 @@ def translate_shard(device, codec, tokenizer, ids, texts, shapes, sync_every, co
 
 
 # Arm G4-7: the columns of a sample shard (g4rl.SAMPLE_COLUMNS, and tokens_in)
-PROTOCOL_COLUMNS = ("uid", "source_id", "j", "source", "hypothesis", "token_ids", "sampler_logp", "ended", "decode_loop",
-                    "english_left", "empty", "tokens_in", "tokens_out")
+PROTOCOL_COLUMNS = ("uid", "id", "j", "source", "hypothesis", "token_ids", "sampler_logp", "ended", "decode_loop",
+                    "english_left", "empty", "tokens_out", "tokens_in")
 
 
 def copies_of(ids, texts, copies):
@@ -679,7 +680,7 @@ def protocol_rows(rows, sources, column="text_nl"):
         if not sep or not j.isdigit():
             raise ValueError(f"not a uid <id>#<j>: {u!r}")
         hyp, src = rows[column][k], sources[u]
-        values = {"uid": str(u), "source_id": source_id, "j": int(j), "source": src, "hypothesis": hyp,
+        values = {"uid": str(u), "id": source_id, "j": int(j), "source": src, "hypothesis": hyp,
                   "token_ids": [int(t) for t in rows["token_ids"][k]],
                   "sampler_logp": [float(x) for x in rows["sampler_logp"][k]], "ended": bool(rows["ended"][k]),
                   "decode_loop": bool(hyp) and publish.decode_loop(hyp, src),
@@ -717,13 +718,13 @@ def remote_digest(url, client):
 
 
 def done_marker(names, digests):
-    """Arm G4-7: the DONE marker of a sample directory, {"rows", "shards", "sha256": {name: digest}}, of every shard
-    name with its (rows, digest)"""
+    """Arm G4-7: the DONE marker of a sample directory (G4-7.4a), {"rows", "shards": {name: {"rows", "sha256"}}}, of
+    every shard name with its (rows, digest)"""
     missing = sorted(set(names) - set(digests))
     if missing:
         raise RuntimeError(f"no digest of {missing[:3]}")
-    return {"rows": int(sum(digests[n][0] for n in names)), "shards": len(names),
-            "sha256": {n: digests[n][1] for n in sorted(names)}}
+    return {"rows": int(sum(digests[n][0] for n in names)),
+            "shards": {n: {"rows": int(digests[n][0]), "sha256": digests[n][1]} for n in sorted(names)}}
 
 
 def main(argv=None):

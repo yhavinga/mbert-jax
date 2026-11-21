@@ -2,7 +2,7 @@
 # G4-7's CPU proof (spec translator-sft/g4-rl-spec.md §8.2, amendment G4-7.9) on a worker's CPU, the TPU untouched,
 # nothing written to the bucket: sft_lora.py --grpo in the SFT venv (MaxText 0.2.5, Tunix, qwix) with a tiny Gemma 4
 # (6 layers, random weights, float32) on 4 simulated CPU devices, on two synthetic iterations of 64 samples (8 sources x
-# G = 8; Gemma 4's tokenizer; the bucket protocol's sample and score files; g4rl.py iter7: rewards, advantages, packed
+# G = 8; Gemma 4's tokenizer; the sample and score files of amendment G4-7.4a; g4rl.py iter7: rewards, advantages, packed
 # rows of 1,024 at 4 rows per batch, so that 64 samples give at least 4 batches):
 #   (a)  iteration 1: --grpo on F1 (iteration 0's file), 4 steps, LR 1e-2, 2 warmup steps, then constant
 #   (c)  iteration 2 in a new process: --grpo on F2 (iteration 1's file) with --resume-step 4 (a's Tunix checkpoint of
@@ -66,7 +66,7 @@ for it in (0, 1):
             ids = ids + [stop] if ended else ids
             u = g4rl.uid(src["id"], j)
             samples.setdefault(f"w{n % 2}", []).append({
-                "uid": u, "source_id": src["id"], "j": j, "source": src["en"], "hypothesis": hyp, "token_ids": ids,
+                "uid": u, "id": src["id"], "j": j, "source": src["en"], "hypothesis": hyp, "token_ids": ids,
                 "sampler_logp": [-rng.uniform(0.01, 3.0) for _ in ids], "ended": ended, "decode_loop": False,
                 "english_left": False, "empty": False, "tokens_in": len(prompt), "tokens_out": len(ids)})
             logit = rng.uniform(-3, 3)
@@ -82,14 +82,21 @@ for it in (0, 1):
             pq.write_table(pa.Table.from_pylist(rows[k:k + 16]), f"{d}/{name}")
             digests[name] = (len(rows[k:k + 16]), g4rl.file_sha256(f"{d}/{name}"))
         open(f"{d}/DONE", "w").write(json.dumps(g4rl.samples_done(digests)))
+    # the judges' files as g4judge.py writes them: a score shard per sample shard, MetricX on the parity of sha256(uid)
     for role, judges in (("metricx", ("w0", "w2")), ("c2", ("w1",))):
         for m, judge in enumerate(judges):
             d = f"{root}/scores/{role}/{judge}"
             os.makedirs(d)
             for w, rows in samples.items():
-                mine = [scores[role][r["uid"]] for r in rows if int(hashlib.md5(r["uid"].encode()).hexdigest(), 16) % len(judges) == m]
-                pq.write_table(pa.Table.from_pylist(mine), f"{d}/shard-{w[1:]}-0.parquet")
-                open(f"{d}/DONE-{w[1:]}", "w").write(json.dumps({"rows": len(mine)}))
+                marker = {"rows": 0, "shards": {}}
+                for k in range(0, len(rows), 16):
+                    name = f"shard-{k // 16:05d}.parquet"
+                    mine = [scores[role][r["uid"]] for r in rows[k:k + 16]
+                            if role == "c2" or int(hashlib.sha256(r["uid"].encode()).hexdigest()[:8], 16) % 2 == m]
+                    pq.write_table(pa.Table.from_pylist(mine), f"{d}/shard-{w[1:]}-{k // 16}.parquet")
+                    marker["shards"][name] = {"rows": len(mine), "samples_sha256": g4rl.file_sha256(f"{root}/samples/{w}/{name}")}
+                    marker["rows"] += len(mine)
+                open(f"{d}/DONE-{w[1:]}", "w").write(json.dumps(marker))
 open("$P/template.jinja", "w").write(g4lora.TEMPLATE)
 pq.write_table(pa.Table.from_pylist([g4arm.messages_row(r["en"], "het huis") for r in plan]), "$P/train-messages.parquet")
 json.dump(g4rl.grpo_spec(), open("$P/grpo.json", "w"))

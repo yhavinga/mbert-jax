@@ -218,7 +218,11 @@ de bewaking gaat ervan uit dat een burst kan komen. Een overgeslagen stap verand
    checkpoint in **float32** (`COMPUTE_DTYPE=float32`; de fix en de z-loss blijven, dus hetzelfde doel) tot
    **P = (⌊b / 10.000⌋ + 3) × 10.000**, met b de stap waarop de burst gezien is (20.000–30.000 stappen erna; v2's
    bursts kwamen 12–24k stappen na de terugkeer naar bf16), daarna weer bf16. Komt P voorbij het einde van een deel
-   (1.040.000, 1.306.000, 1.959.000), dan stopt het stuk daar en gaat het volgende deel in float32 verder tot P.
+   (1.040.000, 1.306.000, 1.959.000), dan stopt het stuk daar en gaat het volgende deel in float32 verder tot P. P
+   geldt voor de stappen, niet voor één run: hoofdrun en tak lezen na 1.040.000 dezelfde batches, dus een burst in de
+   tak bij b maakt ook de stappen 1.040.000–P van de hoofdrun float32 (en omgekeerd). Een burst wordt gezien bij de
+   volgende poll (elke 180 s, ~560 stappen); is er sinds de burst al een nieuw checkpoint, dan hervat het stuk daar
+   (de overgeslagen stappen ervoor blijven overgeslagen; de parameters zijn gaaf).
 3. **Derde burst** (geteld over de hele run, hoofdrun en tak samen): de rest van alle training in float32, zoals Yeb
    op 16 nov voor v2 besloot. Kost +38% staptijd over de rest (v2: 0,30 tegen 0,22 s per stap).
 4. **Een burst of zelfstop in float32**: `FAILED`, Yeb beslist (v2 had in ~1 mln stappen float32 geen enkele).
@@ -276,10 +280,10 @@ herstart overgeslagen:
 2. **Wachten** [Yeb]: tot mbert-corpus vrij is. Voorwaarde: de keten van G4-7 (`logs/g4arm7_run.log`, pidbestand
    `g4arm7_run.pid`) is geëindigd (het proces leeft niet meer en de laatste regel is `EXIT <n>`), of het overridebestand
    `mbert-ops/t3.corpus-go` bestaat; daarna `final_run.lock` (zonder wachten op een andere houder; anders wacht de
-   keten verder). Ten hoogste 72 u. Een `EXIT` anders dan 0 [eigen keuze]: de keten wacht nog 60 min, en neemt
-   mbert-corpus niet als in die tijd `mbert-ops/t3.corpus-hold` is aangemaakt (de hoofdsessie wil G4-7 dan eerst
-   herstellen; daarna alleen met `t3.corpus-go`). Tijdens het wachten doet de keten niets op een worker of in de
-   bucket.
+   keten verder). Ten hoogste 72 u. Een `EXIT` anders dan 0 [eigen keuze]: de keten wacht nog 60 min en neemt
+   mbert-corpus niet zolang `mbert-ops/t3.corpus-hold` bestaat (de hoofdsessie wil G4-7 dan eerst herstellen; daarna
+   `t3.corpus-go`, of het holdbestand weg en weer 60 min). Tijdens het wachten doet de keten niets op een worker of in
+   de bucket (in de droge run gemeten: 0 aanroepen van `gcloud` en `gsutil` tot het slot genomen was).
 3. **Setup** (mbert-corpus): `~/mbert-t3` op de commit, de venv tegen `vm.lock` en vingerafdruk `91a3c3a5f544`,
    tokenizer (a) naar `~/mbert-t3-tokenizer` met de sha256 van co1's bouw.
 4. **Data** (§5): `prepare_t3.sh data` op de 4 workers, het bewijs en de steekproef naar de bucket.
@@ -299,6 +303,23 @@ evaluatie: de venvs `~/mbert-dumb/.venv` en `~/mbert-jax/.venv` met vingerafdruk
 
 Elke `gcloud … tpu-vm ssh` met `timeout 900` en `ConnectTimeout`/`ServerAlive`; de keten stopt alleen zijn eigen
 trainers (op hun runnaam), verwijdert niets en eindigt op `DONE …` of `FAILED: …`, gevolgd door de `EXIT`-regel.
+Elke start draait een eigen kopie van het script (`dx/t3/chain-scripts/t3_run.<TAG>.sh`): bash leest een script
+tijdens het lopen, en een latere bewerking van `t3_run.sh` mag een lopende keten niet veranderen. Een herstart (nieuwe
+TAG) slaat de gemarkeerde stappen over en volgt trainers die al lopen (hun eigen commando zegt tot welke stap en in
+welke precisie). Zolang de keten niet loopt, kopieert niemand checkpoints naar `ckpt_keep/` (de trainer houdt de laatste
+3, dus 30.000 stappen of ~2,7 u): een gestopte keten moet binnen die tijd weer lopen.
+
+**Droge run [gemeten, 22 nov, co1, nep-`gcloud`/`gsutil` met nep-workers en een nep-bucket; de datascripts en de
+tokenizerbouw echt, trainer en TPU-jobs nep met T2's echte uitslagen als basis]:** wachten op G4-7 (proces leeft, geen
+`EXIT`; override terwijl het slot bezet is: blijft wachten; `EXIT 0`: neemt het slot); `EXIT 1` met holdbestand: blijft
+wachten, zonder holdbestand na de wachttijd verder; setup, data (held-out op w0 gevonden, een exacte kopie op w2 en een
+witruimtevariant op w3 ook; bewijs 0), smoke-test met hervatting en geheugen; hoofdrun met burst 1 (> 50% in 1.000
+stappen) → float32-stuk → bf16; keten gestopt en herstart; tak met burst 2 (10 op rij) → float32-stuk; evaluatie
+met een mislukte fine-tune → `FAILED`, herstart doet alleen die taak opnieuw; hoofdrun verder (eerst float32 tot P van
+burst 2), keten gestopt tijdens het trainen en herstart (volgt de lopende trainers), een reboot (trainers weg zonder
+exitbestand → hervat), burst 3 (zelfstop) → de rest float32; evaluatie, `decide_t3.py`, rapport, `DONE`. Apart: een
+geheugenfout in de smoke-test → `FAILED`, niets getraind. De nep-`gsutil rsync` faalt naar een lokale map die niet
+bestaat, zoals de echte.
 
 ## 10. Evaluatie
 
@@ -396,9 +417,11 @@ keten blijft die van vraag 1.
 **Geldigheid van de run:** 1.959.000 en 1.306.000 gehaald (`ckpt_keep/…` met `commit_success.txt`); niet-eindige
 stappen alleen afgehandeld volgens §7; elke andere afwijking als amendement vóór de evaluatie.
 
-**Controle van de code [gemeten, 22 nov, `tests/test_t3_decide.py` en de droge run]:** met T2's uitslagen als beide
-T3-armen geeft `decide_t3.py` op vraag 1 "geen verschil", nergens beter → **niet publiceren** (een even goed, groter
-model vervangt T2 niet).
+**Controle van de code [gemeten, 22 nov, `tests/test_t3_decide.py`]:** met T2's uitslagen als beide T3-armen geeft
+`decide_t3.py` op vraag 1 "geen verschil", nergens beter → **niet publiceren** (een even goed, groter model vervangt
+T2 niet). In de droge run (T2's echte uitslagen + 60/4.864 op SICK-NL en +50/8.400 op BLiMP-NL voor de hoofdtak, de
+echte ruis van A en A2) gaf hij "helpt" → **vervangt T2**, en voor de tak (+40/4.864 op SICK-NL, 0,82 > drempel 0,76)
+"helpt".
 
 ## 12. Rekentijd en geheugen (schatting; de smoke-test meet ze) [afgeleid]
 
@@ -444,6 +467,8 @@ onder de 32 GiB van een v4-chip. De smoke-test meet het; grens 30 GiB (§8).
    eerst vragen?
 3. **Een andere `EXIT` dan 0 van G4-7** (§9.2): de keten neemt mbert-corpus na 60 minuten, tenzij `t3.corpus-hold`
    bestaat. Liever alleen bij `EXIT 0` of het overridebestand?
+5. **Vervangen vraagt winst** (§11): anders dan v2's regel is "geen verschil" zonder extra winst hier "niet
+   publiceren", omdat T3 groter is. Akkoord?
 4. **DBRD@1024** heeft geen ruismaat uit de ablatie; ik neem die van DBRD@512 (0,016 punt, in de praktijk telt dan de
    seed-range).
 

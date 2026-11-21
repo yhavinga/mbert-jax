@@ -146,6 +146,10 @@ def nl(fraction, digits=2):
     return f"{pct(fraction):.{digits}f}".replace(".", ",")
 
 
+def signed(fraction):
+    return ("+" if fraction >= 0 else "−") + nl(abs(fraction))
+
+
 def mean_of(cell):
     return Fraction(cell["k"], decide.BLIMP_PAIRS) if cell["kind"] == "blimp" else cell["stat"][0]
 
@@ -174,7 +178,7 @@ def markdown(arms, noise, d):
         lines += ["", f"**{title}**", "", "| taak | verschil | drempel | oordeel |", "|---|---:|---:|---|"]
         for task in TASKS:
             c = q["cells"][task]
-            lines.append(f"| {TITLES[task]} | {pct(c['difference']):+.2f} | {pct(c['threshold']):.2f} | {word[c['outcome']]} |")
+            lines.append(f"| {TITLES[task]} | {signed(c['difference'])} | {nl(c['threshold'])} | {word[c['outcome']]} |")
         lines.append("")
         lines.append(f"Oordeel: **{q['verdict']}**" + (f" — {q['meaning']}" if "meaning" in q else "") + ".")
     if "question2" in d and "question1" not in d:

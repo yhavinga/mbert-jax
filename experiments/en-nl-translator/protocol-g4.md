@@ -1409,3 +1409,50 @@ ingelezen referentie, de referentierun, de volle run en het vervolg als G4-6c.11
 `$G/runs/g4arm_G4-6c_s8_ref/` en `$G/runs/g4arm_G4-6c_ref/` (`ref-train.npy`, `ref-train.json`, `summary.json`,
 `dpo_ref.parquet`). De markers `cpuproof6`, `smoke6` en `train-g4arm_G4-6c_s8` van code `20904d4` hernoemd met
 `-g4h1120e`, de smoke-run van `g4h1120e` naar `g4arm_G4-6c_s8-g4h1120e`; nieuwe TAG.
+
+*G4-6c.6f Amendement 21 nov 2026 ~14:30 (besluit van de hoofdsessie 21 nov 14:10, optie 4 van §0a van de overdracht;
+Yeb liet de DPO-armen aan de hoofdsessie; uitgewerkt door een subagent; vóór elke stap op een worker).* **Aanleiding.**
+Bij rijen van 4.096 liep G4-6c vijf keer op dezelfde plek tegen `RESOURCE_EXHAUSTED`: in de eerste voorkeurseval op
+stap 0 (`pref_books`, direct na de SFT-evals, vóór stap 1), elke keer "Attempting to allocate 21.00M" [gemeten: de
+worker-logs, herhaald in `mbert-ops/logs/g4arm6c_run-<tag>.log`]: (1) smoke-test `g4h1120b` (20 nov 15:54; 5,00M vrij);
+(2) smoke-test `g4h1120c` (16:59; 5,00M vrij); (3) volle run `g4h1120d` (19:32; 4,96M vrij); (4) volle run `g4h1120e`
+(22:10; 4,96M vrij); (5) smoke-test `g4h1121a` met de ingelezen referentie van G4-6c.6e (21 nov 13:43; 4,96M vrij).
+De fixes G4-6c.6b–.6e veranderden dat niet: met .6c en .6d paste de smoke-test (piek 29,13 van 30,75 GiB), de volle run
+niet; met .6e paste ook de smoke-test niet meer. [Gevolgtrekking, niet gemeten] De eval bij 4.096 zit binnen enkele
+tientallen MB van de grens, en kleine verschillen in het programma beslissen of ze past. **Wijziging: rijen van 2.048.**
+Dezelfde paren, gepakt bij 2.048 door `build6` (`train-2048.parquet`, `smoke-2048.parquet`,
+`eval-pref_<set>-2048.parquet` in `$G/data/G4-6b/`, gecontroleerd door `ends6c`). Eén epoch is dan **1.689 stappen**
+in plaats van 717 [gemeten: `$G/data/G4-6b/report.json`, packing 2048 train: 27.024 rijen, 1.689 batches, 42.697
+paren, 44.338.321 tokens, vulling 0,8011; bij 4.096 717 batches]: 2,356 × zoveel optimizerstappen, met ~25,3 paren per
+stap in plaats van ~59,6. **De LR geschaald** [besluit hoofdsessie]: 1e-5 × 717 / 1.689 = **4,2451e-6**
+(`g4arm.lr6c(2048)`), zodat de som van de LR over de run gelijk blijft aan die bij 4.096 en de totale update even mild
+als bedoeld [gevolgtrekking: AdamW normaliseert de grootte van de gradiënt, dus de stap per update schaalt met de LR].
+Het schema blijft WSD met dezelfde fracties, die met de run meeschalen: opwarming 3% (50 stappen; bij 4.096 21), de
+laatste 10% lineair naar 0,1 × de LR (168 stappen; bij 4.096 71) [berekend: MaxText neemt int(stappen × fractie)]. De
+smoke-tests (`g4arm_G4-6c_s8_2048`) trainen met dezelfde LR als de volle run [keuze subagent]. **Evals en
+checkpoints op dezelfde fracties van de epoch** [besluit hoofdsessie]: evaluatie elke **565** stappen
+(afgerond 240 × 1.689 / 717 = 565,36; `g4arm.eval_every6c(2048)`), dus op stap 0, 565, 1.130 en na de laatste
+(1.689); de adapter bewaard na stap **565 en 1.130** (`--save-steps 565,1130`) en na de laatste: checkpoints
+**`G4-6c-s565`, `G4-6c-s1130`, `G4-6c-s1689`** (33,45%, 66,90% en 100% van de epoch; bij 4.096 33,47%, 66,95%, 100%).
+Elke bewaarstap is een eval-stap (G4-6c.6a). De evaluatie bij 2.048 op `books`, `btval`, `own`, `novels`, `own4` en de
+voorkeurssets bij 2.048 (dezelfde paren; 24, 25 en 24 batches), zonder `btlong` (G4-6.4: MaxText zou die rijen bij
+2.048 afsnijden). De schatting van de smoke-test telt vier evaluatierondes (0, 565, 1.130, 1.689). **De referentie in
+een eigen run blijft** (G4-6c.6e) [keuze subagent: het eenvoudigst en het robuustst, want (i) de code bestaat en
+verandert niet, (ii) ze is op de CPU bitgelijk aan de referentie in hetzelfde proces, (iii) ze draaide op de TPU
+(`g4arm_G4-6c_s8_ref`, keten `g4h1121a`: 8 batches, piek 18,04 GiB), en (iv) de volle run doet dan vóór zijn eerste
+eval hetzelfde als de smoke-run, zodat de smoke-test het geheugen van de volle run voorspelt; bij 4.096 verschilden
+die twee juist daarin. De referentie terug in de trainingsrun zou de run, de smoke-controle `ref_in` en de keten
+veranderen]: `g4arm_G4-6c_s8_2048_ref`, dan `g4arm_G4-6c_s8_2048`; daarna `g4arm_G4-6c_ref` (1.689 batches), dan
+`g4arm_G4-6c`. **Geheugen** [besluit hoofdsessie]: geen smoke-test meer bij 4.096. Loopt de smoke-test of de volle run
+bij 2.048 tegen `RESOURCE_EXHAUSTED` (of faalt bij de smoke-test alleen de controle van de piek), dan stopt de keten
+zonder verdere terugval. Daarna beslist de hoofdsessie, en dan vervalt G4-6c. **Ongewijzigd:** β 0,5, NLL-gewicht 2,0,
+`<turn|>\n` buiten de log-ratio, startmodel en referentie G4-4, de paren van G4-6b, rank 32 / alpha 16, de keuze op het
+zoekdeel (G4-6c.7, over `G4-6c-s565`, `G4-6c-s1130` en `G4-6c-s1689`; bij gelijkheid het eerdere) en het besluit op het
+beslisdeel (G4-6c.8). De rapportage (G4-6c.9) leest de training op stap 0, 565, 1.130 en 1.689. G4-6c.6b's zin over
+14% en 28% van de epoch vervalt: de checkpoints schalen nu mee. **Code:** `g4arm.STEPS6C` (717 bij 4.096, 1.689 bij
+2.048), `lr6c`, `eval_every6c`, `save_steps6c` per rijlengte (bij 4.096 gelijk aan G4-6c.4); `run_g4arm.sh` neemt ze
+bij de rijlengte van de run en stopt als de epoch volgens `build6` niet `STEPS6C` is; `adapter` en `report6c` nemen
+`SEQ6`. De markers `cpuproof6`, `smoke-4096-memory` en `train-g4arm_G4-6c_s8_ref` van keten `g4h1121a` hernoemd met
+`-g4h1121a`, de runs `g4arm_G4-6c_s8` → `g4arm_G4-6c_s8-fail3` en `g4arm_G4-6c_s8_ref` → `g4arm_G4-6c_s8_ref-g4h1121a`;
+CPU-proef opnieuw met de nieuwe code; nieuwe TAG. Uitvoer erbij: `$G/runs/g4arm_G4-6c_s8_2048_ref/`,
+`$G/runs/g4arm_G4-6c_s8_2048/`, `$G/G4-6c-s565/`, `$G/G4-6c-s1130/`, `$G/G4-6c-s1689/`.

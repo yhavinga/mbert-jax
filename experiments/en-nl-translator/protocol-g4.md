@@ -1575,3 +1575,28 @@ MTLD en PLL.
 *G4-7.11 Uitvoer.* `$RL/c2/data/`, `$RL/c2/model/`, `$RL/c2/cal7/`, `$RL/data/`, `$RL/anchor/`, `$RL/iter/<i>/`,
 `$RL/val/<i>/`, `$RL/judges/`, `$G/G4-7-i<k>/`, `$G/eval/G4-7-i<k>/`, `$G/naturalness-G4-7/`, `$S/blind/G4-7/`,
 `$G/report-G4-7/` (kopie `mbert-ops/translator-sft/g4-7-report.md`), markers `$G/stages/g4-7/`.
+
+*G4-7.4b Aanvulling 21 nov 2026 (subagent van de judge-kant; vóór elke stap van G4-7 op een worker; geen
+methodewijziging).* Wat de code (`g4judge.py`, `g4c2.py`, `run_g4arm7_judges.sh` op `en-nl-g4arm7`) aan G4-7.4a en
+G4-7.6 toevoegt:
+- **Markers.** `DONE-<k>` van een judge heeft naast `rows` en `shards` (per shard `rows` en `samples_sha256`) ook
+  `samples_rows` (per shard en in totaal), `role`, `worker`, `part` en `time`. Elk scorebestand draagt in zijn
+  parquet-metadata (`g4judge`) de naam, de sha256 en het aantal rijen van het samplebestand dat de judge las, zodat een
+  herstarte judge `DONE-<k>` kan schrijven zonder opnieuw te scoren.
+- **Hartslag.** Toestanden `loading`, `idle`, `scoring`, `stopped`, `stopped-idle`, `stopped-signal`, `failed` (met
+  `error`); verder `part`, `scorer`, `started`, `busy_since`, `scored_rows`, `scored_shards`. Een draad schrijft hem elke
+  60 s, ook tijdens het laden van een model en het scoren van een shard. `g4judge.py alive` en `wait` rekenen een judge
+  als dood bij een hartslag ouder dan 5 min, een andere toestand dan `loading`/`idle`/`scoring`, een ander deel dan
+  verwacht, of één shard langer dan 15 min bezig. `wait` controleert zonder samplebestanden te lezen (alleen markers):
+  elke judge las per shard dezelfde bytes als `DONE` noemt, C2 scoorde elke rij, de twee MetricX-delen samen elke rij;
+  `--full` vergelijkt ook de `uid`'s (leest alles: alleen in de regio van de bucket).
+- **Einde.** Een judge stopt op `judges/STOP` of na 6 u zonder werk (`MAX_IDLE`), met exit 0.
+- **C2's tokenizer** (`yhavinga/dutch-llama-tokenizer`, zoals C1) zet alleen `<s>` vooraan, geen `</s>`
+  [gemeten 21 nov op co1]. De regel blijft die van Yeb: meer dan 1.022 tokens zonder de speciale tokens is
+  `c2_overflow`; een tekst die met `<s>` meer dan 1.024 tokens zou hebben, bereikt het model nooit (de judge stopt dan
+  met een fout).
+- **Data van C2.** Een passage waarvan `nl` of `nl_back` gelijk is aan een tekst die al getrokken is, wordt
+  overgeslagen (geen dubbele tekst over train en test). De controle op de split `validation` gebruikt de opgeslagen
+  fetch van G4-3 (`$G/input/bt3-val`); de trainsplit komt uit `$G/input/bt3` (beide `BT_REPOS3`). Het checkpoint van v2
+  wordt op de CPU van w1 omgezet zoals C1's S @ 653k (`convert_gcs_checkpoint.py --params-only`, tokenizer
+  `yhavinga/dutch-llama-tokenizer`, `--global-attn-every-n-layers 3`, kop 0).

@@ -8,18 +8,20 @@ chips computes the reference's and the old policy's log-probabilities of every s
 per batch, the optimizer state continued from iteration to iteration (--resume-step).
 
 Decisions of Yeb (20-21 Nov) over the spec: C2 on dmbert v2 (its token bound 1,022: the judges' c2_overflow); stop rules
-S1-S4 and S6, S4's band [0.85, 1.15]; sources of at most 256 Gemma 4 tokens; the rest as the spec advises: start G4-0
+S1-S4 and S6, S4's band [0.85, 1.15]; sources of at most 256 Gemma 4 tokens; the mix FLAN 10%, novels 45%, BT 45% (21 Nov
+~11:50, addendum G4-7.4d) with sources of at least 20 Gemma 4 tokens (the main session's reading of it); the rest as the
+spec advises: start G4-0
 (the reference is the model with its LoRA at zero), G = 8, 512 sources per iteration, LR 5e-6, beta 0.04 with k2 and
 sg(rho), Dr. GRPO's advantage (no division by the group's std), no overlap.
 
 Pure parts (numpy, no JAX):
-  pool7     the sources: FLAN 40%, novels 30%, BT 30% (BT equal per source), English of at most 256 Gemma 4 tokens, no
+  pool7     the sources: FLAN 10%, novels 45%, BT 45% (BT equal per source), English of 20 to 256 Gemma 4 tokens, no
             13-gram of the evaluation sets or the blind passages, the excluded documents out; RL-val (128 per part)
             drawn first, its documents kept out of the pool; the order of the iterations (seed SEED7/order); a reserve
             of RESERVE7 per part for the sources the anchor drops
   plan7     the anchor (G4-0's greedy translation of every pool and RL-val source, with its QE and C2): a source whose
             anchor did not end, loops, is empty or leaves English is dropped; per part the first sources that remain
-            make the iterations (512 each: 205 FLAN, 154 novels, 153 BT) and RL-val (128 per part)
+            make the iterations (512 each: 51 FLAN, 231 novels, 230 BT) and RL-val (128 per part)
   segments7 an iteration's (or RL-val's) sources for the workers' translate.py
   iter7     an iteration's samples and scores (the bucket protocol of spec §3.4, checked: markers, sha256, the uids of
             samples and scores equal) -> reward (§4.1), advantage (Dr. GRPO, §4.3; groups with max - min < 0.05 left out),
@@ -61,9 +63,11 @@ SEED7 = "en-nl-g4arm/0/G4-7"
 G7 = 8                               # samples per source
 SOURCES7 = 512                       # sources per iteration
 ITERATIONS7 = 30
-PARTS7 = {"flan": 0.4, "novels": 0.3, "bt": 0.3}
+PARTS7 = {"flan": 0.1, "novels": 0.45, "bt": 0.45}   # Yeb 21 Nov ~11:50 (G4-7.4d); was 0.4 / 0.3 / 0.3
 RLVAL_PER_PART7 = 128
 MAX_SOURCE7 = 256                    # Gemma 4 tokens of the English (Yeb 20-21 Nov; class medium of translate.py)
+# a shorter source gives a group of 8 nearly identical samples and so no signal (G4-7.4d; the main session, 21 Nov)
+MIN_SOURCE7 = 20
 LENGTH_CLASS7 = "medium"             # prefill 256/384, decode limit 448, 52 slots: one engine per worker
 RESERVE7 = 0.03                      # pool7 draws this share more per part, for the sources plan7 drops
 SEQ7 = 4096
@@ -182,20 +186,22 @@ def ordered(rows, seed):
     return out
 
 
-def candidate_filter(rows, counter, blocked, excluded_docs=frozenset(), max_tokens=MAX_SOURCE7):
-    """(the candidates that may be sources, {reason: count}): English of at most max_tokens Gemma 4 tokens (the ids of
-    the text alone, as translate.py's segments count them), not empty, no 13-gram of the evaluation sets or the blind
+def candidate_filter(rows, counter, blocked, excluded_docs=frozenset(), max_tokens=MAX_SOURCE7, min_tokens=MIN_SOURCE7):
+    """(the candidates that may be sources, {reason: count}): English of min_tokens to max_tokens Gemma 4 tokens (the
+    ids of the text alone, as translate.py's segments count them), not empty, no 13-gram of the evaluation sets or the blind
     passages, not of an excluded document, one source per distinct English text (the first id)"""
     import select_passages as sp
 
     lengths = counter.lengths([r["en"] for r in rows])
-    keep, drops, seen = [], {"empty": 0, "tokens": 0, "ngram": 0, "excluded_doc": 0, "duplicate": 0}, set()
+    keep, drops, seen = [], {"empty": 0, "tokens": 0, "short": 0, "ngram": 0, "excluded_doc": 0, "duplicate": 0}, set()
     for r, n in sorted(zip(rows, lengths), key=lambda x: x[0]["id"]):
         text = (r["en"] or "").strip()
         if not text:
             drops["empty"] += 1
         elif n > max_tokens:
             drops["tokens"] += 1
+        elif n < min_tokens:
+            drops["short"] += 1
         elif r["doc"] in excluded_docs:
             drops["excluded_doc"] += 1
         elif sp.ngrams(text) & blocked:
@@ -259,7 +265,8 @@ def pool7(args, counter=None):
     excluded = set(c2_docs)
     for path in args.exclude_docs or []:
         excluded |= read_docs(path)
-    cands, report = {}, {"arm": ARM7, "seed": SEED7, "parts": {}, "c2_docs": len(c2_docs), "excluded_docs": len(excluded)}
+    cands, report = {}, {"arm": ARM7, "seed": SEED7, "shares": PARTS7, "min_tokens": MIN_SOURCE7, "max_tokens": MAX_SOURCE7,
+                         "parts": {}, "c2_docs": len(c2_docs), "excluded_docs": len(excluded)}
     for part in PARTS7:
         rows = read_rows(Path(args.cands) / f"cands-{part}.parquet")
         missing = sorted({"id", "en", "doc"} - set(rows[0] if rows else {}))
@@ -297,16 +304,16 @@ def pool_need(iterations=ITERATIONS7, per_iter=SOURCES7, rlval=RLVAL_PER_PART7, 
     return {p: math.ceil(rlval * (1 + reserve)) + math.ceil(iterations * counts[p] * (1 + reserve)) for p in PARTS7}
 
 
-def draw_candidates(rows, n, counter, seed, max_tokens=MAX_SOURCE7, chunk=CANDS_CHUNK7):
+def draw_candidates(rows, n, counter, seed, max_tokens=MAX_SOURCE7, chunk=CANDS_CHUNK7, min_tokens=MIN_SOURCE7):
     """(rows, funnel): of rows in a seeded order (sorted by id, then shuffled with seed) the first n whose English,
-    stripped, is not empty, not a text looked at before and of at most max_tokens Gemma 4 tokens (pool7's count of the
-    same text). The tokens are counted a chunk at a time, so about as many texts as the draw needs."""
+    stripped, is not empty, not a text looked at before and of min_tokens to max_tokens Gemma 4 tokens (pool7's count of
+    the same text). The tokens are counted a chunk at a time, so about as many texts as the draw needs."""
     order = sorted(rows, key=lambda r: r["id"])
     if len({r["id"] for r in order}) != len(order):
         raise SystemExit(f"cands7: an id twice among the rows of {seed}")
     random.Random(seed).shuffle(order)
     out, seen, i = [], set(), 0
-    funnel = {"looked_at": 0, "empty": 0, "duplicate": 0, "tokens": 0}
+    funnel = {"looked_at": 0, "empty": 0, "duplicate": 0, "tokens": 0, "short": 0}
     while len(out) < n and i < len(order):
         part = order[i:i + chunk]
         i += len(part)
@@ -325,6 +332,8 @@ def draw_candidates(rows, n, counter, seed, max_tokens=MAX_SOURCE7, chunk=CANDS_
                 seen.add(text)
                 if lengths[text] > max_tokens:
                     funnel["tokens"] += 1
+                elif lengths[text] < min_tokens:
+                    funnel["short"] += 1
                 else:
                     out.append({**r, "en": text})
     funnel["drawn"] = len(out)
@@ -481,8 +490,8 @@ def cands7(args, counter=None):
     """pool7's candidates (G4-7.2, spec §6.2): cands-flan, cands-novels, cands-bt .parquet (id, en, doc, stratum) and
     cands.json (the inputs with their sha256, the counts, what fell out and why). Per part, and per source for BT in
     equal numbers, margin x what pool7 takes of it, drawn in a seeded order (SEED7/cands/<part>[/<source>]) from the
-    texts that pass pool7's own filters on the English: not empty, a text once, at most MAX_SOURCE7 Gemma 4 tokens (the
-    same counter on the same text, so pool7 drops none of them for these). Left to pool7: the 13-grams, C2's documents
+    texts that pass pool7's own filters on the English: not empty, a text once, MIN_SOURCE7 to MAX_SOURCE7 Gemma 4 tokens
+    (the same counter on the same text, so pool7 drops none of them for these). Left to pool7: the 13-grams, C2's documents
     and RL-val's documents."""
     import g4arm
     import g4c2
@@ -492,6 +501,7 @@ def cands7(args, counter=None):
     want = {p: math.ceil(args.margin * n) for p, n in need.items()}
     out = Path(args.out)
     report = {"arm": ARM7, "seed": f"{SEED7}/cands", "margin": args.margin, "max_tokens": MAX_SOURCE7,
+              "min_tokens": MIN_SOURCE7, "shares": PARTS7,
               "pool7_takes": need, "wanted": want, "parts": {},
               "left_to_pool7": ["13-grams of the evaluation sets, the blind passages and the FLAN evaluation rows",
                                 "C2's documents (docs.txt)", "RL-val's documents in the pool"]}

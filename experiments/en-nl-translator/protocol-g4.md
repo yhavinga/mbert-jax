@@ -1679,3 +1679,51 @@ toevoegen, of waarin de code van de letter van de spec afwijkt:
   beslisdeel als (a1) (WMT24++ zonder de slechte bronnen, zoals (a1)); de vlag "C2 stijgt, C1 niet" is ΔC2 ≥ +0,10 en
   ΔC1 < +0,10 op WMT24++ (goed) + FLAN samen; PLL (protocol.md §4.2.3) met `naturalness.py pll` onder S @ 653k op de
   teksten van de classify-run (`run_g4arm.sh pll`).
+
+*G4-7.4d Aanvulling 21 nov 2026 (besluit van Yeb ~11:50 en de invulling door de hoofdsessie; uitgewerkt door een
+subagent; vóór elke stap van G4-7 op een worker: de keten `g4i1121a` wachtte nog op G4-6c en is om 11:49 gestopt zonder
+iets gedaan te hebben; een methodewijziging van G4-7.0 en G4-7.2).* De datamix van de RL-bronnen:
+- **Verhoudingen** [Yeb 21 nov ~11:50]: FLAN 10%, romans 45%, BT 45% (was FLAN 40 / romans 30 / BT 30, de invulling van
+  G4-7.0 volgens de spec). Per iteratie van 512 bronnen: 51 FLAN, 231 romans, 230 BT (de grootste resten; de ene bron
+  die overblijft gaat bij gelijke rest naar het eerste deel in de volgorde, de romans). Yebs reden: FLAN-bronnen zijn
+  kort (mediaan 19 Gemma 4-tokens, 31% ≤ 10 [gemeten 21 nov, de subagent van `cands7`]), zodat een groep van 8 vaak 8
+  gelijke samples heeft en dan niets leert; ze zijn opdrachtachtig; en ze zijn dezelfde soort tekst als de helft van de
+  (b)-meting.
+- **Minimumlengte** [invulling hoofdsessie 21 nov]: elke bron, in alle drie de delen, in de pool en in RL-val, heeft ten
+  minste 20 Gemma 4-tokens, geteld zoals het maximum van 256 (de ids van de Engelse tekst alleen, `g4arm.TokenCounter`):
+  20 ≤ tokens ≤ 256. `cands7` trekt alleen zulke teksten (trechter: `short`), `pool7` toetst het opnieuw (`drops.short`)
+  (`g4rl.MIN_SOURCE7 = 20`, `candidate_filter`, `draw_candidates`).
+- **RL-val** blijft 128 bronnen per deel (384), getrokken met dezelfde filters, dus ook ≥ 20 tokens [keuze subagent].
+  Reden: RL-val dient alleen de stopregels S1, S2 en S4 (G4-7.5), en die moeten schade in elk register zien, ook in het
+  register dat de training nu minder ziet; FLAN is de helft van (b). Met de nieuwe verhouding had RL-val 38
+  FLAN-bronnen, en een terugval op FLAN zou in S1 (8 van 384) en in de mediaan van S4 nauwelijks te zien zijn. Gelijke
+  delen houden ook de drempels van Yeb (S1: 8 van 384) en `plan7`, `stop7` en `smoke7` zoals ze zijn.
+- **Nodig** (`pool7` met de reserve van 3%, G4-7.4c): FLAN 132 RL-val + 1.576 pool = 1.708, romans 132 + 7.138 = 7.270,
+  BT 132 + 7.107 = 7.239 (was 6.467, 4.891, 4.860); het anker vertaalt 16.217 bronnen (was 16.218). `cands7` trekt
+  ongewijzigd 2× zoveel (FLAN 3.416, romans 14.540, BT 14.478, 2.896 per BT-bron).
+- **Beschikbaar** [gemeten 21 nov op mbert-corpus w1, alleen CPU met nice 19: `cands7` en `pool7` van deze commit
+  (dezelfde `g4rl.py`, sha256 `71e8bc76…`) op de invoer van de proef van G4-7.4c, met dezelfde benadering van C2's
+  `docs.txt` (per BT-bron de eerste 1.000 documenten in C2's geseede volgorde); de echte `docs.txt` komt pas uit
+  `data7`]: per deel de trechter van `cands7` en wat `pool7` hield:
+  - FLAN: van 7.250 bekeken segmenten 2.989 korter dan 20 tokens (41%), 845 langer dan 256 (12%), 3.416 getrokken; na de
+    13-grammen (637 eruit, 19%; korte segmenten hebben er geen, dus lange vallen vaker) 2.779 kandidaten tegen 1.708
+    nodig. Naar schatting komen ~745.000 van de 1.580.656 FLAN-segmenten door de lengtefilters (1.580.656 × 3.416 /
+    7.250).
+  - romans: van 18.173 bekeken passages 10 korter dan 20 tokens, 3.623 langer dan 256, 14.540 getrokken; `pool7` hield
+    ze alle 14.540, tegen 7.270 nodig (~988.000 van de 1.234.854 passages komen door de lengtefilters [schatting, zo
+    gerekend]).
+  - BT: per bron 2.896 getrokken, geen enkele korter dan 20 tokens (langer dan 256: handelingen 815, raad 830, dpc
+    1.387, rechtspraak 1.580, fineweb 977 van 3.711–4.476 bekeken; door de lengtefilters naar schatting 73.000 / 38.000
+    / 14.000 / 13.700 / 47.000); na C2's documenten (679 eruit, 5%) 13.801 kandidaten tegen 7.239 nodig; de pool per
+    bron 1.419–1.423, RL-val 26–27 per bron.
+  - `pool7` slaagde (pool 1.576 / 7.138 / 7.107, RL-val 132 per deel); `cands7` 8:36 min en 14,0 GB RAM, `pool7` 8 s.
+  Het minimum raakt dus vrijwel alleen FLAN: in de pool van de oude verhouding (proef van G4-7.4c) had FLAN 51,6%
+  bronnen korter dan 20 tokens, romans en BT 0,0%.
+- **Iteraties**: 30 blijft. Elk deel heeft ruim genoeg bronnen; minder iteraties is niet nodig.
+- **Tijd**: de bronnen van de pool zijn gemiddeld langer: FLAN 67,9 tokens (mediaan 45; was 38,4, mediaan 19), romans
+  195,9, BT 116,9; per iteratie gemiddeld ~148 tokens per bron tegen ~109 bij 40 / 30 / 30 (+35%) [gemeten op de pools
+  van beide proeven]. Genereren en trainen schalen ongeveer met de tokens: ~+25–35% per iteratie tegenover de oude
+  verhouding, dicht bij de aanname van spec §7.2 (~390 tokens per sample met de prompt, ~26 batches) [schatting]. De
+  smoke-test meet het (`smoke_estimate7` neemt de tokens per sample van de echte iteraties; grens 24 u).
+- Waar G4-7.0, G4-7.2, G4-7.4c ("205/154/153") of de spec nog FLAN 40 / romans 30 / BT 30 noemen, geldt deze aanvulling.
+  De beslisregel (G4-7.7, G4-7.8), de reward, de stopregels en de evaluatie veranderen niet.

@@ -113,8 +113,9 @@ def test_the_advantage_is_dr_grpos_reward_minus_the_group_mean_and_a_flat_group_
 
 # ---------------------------------------------------------------------------------------------------- pool, plan
 
-def test_part_counts_are_205_154_153_of_512():
-    assert g4rl.part_counts(512) == {"flan": 205, "novels": 154, "bt": 153}
+def test_part_counts_are_51_231_230_of_512():
+    # FLAN 10 / novels 45 / BT 45 (G4-7.4d); the one left over goes to the first of the tied remainders, novels
+    assert g4rl.part_counts(512) == {"flan": 51, "novels": 231, "bt": 230}
     assert sum(g4rl.part_counts(37).values()) == 37
 
 
@@ -133,18 +134,21 @@ def test_ordered_is_equal_per_stratum_and_fixed_by_its_seed():
     assert [r["id"] for r in g4rl.ordered(rows, "t")] != [r["id"] for r in a]
 
 
-def test_candidate_filter_keeps_short_new_texts_of_allowed_documents():
+def test_candidate_filter_keeps_new_texts_of_20_to_256_tokens_of_allowed_documents():
     import select_passages as sp
 
     counter = FakeCounter7()
-    rows = [{"id": "a", "en": "the house", "doc": "d1"}, {"id": "b", "en": " ".join(["the"] * 300), "doc": "d2"},
-            {"id": "c", "en": "the river", "doc": "gone"}, {"id": "d", "en": "  ", "doc": "d3"},
-            {"id": "e", "en": "the house", "doc": "d4"},
-            {"id": "f", "en": "a b c d e f g h i j k l m n", "doc": "d5"}]
+    house = " ".join(["the house"] * 10)            # 20 tokens, the shortest source (G4-7.4d)
+    rows = [{"id": "a", "en": house, "doc": "d1"}, {"id": "b", "en": " ".join(["the"] * 257), "doc": "d2"},
+            {"id": "c", "en": " ".join(["the river"] * 10), "doc": "gone"}, {"id": "d", "en": "  ", "doc": "d3"},
+            {"id": "e", "en": house, "doc": "d4"},
+            {"id": "f", "en": "a b c d e f g h i j k l m n o p q r s t", "doc": "d5"},
+            {"id": "g", "en": " ".join(["the house"] * 9) + " river", "doc": "d6"},
+            {"id": "h", "en": " ".join(["the"] * 255) + " river", "doc": "d7"}]
     blocked = sp.ngrams("a b c d e f g h i j k l m")
     keep, drops = g4rl.candidate_filter(rows, counter, blocked, {"gone"})
-    assert [r["id"] for r in keep] == ["a"] and keep[0]["tokens"] == 2
-    assert drops == {"empty": 1, "tokens": 1, "ngram": 1, "excluded_doc": 1, "duplicate": 1}
+    assert [r["id"] for r in keep] == ["a", "h"] and [r["tokens"] for r in keep] == [20, 256]
+    assert drops == {"empty": 1, "tokens": 1, "short": 1, "ngram": 1, "excluded_doc": 1, "duplicate": 1}
 
 
 def test_draw_pool_takes_rlval_first_and_keeps_its_documents_out_of_the_pool():
@@ -159,7 +163,7 @@ def test_draw_pool_takes_rlval_first_and_keeps_its_documents_out_of_the_pool():
         assert [r["rank"] for r in pool] == list(range(len(pool)))
     assert rows == g4rl.draw_pool(data, iterations=3, per_iter=20, rlval=5, reserve=0.1)
     with pytest.raises(SystemExit, match="flan has"):
-        g4rl.draw_pool({**data, "flan": cands(20, "flan")}, iterations=3, per_iter=20, rlval=5)
+        g4rl.draw_pool({**data, "flan": cands(12, "flan")}, iterations=3, per_iter=20, rlval=5)
 
 
 def anchor(ok=True, **kw):
@@ -183,7 +187,8 @@ def test_plan_drops_sources_whose_anchor_failed_and_fills_the_iterations_in_rank
         assert sorted(r["position"] for r in rows) == list(range(10))
     assert sum(r["iteration"] == -1 for r in plan) == 9
     flan0 = [r["id"] for r in plan if r["part"] == "flan" and r["iteration"] == 0]
-    want = [r["id"] for r in sorted(pool, key=lambda r: r["rank"]) if r["part"] == "flan" and r["role"] == "pool"][1:5]
+    want = [r["id"] for r in sorted(pool, key=lambda r: r["rank"]) if r["part"] == "flan" and r["role"] == "pool"][
+        1:1 + counts["flan"]]
     assert sorted(flan0) == sorted(want)
     with pytest.raises(SystemExit, match="without an anchor"):
         g4rl.plan_sources(pool, {}, iterations=2, per_iter=10, rlval=3)
@@ -774,7 +779,7 @@ def test_pool7_needs_c2s_documents_and_keeps_them_out(tmp_path, monkeypatch):
     monkeypatch.setattr(g4arm, "checked_blocked", lambda evalsets, blind: set())
     rng = random.Random(4)
     for part in g4rl.PARTS7:
-        rows = [{"id": f"{part}:{k}", "en": f"{sentence(rng, EN, 6)} {part} {k}",
+        rows = [{"id": f"{part}:{k}", "en": f"{sentence(rng, EN, 20)} {part} {k}",
                  "doc": f"bt:{k // 2}" if part == "bt" else f"{part}:{k}"} for k in range(160)]
         pq.write_table(pa.Table.from_pylist(rows), tmp_path / f"cands-{part}.parquet")
     pq.write_table(pa.Table.from_pylist([{"inputs": "x", "targets": "y"}]), tmp_path / "flan_eval.parquet")
@@ -828,7 +833,7 @@ def cands7_inputs(root, reverse=False):
     # FLAN: segment 0 is a template string; 1..3 of example w0-1, 2 and 4 of w0-2 (2 in both: its doc is w0-1), 5 of
     # w1-5 (left out by a publication check), 6 of w1-6 (dropped by assemble), 8 and 10 of the evaluation row w0-9,
     # 10 also of w0-3; 20.. one each of w0-100.. and w1-100.., some longer than 256 tokens
-    texts = {0: "Question:", **{s: text_of(rng, f"seg{s}", 6) for s in range(1, 13)}}
+    texts = {0: "Question:", **{s: text_of(rng, f"seg{s}", 24) for s in range(1, 13)}}
     examples = [(0, 2, "translate", [2, 4]), (0, 1, "translate", [0, 1, 2, 3]), (1, 5, "translate", [5]),
                 (1, 6, "translate", [6]), (1, 7, "dutch_task", []), (0, 9, "translate", [8, 10]),
                 (0, 3, "translate", [10, 11, 12])]
@@ -871,11 +876,12 @@ def cands7_inputs(root, reverse=False):
         "near_duplicates": {"books_left": 30, "rows_left": 30 * 12 - 1}}}))
     (root / "heldout4.json").write_text(json.dumps({"draw": {"books": [{"en_book_id": str(101 + b)}
                                                                        for b in range(10)]}}))
-    # BT: per source 24 passages of 8 documents, every 5th with hard_fails, one long passage (its id p<a>-<b>)
+    # BT: per source 24 passages of 8 documents, every 5th with hard_fails, every 6th shorter than 20 tokens, one long
+    # passage (its id p<a>-<b>)
     bt_rows = {}
     for source in g4arm.BT_REPOS3:
         rows = [{"id": f"{source}:doc{k // 3}:{'d' if source != 'handelingen' else 't1'}:{k % 3}",
-                 "nl": "nl", "en": text_of(rng, f"{source}{k}", rng.randint(5, 40)),
+                 "nl": "nl", "en": text_of(rng, f"{source}{k}", 8 if k % 6 == 0 else rng.randint(20, 40)),
                  "hard_fails": ["dutch_left"] if k % 5 == 4 else [], "chrf": 0.5, "model": "gemma-4"} for k in range(24)]
         rows.append({**rows[0], "id": f"{source}:docL:d:p0-3", "en": text_of(rng, f"{source}L", 600),
                      "hard_fails": []})
@@ -892,22 +898,25 @@ def test_pool_need_is_what_draw_pool_takes():
     data = {p: cands(400, p, strata=("x", "y")) for p in g4rl.PARTS7}
     rows = g4rl.draw_pool(data, iterations=3, per_iter=20, rlval=5)
     assert g4rl.pool_need(3, 20, 5) == {p: sum(r["part"] == p for r in rows) for p in g4rl.PARTS7}
-    assert g4rl.pool_need() == {"flan": 132 + 6335, "novels": 132 + 4759, "bt": 132 + 4728}
+    assert g4rl.pool_need() == {"flan": 132 + 1576, "novels": 132 + 7138, "bt": 132 + 7107}
 
 
-def test_draw_candidates_takes_the_first_short_new_texts_of_a_seeded_order():
+def test_draw_candidates_takes_the_first_new_texts_of_20_to_256_tokens_of_a_seeded_order():
     counter = FakeCounter7()
-    rows = [{"id": f"r{k}", "en": " ".join(["the"] * (300 if k % 4 == 0 else 3)) + f" w{k % 30}"} for k in range(60)]
+    # k % 4 == 0: 301 tokens; k % 4 == 2: 6 tokens (short); k odd: 22 tokens, and k, k + 30 the same text
+    rows = [{"id": f"r{k}", "en": " ".join(["the"] * (300 if k % 4 == 0 else 5 if k % 4 == 2 else 21)) + f" w{k % 30}"}
+            for k in range(60)]
     rows += [{"id": "e1", "en": "  "}, {"id": "e2", "en": None}]
     got, funnel = g4rl.draw_candidates(rows, 10, counter, "s", chunk=7)
     again, _ = g4rl.draw_candidates(rows[::-1], 10, counter, "s", chunk=50)
     assert [r["id"] for r in got] == [r["id"] for r in again]
-    assert len(got) == 10 and all(len(r["en"].split()) <= g4rl.MAX_SOURCE7 for r in got)
+    assert len(got) == 10 and all(g4rl.MIN_SOURCE7 <= len(r["en"].split()) <= g4rl.MAX_SOURCE7 for r in got)
     assert len({r["en"] for r in got}) == 10
-    assert funnel["looked_at"] == sum(funnel[k] for k in ("empty", "duplicate", "tokens", "drawn"))
+    assert funnel["looked_at"] == sum(funnel[k] for k in ("empty", "duplicate", "tokens", "short", "drawn"))
     assert [r["id"] for r in g4rl.draw_candidates(rows, 10, counter, "t")[0]] != [r["id"] for r in got]
     every, funnel = g4rl.draw_candidates(rows, 1000, counter, "s")
-    assert funnel == {"looked_at": 62, "empty": 2, "duplicate": 15, "tokens": 15, "drawn": 30} and len(every) == 30
+    assert funnel == {"looked_at": 62, "empty": 2, "duplicate": 15, "tokens": 15, "short": 15, "drawn": 15}
+    assert len(every) == 15
     with pytest.raises(SystemExit, match="an id twice"):
         g4rl.draw_candidates(rows + rows[:1], 10, counter, "s")
 
@@ -927,8 +936,9 @@ def test_cands7_draws_published_flan_segments_novels_without_the_eval_books_and_
     rows = {p: t.to_pylist() for p, t in files.items()}
     ids = [r["id"] for p in g4rl.PARTS7 for r in rows[p]]
     assert len(ids) == len(set(ids)) and all(r["id"].startswith(f"{p}:") for p in g4rl.PARTS7 for r in rows[p])
-    assert all(r["en"] == r["en"].strip() and 0 < len(r["en"].split()) <= g4rl.MAX_SOURCE7
+    assert all(r["en"] == r["en"].strip() and g4rl.MIN_SOURCE7 <= len(r["en"].split()) <= g4rl.MAX_SOURCE7
                for p in g4rl.PARTS7 for r in rows[p])
+    assert (report["min_tokens"], report["max_tokens"]) == (20, 256)
     # FLAN: the segments of published examples to translate, no template, nothing of the evaluation row's example
     flan = {int(r["id"].split(":")[1]): r for r in rows["flan"]}
     assert len(flan) == want["flan"] and not set(flan) & {0, 5, 6, 8, 10}
@@ -941,9 +951,10 @@ def test_cands7_draws_published_flan_segments_novels_without_the_eval_books_and_
     assert info["left_by_checks"] == {"decode_loop": 0, "english_left": 1}
     assert info["published_other_status"] == {"dutch_task": 1} and info["published_to_translate"] == 124
     assert info["segments_in_several_examples"] == 2 and info["segments_of_the_eval_rows_out"] == 2
-    assert info["candidates"] == 126 and info["draw"]["tokens"] >= 1
-    assert info["draw"] == {"looked_at": 42 + info["draw"]["tokens"], "empty": 0, "duplicate": 0,
-                            "tokens": info["draw"]["tokens"], "drawn": 42}
+    d = info["draw"]
+    assert info["candidates"] == 126 and d["tokens"] >= 1 and d["short"] >= 1
+    assert d == {"looked_at": want["flan"] + d["tokens"] + d["short"], "empty": 0, "duplicate": 0,
+                 "tokens": d["tokens"], "short": d["short"], "drawn": want["flan"]}
     # the novels: no row of the eval set's books, none failing a check, doc the English book
     novels = rows["novels"]
     assert len(novels) == want["novels"] and {r["doc"] for r in novels} <= {f"novels:{101 + b}" for b in range(10, 30)}
@@ -976,8 +987,8 @@ def test_cands7_draws_published_flan_segments_novels_without_the_eval_books_and_
                              c2_docs=str(tmp_path / "docs.txt"), exclude_docs=[], tokenizer="t", iterations=2,
                              per_iter=20, rlval=3, out=str(tmp_path / "pool")), FakeCounter7())
     for p in g4rl.PARTS7:
-        assert {k: pool["parts"][p]["drops"][k] for k in ("empty", "tokens", "duplicate")} == {
-            "empty": 0, "tokens": 0, "duplicate": 0}
+        assert {k: pool["parts"][p]["drops"][k] for k in ("empty", "tokens", "short", "duplicate")} == {
+            "empty": 0, "tokens": 0, "short": 0, "duplicate": 0}
     assert pool["parts"]["bt"]["drops"]["excluded_doc"] >= 1
 
 

@@ -75,8 +75,8 @@ ROWS7 = 16                           # a global batch: 16 rows of 4,096 (per_dev
 LR7 = 5e-6
 WARMUP7 = 10                         # linear warmup steps, then constant (decay 0)
 # the reward (spec §4.1)
-FAIL_REWARD = -10.0
-LOGIT_CLIP = 6.0
+FAIL_REWARD = -30.0                  # G4-7.4e: below the lowest non-fail reward, -12 - 2 x 7.5 - 2 (ln 1.5 - ln 1.15) = -27.5
+LOGIT_CLIP = 12.0                    # G4-7.4e (Yeb 21 Nov): C2's logits of G4-0's output lie at -12.2 .. 8.3; +-6 clipped them flat
 QE_WEIGHT = 2.0
 QE_FAIL = 7.5
 LEN_WEIGHT = 2.0
@@ -782,7 +782,7 @@ def read_scores(root, uids, dones):
 # ---------------------------------------------------------------------------------------------------- reward, advantage
 
 def reward7(sample, qe, c2, anchor):
-    """The reward of one sample (spec §4.1): fail -> FAIL_REWARD (no classifier, no QE); else clip(logit C2, -6, 6) -
+    """The reward of one sample (spec §4.1): fail -> FAIL_REWARD (no classifier, no QE); else clip(logit C2, -12, 12) -
     2 max(0, QE - QE0) - 2 max(0, |ln(l / l0)| - ln 1.15), with l and l0 the tokens_out of the sample and of the anchor
     (G4-0's greedy translation of the source). Returns {"reward", "fail": [reasons], "logit", "qe_pen", "len_pen",
     "ratio"}"""

@@ -77,9 +77,10 @@ C2 = {"logit_c2": 1.5, "c2_overflow": False}
 def test_reward_is_the_clipped_logit_minus_the_qe_penalty_against_the_anchor_and_the_length_penalty():
     t = g4rl.reward7(sample(), 1.0, C2, ANCHOR)          # better QE than the anchor: no penalty, no reward
     assert t == {"reward": 1.5, "fail": [], "logit": 1.5, "qe_pen": 0.0, "len_pen": 0.0, "ratio": 1.0}
-    t = g4rl.reward7(sample(), 2.5, {**C2, "logit_c2": 9.0}, ANCHOR)
-    assert t["logit"] == 6.0 and t["qe_pen"] == pytest.approx(1.0) and t["reward"] == pytest.approx(5.0)
-    assert g4rl.reward7(sample(), 2.0, {**C2, "logit_c2": -8.0}, ANCHOR)["reward"] == -6.0
+    t = g4rl.reward7(sample(), 2.5, {**C2, "logit_c2": 15.0}, ANCHOR)
+    assert t["logit"] == 12.0 and t["qe_pen"] == pytest.approx(1.0) and t["reward"] == pytest.approx(11.0)
+    assert g4rl.reward7(sample(), 2.0, {**C2, "logit_c2": -14.0}, ANCHOR)["reward"] == -12.0
+    assert g4rl.reward7(sample(), 2.0, {**C2, "logit_c2": -8.0}, ANCHOR)["reward"] == -8.0   # G4-7.4e: no longer clipped
     # within +-15% of the anchor's length no penalty; beyond it 2 x (|ln ratio| - ln 1.15)
     assert g4rl.reward7(sample(tokens_out=23), 2.0, C2, ANCHOR)["len_pen"] == 0.0
     t = g4rl.reward7(sample(tokens_out=26), 2.0, C2, ANCHOR)
@@ -96,7 +97,7 @@ def test_every_failure_gives_minus_ten_without_classifier_or_qe(change, reason):
     s = sample(**{k: v for k, v in change.items() if k not in ("qe", "c2_overflow")})
     c2 = {**C2, "c2_overflow": change.get("c2_overflow", False)}
     t = g4rl.reward7(s, change.get("qe", 2.0), c2, ANCHOR)
-    assert t["fail"] == [reason] and t["reward"] == -10.0
+    assert t["fail"] == [reason] and t["reward"] == -30.0
     # the band's ends are inside it: 0.67 and 1.5 of the anchor's length
     assert not g4rl.reward7(sample(tokens_out=30), 2.0, C2, ANCHOR)["fail"]
     assert not g4rl.reward7(sample(tokens_out=134), 2.0, C2, {"l0": 200, "qe0": 2.0})["fail"]
@@ -743,7 +744,7 @@ def test_gemma4s_token_ids_decode_to_the_text_in_both_tokenizer_libraries():
 def test_a_null_score_is_allowed_only_where_the_protocol_has_one():
     # G4-7.4a: qe null for an empty hypothesis, p_c2 and logit_c2 null with c2_overflow; both are failures anyway
     t = g4rl.reward7(sample(empty=True), None, C2, ANCHOR)
-    assert t["fail"] == ["empty"] and t["reward"] == -10.0 and t["qe_pen"] is None
+    assert t["fail"] == ["empty"] and t["reward"] == -30.0 and t["qe_pen"] is None
     t = g4rl.reward7(sample(), 2.0, {"logit_c2": None, "c2_overflow": True}, ANCHOR)
     assert t["fail"] == ["c2_overflow"] and t["logit"] is None
     with pytest.raises(SystemExit, match="no QE"):
@@ -1544,3 +1545,9 @@ def test_check7_writes_its_json_also_when_it_cannot_run(tmp_path, monkeypatch):
         g4rl.check7(args)
     out = json.loads((tmp_path / "check.json").read_text())
     assert out["ok"] is False and "transformers" in out["error"] and out["train_sha256"] == g4rl.file_sha256(train)
+
+
+def test_a_fail_is_below_every_reward_that_is_not_a_fail():
+    """G4-7.4e: with the logit clipped at +-12 a fail must still be the worst outcome"""
+    worst = -g4rl.LOGIT_CLIP - g4rl.QE_WEIGHT * g4rl.QE_FAIL - g4rl.LEN_WEIGHT * (math.log(g4rl.LEN_BAND[1]) - g4rl.LEN_FREE)
+    assert g4rl.FAIL_REWARD < worst

@@ -140,9 +140,9 @@ def test_spearman_and_logit():
     # average ranks [1, 2.5, 2.5, 4] and [1, 3, 2, 4]: Pearson of the ranks 4.5 / sqrt(4.5 * 5)
     assert g4c2.spearman([1, 2, 2, 3], [1, 3, 2, 4]) == pytest.approx(4.5 / math.sqrt(4.5 * 5))
     assert g4c2.spearman([1, 1, 1], [1, 2, 3]) is None
-    assert g4c2.logit_of(0.5) == 0 and g4c2.logit_of(1.0) == 6 and g4c2.logit_of(0.0) == -6
+    assert g4c2.logit_of(0.5) == 0 and g4c2.logit_of(1.0) == 12 and g4c2.logit_of(0.0) == -12
     assert g4c2.logit_of(0.9) == pytest.approx(math.log(9))
-    assert g4c2.logit_of(1 - 1e-9) == 6
+    assert g4c2.logit_of(1 - 1e-9) == 12      # ln((1 - 1e-9) / 1e-9) ~ 20.7, clipped (G4-7.4e)
 
 
 def write(path, rows):

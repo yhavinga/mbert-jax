@@ -1727,3 +1727,19 @@ iets gedaan te hebben; een methodewijziging van G4-7.0 en G4-7.2).* De datamix v
   smoke-test meet het (`smoke_estimate7` neemt de tokens per sample van de echte iteraties; grens 24 u).
 - Waar G4-7.0, G4-7.2, G4-7.4c ("205/154/153") of de spec nog FLAN 40 / romans 30 / BT 30 noemen, geldt deze aanvulling.
   De beslisregel (G4-7.7, G4-7.8), de reward, de stopregels en de evaluatie veranderen niet.
+
+*G4-7.4e Aanvulling 21 nov 2026 ~23:00 (besluit van Yeb; een methodewijziging van de reward, G4-7.3; vóór de eerste
+RL-stap: de keten `g4i1121f` stopte om 22:27 in `c2cal7`, vóór het anker gescoord en vóór elke RL-stap).* `c2cal7`
+haalde voorwaarde 4 niet voor FLAN: de mediaan-sd binnen de groep van clip(logit C2, −6, 6) was 0,0 (QE-straf 0,30);
+voorwaarden 1–3 en 4 voor WMT24++ werden gehaald (0,886; 0,864; 0,146; 0,672 tegen 0,263) [gemeten,
+`translator-sft/g4-7-c2cal7.md`]. Oorzaak [gemeten, hoofdsessie, op dezelfde `predictions.parquet`]: C2's logits van
+G4-0's samples liggen ver onder −6 (FLAN p5/p25/p50/p75/p95 −11,0/−9,8/−8,6/−5,8/1,7; WMT24++ −10,4/−8,3/−4,6/−0,5/4,3;
+min −12,2, max 8,3), zodat 52% van de FLAN-groepen en 22% van de WMT24++-groepen geheel op −6 stonden. Mediaan-sd bij
+knip ±10: FLAN 0,96, WMT24++ 1,13; bij ±12 of geen knip: 1,02 en 1,17.
+- **Knip** [Yeb, 21 nov ~23:00, optie 1 van de hoofdsessie]: clip(logit C2, **−12, 12**) in de reward (`g4rl.LOGIT_CLIP`)
+  en in `c2cal7` (`g4c2.LOGIT_CLIP`). `c2cal7` draait opnieuw met deze knip en dezelfde vooraf vastgelegde grenzen.
+- **Fail-reward** [invulling hoofdsessie, gevolg van de knip]: **−30** (was −10). De laagste reward zonder fail is nu
+  −12 − 2 × 7,5 − 2 (ln 1,5 − ln 1,15) = −27,5; met −10 zou een fail vaak boven een gewone vertaling liggen (logits −9 tot
+  −12 zijn gewoon) en zou de RL falen kunnen leren. Een fail blijft zo de slechtste uitkomst, zoals G4-7.3 bedoelt
+  (test `test_a_fail_is_below_every_reward_that_is_not_a_fail`).
+- Het eerdere `c2cal7`-rapport (knip ±6) blijft bewaard als `$RL/c2/cal7/report-clip6.{json,md}`. Verder verandert niets.

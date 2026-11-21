@@ -25,7 +25,7 @@ has C1's columns (pid, id, source, rank, split, label, text) plus tokens; docs.t
 cal7: the four conditions of G4-7.6, all must hold (C2CAL7_OK, exit 0; else C2CAL7_FAIL, exit 1): accuracy on the test
 split >= 0.75; "original" on Europarl-direct's Dutch originals >= 0.75; G4-0's greedy share "original" on WMT24++ (good)
 + FLAN in [0.02, 0.90]; on G4-0's 8 samples per source of the sampling probe, per set, the median over the sources of
-the within-group sd (ddof 0) of clip(logit, -6, 6) >= 0.25 and >= the median sd of 2 max(0, QE - QE0). The rest is
+the within-group sd (ddof 0) of clip(logit, -12, 12) >= 0.25 and >= the median sd of 2 max(0, QE - QE0). The rest is
 reported and decides nothing.
 """
 
@@ -58,7 +58,7 @@ ACCURACY_MIN = 0.75
 EUROPARL_MIN = 0.75
 SHARE_RANGE = (0.02, 0.90)
 SPREAD_MIN = 0.25
-LOGIT_CLIP = 6.0
+LOGIT_CLIP = 12.0                    # G4-7.4e (Yeb 21 Nov), as g4rl.LOGIT_CLIP
 QE_WEIGHT = 2.0
 SPEARMAN_HIGH = 0.5
 SAMPLES = tuple(f"t10s{k}" for k in range(1, 9))
@@ -276,7 +276,7 @@ def cal7_texts(args):
 # ---------------------------------------------------------------------------------------------------- cal7
 
 def logit_of(p):
-    """clip(logit, -6, 6) from P(original): p 0 or 1 clip to the bound"""
+    """clip(logit, -12, 12) from P(original): p 0 or 1 clip to the bound"""
     if p <= 0.0:
         return -LOGIT_CLIP
     if p >= 1.0:

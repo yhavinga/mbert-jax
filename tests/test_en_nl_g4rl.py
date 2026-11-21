@@ -1262,15 +1262,18 @@ def test_check7_with_maxtext_and_gemma4s_tokenizer(tmp_path):
     counter = g4arm.TokenCounter(str(GEMMA4_TOK))
     stop = counter.special_id("<turn|>")
     plan = full_plan7(n=4, val=1)
+    rng = random.Random(3)
+    hyps = [f"Het huis aan de rivier is {rng.choice(('oud', 'nieuw', 'groen'))}, zei {rng.choice(('zij', 'hij'))}."
+            for _ in range(4 * g4rl.G7)]
     for r in plan:
         r["en"] = r["en"].capitalize() + ", and the light falls on the water."
+        r["l0"] = counter.lengths([hyps[0]])[0] + 1        # the anchor as long as the samples: no length failure
     pq.write_table(pa.Table.from_pylist(plan), tmp_path / "plan.parquet")
-    rng = random.Random(3)
     samples = []
     for src in (r for r in plan if r["iteration"] == 0):
         prompt = counter.ids([g4lora_prompt(src["en"])])[0]
         for j in range(g4rl.G7):
-            hyp = f"Het huis aan de rivier is {rng.choice(('oud', 'nieuw', 'groen'))}, zei {rng.choice(('zij', 'hij'))}."
+            hyp = hyps[len(samples)]
             ids = counter.ids([hyp])[0] + [stop]
             samples.append({"uid": g4rl.uid(src["id"], j), "id": src["id"], "j": j, "source": src["en"],
                             "hypothesis": hyp, "token_ids": ids, "sampler_logp": [-rng.uniform(0.01, 3) for _ in ids],

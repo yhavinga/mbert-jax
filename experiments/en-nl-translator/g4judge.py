@@ -183,17 +183,21 @@ class GcsStore:
 
     def write_once(self, name, data):
         from google.api_core.exceptions import PreconditionFailed
+        from google.cloud.storage.retry import DEFAULT_RETRY
 
         blob = self.bucket.blob(self._full(name))
         try:
-            blob.upload_from_string(data, if_generation_match=0)
+            blob.upload_from_string(data, if_generation_match=0, retry=DEFAULT_RETRY)
         except PreconditionFailed:
             # a retried upload that had succeeded meets its own object: the same bytes are not an error
             if self.read(name) != data:
                 raise ObjectExists(name) from None
 
     def overwrite(self, name, data):
-        self.bucket.blob(self._full(name)).upload_from_string(data)
+        from google.cloud.storage.retry import DEFAULT_RETRY
+
+        # the heartbeat: without a generation condition the client does not retry unless told to
+        self.bucket.blob(self._full(name)).upload_from_string(data, retry=DEFAULT_RETRY)
 
 
 def open_store(rl):

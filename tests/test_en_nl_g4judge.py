@@ -85,7 +85,8 @@ class FakeBlob:
     def __init__(self, bucket, name):
         self.bucket, self.name = bucket, name
 
-    def upload_from_string(self, data, if_generation_match=None):
+    def upload_from_string(self, data, if_generation_match=None, retry=None):
+        assert retry is not None  # every upload retried (the heartbeat's too)
         from google.api_core.exceptions import PreconditionFailed
 
         if if_generation_match == 0 and self.name in self.bucket.objects:
@@ -136,7 +137,7 @@ class FakeClient:
 
 
 def test_gcs_store_with_a_fake_client():
-    pytest.importorskip("google.api_core")
+    pytest.importorskip("google.cloud.storage")
     st = gj.GcsStore("gs://bkt/rl/G4-7", client=FakeClient())
     st.write_once("iter/1/samples/w0/shard-0.parquet", b"x")
     st.write_once("iter/1/samples/w0/shard-0.parquet", b"x")
@@ -147,6 +148,9 @@ def test_gcs_store_with_a_fake_client():
     assert st.list("iter/1/") == ["iter/1/samples/w0/shard-0.parquet"]
     assert st.subdirs("iter") == ["1", "2"] and st.exists("iter/2/samples/w1/DONE")
     assert gj.jobs(st) == ["iter/1", "iter/2"]
+    st.overwrite("judges/c2-w1.json", b"{}")
+    st.overwrite("judges/c2-w1.json", b"{1}")
+    assert st.read("judges/c2-w1.json") == b"{1}"
 
 
 def test_done_and_sample_files_are_checked(tmp_path):

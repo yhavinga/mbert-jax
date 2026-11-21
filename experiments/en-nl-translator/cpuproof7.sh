@@ -13,6 +13,7 @@
 #   (e)  --grpo on F12, 8 steps, --passes-in e0's file with a's and c's passes in it: one uninterrupted run of 8 steps on
 #        the same batches with the same old and reference log-probabilities
 #   (d)  --grpo on F2 with --base-adapter a's adapter (merged into the base kernels: the start G4-4 of the spec), 2 steps
+#        (1 warmup step)
 # and checks (spec §8.2):
 #   (a) on step 1 rho = 1 (|log pi - log pi_old| <= 1e-5), KL = 0, the loss = minus the token mean of A over the batch
 #       (<= 1e-4 relative); a's passes: old = ref (iteration 1, every LoRA B zero)
@@ -183,7 +184,9 @@ echo "$(date +%T) (e) one uninterrupted run of 8 steps over F1's and F2's batche
 $PY -u $CODE/sft_lora.py --out $P/e --steps 8 "${WU[@]}" "${GR[@]}" --grpo-train $P/f12.parquet \
   --passes-in $P/e-in/grpo-passes.npz -- run_name=g4a7_e "${MX[@]}"
 echo "$(date +%T) (d) --base-adapter a's adapter (merged), 2 steps on F2"
-$PY -u $CODE/sft_lora.py --out $P/d --steps 2 "${WU[@]}" "${GR[@]}" --grpo-train $F2 --base-adapter tiny=$P/a/adapter.npz \
+# one warmup step: a schedule of 2 steps has no room for 2 (sft_lora.schedule_overrides)
+$PY -u $CODE/sft_lora.py --out $P/d --steps 2 --warmup-steps 1 --decay-fraction 0 "${GR[@]}" --grpo-train $F2 \
+  --base-adapter tiny=$P/a/adapter.npz \
   -- run_name=g4a7_d "${MX[@]}"
 $PY - <<EOF
 import json, math, sys

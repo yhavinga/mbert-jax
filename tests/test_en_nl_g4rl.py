@@ -995,3 +995,541 @@ def test_cands7_stops_on_inputs_that_are_not_the_published_set_or_g4_4s_novels_o
     Path(args.novels_report).write_text(json.dumps(novels))
     with pytest.raises(SystemExit, match="too few candidates"):
         g4rl.cands7(ns(**{**vars(args), "margin": 20.0}), FakeCounter7())
+
+
+# ---------------------------------------------------------------------------------------------------- the smoke test
+
+SMOKE_BASE = 900
+
+
+def full_plan7(n=40, val=6):
+    """A plan7 plan: iterations 0 and 1 of n sources, RL-val of `val`, l0 20, qe0 2.5"""
+    rng = random.Random(11)
+    rows = []
+    for it, count in ((0, n), (1, n), (-1, val)):
+        for k in range(count):
+            rows.append({"id": f"i{it}s{k:02d}", "part": ("flan", "novels", "bt")[k % 3], "stratum": "",
+                         "doc": f"d{it}{k}", "en": sentence(rng, EN, rng.randint(4, 8)), "tokens": 8, "iteration": it,
+                         "position": (k * 7) % count, "qe0": 2.5, "l0": 20, "logit_c2_0": 0.0, "hypothesis0": "x"})
+    return rows
+
+
+def test_smokeplan7_takes_the_first_32_of_iterations_0_and_1_as_n_and_n_plus_1_and_keeps_rlval(tmp_path):
+    plan = full_plan7()
+    pq.write_table(pa.Table.from_pylist(plan), tmp_path / "plan.parquet")
+    report = g4rl.smokeplan7(ns(plan=str(tmp_path / "plan.parquet"), base=SMOKE_BASE, sources=32,
+                                out=str(tmp_path / "smoke")))
+    rows = pq.read_table(tmp_path / "smoke" / "plan.parquet").to_pylist()
+    assert pq.read_table(tmp_path / "smoke" / "plan.parquet").schema.names == [k for k, _ in g4rl.PLAN_SCHEMA]
+    for old, new in ((0, SMOKE_BASE), (1, SMOKE_BASE + 1)):
+        want = [r["id"] for r in sorted((r for r in plan if r["iteration"] == old), key=lambda r: r["position"])][:32]
+        got = sorted((r for r in rows if r["iteration"] == new), key=lambda r: r["position"])
+        assert [r["id"] for r in got] == want and [r["position"] for r in got] == list(range(32))
+        assert report["ids"][str(new)] == want
+    assert [r for r in rows if r["iteration"] == -1] == [r for r in plan if r["iteration"] == -1]
+    assert {r["iteration"] for r in rows} == {-1, SMOKE_BASE, SMOKE_BASE + 1}
+    with pytest.raises(SystemExit, match="at least 900"):
+        g4rl.smoke_plan7(plan, 29)
+    with pytest.raises(SystemExit, match="has 20 sources"):
+        g4rl.smoke_plan7(full_plan7(n=20), SMOKE_BASE)
+    with pytest.raises(SystemExit, match="no RL-val"):
+        g4rl.smoke_plan7(full_plan7(val=0), SMOKE_BASE)
+
+
+def smoke_samples7(counter, plan, iteration, seed, not_ended=0, nan_logp=False):
+    """A smoke iteration's samples as translate.py --copies 8 writes them: 32 sources x 8 over four workers"""
+    rng = random.Random(seed)
+    sources = sorted((r for r in plan if r["iteration"] == iteration), key=lambda r: r["position"])
+    out = []
+    for n, src in enumerate(sources):
+        prompt = counter.ids([g4rl_prompt(src["en"])])[0]
+        for j in range(g4rl.G7):
+            hyp = sentence(rng, NL, rng.randint(15, 25))
+            ended = len(out) >= not_ended
+            ids = counter.ids([hyp])[0] + ([1] if ended else [])
+            out.append({"uid": g4rl.uid(src["id"], j), "id": src["id"], "j": j, "source": src["en"], "hypothesis": hyp,
+                        "token_ids": ids, "sampler_logp": [-rng.uniform(0.01, 3.0) for _ in ids], "ended": ended,
+                        "decode_loop": False, "english_left": False, "empty": False, "tokens_out": len(ids),
+                        "tokens_in": len(prompt), "worker": f"w{n % 4}"})
+    if nan_logp:
+        out[3]["sampler_logp"][0] = float("nan")
+    return out
+
+
+def smoke_scores7(root, samples_root, samples, seed, overflow=0):
+    """The judges' score shards and DONE-<k> as g4judge.py writes them (with its parquet metadata); C2's first
+    `overflow` samples overflow. Returns {uid: {"qe", "p_c2", "logit_c2", "c2_tokens", "c2_overflow"}}."""
+    import g4judge
+
+    rng = random.Random(seed)
+    values = {}
+    for n, s in enumerate(samples):
+        logit = rng.uniform(-3, 3)
+        over = n < overflow
+        values[s["uid"]] = {"qe": round(rng.uniform(1.0, 4.0), 4), "p_c2": None if over else 1 / (1 + math.exp(-logit)),
+                            "logit_c2": None if over else logit, "c2_tokens": 1100 if over else len(s["token_ids"]),
+                            "c2_overflow": over}
+    for role, judges in (("metricx", (("w0", 0), ("w2", 1))), ("c2", (("w1", None),))):
+        for judge, part in judges:
+            d = Path(root) / role / judge
+            d.mkdir(parents=True)
+            for wdir in sorted(Path(samples_root).glob("w*")):
+                k = wdir.name[1:]
+                marker = {"rows": 0, "shards": {}}
+                for shard in sorted(wdir.glob("shard-*.parquet")):
+                    n = int(shard.name[len("shard-"):-len(".parquet")])
+                    read = pq.read_table(shard).to_pylist()
+                    rows = [{"uid": r["uid"], **{c: values[r["uid"]][c] for c in g4rl.SCORE_COLUMNS[role][1:]}}
+                            for r in read if part is None or g4judge.part_of(r["uid"]) == part]
+                    meta = {"samples": shard.name, "samples_sha256": g4rl.file_sha256(shard), "samples_rows": len(read),
+                            "rows": len(rows), "role": role, "worker": judge, "part": part, "seconds": 0.5}
+                    (d / f"shard-{k}-{n}.parquet").write_bytes(g4judge.table_bytes(g4judge.score_table(role, rows, meta)))
+                    marker["shards"][shard.name] = {"rows": len(rows), "samples_sha256": meta["samples_sha256"]}
+                    marker["rows"] += len(rows)
+                (d / f"DONE-{k}").write_text(json.dumps(marker))
+    return values
+
+
+def smoke_summary7(train, report, resume=0, evals=False, step_s=10.6):
+    """sft_lora.py --grpo's summary.json of a smoke phase (the fields smoke7 reads)"""
+    own = report["train"]["batches"]
+    zero = {k: 0.0 for k in g4rl.SUMS7} | {"tokens": 100.0, "loss_sum": -1.0, "adv_sum": 1.0}
+    steps = [g4rl.step_record7(resume + k + 1, zero) for k in range(own)]
+    s = {"steps": resume + own, "own_steps": own, "steps_done": own,
+         "loss": [[resume + k + 1, -0.01] for k in range(own)], "peak_gib_max": 27.3,
+         "times": {"python_to_setup_s": 140.0, "setup_s": 130.0, "train_s": 500.0, "passes_s": 30.0,
+                   "first_step_s": 400.0 if not resume else 70.0, "compile_s_est": 390.0 if not resume else 60.0},
+         "throughput": {"step_s_median": step_s}, "eval": [],
+         "resume": {"step": resume, "adapter": "x/adapter.npz", "lora_keys": 820, "counters": {"a/count": resume}}
+         if resume else None,
+         "grpo": {"identity": {"grpo_train_sha256": g4rl.file_sha256(train)},
+                  "passes": {"tokens": 5000, "k1_old_ref": 0.0 if not resume else 0.01,
+                             "old_ref_abs_max": 0.0 if not resume else 0.3, "old_is_ref": not resume,
+                             "sampler_gap": 0.02, "kl_sampler_old": 0.001, "seconds": 4.0 * own, "batch_s_median": 4.0},
+                  "steps": steps}}
+    if evals:
+        for step in (resume, resume + own):
+            s["eval"] += [{"step": step, "set": name, "batches": 2, "tokens": 900, "loss": 0.5, "seconds": 20.0}
+                          for name in ("books", "btval", "own")]
+    return s
+
+
+def gen_log7(iteration, k, segments, lora=False, seed=None):
+    lines = [f"MAXTEXT {json.dumps({'model': 'gemma4-31b', 'lora': '/dev/shm/x/adapter' if lora else None})}"]
+    if lora:
+        lines.append(f"LORA {json.dumps({'dir': '/dev/shm/x/adapter', 'rank': 32, 'alpha': 16.0, 'modules': 410, 'relative_update_norm': 0.0012, 'elements_changed': 0.4, 'kernel_dtype': 'bfloat16'})}")
+    lines += ["engine ready in 95 s",
+              f"DONE {json.dumps({'class': 'medium', 'segments': segments, 'tokens_in': 9000, 'tokens_out': 1300, 'seconds': 30.0, 'out_per_s': 43, 'sample': 'samples', 'temperature': 1.0, 'seed': g4rl.sample_seed(iteration, k) if seed is None else seed})}",
+              "EXIT 0"]
+    return "\n".join(lines) + "\n"
+
+
+def smoke_world7(tmp_path, overflow=0, not_ended=0, nan_logp=False):
+    """The smoke's directory D as the chain puts it together, every check holding"""
+    import g4arm  # noqa: F401 - iter7's import
+
+    counter = FakeCounter7()
+    d = tmp_path / "D"
+    d.mkdir()
+    plan = g4rl.smoke_plan7(full_plan7(), SMOKE_BASE)
+    g4rl.write_parquet(plan, d / "plan.parquet", g4rl.schema(g4rl.PLAN_SCHEMA))
+    for phase, it in (("A", SMOKE_BASE), ("B", SMOKE_BASE + 1)):
+        root = d / f"iter-{phase}"
+        samples = smoke_samples7(counter, plan, it, seed=it, not_ended=not_ended if phase == "A" else 0,
+                                 nan_logp=nan_logp and phase == "A")
+        write_samples(root / "samples", samples, shard_size=16)
+        values = smoke_scores7(root / "scores", root / "samples", samples, seed=it,
+                               overflow=overflow if phase == "A" else 0)
+        g4rl.iter7(ns(plan=str(d / "plan.parquet"), iteration=it, samples=str(root / "samples"),
+                      scores=str(root / "scores"), tokenizer="x", seq=1024, rows=4, out=str(root / "train")), counter)
+        train = root / "train" / "train.parquet"
+        (d / f"check7-{phase}.json").write_text(json.dumps({"ok": True, "train_sha256": g4rl.file_sha256(train),
+                                                            "rows": 1}))
+        report = json.loads((root / "train" / "report.json").read_text())
+        k = "1" if phase == "A" else "2"
+        resume = 0 if phase == "A" else json.loads((d / "train-1" / "summary.json").read_text())["steps"]
+        s = smoke_summary7(train, report, resume=resume, evals=phase == "B")
+        (d / f"train-{k}").mkdir()
+        (d / f"train-{k}" / "summary.json").write_text(json.dumps(s))
+        (d / f"train-{k}" / "files.json").write_text(json.dumps({
+            "adapter.npz": True, "checkpoint": f"gs://b/rl/G4-7/iter/{it}/checkpoints/{s['steps']}",
+            "commit_success": True}))
+        (d / "logs").mkdir(exist_ok=True)
+        for w in range(4):
+            (d / "logs" / f"gen-{phase}-w{w}.log").write_text(gen_log7(it, w, 64, lora=phase == "B"))
+        if phase == "A":
+            pairs, texts = g4rl.loose_inputs7(g4rl.read_samples(root / "samples"))
+            loose = d / "loose"
+            g4rl.write_parquet(pairs, loose / g4rl.LOOSE7["pairs"])
+            g4rl.write_parquet(texts, loose / g4rl.LOOSE7["texts"])
+            # the loose scorers: MetricX leaves an empty hypothesis out, classify truncates at 1,024 tokens
+            g4rl.write_parquet([{"id": r["id"], g4rl.LOOSE_QE7: values[r["id"]]["qe"]} for r in pairs],
+                               loose / g4rl.LOOSE7["metricx"])
+            g4rl.write_parquet([{"model": "G4-7", "set": "smoke7", "id": r["id"],
+                                 "p_original": values[r["id"]]["p_c2"] if values[r["id"]]["p_c2"] is not None else 0.3,
+                                 "truncated": values[r["id"]]["c2_overflow"]} for r in texts],
+                               loose / g4rl.LOOSE7["c2"])
+    (d / "logs" / "translate-S.log").write_text(gen_log7(SMOKE_BASE, 0, 50, lora=True))
+    rng = random.Random(5)
+    for name, shift in (("G4-0", 0.0), ("S", 0.1)):
+        t = d / "translate" / name
+        rows = [{"id": f"wmt{k:03d}", "hypothesis": f"zin {k}", "ended": True, "decode_loop": False, "empty": False}
+                for k in range(50)]
+        g4rl.write_parquet(rows, t / "pairs-w0.parquet")
+        g4rl.write_parquet([{"id": r["id"], g4rl.LOOSE_QE7: round(2.3 + shift + rng.uniform(-0.2, 0.2), 4),
+                             "ref_source_hypothesis_reference": 3.0} for r in rows], t / "metricx-w0.parquet")
+    now = 1_763_700_000.0
+    (d / "heartbeats").mkdir()
+    for role, worker, part in g4rl.JUDGES7:
+        (d / "heartbeats" / f"{role}-{worker}.json").write_text(json.dumps({
+            "pid": 7, "host": f"mix-{worker}", "role": role, "worker": worker, "part": part, "state": "idle",
+            "epoch": now - 40, "busy_since": None, "last_shard": "x", "error": None}))
+    (d / "now.json").write_text(json.dumps({"epoch": now}))
+    (d / "val").mkdir()
+    (d / "val" / "stop.json").write_text(json.dumps({"stop": [], "tis_next": False, "sampler_gap": 0.02}))
+    (d / "timings.json").write_text(json.dumps({
+        "gen_wall_s": {"A": 150.0, "B": 170.0}, "judge_tail_s": {"A": 60.0, "B": 55.0},
+        "iter7_wall_s": {"A": 20.0, "B": 20.0}, "train_wall_s": {"1": 900.0, "2": 800.0}, "val_wall_s": 300.0}))
+    return d, counter
+
+
+def run_smoke7(d, counter, out):
+    try:
+        g4rl.smoke7(ns(dir=str(d), tokenizer="x", out=str(out)), counter)
+        code = 0
+    except SystemExit as stop:
+        code = stop.code
+    return code, json.loads((out / "smoke7.json").read_text())
+
+
+def test_smoke7_passes_a_good_smoke_and_reports_the_gap_the_first_steps_and_the_estimate(tmp_path, capsys):
+    d, counter = smoke_world7(tmp_path)
+    code, r = run_smoke7(d, counter, tmp_path / "out")
+    assert code == 0, r["failed"]
+    assert r["passed"] and set(r["checks"]) == set(g4rl.CHECKS7) and all(c["holds"] for c in r["checks"].values())
+    assert all(set(c) == {"holds", "value", "bound", "what", "point"} for c in r["checks"].values())
+    assert r["iteration"] == {"A": SMOKE_BASE, "B": SMOKE_BASE + 1}
+    assert r["sampler_gap"] == 0.02 and r["tis"] is False and r["first_step_s"] == {"1": 400.0, "2": 70.0}
+    assert 0 < r["estimate"]["hours"] <= 24 and r["checks"]["estimate"]["value"] == r["estimate"]["hours"]
+    assert r["generation_A"]["distinct_per_group"]["max"] == 8 and r["val"]["stop"] == []
+    out = capsys.readouterr().out.splitlines()
+    assert out[-1] == "SMOKE7_OK" and out[-2].startswith("SMOKE7 {")
+    assert json.loads(out[-2][len("SMOKE7 "):])["passed"] is True
+    md = (tmp_path / "out" / "smoke7.md").read_text()
+    assert md.startswith("# Smoke-test G4-7") and "**Geslaagd.**" in md and "## Schatting" in md
+
+
+def edit_json(path, change):
+    data = json.loads(path.read_text())
+    change(data)
+    path.write_text(json.dumps(data))
+
+
+def edit_parquet(path, change):
+    rows = pq.read_table(path).to_pylist()
+    change(rows)
+    g4rl.write_parquet(rows, path)
+
+
+def set_in(path, keys, value):
+    def change(data):
+        x = data
+        for k in keys[:-1]:
+            x = x[k]
+        x[keys[-1]] = value
+    edit_json(path, change)
+
+
+def qe_off(rows):
+    rows[7][g4rl.LOOSE_QE7] += 0.002
+
+
+def p_off(rows):
+    k = next(i for i, r in enumerate(rows) if not r["truncated"])
+    rows[k]["p_original"] += 2e-4
+
+
+def drop_lora(d):
+    log = d / "logs" / "gen-B-w2.log"
+    log.write_text("".join(ln for ln in log.read_text().splitlines(True) if not ln.startswith("LORA ")))
+
+
+def shift_s(rows):
+    for r in rows:
+        r[g4rl.LOOSE_QE7] += 0.5
+
+
+def reward_off(rows):
+    rows[0]["reward"] += 1e-6
+
+
+def s_not_ended(rows):
+    for r in rows[:3]:
+        r["ended"] = False
+
+
+def drop_own(data):
+    data["eval"] = [e for e in data["eval"] if e["set"] != "own"]
+
+
+@pytest.mark.parametrize("change, failed", [
+    # the ones the task names
+    (lambda d: edit_parquet(d / "loose" / "metricx.parquet", qe_off), {"qe_loose"}),
+    ("overflow2", {"c2_overflow"}),
+    (lambda d: set_in(d / "train-1" / "summary.json", ["peak_gib_max"], 29.6), {"train1_peak"}),
+    (drop_lora, {"gen_B_lora"}),
+    (lambda d: edit_parquet(d / "translate" / "S" / "metricx-w0.parquet", shift_s), {"translate_qe"}),
+    (lambda d: set_in(d / "timings.json", ["val_wall_s"], 1400.0), {"estimate"}),
+    # and every other check on its own
+    ("not_ended9", {"gen_A_ended"}),
+    ("nan_logp", {"gen_A_logp"}),
+    (lambda d: (d / "logs" / "gen-A-w1.log").write_text(gen_log7(SMOKE_BASE, 1, 64, seed=5)), {"gen_A_setup"}),
+    (lambda d: (d / "logs" / "gen-A-w3.log").write_text(gen_log7(SMOKE_BASE, 3, 64, lora=True)), {"gen_A_setup"}),
+    (lambda d: edit_parquet(d / "loose" / "c2.parquet", p_off), {"c2_loose"}),
+    (lambda d: set_in(d / "heartbeats" / "c2-w1.json", ["epoch"], 1_763_700_000.0 - 400), {"heartbeats"}),
+    (lambda d: set_in(d / "heartbeats" / "metricx-w2.json", ["state"], "failed"), {"heartbeats"}),
+    (lambda d: (d / "heartbeats" / "metricx-w0.json").unlink(), {"heartbeats"}),
+    (lambda d: edit_parquet(d / "iter-A" / "train" / "samples.parquet", reward_off), {"rewards_A"}),
+    (lambda d: set_in(d / "check7-B.json", ["ok"], False), {"check7_B"}),
+    (lambda d: set_in(d / "check7-A.json", ["train_sha256"], "0" * 64), {"check7_A"}),
+    (lambda d: set_in(d / "train-1" / "summary.json", ["grpo", "steps", 0, "log_ratio_abs_max"], 2e-4),
+     {"train1_step1"}),
+    (lambda d: set_in(d / "train-1" / "summary.json", ["grpo", "steps", 0, "kl"], -2e-4), {"train1_step1"}),
+    (lambda d: set_in(d / "train-1" / "summary.json", ["grpo", "passes", "old_ref_abs_max"], 2e-4),
+     {"train1_old_ref"}),
+    (lambda d: set_in(d / "train-1" / "summary.json", ["loss", 1, 1], float("nan")), {"train1_finite"}),
+    (lambda d: set_in(d / "train-1" / "files.json", ["commit_success"], False), {"train1_files"}),
+    (lambda d: set_in(d / "train-2" / "files.json", ["checkpoint"], "gs://b/checkpoints/1"), {"train2_files"}),
+    (lambda d: set_in(d / "train-2" / "summary.json", ["grpo", "identity", "grpo_train_sha256"], "0" * 64),
+     {"train2_data"}),
+    (lambda d: set_in(d / "train-2" / "summary.json", ["resume", "step"], 1), {"train2_resume"}),
+    (lambda d: set_in(d / "train-2" / "summary.json", ["peak_gib_max"], 29.6), {"train2_peak"}),
+    (lambda d: edit_json(d / "train-2" / "summary.json", drop_own), {"train2_finite"}),
+    (lambda d: set_in(d / "train-2" / "summary.json", ["eval", 0, "loss"], float("inf")), {"train2_finite"}),
+    (lambda d: (d / "logs" / "translate-S.log").write_text(gen_log7(SMOKE_BASE, 0, 50)), {"translate_S_lora"}),
+    (lambda d: edit_parquet(d / "translate" / "S" / "pairs-w0.parquet", s_not_ended), {"translate_ended"}),
+    (lambda d: (d / "iter-A" / "scores" / "c2" / "w1" / "DONE-2").unlink(),
+     {"scores_A", "c2_overflow", "qe_loose", "c2_loose", "rewards_A"}),
+    (lambda d: set_in(d / "timings.json", ["judge_tail_s", "A"], 901.0), {"scores_A"}),
+])
+def test_smoke7_fails_each_check_on_its_own(tmp_path, change, failed, capsys):
+    kw = {"overflow2": {"overflow": 2}, "not_ended9": {"not_ended": 9}, "nan_logp": {"nan_logp": True}}
+    d, counter = smoke_world7(tmp_path, **kw.get(change, {}) if isinstance(change, str) else {})
+    if not isinstance(change, str):
+        change(d)
+    code, r = run_smoke7(d, counter, tmp_path / "out")
+    assert code == 1 and set(r["failed"]) == failed and not r["passed"]
+    out = capsys.readouterr().out.splitlines()
+    assert out[-1] == "SMOKE7_FAIL " + " ".join(k for k in g4rl.CHECKS7 if k in failed)
+    assert "**Niet geslaagd: " in (tmp_path / "out" / "smoke7.md").read_text()
+
+
+def test_one_overflow_is_allowed_and_a_gap_above_005_reports_tis_without_failing(tmp_path):
+    d, counter = smoke_world7(tmp_path, overflow=1)
+    set_in(d / "train-2" / "summary.json", ["grpo", "passes", "sampler_gap"], 0.06)
+    code, r = run_smoke7(d, counter, tmp_path / "out")
+    assert code == 0 and r["checks"]["c2_overflow"]["value"]["overflow"] == 1 and r["checks"]["c2_loose"]["holds"]
+    assert r["tis"] is True and r["sampler_gap"] == 0.06
+    assert "TIS vanaf de eerste RL-iteratie" in (tmp_path / "out" / "smoke7.md").read_text()
+
+
+def test_a_decode_that_is_not_the_hypothesis_fails_the_decode_check(tmp_path):
+    d, counter = smoke_world7(tmp_path)
+    first = g4rl.read_samples(d / "iter-A" / "samples")[0]
+
+    class Off(FakeTok):
+        def decode(self, ids, skip_special_tokens=True):
+            text = super().decode(ids, skip_special_tokens)
+            return text + " x" if list(ids) == first["token_ids"][:-1] else text
+
+    counter.tok = Off(counter.vocab)
+    code, r = run_smoke7(d, counter, tmp_path / "out")
+    assert code == 1 and r["failed"] == ["gen_A_decoded"] and r["checks"]["gen_A_decoded"]["value"]["bad"] == 1
+
+
+def test_the_smoke_estimate_follows_its_formula():
+    gen = {"A": {"wall_s": 150.0, "decode_s": 30.0, "per_sample_s": 0.5}, "B": {"wall_s": 170.0, "decode_s": 32.0,
+                                                                                "per_sample_s": 0.4}}
+    judges = {"A": {"tail_s": 60.0, "s_per_sample": 0.01}, "B": {"tail_s": 50.0, "s_per_sample": 0.2}}
+    runs = {"A": {"wall_s": 16.0, "samples": 256}, "B": {"wall_s": 8.0, "samples": 256}}
+    s1 = {"own_steps": 2, "throughput": {"step_s_median": 10.0}, "eval": [], "loss": [[1, 0.0], [2, 0.0]],
+          "grpo": {"passes": {"batch_s_median": 30.0}}, "times": {"first_step_s": 400.0}}
+    s2 = {"own_steps": 2, "throughput": {"step_s_median": 12.0}, "loss": [[3, 0.0], [4, 0.0]],
+          "eval": [{"step": 2, "set": "own", "seconds": 40.0}, {"step": 4, "set": "own", "seconds": 30.0}],
+          "grpo": {"passes": {"batch_s_median": 4.0}}, "times": {"first_step_s": 60.0}}
+    trains = {"1": {"summary": s1, "wall_s": 900.0}, "2": {"summary": s2, "wall_s": 700.0}}
+    x = g4rl.smoke_estimate7(gen, judges, runs, trains, tokens_per_sample=380.0, val_s=300.0)
+    n, steps = 4096, math.ceil(4096 * 380.0 / (16 * 4096 * 0.95))
+    assert x["steps"] == steps == 25
+    gen_s = 138.0 + 0.5 * 1024                      # startup: B's 170 - 32; the slowest per sample: A's
+    judge_s = 60.0 + max(0.0, 0.2 * n - 0.5 * 1024)  # B's judge cannot keep up: 819.2 - 512 s added to A's tail
+    iter7_s = 16.0 / 256 * n
+    step = 12.0                                     # phase 2 has no eval between its steps: the larger median
+    t1 = 900.0 + (steps - 2) * (step + min(30.0, step))
+    t2 = 700.0 - 70.0 + (steps - 2) * (step + 4.0)
+    total = 30 * (gen_s + judge_s + iter7_s + 300.0) + t1 + 29 * t2 + 6 * 40.0
+    assert x["total_s"] == pytest.approx(total, abs=0.1) and x["hours"] == round(total / 3600, 2)
+    # an eval between phase 2's steps makes its step time the eval's: phase 1's alone then
+    s2b = {**s2, "loss": [[3, 0.0], [4, 0.0], [5, 0.0]], "eval": [{"step": 4, "set": "own", "seconds": 40.0}]}
+    assert g4rl.smoke_estimate7(gen, judges, runs, {**trains, "2": {"summary": s2b, "wall_s": 700.0}}, 380.0,
+                                300.0)["step_s"] == 10.0
+
+
+def test_smoke7_loose_writes_the_pairs_and_texts_of_the_samples_in_the_judges_order(tmp_path, capsys):
+    counter = FakeCounter7()
+    plan = g4rl.smoke_plan7(full_plan7(), SMOKE_BASE)
+    samples = smoke_samples7(counter, plan, SMOKE_BASE, seed=1)
+    samples[5]["hypothesis"] = ""
+    write_samples(tmp_path / "samples", samples, shard_size=16)
+    report = g4rl.smoke7_loose(ns(samples=str(tmp_path / "samples"), out=str(tmp_path / "loose")))
+    pairs = pq.read_table(tmp_path / "loose" / "pairs.parquet").to_pylist()
+    texts = pq.read_table(tmp_path / "loose" / "texts.parquet").to_pylist()
+    order = [s["uid"] for s in g4rl.read_samples(tmp_path / "samples")]
+    assert [r["id"] for r in pairs] == [r["id"] for r in texts] == order and len(order) == 256
+    by = {s["uid"]: s for s in samples}
+    assert all((r["source"], r["hypothesis"]) == (by[r["id"]]["source"], by[r["id"]]["hypothesis"]) for r in pairs)
+    assert all(r["text"] == by[r["id"]]["hypothesis"] and (r["model"], r["set"]) == ("G4-7", "smoke7") for r in texts)
+    assert report["samples"] == 256 and report["outputs"] == {"metricx": "metricx.parquet", "c2": "c2.parquet"}
+    assert capsys.readouterr().out.startswith("SMOKE7_LOOSE {")
+
+
+def maxtext_shift7(x, ignored_ids, axis=1):
+    """MaxText 0.2.5's shift_and_refine (input_pipeline_utils.py), copied, for the tests without MaxText"""
+    def left(a, pad):
+        widths = [(0, 0)] * a.ndim
+        widths[axis] = (0, 1)
+        return np.take(np.pad(a, widths, constant_values=pad), np.arange(1, a.shape[axis] + 1), axis=axis)
+
+    x["targets"] = left(x["targets"], ignored_ids[0])
+    x["targets_segmentation"] = left(x["targets_segmentation"], 0)
+    for ignored in ignored_ids:
+        x["targets_segmentation"] = np.where(x["targets"] != ignored, x["targets_segmentation"], 0)
+    return x
+
+
+def checked_world7(tmp_path, monkeypatch):
+    import g4lora
+
+    d, counter = smoke_world7(tmp_path)
+    calls = []
+
+    def fake(messages, ens, path, model, labels):
+        calls.append(list(labels))
+        assert all(m[0]["content"] == g4lora.user_turn(e) for m, e in zip(messages, ens))
+        return [0] * len(labels), 0, 0
+
+    monkeypatch.setattr(g4lora, "check_examples", fake)
+    return d, counter, calls
+
+
+def run_check7(d, counter, phase="A", ids_of=None):
+    root = d / f"iter-{phase}"
+    return g4rl.check_packed7(root / "train" / "train.parquet", g4rl.read_samples(root / "samples"),
+                              pq.read_table(root / "train" / "samples.parquet").to_pylist(), "tok",
+                              ids_of or counter.ids, 2, maxtext_shift7, rows_per_batch=4, chunk=10)
+
+
+def test_check7_rebuilds_every_row_from_maxtexts_prompt_and_the_sampled_ids(tmp_path, monkeypatch):
+    d, counter, calls = checked_world7(tmp_path, monkeypatch)
+    out = run_check7(d, counter)
+    report = json.loads((d / "iter-A" / "train" / "report.json").read_text())
+    assert out["samples"] == report["train"]["samples"] and out["rows"] == report["train"]["rows"]
+    assert out["loss_tokens"] == report["train"]["loss_tokens"] and out["pad_id"] == 0 and out["bos_id"] == 2
+    assert sorted(x for c in calls for x in c) == sorted({u.split("#")[0] for u in
+                                                          pq.read_table(d / "iter-A" / "train" / "train.parquet")
+                                                          .column("uids").to_pylist() for u in u})
+    assert max(len(c) for c in calls) <= 10
+
+
+@pytest.mark.parametrize("key", ["targets", "inputs_position", "adv", "sampler_logp"])
+def test_check7_finds_a_changed_place_of_a_row(tmp_path, monkeypatch, key):
+    d, counter, _ = checked_world7(tmp_path, monkeypatch)
+    path = d / "iter-A" / "train" / "train.parquet"
+    table = pq.read_table(path)
+    rows = table.to_pylist()
+    on = [t for t, s in enumerate(rows[1]["targets_segmentation"]) if s]
+    rows[1][key][on[3]] += 1
+    pq.write_table(pa.Table.from_pylist(rows, schema=table.schema), path)
+    with pytest.raises(SystemExit, match=f"row 1 .*{key}"):
+        run_check7(d, counter)
+
+
+def test_check7_refuses_another_prompt_and_a_file_without_every_sample_with_signal(tmp_path, monkeypatch):
+    d, counter, _ = checked_world7(tmp_path, monkeypatch)
+    with pytest.raises(SystemExit, match="differ from MaxText"):
+        run_check7(d, counter, ids_of=lambda texts: [ids[1:] for ids in counter.ids(texts)])
+    path = d / "iter-A" / "train" / "samples.parquet"
+    rows = pq.read_table(path).to_pylist()
+    rows[0]["signal"] = not rows[0]["signal"]
+    g4rl.write_parquet(rows, path)
+    with pytest.raises(SystemExit, match="with signal"):
+        run_check7(d, counter)
+
+
+GEMMA4_TOK = Path(__import__("os").environ.get("GEMMA4_TOKENIZER", str(GEMMA4)))
+
+
+def test_check7_with_maxtext_and_gemma4s_tokenizer(tmp_path):
+    """check7 itself (MaxText's own SFT steps and shift_and_refine): only where MaxText, transformers and Gemma 4's
+    tokenizer are (the SFT venv on a worker, GEMMA4_TOKENIZER=<its tokenizer directory>)"""
+    pytest.importorskip("maxtext.input_pipeline.input_pipeline_utils")
+    pytest.importorskip("transformers")
+    if not (GEMMA4_TOK / "tokenizer.json").is_file():
+        pytest.skip("no Gemma 4 tokenizer here")
+    import g4arm
+
+    counter = g4arm.TokenCounter(str(GEMMA4_TOK))
+    stop = counter.special_id("<turn|>")
+    plan = full_plan7(n=4, val=1)
+    rng = random.Random(3)
+    hyps = [f"Het huis aan de rivier is {rng.choice(('oud', 'nieuw', 'groen'))}, zei {rng.choice(('zij', 'hij'))}."
+            for _ in range(4 * g4rl.G7)]
+    for r in plan:
+        r["en"] = r["en"].capitalize() + ", and the light falls on the water."
+        r["l0"] = counter.lengths([hyps[0]])[0] + 1        # the anchor as long as the samples: no length failure
+    pq.write_table(pa.Table.from_pylist(plan), tmp_path / "plan.parquet")
+    samples = []
+    for src in (r for r in plan if r["iteration"] == 0):
+        prompt = counter.ids([g4lora_prompt(src["en"])])[0]
+        for j in range(g4rl.G7):
+            hyp = hyps[len(samples)]
+            ids = counter.ids([hyp])[0] + [stop]
+            samples.append({"uid": g4rl.uid(src["id"], j), "id": src["id"], "j": j, "source": src["en"],
+                            "hypothesis": hyp, "token_ids": ids, "sampler_logp": [-rng.uniform(0.01, 3) for _ in ids],
+                            "ended": True, "decode_loop": False, "english_left": False, "empty": False,
+                            "tokens_out": len(ids), "tokens_in": len(prompt), "worker": "w0"})
+    write_samples(tmp_path / "samples", samples, shard_size=16)
+    values = smoke_scores7(tmp_path / "scores", tmp_path / "samples", samples, seed=0)
+    assert values
+    g4rl.iter7(ns(plan=str(tmp_path / "plan.parquet"), iteration=0, samples=str(tmp_path / "samples"),
+                  scores=str(tmp_path / "scores"), tokenizer=str(GEMMA4_TOK), seq=512, rows=4, out=str(tmp_path / "it")),
+               counter)
+    args = ns(train=str(tmp_path / "it" / "train.parquet"), samples=str(tmp_path / "samples"), tokenizer=str(GEMMA4_TOK),
+              rows=4, processes=1, chunk=256, out=str(tmp_path / "check.json"))
+    out = g4rl.check7(args)
+    assert out["ok"] and out["samples"] == 32 and out["sources"] == 4 and out["pad_id"] == 0
+    rows = pq.read_table(tmp_path / "it" / "train.parquet").to_pylist()
+    rows[0]["targets"][5] += 1
+    pq.write_table(pa.Table.from_pylist(rows, schema=pq.read_table(tmp_path / "it" / "train.parquet").schema),
+                   tmp_path / "it" / "train.parquet")
+    with pytest.raises(SystemExit):
+        g4rl.check7(args)
+    assert json.loads((tmp_path / "check.json").read_text())["ok"] is False
+
+
+def g4lora_prompt(en):
+    import g4lora
+
+    return g4lora.prompt_text(en)
+
+
+def test_check7_writes_its_json_also_when_it_cannot_run(tmp_path, monkeypatch):
+    monkeypatch.setitem(sys.modules, "transformers", None)          # an import that fails
+    train = tmp_path / "train.parquet"
+    train.write_bytes(b"x")
+    args = ns(train=str(train), samples=str(tmp_path), tokenizer="t", rows=4, processes=1, chunk=8,
+              out=str(tmp_path / "check.json"))
+    with pytest.raises(SystemExit):
+        g4rl.check7(args)
+    out = json.loads((tmp_path / "check.json").read_text())
+    assert out["ok"] is False and "transformers" in out["error"] and out["train_sha256"] == g4rl.file_sha256(train)

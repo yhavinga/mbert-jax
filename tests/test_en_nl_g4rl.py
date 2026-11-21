@@ -1299,3 +1299,15 @@ def g4lora_prompt(en):
     import g4lora
 
     return g4lora.prompt_text(en)
+
+
+def test_check7_writes_its_json_also_when_it_cannot_run(tmp_path, monkeypatch):
+    monkeypatch.setitem(sys.modules, "transformers", None)          # an import that fails
+    train = tmp_path / "train.parquet"
+    train.write_bytes(b"x")
+    args = ns(train=str(train), samples=str(tmp_path), tokenizer="t", rows=4, processes=1, chunk=8,
+              out=str(tmp_path / "check.json"))
+    with pytest.raises(SystemExit):
+        g4rl.check7(args)
+    out = json.loads((tmp_path / "check.json").read_text())
+    assert out["ok"] is False and "transformers" in out["error"] and out["train_sha256"] == g4rl.file_sha256(train)

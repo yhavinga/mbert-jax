@@ -1285,6 +1285,11 @@ def check7(args):
         out["ok"] = True
     except SystemExit as stop:
         out["error"] = str(stop.code)
+    except Exception as e:  # noqa: BLE001 - written to --out for the chain and printed with its traceback, then exit 1
+        import traceback
+
+        traceback.print_exc()
+        out["error"] = f"{type(e).__name__}: {e}"
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     Path(args.out).write_text(json.dumps(out, indent=1) + "\n")
     print(f"CHECK7 {json.dumps(out)}", flush=True)

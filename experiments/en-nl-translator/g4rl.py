@@ -341,8 +341,8 @@ def plan_sources(pool, anchors, iterations=ITERATIONS7, per_iter=SOURCES7, rlval
 
 
 PLAN_SCHEMA = (("id", "string"), ("part", "string"), ("stratum", "string"), ("doc", "string"), ("en", "string"),
-               ("tokens", "int64"), ("iteration", "int64"), ("position", "int64"), ("qe0", "double"), ("l0", "int64"),
-               ("logit_c2_0", "double"), ("hypothesis0", "string"))
+               ("tokens", "int64"), ("iteration", "int64"), ("position", "int64"), ("qe0", "float64"), ("l0", "int64"),
+               ("logit_c2_0", "float64"), ("hypothesis0", "string"))
 
 
 def plan7(args):
@@ -1036,6 +1036,827 @@ def make_grpo_loss(config, opts, is_train):
     return loss_func
 
 
+# ---------------------------------------------------------------------------------------------------- the smoke test
+
+# spec §8.3 and amendment G4-7.9: two mini-iterations of 32 sources x G = 8 on mbert-corpus (A: G4-0; B: phase 1's
+# adapter merged), the judges of mbert-mix; the checks of smoke7 below. The bounds are the spec's.
+SMOKE_BASE_MIN7 = 900                # the smoke's iterations N, N+1 under the same $RL, far from the run's 0..29
+SMOKE_SOURCES7 = 32
+SMOKE_SAMPLES7 = SMOKE_SOURCES7 * G7  # 256
+SMOKE_MIN_OK7 = 248                  # §8.3 point 1: at least this many of the 256 ended (no loop, not empty)
+SMOKE_QE_TOL7 = 1e-3                 # §8.3 point 2: the judges' QE against a loose metricx_qe.py score
+SMOKE_C2_TOL7 = 1e-4                 # §8.3 point 2: the judge's p_c2 against a loose naturalness.py classify
+SMOKE_OVERFLOW_MAX7 = 1              # G4-7.9: c2_overflow at more than 1 of the 256 samples is a stop
+SMOKE_STEP1_TOL7 = 1e-4              # §8.3 point 4: phase 1's step 1, rho = 1 and KL = 0; old = ref
+SMOKE_HOURS_MAX7 = 24.0              # §8.3 point 7: the full run's estimate
+SMOKE_FILL7 = 0.95                   # §7.2's packing fill of the full run's batches (the smoke's ~2 are not full)
+SMOKE_EVAL_SETS7 = ("books", "btval", "own")   # phase 2's SFT evals (G4-7.10: every 5 iterations in the run)
+EVAL_EVERY7 = 5
+WORKERS7 = 4                         # the generating workers of mbert-corpus
+JUDGES7 = (("metricx", "w0", 0), ("metricx", "w2", 1), ("c2", "w1", None))
+# smoke7-loose's inputs of the loose scorers and the names their outputs get in D/loose/
+LOOSE7 = {"pairs": "pairs.parquet", "texts": "texts.parquet", "metricx": "metricx.parquet", "c2": "c2.parquet"}
+LOOSE_QE7 = "qe_source_hypothesis"   # the column of metricx_qe.py score --pair source:hypothesis
+# each check of smoke7: (point of spec §8.3, its bound, what it is)
+CHECKS7 = {
+    "gen_A_samples": (1, "256 = 32 bronnen × 8 (j = 0..7), de bronnen en het Engels van iteratie N van het plan",
+                      "generatie A: aantal samples en bronnen"),
+    "gen_A_decoded": (1, "alle 256", "de token-id's decoderen tot de opgeslagen hypothese (decoded_ok)"),
+    "gen_A_logp": (1, "alle eindig, even lang als de token-id's", "sampler-logprobs"),
+    "gen_A_ended": (1, f">= {SMOKE_MIN_OK7} van 256", "af (stoptoken), geen lus, niet leeg"),
+    "gen_A_setup": (1, "geen LORA-regel, MAXTEXT lora null, T = 1, zaad sample_seed(N, k)",
+                    "G4-0 zonder adapter, met de zaden van de keten"),
+    "scores_A": (2, "read_scores zonder fout", "alle scores van A er (markers, sha256, uid's, eindig of null volgens G4-7.4a)"),
+    "qe_loose": (2, f"max |verschil| <= {SMOKE_QE_TOL7}, null op dezelfde rijen",
+                 "QE van de judges gelijk aan een losse metricx_qe.py score op dezelfde rijen"),
+    "c2_loose": (2, f"max |verschil| <= {SMOKE_C2_TOL7} (rijen zonder c2_overflow); truncated = c2_overflow",
+                 "p_c2 van de judge gelijk aan een losse naturalness.py classify met C2"),
+    "c2_overflow": (2, f"<= {SMOKE_OVERFLOW_MAX7} van 256 (G4-7.9)", "c2_overflow in A"),
+    "heartbeats": (2, "elke hartslag aanwezig, <= 300 s oud bij het verzamelen, toestand loading/idle/scoring",
+                   "hartslagen van de drie judges"),
+    "rewards_A": (3, "gelijk (|verschil| <= 1e-9), dezelfde fails en signalen",
+                  "reward en voordeel van A opnieuw berekend (reward7, advantages7) tegen iter7's samples.parquet"),
+    "rewards_B": (3, "gelijk (|verschil| <= 1e-9), dezelfde fails en signalen", "idem voor B"),
+    "check7_A": (3, "ok, op het trainbestand van A (sha256)", "check7: MaxText's SFT-stappen en shift_and_refine"),
+    "check7_B": (3, "ok, op het trainbestand van B (sha256)", "idem voor B"),
+    "train1_data": (4, "getraind op A's trainbestand (sha256), stappen = de batches van dat bestand",
+                    "fase 1: data en stappen"),
+    "train1_step1": (4, f"stap 1: max |log pi - log pi_old| <= {SMOKE_STEP1_TOL7} en |KL| <= {SMOKE_STEP1_TOL7}",
+                     "fase 1: rho = 1 en KL = 0 op stap 1"),
+    "train1_old_ref": (4, f"max |log pi_old - log pi_ref| <= {SMOKE_STEP1_TOL7}", "fase 1: old = ref (LoRA op nul)"),
+    "train1_peak": (4, "<= 29,5 GiB per chip", "fase 1: piekgeheugen"),
+    "train1_finite": (4, "alle verliezen en stapmaten eindig", "fase 1: verliezen"),
+    "train1_files": (4, "adapter.npz en checkpoints/<stappen van fase 1> met commit_success",
+                     "fase 1: adapter en Tunix-checkpoint in de bucket"),
+    "gen_B_samples": (5, "256 = 32 × 8 van iteratie N+1, alle scores, decoded_ok, logprobs eindig",
+                      "generatie B: samples en scores"),
+    "gen_B_lora": (5, "elke generatielog: LORA met 410 modules en norm > 0; T = 1, zaad sample_seed(N+1, k)",
+                   "generatie B met de ingebakken adapter van fase 1"),
+    "train2_data": (5, "getraind op B's trainbestand (sha256), stappen = de batches van dat bestand",
+                    "fase 2: data en stappen"),
+    "train2_resume": (5, "hervat op stap = de stappen van fase 1, eerste stap die + 1",
+                      "fase 2: --resume-step (optimizer-state doorgezet)"),
+    "train2_peak": (5, "<= 29,5 GiB per chip", "fase 2: piekgeheugen"),
+    "train2_finite": (5, "alle verliezen eindig; evals books, btval, own aanwezig en eindig", "fase 2: verliezen en evals"),
+    "train2_files": (5, "adapter.npz en checkpoints/<stappen na fase 2> met commit_success",
+                     "fase 2: adapter en Tunix-checkpoint in de bucket"),
+    "translate_S_lora": (6, "LORA met 410 modules en norm > 0", "de 50 segmenten met de adapter van fase 2 ingebakken"),
+    "translate_ended": (6, ">= 48 van 50 af (geen lus, niet leeg), in beide", "vertaling S en G4-0, greedy, klasse small"),
+    "translate_qe": (6, "alle QE eindig, |gemiddelde QE S - G4-0| <= 0,5", "MetricX-QE van de 50 segmenten"),
+    "estimate": (7, f"<= {SMOKE_HOURS_MAX7:g} u", "schatting van de volle RL-run (30 iteraties van 512 bronnen × 8)"),
+}
+
+
+def smoke_plan7(plan, base, sources=SMOKE_SOURCES7):
+    """The smoke test's plan rows (spec §8.3): the first `sources` sources (by position) of the plan's iteration 0 as
+    iteration `base` (A) and those of its iteration 1 as `base` + 1 (B), positions 0.. again; RL-val (iteration -1) as
+    it is. Every other column unchanged (the anchor's qe0, l0, ...)."""
+    if base < SMOKE_BASE_MIN7:
+        raise SystemExit(f"smokeplan7: --base {base}: at least {SMOKE_BASE_MIN7} (the run's iterations are "
+                         f"0..{ITERATIONS7 - 1})")
+    out = []
+    for old, new in ((0, base), (1, base + 1)):
+        rows = sorted((r for r in plan if r["iteration"] == old), key=lambda r: r["position"])[:sources]
+        if len(rows) < sources:
+            raise SystemExit(f"smokeplan7: iteration {old} of the plan has {len(rows)} sources, {sources} wanted")
+        out += [{**r, "iteration": new, "position": k} for k, r in enumerate(rows)]
+    val = [r for r in plan if r["iteration"] == -1]
+    if not val:
+        raise SystemExit("smokeplan7: the plan has no RL-val (iteration -1)")
+    return out + val
+
+
+def smokeplan7(args):
+    plan = read_rows(args.plan)
+    rows = smoke_plan7(plan, args.base, args.sources)
+    out = Path(args.out)
+    write_parquet([{k: r[k] for k, _ in PLAN_SCHEMA} for r in rows], out / "plan.parquet", schema(PLAN_SCHEMA))
+    report = {"plan": str(args.plan), "plan_sha256": file_sha256(args.plan), "iterations": {"A": args.base,
+                                                                                             "B": args.base + 1},
+              "sources": args.sources, "rlval": sum(r["iteration"] == -1 for r in rows),
+              "ids": {str(i): [r["id"] for r in rows if r["iteration"] == i] for i in (args.base, args.base + 1)}}
+    (out / "plan.json").write_text(json.dumps(report, indent=1) + "\n")
+    print(f"SMOKEPLAN7 {json.dumps({k: v for k, v in report.items() if k != 'ids'})}", flush=True)
+    return report
+
+
+def loose_inputs7(samples):
+    """The loose scorers' inputs of the samples in the order the judges read them (worker, shard, row): metricx_qe.py
+    score's pairs (id = uid, source, hypothesis; QE mode as the judge, an empty hypothesis unscored) and naturalness.py
+    classify's texts (model, set, id = uid, text = the hypothesis)"""
+    pairs = [{"id": s["uid"], "source": s["source"], "hypothesis": s["hypothesis"]} for s in samples]
+    texts = [{"model": ARM7, "set": "smoke7", "id": s["uid"], "text": s["hypothesis"]} for s in samples]
+    return pairs, texts
+
+
+def smoke7_loose(args):
+    """The inputs of the loose scorers of §8.3 point 2 from the samples of A (checked as iter7 reads them)"""
+    samples = read_samples(args.samples)
+    pairs, texts = loose_inputs7(samples)
+    out = Path(args.out)
+    write_parquet(pairs, out / LOOSE7["pairs"], schema((("id", "string"), ("source", "string"),
+                                                        ("hypothesis", "string"))))
+    write_parquet(texts, out / LOOSE7["texts"], schema((("model", "string"), ("set", "string"), ("id", "string"),
+                                                        ("text", "string"))))
+    report = {"samples": len(samples), "dones": {k: file_sha256(Path(args.samples) / f"w{k}" / DONE)
+                                                 for k in sample_dones(args.samples)},
+              "files": {LOOSE7[k]: file_sha256(out / LOOSE7[k]) for k in ("pairs", "texts")},
+              "outputs": {"metricx": LOOSE7["metricx"], "c2": LOOSE7["c2"]}}
+    (out / "loose.json").write_text(json.dumps(report, indent=1) + "\n")
+    print(f"SMOKE7_LOOSE {json.dumps(report)}", flush=True)
+    return report
+
+
+# ---------------------------------------------------------------------------------------------------- check7
+
+def _check_chunk7(job):
+    import g4arm
+    import g4lora
+
+    messages, ens, labels, tokenizer = job
+    return g4lora.check_examples(messages, ens, tokenizer, g4arm.MODEL, labels)
+
+
+def check_packed7(train, samples, scored, tokenizer, ids_of, bos_id, shift, rows_per_batch=ROWS7, processes=1,
+                  chunk=256):
+    """check7's comparison (see check7). samples: read_samples of the job; scored: iter7's samples.parquet rows; ids_of:
+    the model tokenizer's ids of texts (no special tokens added); shift: MaxText's shift_and_refine"""
+    import multiprocessing
+
+    import g4lora
+    import pyarrow.parquet as pq
+
+    by_uid = {s["uid"]: s for s in samples}
+    adv = {r["uid"]: r["adv"] for r in scored}
+    signal = {r["uid"] for r in scored if r["signal"]}
+    rows = pq.read_table(train).to_pylist()
+    if not rows:
+        raise SystemExit(f"check7: {train} has no row")
+    seq = len(rows[0]["inputs"])
+    packed = [u for r in rows for u in r["uids"]]
+    if len(set(packed)) != len(packed) or set(packed) != signal or not signal <= set(by_uid):
+        raise SystemExit(f"check7: the file's {len(packed)} samples ({len(set(packed))} distinct) are not the "
+                         f"{len(signal)} with signal of samples.parquet (or not of the job's samples)")
+    if len(rows) % rows_per_batch or [r["batch"] for r in rows] != [k // rows_per_batch for k in range(len(rows))]:
+        raise SystemExit(f"check7: {len(rows)} rows are not whole batches of {rows_per_batch} in order")
+    # MaxText's SFT steps per source: its user turn and (as the assistant turn) a trained sample's hypothesis, one that
+    # is not empty if there is one
+    sources = {}
+    for u in sorted(packed, key=lambda u: (not by_uid[u]["hypothesis"], u)):
+        s = by_uid[u]
+        sources.setdefault(s["source_id"], (s["source"], s["hypothesis"]))
+    names = sorted(sources)
+    jobs = []
+    for k in range(0, len(names), chunk):
+        part = names[k:k + chunk]
+        jobs.append(([[{"role": "user", "content": g4lora.user_turn(sources[n][0])},
+                       {"role": "assistant", "content": sources[n][1]}] for n in part],
+                     [sources[n][0] for n in part], part, tokenizer))
+    if processes > 1:
+        with multiprocessing.get_context("spawn").Pool(processes) as pool:
+            results = pool.map(_check_chunk7, jobs, chunksize=1)
+    else:
+        results = [_check_chunk7(j) for j in jobs]
+    pads = {pad for _, _, pad in results}
+    if len(pads) != 1:
+        raise SystemExit(f"check7: MaxText's pad ids {pads}")
+    pad = pads.pop()
+    prompt_of = dict(zip(names, ids_of([g4lora.prompt_text(sources[n][0]) for n in names])))
+    loss_tokens = completion_tokens = 0
+    for r, row in enumerate(rows):
+        if not row["uids"]:
+            if any(any(row[k]) for k in (*g4dpo.KEYS, *TOKEN_KEYS)):
+                raise SystemExit(f"check7: row {r} has no sample and is not all zero")
+            continue
+        parts = [(list(prompt_of[by_uid[u]["source_id"]]), list(by_uid[u]["token_ids"])) for u in row["uids"]]
+        want = g4dpo.row_unshifted(parts, seq, pad)
+        want = {k: np.asarray(v)[0] for k, v in shift({k: v[None] for k, v in want.items()},
+                                                      ignored_ids=[pad, bos_id], axis=1).items()}
+        differ = [k for k in g4dpo.KEYS if list(want[k]) != list(row[k])]
+        # the advantage and the sampler's log-probability of each completion token at the place whose target it is
+        adv_w, slp_w = np.zeros(seq, np.float32), np.zeros(seq, np.float32)
+        at = 0
+        for (p, c), u in zip(parts, row["uids"]):
+            lo = at + len(p) - 1
+            adv_w[lo:lo + len(c)] = adv[u]
+            slp_w[lo:lo + len(c)] = by_uid[u]["sampler_logp"]
+            at += len(p) + len(c)
+            completion_tokens += len(c)
+        differ += [k for k, w in (("adv", adv_w), ("sampler_logp", slp_w))
+                   if not np.array_equal(np.asarray(row[k], np.float32), w)]
+        if differ:
+            raise SystemExit(f"check7: row {r} (batch {row['batch']}, samples {row['uids'][:2]}...): {differ} differ "
+                             f"from MaxText's prompt + the sampled ids, packed and shifted by MaxText's shift_and_refine")
+        loss_tokens += int(np.count_nonzero(want["targets_segmentation"]))
+    return {"rows": len(rows), "batches": len(rows) // rows_per_batch, "samples": len(packed), "sources": len(names),
+            "seq": seq, "pad_id": pad, "bos_id": bos_id, "loss_tokens": loss_tokens,
+            "completion_tokens": completion_tokens, "masked_completion_tokens": completion_tokens - loss_tokens}
+
+
+def check7(args):
+    """Every packed row of an iter7 file against MaxText's own SFT steps (as check6, amendment G4-6.3; spec §8.3 point
+    3). What is compared:
+    (1) per source, g4lora.check_examples: MaxText's apply_chat_template (g4lora.TEMPLATE), tokenization and
+        SFTPromptMasking on the source's user turn give as prompt the model's own chat template's prompt, which is the
+        tokenizer's ids of g4lora.prompt_text(en): the prompt iter7 packs (the assistant turn there is a sampled
+        hypothesis; its text tokenization is not what the row holds, see (2));
+    (2) every row = for each of its samples those prompt ids followed by the sampled token ids exactly as translate.py
+        wrote them (the stop token included; never tokenized again from the text), packed in the row's order (segments
+        1, 2, ..., positions from 0 per sample), then shifted by MaxText's shift_and_refine with MaxText's pad id and the
+        tokenizer's bos id ignored: every key of g4dpo.KEYS at every place equals the file's;
+    (3) adv and sampler_logp: at the place whose target is a completion token, that sample's advantage (iter7's
+        samples.parquet) and the sampler's log-probability of that token (float32), 0 elsewhere, exactly;
+    (4) the file holds exactly the samples with signal, each once, in whole batches of --rows rows (an empty row all 0).
+    Not compared: the completion's text tokenization (SFT tokenizes the Dutch + "<turn|>\\n"; RL trains on the sampled
+    ids, which iter7's decoded_ok checks against the hypothesis). Writes --out (JSON, also on a failure) and CHECK7."""
+    out = {"train": str(args.train), "train_sha256": file_sha256(args.train), "samples": str(args.samples), "ok": False}
+    try:
+        import transformers
+        from maxtext.input_pipeline import input_pipeline_utils as ipu
+
+        own = transformers.AutoTokenizer.from_pretrained(args.tokenizer)
+
+        def ids_of(texts):
+            return [own(t, add_special_tokens=False)["input_ids"] for t in texts]
+
+        scored = read_rows(Path(args.train).parent / "samples.parquet")
+        out.update(check_packed7(args.train, read_samples(args.samples), scored, args.tokenizer, ids_of,
+                                 own.bos_token_id, ipu.shift_and_refine, args.rows, args.processes, args.chunk))
+        out["ok"] = True
+    except SystemExit as stop:
+        out["error"] = str(stop.code)
+    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+    Path(args.out).write_text(json.dumps(out, indent=1) + "\n")
+    print(f"CHECK7 {json.dumps(out)}", flush=True)
+    if not out["ok"]:
+        raise SystemExit(1)
+    return out
+
+
+# ---------------------------------------------------------------------------------------------------- smoke7
+
+def log_json(text, tag):
+    """The JSON of every line 'TAG {...}' of a log, in order"""
+    return [json.loads(line[len(tag) + 1:]) for line in text.splitlines() if line.startswith(tag + " {")]
+
+
+def finite(x):
+    return x is not None and isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+
+
+def generation7(samples, plan, iteration, counter):
+    """What a generation of the smoke is (§8.3 points 1 and 5): its samples against the plan's sources of the
+    iteration, the decode check, the sampler's log-probabilities, the ended ones, the different samples per group"""
+    sources = {r["id"]: r for r in plan if r["iteration"] == iteration}
+    groups = groups7(samples)
+    same = set(groups) == set(sources) and all(s["source"] == sources[k]["en"] for k, g in groups.items() for s in g
+                                               if k in sources)
+    bad_decode = [s["uid"] for s in samples if not decoded_ok(counter, s)]
+    bad_logp = [s["uid"] for s in samples if len(s["sampler_logp"]) != len(s["token_ids"])
+                or not all(finite(x) for x in s["sampler_logp"])]
+    ok = [s for s in samples if s["ended"] and not s["decode_loop"] and not s["empty"]]
+    distinct = [len({s["hypothesis"] for s in g}) for g in groups.values()]
+    return {"samples": len(samples), "sources": len(groups), "plan_sources": len(sources), "same_sources": same,
+            "decode_bad": len(bad_decode), "decode_bad_uids": bad_decode[:5], "logp_bad": len(bad_logp),
+            "logp_bad_uids": bad_logp[:5], "ok": len(ok), "ended": sum(bool(s["ended"]) for s in samples),
+            "decode_loop": sum(bool(s["decode_loop"]) for s in samples), "empty": sum(bool(s["empty"]) for s in samples),
+            "english_left": sum(bool(s["english_left"]) for s in samples),
+            "logp_max": max((max(s["sampler_logp"]) for s in samples if s["sampler_logp"]), default=None),
+            "distinct_per_group": {"min": min(distinct), "median": median(distinct), "max": max(distinct),
+                                   "groups_all_same": sum(d == 1 for d in distinct)}}
+
+
+def gen_logs7(logs, phase, workers):
+    """{k: the LORA, MAXTEXT and DONE lines of D/logs/gen-<phase>-w<k>.log} (translate.py's)"""
+    out = {}
+    for k in workers:
+        path = Path(logs) / f"gen-{phase}-w{k}.log"
+        if not path.is_file():
+            raise SystemExit(f"no {path}")
+        text = path.read_text(errors="replace")
+        done = log_json(text, "DONE")
+        out[k] = {"lora": log_json(text, "LORA"), "maxtext": log_json(text, "MAXTEXT"),
+                  "done": done[-1] if done else None}
+    return out
+
+
+def setup_ok7(logs, iteration, lora):
+    """translate.py's lines of every worker: T = 1 and seed sample_seed(iteration, k) on its DONE line; with lora a LORA
+    line of SMOKE_MODULES modules and a relative update norm > 0, without one no LORA line and MAXTEXT's lora null"""
+    import g4arm
+
+    problems = []
+    for k, x in logs.items():
+        done = x["done"] or {}
+        if done.get("temperature") != 1.0 or done.get("seed") != sample_seed(iteration, int(k)):
+            problems.append(f"w{k}: DONE has T {done.get('temperature')} and seed {done.get('seed')}, not 1.0 and "
+                            f"{sample_seed(iteration, int(k))}")
+        if lora:
+            last = x["lora"][-1] if x["lora"] else {}
+            if last.get("modules") != g4arm.SMOKE_MODULES or not (last.get("relative_update_norm") or 0) > 0:
+                problems.append(f"w{k}: LORA {last or 'missing'}")
+        elif x["lora"] or any(m.get("lora") for m in x["maxtext"]) or not x["maxtext"]:
+            problems.append(f"w{k}: an adapter (LORA {x['lora'][:1]}, MAXTEXT lora "
+                            f"{[m.get('lora') for m in x['maxtext']]})")
+    return problems
+
+
+def loose_compare7(samples, scores, loose):
+    """§8.3 point 2: the judges' scores of A against the loose scorers' outputs of the same rows (D/loose/): the loose
+    inputs are the samples' texts; QE (both null for an empty hypothesis) within SMOKE_QE_TOL7; p_c2 within SMOKE_C2_TOL7
+    on the rows without c2_overflow, and classify's truncated flag is c2_overflow (C2's tokenizer puts only <s> in
+    front, G4-7.4b: more than 1,022 tokens is 1,024 with it)"""
+    loose = Path(loose)
+    pairs = {r["id"]: r for r in read_rows(loose / LOOSE7["pairs"])}
+    texts = {r["id"]: r for r in read_rows(loose / LOOSE7["texts"])}
+    mx = {r["id"]: r for r in read_rows(loose / LOOSE7["metricx"])}
+    c2 = {r["id"]: r for r in read_rows(loose / LOOSE7["c2"])}
+    uids = {s["uid"] for s in samples}
+    inputs_bad = [s["uid"] for s in samples if s["uid"] not in pairs or s["uid"] not in texts
+                  or (pairs[s["uid"]]["source"], pairs[s["uid"]]["hypothesis"]) != (s["source"], s["hypothesis"])
+                  or texts[s["uid"]]["text"] != s["hypothesis"]]
+    qe = {"rows": 0, "null_both": 0, "max_abs_diff": 0.0, "mismatch": []}
+    p = {"rows": 0, "overflow": 0, "max_abs_diff": 0.0, "mismatch": []}
+    for u in sorted(uids):
+        a, b = scores["metricx"][u]["qe"], (mx.get(u) or {}).get(LOOSE_QE7)
+        if a is None and b is None and u in mx:
+            qe["null_both"] += 1
+        elif a is None or b is None:
+            qe["mismatch"].append(u)
+        else:
+            qe["rows"] += 1
+            qe["max_abs_diff"] = max(qe["max_abs_diff"], abs(float(a) - float(b)))
+        j, c = scores["c2"][u], c2.get(u)
+        if c is None or bool(c["truncated"]) != bool(j["c2_overflow"]):
+            p["mismatch"].append(u)
+        elif j["c2_overflow"]:
+            p["overflow"] += 1
+        else:
+            p["rows"] += 1
+            p["max_abs_diff"] = max(p["max_abs_diff"], abs(float(j["p_c2"]) - float(c["p_original"])))
+    for x in (qe, p):
+        x["mismatch_count"] = len(x["mismatch"])
+        x["mismatch"] = x["mismatch"][:5]
+    extra = {"metricx": len(set(mx) - uids), "c2": len(set(c2) - uids)}
+    return {"inputs_bad": len(inputs_bad), "inputs_bad_uids": inputs_bad[:5], "qe": qe, "p_c2": p, "extra_rows": extra}
+
+
+class _HeartbeatDir:
+    """g4judge's store interface over D/heartbeats/ (judges/<role>-w<m>.json -> heartbeats/<role>-w<m>.json)"""
+
+    def __init__(self, root):
+        self.root = Path(root)
+
+    def _path(self, name):
+        return self.root / name.split("/", 1)[1]
+
+    def exists(self, name):
+        return self._path(name).is_file()
+
+    def read(self, name):
+        return self._path(name).read_bytes()
+
+
+def rewards_compare7(samples, scores, plan, iteration, train_dir):
+    """§8.3 point 3: the rewards and advantages computed again (reward7, advantages7 through iteration_samples) from the
+    samples, the scores and the plan, against iter7's samples.parquet and report.json"""
+    rows, info = iteration_samples(samples, scores, plan, iteration)
+    got = {r["uid"]: r for r in read_rows(Path(train_dir) / "samples.parquet")}
+    report = json.loads((Path(train_dir) / "report.json").read_text())
+    differ, d_reward, d_adv = [], 0.0, 0.0
+    for r in rows:
+        g = got.get(r["uid"])
+        if g is None or g["signal"] != r["signal"] or g["fail"] != ",".join(r["fail"]):
+            differ.append(r["uid"])
+            continue
+        d_reward = max(d_reward, abs(g["reward"] - r["reward"]))
+        d_adv = max(d_adv, abs(g["adv"] - r["adv"]))
+    return {"samples": len(rows), "file_rows": len(got), "report_iteration": report.get("iteration"),
+            "groups_without_signal": info["groups_without_signal"],
+            "report_groups_without_signal": report.get("groups_without_signal"), "differ": len(differ),
+            "differ_uids": differ[:5], "reward_max_abs_diff": d_reward, "adv_max_abs_diff": d_adv,
+            "fail_share": iteration_report(rows)["fail_share"]}
+
+
+def judge_seconds7(scores_root):
+    """{judge: (scoring seconds, sample rows read)} of a job's score shards (the metadata g4judge.py writes)"""
+    import pyarrow.parquet as pq
+
+    out = {}
+    for path in sorted(Path(scores_root).glob("*/w*/shard-*.parquet")):
+        meta = json.loads((pq.read_schema(path).metadata or {})[b"g4judge"])
+        key = f"{path.parent.parent.name}-{path.parent.name}"
+        s, n = out.get(key, (0.0, 0))
+        out[key] = (s + float(meta["seconds"]), n + int(meta["samples_rows"]))
+    return out
+
+
+def evals_between(summary):
+    """phase 2's evals after its first step and before its last (they would sit inside a step's duration)"""
+    loss = summary.get("loss") or []
+    if len(loss) < 2:
+        return []
+    return [e for e in summary.get("eval") or [] if loss[0][0] <= e["step"] < loss[-1][0]]
+
+
+def smoke_estimate7(gen, judges, iter7_runs, trains, tokens_per_sample, val_s, iterations=ITERATIONS7,
+                    sources=SOURCES7, g=G7, workers=WORKERS7):
+    """The full RL run's hours from the smoke's measured phases (spec §7.2 as the model; every measure the larger of A
+    and B, so the estimate leans long):
+      S = sources x g samples per iteration, S / workers per generating worker;
+      generation = startup + per sample x S / workers, startup = the phase's wall time - its slowest worker's decode
+        seconds (translate.py's DONE), per sample = the slowest worker's decode seconds per sample;
+      judges = the tail after the generation's last DONE + max(0, a judge's scoring seconds per iteration sample x S -
+        the generation's decode time x S / workers) (the judges stream: only what they cannot keep up with adds);
+      iter7 = its wall time per sample x S (linear: the fixed part scaled too);
+      steps = ceil(S x the trained tokens per sample (iter7's report) / (ROWS7 x SEQ7 x SMOKE_FILL7));
+      training of iteration 0 = phase 1's wall time (startup, the passes, compilation, its steps, saving, the chain's
+        copies) - its evals + (steps - its steps) x (step + passes per batch); iterations 1..29 the same from phase 2
+        (its first step with the compile cache: first_step_s); step = the median step time (phase 1's, and phase 2's
+        when no eval sits between its steps); passes per batch = min(the phase's median passes batch, step) (two
+        forwards cost less than a forward and backward; a median of two batches holds a compilation);
+      evals = (iterations // EVAL_EVERY7) x the longest eval round of phase 2 (books, btval, own);
+      RL-val = its wall time after every iteration (on the critical path: the stop rules wait for it).
+    total = iterations x (generation + judges + iter7 + RL-val) + training of iteration 0 + (iterations - 1) x the
+    next iterations' training + evals."""
+    n = sources * g
+    per_worker = n / workers
+    startup = max(x["wall_s"] - x["decode_s"] for x in gen.values())
+    per_sample = max(x["per_sample_s"] for x in gen.values())
+    decode_full = per_sample * per_worker
+    gen_s = startup + decode_full
+    tail = max(x["tail_s"] for x in judges.values())
+    judge_rate = max(x["s_per_sample"] for x in judges.values())
+    judge_s = tail + max(0.0, judge_rate * n - decode_full)
+    iter7_s = max(x["wall_s"] / x["samples"] for x in iter7_runs.values()) * n
+    steps = math.ceil(n * tokens_per_sample / (ROWS7 * SEQ7 * SMOKE_FILL7))
+    s1, s2 = trains["1"]["summary"], trains["2"]["summary"]
+    step_times = [(s1.get("throughput") or {}).get("step_s_median")]
+    if not evals_between(s2):
+        step_times.append((s2.get("throughput") or {}).get("step_s_median"))
+    step_times = [x for x in step_times if finite(x)]
+    if not step_times:
+        raise SystemExit("estimate: no step time (phase 1 and 2 have one step each, or phase 2 evaluates between)")
+    step_s = max(step_times)
+    train = {}
+    for k, x in trains.items():
+        s = x["summary"]
+        passes = (s.get("grpo") or {}).get("passes") or {}
+        pbs = min(passes.get("batch_s_median") or step_s, step_s)
+        evals = sum(e.get("seconds") or 0.0 for e in s.get("eval") or [])
+        train[k] = {"wall_s": x["wall_s"], "evals_s": evals, "own_steps": s["own_steps"], "passes_batch_s": pbs,
+                    "first_step_s": (s.get("times") or {}).get("first_step_s"),
+                    "iteration_s": x["wall_s"] - evals + (steps - s["own_steps"]) * (step_s + pbs)}
+    rounds = {}
+    for e in s2.get("eval") or []:
+        rounds[e["step"]] = rounds.get(e["step"], 0.0) + (e.get("seconds") or 0.0)
+    eval_round = max(rounds.values(), default=0.0)
+    total = (iterations * (gen_s + judge_s + iter7_s + val_s) + train["1"]["iteration_s"]
+             + (iterations - 1) * train["2"]["iteration_s"] + (iterations // EVAL_EVERY7) * eval_round)
+    per_iteration = {"generation_s": gen_s, "judges_s": judge_s, "iter7_s": iter7_s, "val_s": val_s,
+                     "training_s": train["2"]["iteration_s"]}
+    return {"iterations": iterations, "samples": n, "steps": steps, "tokens_per_sample": tokens_per_sample,
+            "fill": SMOKE_FILL7, "generation": {"startup_s": startup, "per_sample_s": per_sample,
+                                                "decode_s": decode_full},
+            "judges": {"tail_s": tail, "s_per_sample": judge_rate}, "step_s": step_s, "train": train,
+            "eval_round_s": eval_round, "eval_rounds": iterations // EVAL_EVERY7,
+            "per_iteration": {k: round(v, 1) for k, v in per_iteration.items()},
+            "minutes_per_iteration": round(sum(per_iteration.values()) / 60, 1),
+            "total_s": round(total, 1), "hours": round(total / 3600, 2)}
+
+
+def smoke_verdict7(d, counter):
+    """Every check of spec §8.3 points 1-7 (and G4-7.9) on the smoke's directory d, and what is reported beside them.
+    A check whose files are missing or wrong fails with the error as its value; the others still run."""
+    import g4arm
+    import g4judge
+
+    d = Path(d)
+    checks, out = {}, {}
+
+    def put(name, holds, value):
+        point, bound, what = CHECKS7[name]
+        checks[name] = {"holds": bool(holds), "value": value, "bound": bound, "what": what, "point": point}
+
+    def guard(names, fn):
+        try:
+            fn()
+        except (SystemExit, Exception) as e:  # a missing or broken input fails its checks, not the whole verdict
+            text = str(e.code if isinstance(e, SystemExit) else f"{type(e).__name__}: {e}")[:600]
+            for name in names:
+                if name not in checks:
+                    put(name, False, {"error": text})
+
+    plan = read_rows(d / "plan.parquet")
+    smoke_iters = sorted({r["iteration"] for r in plan if r["iteration"] >= 0})
+    if len(smoke_iters) != 2 or smoke_iters[1] != smoke_iters[0] + 1 or smoke_iters[0] < SMOKE_BASE_MIN7:
+        raise SystemExit(f"{d}/plan.parquet: iterations {smoke_iters}, not N, N+1 with N >= {SMOKE_BASE_MIN7} "
+                         "(smokeplan7's plan)")
+    it = {"A": smoke_iters[0], "B": smoke_iters[1]}
+    out["iteration"] = it
+    data = {}
+
+    def job(phase):
+        if phase not in data:
+            root = d / f"iter-{phase}"
+            samples = read_samples(root / "samples")
+            scores = read_scores(root / "scores", {s["uid"] for s in samples}, sample_dones(root / "samples"))
+            data[phase] = (samples, scores)
+        return data[phase]
+
+    # (1) the generation of A (G4-0)
+    def point1():
+        samples = read_samples(d / "iter-A" / "samples")
+        x = generation7(samples, plan, it["A"], counter)
+        out["generation_A"] = x
+        put("gen_A_samples", x["samples"] == SMOKE_SAMPLES7 and x["sources"] == SMOKE_SOURCES7
+            and x["plan_sources"] == SMOKE_SOURCES7 and x["same_sources"],
+            {k: x[k] for k in ("samples", "sources", "plan_sources", "same_sources")})
+        put("gen_A_decoded", x["decode_bad"] == 0, {"bad": x["decode_bad"], "uids": x["decode_bad_uids"]})
+        put("gen_A_logp", x["logp_bad"] == 0, {"bad": x["logp_bad"], "uids": x["logp_bad_uids"], "max": x["logp_max"]})
+        put("gen_A_ended", x["ok"] >= SMOKE_MIN_OK7,
+            {k: x[k] for k in ("ok", "ended", "decode_loop", "empty", "english_left")})
+        logs = gen_logs7(d / "logs", "A", sorted(int(k) for k in sample_dones(d / "iter-A" / "samples")))
+        problems = setup_ok7(logs, it["A"], lora=False)
+        put("gen_A_setup", not problems, problems or {"workers": sorted(logs)})
+
+    guard(("gen_A_samples", "gen_A_decoded", "gen_A_logp", "gen_A_ended", "gen_A_setup"), point1)
+
+    # (2) the judges
+    def scores_a():
+        samples, scores = job("A")
+        put("scores_A", True, {role: len(v) for role, v in scores.items()})
+        n = sum(bool(r["c2_overflow"]) for r in scores["c2"].values())
+        put("c2_overflow", n <= SMOKE_OVERFLOW_MAX7, {"overflow": n, "of": len(scores["c2"]),
+                                                      "c2_tokens_max": max(r["c2_tokens"] for r in scores["c2"].values())})
+
+    guard(("scores_A", "c2_overflow"), scores_a)
+
+    def loose():
+        samples, scores = job("A")
+        x = loose_compare7(samples, scores, d / "loose")
+        out["loose"] = x
+        put("qe_loose", not x["inputs_bad"] and not x["qe"]["mismatch_count"] and not x["extra_rows"]["metricx"]
+            and x["qe"]["max_abs_diff"] <= SMOKE_QE_TOL7, {"inputs_bad": x["inputs_bad"], **x["qe"]})
+        put("c2_loose", not x["inputs_bad"] and not x["p_c2"]["mismatch_count"] and not x["extra_rows"]["c2"]
+            and x["p_c2"]["max_abs_diff"] <= SMOKE_C2_TOL7, {"inputs_bad": x["inputs_bad"], **x["p_c2"]})
+
+    guard(("qe_loose", "c2_loose"), loose)
+
+    def heartbeats():
+        now = json.loads((d / "now.json").read_text())["epoch"]
+        problems = g4judge.check_judges(_HeartbeatDir(d / "heartbeats"), JUDGES7, now=now)
+        ages = {}
+        for role, worker, _ in JUDGES7:
+            path = d / "heartbeats" / f"{role}-{worker}.json"
+            if path.is_file():
+                hb = json.loads(path.read_text())
+                ages[f"{role}-{worker}"] = {"age_s": round(now - hb["epoch"], 1), "state": hb["state"]}
+        put("heartbeats", not problems, {"problems": problems, "judges": ages})
+
+    guard(("heartbeats",), heartbeats)
+
+    # (3) the iterations' files
+    for phase in ("A", "B"):
+        def rewards(phase=phase):
+            samples, scores = job(phase)
+            x = rewards_compare7(samples, scores, plan, it[phase], d / f"iter-{phase}" / "train")
+            out[f"rewards_{phase}"] = x
+            put(f"rewards_{phase}", x["differ"] == 0 and x["samples"] == x["file_rows"] and x["report_iteration"]
+                == it[phase] and x["report_groups_without_signal"] == x["groups_without_signal"]
+                and x["reward_max_abs_diff"] <= 1e-9 and x["adv_max_abs_diff"] <= 1e-9, x)
+
+        def check(phase=phase):
+            x = json.loads((d / f"check7-{phase}.json").read_text())
+            sha = file_sha256(d / f"iter-{phase}" / "train" / "train.parquet")
+            put(f"check7_{phase}", x.get("ok") is True and x.get("train_sha256") == sha,
+                {k: x.get(k) for k in ("ok", "rows", "samples", "sources", "loss_tokens", "error")}
+                | {"same_file": x.get("train_sha256") == sha})
+
+        guard((f"rewards_{phase}",), rewards)
+        guard((f"check7_{phase}",), check)
+
+    # (4), (5) the training phases
+    summaries = {}
+
+    def phase_checks(k, phase):
+        s = json.loads((d / f"train-{k}" / "summary.json").read_text())
+        summaries[k] = s
+        report = json.loads((d / f"iter-{phase}" / "train" / "report.json").read_text())
+        grpo = s.get("grpo") or {}
+        sha = file_sha256(d / f"iter-{phase}" / "train" / "train.parquet")
+        put(f"train{k}_data", (grpo.get("identity") or {}).get("grpo_train_sha256") == sha
+            and s.get("own_steps") == s.get("steps_done") == report["train"]["batches"],
+            {"same_file": (grpo.get("identity") or {}).get("grpo_train_sha256") == sha, "own_steps": s.get("own_steps"),
+             "steps_done": s.get("steps_done"), "batches": report["train"]["batches"]})
+        put(f"train{k}_peak", finite(s.get("peak_gib_max")) and s["peak_gib_max"] <= g4arm.MEM_MAX_GIB,
+            s.get("peak_gib_max"))
+        losses = [v for _, v in s.get("loss") or []]
+        measures = [v for st in grpo.get("steps") or [] for key, v in st.items() if key != "step"]
+        holds = bool(losses) and all(finite(v) for v in losses + measures) and len(grpo.get("steps") or []) == len(losses)
+        value = {"loss": s.get("loss"), "grpo_steps": len(grpo.get("steps") or [])}
+        if k == "2":
+            evals = s.get("eval") or []
+            names = {e["set"] for e in evals}
+            holds = holds and set(SMOKE_EVAL_SETS7) <= names and all(finite(e.get("loss")) for e in evals)
+            value["eval"] = [[e["set"], e["step"], e.get("loss")] for e in evals]
+        put(f"train{k}_finite", holds, value)
+        files = json.loads((d / f"train-{k}" / "files.json").read_text())
+        ck = str(files.get("checkpoint") or "")
+        put(f"train{k}_files", files.get("adapter.npz") is True and files.get("commit_success") is True
+            and ck.rstrip("/").endswith(f"/checkpoints/{s.get('steps')}"), files)
+        passes = grpo.get("passes") or {}
+        out[f"train_{k}"] = {"steps": s.get("steps"), "own_steps": s.get("own_steps"), "resume": s.get("resume"),
+                             "times": s.get("times"), "throughput": s.get("throughput"),
+                             "peak_gib_max": s.get("peak_gib_max"),
+                             "passes": {key: passes.get(key) for key in (
+                                 "tokens", "k1_old_ref", "old_ref_abs_max", "old_is_ref", "sampler_gap",
+                                 "kl_sampler_old", "seconds", "batch_s_median")},
+                             "steps_grpo": grpo.get("steps")}
+        return s
+
+    def phase1():
+        s = phase_checks("1", "A")
+        steps = (s.get("grpo") or {}).get("steps") or []
+        first = steps[0] if steps else {}
+        put("train1_step1", first.get("step") == 1 and finite(first.get("log_ratio_abs_max"))
+            and first["log_ratio_abs_max"] <= SMOKE_STEP1_TOL7 and finite(first.get("kl"))
+            and abs(first["kl"]) <= SMOKE_STEP1_TOL7,
+            {k: first.get(k) for k in ("step", "log_ratio_abs_max", "kl", "loss", "adv_mean", "clip_frac")})
+        passes = (s.get("grpo") or {}).get("passes") or {}
+        put("train1_old_ref", finite(passes.get("old_ref_abs_max")) and passes["old_ref_abs_max"] <= SMOKE_STEP1_TOL7,
+            {k: passes.get(k) for k in ("old_ref_abs_max", "old_is_ref", "k1_old_ref")})
+
+    guard(("train1_data", "train1_peak", "train1_finite", "train1_files", "train1_step1", "train1_old_ref"), phase1)
+
+    def gen_b():
+        samples, scores = job("B")
+        x = generation7(samples, plan, it["B"], counter)
+        out["generation_B"] = x
+        out["c2_overflow_B"] = sum(bool(r["c2_overflow"]) for r in scores["c2"].values())
+        put("gen_B_samples", x["samples"] == SMOKE_SAMPLES7 and x["sources"] == SMOKE_SOURCES7 and x["same_sources"]
+            and x["plan_sources"] == SMOKE_SOURCES7 and x["decode_bad"] == 0 and x["logp_bad"] == 0,
+            {k: x[k] for k in ("samples", "sources", "same_sources", "decode_bad", "logp_bad", "ok", "ended")})
+        logs = gen_logs7(d / "logs", "B", sorted(int(k) for k in sample_dones(d / "iter-B" / "samples")))
+        problems = setup_ok7(logs, it["B"], lora=True)
+        put("gen_B_lora", not problems, problems or {f"w{k}": x["lora"][-1] for k, x in logs.items()})
+
+    guard(("gen_B_samples", "gen_B_lora"), gen_b)
+
+    def phase2():
+        s = phase_checks("2", "B")
+        s1 = summaries.get("1") or json.loads((d / "train-1" / "summary.json").read_text())
+        steps1 = s1.get("steps")
+        loss = s.get("loss") or []
+        grpo_steps = (s.get("grpo") or {}).get("steps") or []
+        put("train2_resume", (s.get("resume") or {}).get("step") == steps1 and bool(loss) and loss[0][0] == steps1 + 1
+            and bool(grpo_steps) and grpo_steps[0]["step"] == steps1 + 1
+            and s.get("steps") == steps1 + (s.get("own_steps") or 0),
+            {"steps_1": steps1, "resume": s.get("resume"), "first_step": loss[0][0] if loss else None,
+             "steps": s.get("steps")})
+
+    guard(("train2_data", "train2_peak", "train2_finite", "train2_files", "train2_resume"), phase2)
+    gap = (((summaries.get("2") or {}).get("grpo") or {}).get("passes") or {}).get("sampler_gap")
+    out["sampler_gap"] = gap
+    out["sampler_gap_1"] = (((summaries.get("1") or {}).get("grpo") or {}).get("passes") or {}).get("sampler_gap")
+    out["tis"] = bool(finite(gap) and gap > TIS_GAP)
+    out["first_step_s"] = {k: (s.get("times") or {}).get("first_step_s") for k, s in summaries.items()}
+    out["compile_s_est"] = {k: (s.get("times") or {}).get("compile_s_est") for k, s in summaries.items()}
+
+    # (6) the 50 WMT24++ segments
+    def translation():
+        lora = g4arm.lora_line((d / "logs" / "translate-S.log").read_text(errors="replace"))
+        put("translate_S_lora", bool(lora) and lora.get("modules") == g4arm.SMOKE_MODULES
+            and (lora.get("relative_update_norm") or 0) > 0, lora)
+        rows = {}
+        for name in ("S", "G4-0"):
+            p = {r["id"]: r for r in read_rows(d / "translate" / name / "pairs-w0.parquet")}
+            m = {r["id"]: r for r in read_rows(d / "translate" / name / "metricx-w0.parquet")}
+            rows[name] = [{**r, "qe": m.get(i, {}).get(LOOSE_QE7)} for i, r in p.items()]
+        ok = {k: sum(bool(r["ended"]) and not r["decode_loop"] and not r["empty"] for r in v) for k, v in rows.items()}
+        n = {k: len(v) for k, v in rows.items()}
+        put("translate_ended", all(n[k] == g4arm.SMOKE_N and ok[k] >= g4arm.SMOKE_MIN_ENDED for k in rows),
+            {"segments": n, "ok": ok})
+        qe = {k: [r["qe"] for r in v] for k, v in rows.items()}
+        all_finite = all(len(v) == g4arm.SMOKE_N and all(finite(q) for q in v) for v in qe.values())
+        means = {k: mean(v) if all(finite(q) for q in v) else None for k, v in qe.items()}
+        delta = means["S"] - means["G4-0"] if all_finite else None
+        put("translate_qe", all_finite and abs(delta) <= g4arm.SMOKE_QE_MAX_DELTA,
+            {"mean": means, "delta": delta})
+        same = {r["id"]: r["hypothesis"] for r in rows["G4-0"]}
+        out["identical_translations"] = sum(same.get(r["id"]) == r["hypothesis"] for r in rows["S"])
+
+    guard(("translate_S_lora", "translate_ended", "translate_qe"), translation)
+
+    # (7) the estimate
+    def estimate():
+        t = json.loads((d / "timings.json").read_text())
+        gen, judges, runs, tokens = {}, {}, {}, []
+        for phase in ("A", "B"):
+            dones = sample_dones(d / f"iter-{phase}" / "samples")
+            logs = gen_logs7(d / "logs", phase, sorted(int(k) for k in dones))
+            per = [(x["done"]["seconds"], x["done"]["segments"]) for x in logs.values()]
+            samples = sum(v["rows"] for v in dones.values())
+            gen[phase] = {"wall_s": float(t["gen_wall_s"][phase]), "decode_s": max(s for s, _ in per),
+                          "per_sample_s": max(s / n for s, n in per)}
+            js = judge_seconds7(d / f"iter-{phase}" / "scores")
+            judges[phase] = {"tail_s": float(t["judge_tail_s"][phase]),
+                             "s_per_sample": max(s for s, _ in js.values()) / samples, "judges": js}
+            runs[phase] = {"wall_s": float(t["iter7_wall_s"][phase]), "samples": samples}
+            report = json.loads((d / f"iter-{phase}" / "train" / "report.json").read_text())
+            tokens.append(report["train"]["tokens"] / report["train"]["samples"])
+        trains = {k: {"summary": json.loads((d / f"train-{k}" / "summary.json").read_text()),
+                      "wall_s": float(t["train_wall_s"][k])} for k in ("1", "2")}
+        x = smoke_estimate7(gen, judges, runs, trains, max(tokens), float(t["val_wall_s"]))
+        x["measured"] = {"generation": gen, "judges": {p: {k: v for k, v in j.items() if k != "judges"}
+                                                       for p, j in judges.items()},
+                         "judge_seconds": {p: j["judges"] for p, j in judges.items()}, "iter7": runs,
+                         "timings": t}
+        out["estimate"] = x
+        put("estimate", finite(x["hours"]) and x["hours"] <= SMOKE_HOURS_MAX7, x["hours"])
+
+    guard(("estimate",), estimate)
+    out.setdefault("estimate", {"hours": None})
+
+    # reported, deciding nothing: stop7 on RL-val after phase 1
+    stop = d / "val" / "stop.json"
+    out["val"] = json.loads(stop.read_text()) if stop.is_file() else None
+    ordered_checks = {k: checks[k] for k in CHECKS7 if k in checks}
+    failed = [k for k, c in ordered_checks.items() if not c["holds"]]
+    return {"checks": ordered_checks, "passed": not failed, "failed": failed, **out}
+
+
+def cell7(text):
+    """A markdown table cell: its | escaped"""
+    return str(text).replace("|", "\\|")
+
+
+def f3_7(x):
+    return "–" if x is None else f"{x:.3f}" if isinstance(x, float) else str(x)
+
+
+def smoke7_md(r):
+    """The smoke test's report in Dutch"""
+    e = r.get("estimate") or {}
+    L = [f"# Smoke-test G4-7 (spec §8.3, amendement G4-7.9): iteraties A = {r['iteration']['A']}, "
+         f"B = {r['iteration']['B']}", "",
+         f"**{'Geslaagd' if r['passed'] else 'Niet geslaagd: ' + ', '.join(r['failed'])}.** Schatting van de volle "
+         f"RL-run: {f3_7(e.get('hours'))} u (grens {SMOKE_HOURS_MAX7:g} u).", "",
+         "| punt | controle | wat | waarde | grens | gehaald |", "|---:|---|---|---|---|---|"]
+    for name, c in r["checks"].items():
+        value = json.dumps(c["value"], default=str, ensure_ascii=False)[:220]
+        L.append(f"| {c['point']} | {name} | {cell7(c['what'])} | `{cell7(value)}` | {cell7(c['bound'])} | "
+                 f"{'ja' if c['holds'] else 'nee'} |")
+    gen = r.get("generation_A") or {}
+    L += ["", "## Gerapporteerd (beslist niets)", "",
+          f"- Verschillende hypothesen per groep van 8 in A: {json.dumps(gen.get('distinct_per_group'))}; in B: "
+          f"{json.dumps((r.get('generation_B') or {}).get('distinct_per_group'))}.",
+          f"- Verschil sampler/leerder (gemiddelde |log π_old − log π_sampler| per token): fase 2 "
+          f"{f3_7(r.get('sampler_gap'))}, fase 1 {f3_7(r.get('sampler_gap_1'))}; grens {TIS_GAP} (spec §4.4): "
+          + ("**boven de grens: TIS vanaf de eerste RL-iteratie**." if r.get("tis") else "eronder: geen TIS."),
+          f"- `first_step_s` (compileren en de eerste stap; fase 2 met de compileercache): "
+          f"{json.dumps(r.get('first_step_s'))}; `compile_s_est` {json.dumps(r.get('compile_s_est'))}.",
+          f"- `c2_overflow` in B: {r.get('c2_overflow_B')}; gelijke vertalingen S en G4-0 (50 segmenten): "
+          f"{r.get('identical_translations')}.",
+          f"- stop7 op RL-val na fase 1: {json.dumps({k: (r.get('val') or {}).get(k) for k in ('stop', 'tis_next')})}."]
+    if e.get("per_iteration"):
+        L += ["", "## Schatting (spec §7.2 als model; elke maat de grootste van A en B)", "",
+              f"S = {e['samples']} samples per iteratie, {e['iterations']} iteraties, {e['steps']} stappen per iteratie "
+              f"(⌈S × {f3_7(e['tokens_per_sample'])} getrainde tokens per sample / (16 × 4.096 × {e['fill']})⌉), "
+              f"stap {f3_7(e['step_s'])} s.", "",
+              "- generatie = opstart (wandtijd − decodeertijd van de traagste worker) + decodeertijd per sample × S / 4: "
+              f"{f3_7(e['generation']['startup_s'])} + {f3_7(e['generation']['per_sample_s'])} × {e['samples'] // 4} s;",
+              "- judges = staart na de laatste DONE + max(0, scoortijd per sample × S − decodeertijd): "
+              f"{f3_7(e['judges']['tail_s'])} s staart, {f3_7(e['judges']['s_per_sample'])} s per sample;",
+              "- iter7 = wandtijd per sample × S (lineair, ook het vaste deel);",
+              "- trainen (iteratie 0 uit fase 1, de andere uit fase 2 met de cache) = wandtijd − evals + (stappen − "
+              "eigen stappen) × (stap + passes per batch), passes per batch = min(mediaan, stap): "
+              f"{json.dumps({k: round(v['iteration_s'], 1) for k, v in e['train'].items()})} s;",
+              f"- evals: {e['eval_rounds']} × {f3_7(e['eval_round_s'])} s; RL-val na elke iteratie.", "",
+              f"Per iteratie (s): {json.dumps(e['per_iteration'])}, samen {e['minutes_per_iteration']} min; totaal "
+              f"{e['total_s']} s = **{e['hours']} u**."]
+    return "\n".join(L) + "\n"
+
+
+def smoke7(args, counter=None):
+    import g4arm
+
+    counter = counter or g4arm.TokenCounter(args.tokenizer)
+    result = smoke_verdict7(args.dir, counter)
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "smoke7.json").write_text(json.dumps(result, indent=1, default=str) + "\n")
+    (out / "smoke7.md").write_text(smoke7_md(result), encoding="utf-8")
+    short = {"passed": result["passed"], "failed": result["failed"], "hours": result["estimate"].get("hours"),
+             "sampler_gap": result.get("sampler_gap"), "tis": result.get("tis"),
+             "first_step_s": result.get("first_step_s")}
+    print(f"SMOKE7 {json.dumps(short, default=str)}", flush=True)
+    print("SMOKE7_OK" if result["passed"] else f"SMOKE7_FAIL {' '.join(result['failed'])}", flush=True)
+    if not result["passed"]:
+        raise SystemExit(1)
+    return result
+
+
 # ---------------------------------------------------------------------------------------------------- main
 
 def main(argv=None):
@@ -1086,8 +1907,30 @@ def main(argv=None):
     p.add_argument("--train-summary", required=True, help="the iteration's sft_lora.py --grpo summary.json")
     p.add_argument("--previous", default=None, help="the previous iteration's stop7 result (S2)")
     p.add_argument("--out", required=True)
+    # the smoke test (spec §8.3, G4-7.9)
+    p = sub.add_parser("smokeplan7", help="the smoke's plan: iterations N (A) and N+1 (B) of 32 sources, RL-val")
+    p.add_argument("--plan", required=True, help="plan7's plan.parquet")
+    p.add_argument("--base", type=int, required=True, help=f"N (>= {SMOKE_BASE_MIN7}): A is iteration N, B N+1")
+    p.add_argument("--sources", type=int, default=SMOKE_SOURCES7)
+    p.add_argument("--out", required=True)
+    p = sub.add_parser("smoke7-loose", help="the loose scorers' inputs of A's samples (metricx_qe.py, naturalness.py)")
+    p.add_argument("--samples", required=True, help="iter/<N>/samples/ (w<k>/ shards and DONE)")
+    p.add_argument("--out", required=True)
+    p = sub.add_parser("check7", help="every packed row of an iter7 file against MaxText's own SFT steps")
+    p.add_argument("--train", required=True, help="iter7's train.parquet (its samples.parquet beside it)")
+    p.add_argument("--samples", required=True, help="the iteration's samples/ (w<k>/ shards and DONE)")
+    p.add_argument("--tokenizer", required=True, help="Gemma 4's tokenizer directory")
+    p.add_argument("--rows", type=int, default=ROWS7)
+    p.add_argument("--processes", type=int, default=1)
+    p.add_argument("--chunk", type=int, default=256)
+    p.add_argument("--out", required=True, help="the check's JSON")
+    p = sub.add_parser("smoke7", help="the smoke test's verdict (spec §8.3 points 1-7)")
+    p.add_argument("--dir", required=True, help="the smoke's files as the chain puts them together")
+    p.add_argument("--tokenizer", required=True, help="Gemma 4's tokenizer directory (decoded_ok)")
+    p.add_argument("--out", required=True, help="a directory: smoke7.json, smoke7.md")
     args = parser.parse_args(argv)
-    {"pool7": pool7, "plan7": plan7, "segments7": segments7, "iter7": iter7, "stop7": stop7}[args.cmd](args)
+    {"pool7": pool7, "plan7": plan7, "segments7": segments7, "iter7": iter7, "stop7": stop7, "smokeplan7": smokeplan7,
+     "smoke7-loose": smoke7_loose, "check7": check7, "smoke7": smoke7}[args.cmd](args)
 
 
 if __name__ == "__main__":

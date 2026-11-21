@@ -23,6 +23,14 @@ The prompt is a setting of the model. TranslateGemma's (prompt translategemma) i
 nl, text} (the defaults of --source-lang and --target-lang), which the template turns into "You are a professional
 English (en) to Dutch (nl) translator. ... Please translate the following English text into Dutch:\n\n\n<text>".
 Other models get TranslateGemma's words (prompt chat-v1, user_text) in one user turn of their own chat format.
+Arm G4-7 (experiments/en-nl-translator/g4rl.py; the bucket protocol of protocol-g4.md amendment G4-7.4a): with
+--copies G every segment is translated G times (uids <id>#<j>, j = 0 .. G-1; with --sample each copy its own sample), the
+class takes every segment up to its max_source (one engine for the iteration's sources), the engine returns the
+log-probability of every token it chose (return_log_prob), and a shard holds per copy uid, id (the segment's, a
+string), j, source, hypothesis, token_ids (every token decoded, the stop token included when it ended), sampler_logp
+(one per token id), ended, decode_loop, english_left, empty (FLAN-nl's detectors, as evalsets.py collect), tokens_out,
+and tokens_in (beyond G4-7.4a's columns: g4rl.py iter7 checks the prompt's length with it); after the last shard of a
+setting --out gets DONE, {"rows", "shards": {shard: {"rows", "sha256"}}} of every shard there.
 A segment with context (a column `context` of the segments: a list of {label, source, translation}, the earlier turns
 of its conversation, and optionally a column `label`, the speaker of the segment) gets the model's context_prompt,
 which puts the earlier turns before the current turn; only the current turn is translated.
@@ -330,7 +338,8 @@ def make_engine(args, shapes, chips=4):
         ici_fsdp_parallelism=1, ici_tensor_parallelism=tensor, ici_data_parallelism=data,
         per_device_batch_size=shapes["slots"] / chips,
         max_prefill_predict_length=max_prefill, max_target_length=max_prefill + shapes["max_decode"],
-        decode_sampling_strategy="greedy", return_log_prob=False, tokenizer_type="huggingface",
+        decode_sampling_strategy="greedy", return_log_prob=bool(getattr(args, "copies", None)),
+        tokenizer_type="huggingface",
         tokenizer_path=args.tokenizer, **engine_overrides(MODELS[args.model]))
     engine = maxengine.MaxEngine(config)
     return engine, engine.load_params()
@@ -452,10 +461,12 @@ class EngineSlots:
     engine's decode_sampling_strategy) unless sample() set a temperature: then MaxEngine's "weighted" sampling,
     categorical over logits / T, with the engine's rng from the given seed (split by MaxEngine at every call)."""
 
-    def __init__(self, engine, params, prefill_lengths):
+    def __init__(self, engine, params, prefill_lengths, logprobs=False):
         self.engine, self.params, self.prefill_lengths = engine, params, prefill_lengths
         self.state = engine.init_decode_state()
         self.sampling = {}
+        # arm G4-7: the engine's log-probability of each chosen token beside it (MaxEngine's return_log_prob)
+        self.logprobs = logprobs
 
     def sample(self, temperature, seed):
         import jax
@@ -474,6 +485,8 @@ class EngineSlots:
         padded[:len(tokens)] = tokens
         prefix, first = self.engine.prefill(params=self.params, padded_tokens=jnp.asarray(padded), true_length=len(tokens),
                                             **self.sampling)
+        if self.logprobs:
+            return prefix, (first.data[0, 0], first.log_prob[0, 0])
         return prefix, first.data[0, 0]
 
     def insert(self, prefix, slot):
@@ -481,6 +494,8 @@ class EngineSlots:
 
     def generate(self):
         self.state, result = self.engine.generate(self.params, self.state, **self.sampling)
+        if self.logprobs:
+            return result.data[:, 0], result.log_prob[:, 0]
         return result.data[:, 0]
 
     @staticmethod
@@ -490,8 +505,10 @@ class EngineSlots:
         return np.asarray(jax.device_get(arrays))
 
 
-def decode_all(prompts, slots, device, max_decode, sync_every, eos_ids=EOS_IDS):
-    """Greedy completions of prompts over a fixed number of slots: [(tokens without the stop token, ended)].
+def decode_all(prompts, slots, device, max_decode, sync_every, eos_ids=EOS_IDS, logprobs=False):
+    """Greedy completions of prompts over a fixed number of slots: [(tokens without the stop token, ended)]. With
+    logprobs (arm G4-7; the device then gives (token, log-probability) pairs): [(every token decoded, the stop token
+    included when it ended, ended, the log-probability of each)].
 
     Continuous batching with the engine's own pieces: every free slot gets the next prompt (prefill, insert; the
     prefill's token is the first of the completion), then sync_every generate steps run for all slots at once and come
@@ -505,6 +522,7 @@ def decode_all(prompts, slots, device, max_decode, sync_every, eos_ids=EOS_IDS):
     outputs = [None] * len(prompts)
     owner = [-1] * slots
     tokens = [[] for _ in range(slots)]
+    logps = [[] for _ in range(slots)]
 
     def finished(s):
         return bool(tokens[s]) and (tokens[s][-1] in eos_ids or len(tokens[s]) >= max_decode)
@@ -516,20 +534,35 @@ def decode_all(prompts, slots, device, max_decode, sync_every, eos_ids=EOS_IDS):
                 i = queue.pop()
                 prefix, first = device.prefill(prompts[i])
                 device.insert(prefix, s)
-                owner[s], tokens[s] = i, []
+                owner[s], tokens[s], logps[s] = i, [], []
                 firsts.append((s, first))
         steps = [device.generate() for _ in range(sync_every)]
         if firsts:
-            for (s, _), token in zip(firsts, device.fetch([f for _, f in firsts])):
+            if logprobs:
+                pairs = zip(device.fetch([f[0] for _, f in firsts]), device.fetch([f[1] for _, f in firsts]))
+            else:
+                pairs = ((t, None) for t in device.fetch([f for _, f in firsts]))
+            for (s, _), (token, lp) in zip(firsts, pairs):
                 tokens[s].append(int(token))
-        for step in device.fetch(steps):
+                if logprobs:
+                    logps[s].append(float(lp))
+        if logprobs:
+            step_tokens, step_logps = device.fetch([t for t, _ in steps]), device.fetch([lp for _, lp in steps])
+        else:
+            step_tokens, step_logps = device.fetch(steps), None
+        for k, step in enumerate(step_tokens):
             for s in range(slots):
                 if owner[s] >= 0 and not finished(s):
                     tokens[s].append(int(step[s]))
+                    if logprobs:
+                        logps[s].append(float(step_logps[k][s]))
         for s in range(slots):
             if owner[s] >= 0 and finished(s):
                 ended = tokens[s][-1] in eos_ids
-                outputs[owner[s]] = (tokens[s][:-1] if ended else tokens[s], ended)
+                if logprobs:
+                    outputs[owner[s]] = (tokens[s], ended, logps[s])
+                else:
+                    outputs[owner[s]] = (tokens[s][:-1] if ended else tokens[s], ended)
                 owner[s] = -1
     return outputs
 
@@ -593,24 +626,105 @@ def upload(path, url, client=None):
 
 
 def translate_shard(device, codec, tokenizer, ids, texts, shapes, sync_every, contexts=None, eos_ids=EOS_IDS,
-                    labels=None):
+                    labels=None, logprobs=False):
+    """The shard's rows {id, text_<target>, ended, tokens_in, tokens_out} and the seconds of its decoding; with logprobs
+    (arm G4-7) also token_ids (every token decoded, the stop token included when it ended) and sampler_logp (the
+    engine's log-probability of each); the text is the decode of the token ids without the stop token."""
     if contexts is None:
         prompts = [codec.encode(text) for text in texts]
     else:
         prompts = [codec.encode(text, context, label)
                    for text, context, label in zip(texts, contexts, labels or [None] * len(texts))]
     started = time.time()
-    outputs = decode_all(prompts, shapes["slots"], device, shapes["max_decode"], sync_every, eos_ids)
+    outputs = decode_all(prompts, shapes["slots"], device, shapes["max_decode"], sync_every, eos_ids, logprobs)
     seconds = time.time() - started
     column = f"text_{codec.target}"
     rows = {"id": [], column: [], "ended": [], "tokens_in": [], "tokens_out": []}
-    for i, prompt, (completion, ended) in zip(ids, prompts, outputs):
+    if logprobs:
+        rows.update({"token_ids": [], "sampler_logp": []})
+    for i, prompt, output in zip(ids, prompts, outputs):
+        if logprobs:
+            ids_out, ended, lps = output
+            completion = ids_out[:-1] if ended else ids_out
+            rows["token_ids"].append(list(ids_out))
+            rows["sampler_logp"].append(list(lps))
+        else:
+            completion, ended = output
         rows["id"].append(i)
         rows[column].append(tokenizer.decode(completion, skip_special_tokens=True).strip())
         rows["ended"].append(ended)
         rows["tokens_in"].append(len(prompt))
         rows["tokens_out"].append(len(completion) + int(ended))
     return rows, seconds
+
+
+# Arm G4-7: the columns of a sample shard (g4rl.SAMPLE_COLUMNS, and tokens_in)
+PROTOCOL_COLUMNS = ("uid", "id", "j", "source", "hypothesis", "token_ids", "sampler_logp", "ended", "decode_loop",
+                    "english_left", "empty", "tokens_out", "tokens_in")
+
+
+def copies_of(ids, texts, copies):
+    """Arm G4-7: (uids, texts) with every segment `copies` times, uid <id>#<j>, the copies of a segment together"""
+    uids = [f"{i}#{j}" for i in ids for j in range(copies)]
+    return uids, [t for t in texts for _ in range(copies)]
+
+
+def protocol_rows(rows, sources, column="text_nl"):
+    """Arm G4-7: translate_shard's rows (with logprobs, ids being uids) as a sample shard of the bucket protocol
+    (PROTOCOL_COLUMNS); sources: {uid: the English}; the flags those of evalsets.py collect (FLAN-nl's detectors)"""
+    import publish
+
+    out = {k: [] for k in PROTOCOL_COLUMNS}
+    for k, u in enumerate(rows["id"]):
+        source_id, sep, j = str(u).rpartition("#")
+        if not sep or not j.isdigit():
+            raise ValueError(f"not a uid <id>#<j>: {u!r}")
+        hyp, src = rows[column][k], sources[u]
+        values = {"uid": str(u), "id": source_id, "j": int(j), "source": src, "hypothesis": hyp,
+                  "token_ids": [int(t) for t in rows["token_ids"][k]],
+                  "sampler_logp": [float(x) for x in rows["sampler_logp"][k]], "ended": bool(rows["ended"][k]),
+                  "decode_loop": bool(hyp) and publish.decode_loop(hyp, src),
+                  "english_left": bool(hyp) and publish.english_left(hyp, src), "empty": not hyp.strip(),
+                  "tokens_in": int(rows["tokens_in"][k]), "tokens_out": int(rows["tokens_out"][k])}
+        for name in PROTOCOL_COLUMNS:
+            out[name].append(values[name])
+    return out
+
+
+def file_digest(path):
+    import hashlib
+
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def blob_of(url, client):
+    bucket, name = split_gs(url)
+    return client.bucket(bucket).blob(name)
+
+
+def remote_digest(url, client):
+    """(rows, sha256) of a shard already in the bucket (a shard of an earlier start)"""
+    import hashlib
+    import io
+
+    import pyarrow.parquet as pq
+
+    data = blob_of(url, client).download_as_bytes()
+    return pq.read_table(io.BytesIO(data)).num_rows, hashlib.sha256(data).hexdigest()
+
+
+def done_marker(names, digests):
+    """Arm G4-7: the DONE marker of a sample directory (G4-7.4a), {"rows", "shards": {name: {"rows", "sha256"}}}, of
+    every shard name with its (rows, digest)"""
+    missing = sorted(set(names) - set(digests))
+    if missing:
+        raise RuntimeError(f"no digest of {missing[:3]}")
+    return {"rows": int(sum(digests[n][0] for n in names)),
+            "shards": {n: {"rows": int(digests[n][0]), "sha256": digests[n][1]} for n in sorted(names)}}
 
 
 def main(argv=None):
@@ -641,8 +755,14 @@ def main(argv=None):
     parser.add_argument("--sample", action="append", default=[],
                         help="NAME=T:SEED (repeatable): sampling at temperature T from the seed instead of greedy, one "
                              "pass per sample with the engine loaded once; --out then holds {sample}, the sample's name")
+    parser.add_argument("--copies", type=int, default=None,
+                        help="arm G4-7: every segment this many times (uids <id>#<j>), the class every segment up to its "
+                             "max_source, token ids and the engine's log-probabilities, shards of the bucket protocol "
+                             "(g4rl.py) and a DONE marker; more than 1 needs --sample")
     args = parser.parse_args(argv)
     samples = parse_samples(args.sample)
+    if args.copies is not None and (args.copies < 1 or (args.copies > 1 and not samples)):
+        parser.error("--copies G: G >= 1, and G > 1 only with --sample (greedy copies are the same)")
     if bool(samples) != ("{sample}" in args.out):
         parser.error("--out holds {sample} exactly when --sample is given")
     settings = samples or [(None, None, None)]
@@ -675,16 +795,30 @@ def main(argv=None):
     labels = table.column("label").to_pylist() if "label" in table.column_names else None
     if max(tokens, default=0) > classes[order[-1]]["max_source"]:
         raise SystemExit(f"{args.segments} has a segment of {max(tokens)} tokens, more than the plan allows")
+    if args.copies:
+        # arm G4-7: one engine for every source of the iteration (all of them fit this class)
+        if contexts is not None or max(tokens, default=0) > shapes["max_source"]:
+            raise SystemExit(f"--copies: {args.segments} has context or a segment of more than "
+                             f"{shapes['max_source']} tokens (class {args.length_class})")
+        low = 0
     chosen = [k for k, n in enumerate(tokens) if low < n <= shapes["max_source"]]
     ids, texts = [ids[k] for k in chosen], [texts[k] for k in chosen]
     context_of = {ids[j]: contexts[k] for j, k in enumerate(chosen)} if contexts is not None else None
     label_of = {ids[j]: labels[k] for j, k in enumerate(chosen)} if labels is not None else None
+    source_of = None
+    if args.copies:
+        ids, texts = copies_of(ids, texts, args.copies)
+        source_of = dict(zip(ids, texts))
     # Shards hold consecutive ids, so similar lengths; they are done in a fixed random order, so that the time of the
     # first few is a fair sample of the whole class (the projection of the run's length)
     shards = shards_of(ids, texts, args.shard_size)
     shards = random.Random(0).sample(shards, len(shards))
     done = {setting: done_shards(out_of(setting)) for setting, _, _ in settings}
     pending = {setting: sum(name not in done[setting] for name, _, _ in shards) for setting, _, _ in settings}
+    if args.copies:
+        # arm G4-7: a setting whose shards are all there but whose DONE is not still writes it
+        marked = {setting: blob_of(f"{out_of(setting)}/DONE", gcs_client()).exists() for setting, _, _ in settings}
+        pending = {s: n + (not marked[s]) for s, n in pending.items()}
     print(f"{args.length_class}: {len(ids):,} segments in {len(shards)} shards, "
           f"{', '.join(f'{len(shards) - n} done before' + (f' ({s})' if s else '') for s, n in pending.items())}; "
           f"shapes {json.dumps(shapes)}", flush=True)
@@ -703,7 +837,7 @@ def main(argv=None):
     engine, params = make_engine(args, shapes, chips)
     if args.lora:
         params = load_lora(params, args.lora)
-    device = EngineSlots(engine, params, shapes["prefill_lengths"])
+    device = EngineSlots(engine, params, shapes["prefill_lengths"], logprobs=bool(args.copies))
     print(f"engine ready in {time.time() - started:.0f} s", flush=True)
     local = Path(args.work_dir) / "shards" / args.length_class
     local.mkdir(parents=True, exist_ok=True)
@@ -712,7 +846,9 @@ def main(argv=None):
 
     def store(name, rows, seconds):
         path = local / name
-        pq.write_table(pa.table(rows), path, compression="zstd")
+        pq.write_table(pa.table(protocol_rows(rows, source_of) if args.copies else rows), path, compression="zstd")
+        if args.copies:
+            current["digests"][name] = (len(rows["id"]), file_digest(path))
         upload(path, f"{out_of(current['sample'])}/{name}", client)
         path.unlink()
         n_in, n_out = sum(rows["tokens_in"]), sum(rows["tokens_out"])
@@ -725,13 +861,24 @@ def main(argv=None):
         shard_contexts = [context_of[i] for i in shard_ids] if context_of else None
         shard_labels = [label_of[i] for i in shard_ids] if label_of else None
         return translate_shard(device, codec, tokenizer, shard_ids, shard_texts, shapes, args.sync_every,
-                               shard_contexts, model["eos_ids"], shard_labels)
+                               shard_contexts, model["eos_ids"], shard_labels, logprobs=bool(args.copies))
 
     for sample, temperature, seed in settings:
         if sample is not None:
             device.sample(temperature, seed)
-        current.update(sample=sample, totals={"segments": 0, "tokens_in": 0, "tokens_out": 0, "seconds": 0.0})
-        translate_pending(shards, done[sample], translate, store, args.max_shards)
+        current.update(sample=sample, totals={"segments": 0, "tokens_in": 0, "tokens_out": 0, "seconds": 0.0},
+                       digests={})
+        stored = translate_pending(shards, done[sample], translate, store, args.max_shards)
+        names = [name for name, _, _ in shards]
+        if args.copies and set(names) <= done[sample] | set(stored):
+            # arm G4-7: the marker last, over every shard there (a shard of an earlier start read back for its digest)
+            digests = {n: current["digests"].get(n) or remote_digest(f"{out_of(sample)}/{n}", client) for n in names}
+            marker = local / f"DONE-{sample or 'greedy'}.json"
+            marker.write_text(json.dumps(done_marker(names, digests)) + "\n")
+            upload(marker, f"{out_of(sample)}/DONE", client)
+            marker.unlink()
+            print(f"MARKER {json.dumps({'out': out_of(sample), 'rows': sum(d[0] for d in digests.values()), 'shards': len(names)})}",
+                  flush=True)
         totals = current["totals"]
         extra = {"sample": sample, "temperature": temperature, "seed": seed} if sample else {}
         print(f"DONE {json.dumps({'class': args.length_class, **totals, 'out_per_s': round(totals['tokens_out'] / max(totals['seconds'], 1e-9))} | extra)}", flush=True)

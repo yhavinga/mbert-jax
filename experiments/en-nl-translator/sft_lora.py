@@ -72,6 +72,18 @@ record; the array's sha256), with summary.json and dpo_ref.parquet; no eval, no 
 --ref-only run's ref-train.npy) a training run takes the training batches' reference from that file, checked against
 its own identity before the model is set up, and runs no reference pass over the training data (the --pref-eval files'
 references are still computed before the first step).
+Arm G4-7 (amendment G4-7, spec translator-sft/g4-rl-spec.md): with --grpo SPEC (g4rl.grpo_spec) the run is one
+iteration of GRPO: the training data are --grpo-train, a packed file of g4rl.py iter7 (one sample a segment, per token
+its advantage and the sampler's log-probability; one optimizer step per batch, every batch of the file). Before the
+first step, after --base-adapter's merge, --init-adapter's load or the restore of --resume-step, two passes over those
+batches in one jitted forward per batch (g4rl.logp_passes): the reference, the model with its LoRA at zero, and the old
+policy, the model as loaded; the loss is g4rl.make_grpo_loss (PPO clip, k2 KL weighted by sg(rho), token-mean). The
+passes are written as DIR/grpo-passes.npz and .json (their identity: the packed file's sha256, the batches, the merged,
+initial and resumed adapters, the forward pass's config and devices); summary.json keeps them (k1 KL of old to the
+reference, the sampler/learner gap) and every step's measures under "grpo". --resume-step continues the optimizer state
+from iteration to iteration as G4-5. With --passes-only the run is the passes alone (no step, no adapter); with
+--passes-in FILE (a run's grpo-passes.npz) a run takes its passes from that file, checked against its own identity, and
+runs none (the CPU proof's uninterrupted run).
 Writes to DIR (process 0): summary.json (configuration, times, throughput, memory per chip, loss per step), adapter.npz
 (the LoRA parameters in float32, keys as decoder/layers_0/self_attention/query/kernel_lora_a), adapter.json (rank,
 alpha, module regex, model, checkpoint, original dtype); MaxText's output (metrics file, tensorboard, Tunix's checkpoint
@@ -349,8 +361,10 @@ def dpo_args(args, evals_wanted):
     (no --eval, --pref-eval, --save-steps or --ref-in), --ref-in an existing file (addendum G4-6c.6e)"""
     ref_only, ref_in = getattr(args, "ref_only", False), getattr(args, "ref_in", None)
     if not args.dpo:
-        if args.pref_train or args.pref_eval or args.base_adapter or ref_only or ref_in:
-            raise SystemExit("--pref-train, --pref-eval, --base-adapter, --ref-only and --ref-in belong to --dpo")
+        base_alone = args.base_adapter and not getattr(args, "grpo", None)
+        if args.pref_train or args.pref_eval or base_alone or ref_only or ref_in:
+            raise SystemExit("--pref-train, --pref-eval, --base-adapter, --ref-only and --ref-in belong to --dpo "
+                             "(--base-adapter also to --grpo)")
         return None, {}
     if ref_only and (ref_in or args.pref_eval or evals_wanted or getattr(args, "save_steps", None)):
         raise SystemExit("--ref-only is the reference of the training batches alone: no --ref-in, --eval, --pref-eval "
@@ -403,6 +417,54 @@ def ref_identity(pref_train, batches, rows, opts, base_spec, config, lora_path, 
     return g4dpo.as_json({
         "pref_train_sha256": g4dpo.file_sha256(pref_train), "batches": batches, "rows": rows,
         "max_segments": opts["max_segments"], "end_tokens": opts["end_tokens"], "base_adapter": base,
+        "config": {k: getattr(config, k, None) for k in REF_CONFIG_KEYS},
+        "lora": {"rank": config.lora.lora_rank, "alpha": config.lora.lora_alpha, "module_path": lora_path},
+        "devices": devices})
+
+
+def grpo_args(args, evals_wanted):
+    """--grpo's spec (g4rl.grpo_spec, arm G4-7), checked before JAX: --grpo-train a packed file of g4rl.py iter7; not
+    with --dpo, --combine, --temperatures or --save-steps; --passes-only alone (no --passes-in, no --eval); --passes-in
+    an existing file. None without --grpo (then --grpo-train, --passes-only and --passes-in are refused)."""
+    grpo = getattr(args, "grpo", None)
+    passes_only, passes_in = getattr(args, "passes_only", False), getattr(args, "passes_in", None)
+    if not grpo:
+        if getattr(args, "grpo_train", None) or passes_only or passes_in:
+            raise SystemExit("--grpo-train, --passes-only and --passes-in belong to --grpo")
+        return None
+    if args.dpo or args.combine or args.temperatures or args.save_steps:
+        raise SystemExit("--grpo: no --dpo, --combine, --temperatures or --save-steps")
+    if not args.grpo_train:
+        raise SystemExit("--grpo needs --grpo-train (a packed file of g4rl.py iter7)")
+    if passes_only and (passes_in or evals_wanted):
+        raise SystemExit("--passes-only is the passes over the training batches alone: no --passes-in, no --eval")
+    if passes_in and not Path(passes_in).is_file():
+        raise SystemExit(f"--passes-in {passes_in}: no such file")
+    import g4rl
+
+    try:
+        return g4rl.read_grpo_spec(grpo)
+    except ValueError as bad:
+        raise SystemExit(f"--grpo {grpo}: {bad}") from None
+
+
+def passes_identity(train, batches, rows, base_spec, init_adapter, resume_step, resume_adapter, config, lora_path,
+                    devices):
+    """Arm G4-7: what the passes of a --grpo run are the passes of: the packed file (sha256), its first `batches` global
+    batches of `rows` rows, the adapters that make the model before the first step (merged, initial, resumed: sha256),
+    the forward pass's config (REF_CONFIG_KEYS, the LoRA's shape) and the devices"""
+    import g4dpo
+
+    def digest(path):
+        return g4dpo.file_sha256(path) if path else None
+
+    base = None
+    if base_spec:
+        base = {"name": base_spec["name"], "sha256": digest(base_spec["path"]), "scale": base_spec["meta"]["scale"]}
+    return g4dpo.as_json({
+        "grpo_train_sha256": digest(train), "batches": batches, "rows": rows, "base_adapter": base,
+        "init_adapter": digest(init_adapter),
+        "resume": {"step": resume_step, "adapter_sha256": digest(resume_adapter)} if resume_step else None,
         "config": {k: getattr(config, k, None) for k in REF_CONFIG_KEYS},
         "lora": {"rank": config.lora.lora_rank, "alpha": config.lora.lora_alpha, "module_path": lora_path},
         "devices": devices})
@@ -903,6 +965,14 @@ def main(argv=None):
     parser.add_argument("--ref-in", default=None,
                         help="with --dpo: the training batches' reference from a --ref-only run's ref-train.npy (its "
                              "ref-train.json beside it, checked); no reference pass over them (addendum G4-6c.6e)")
+    parser.add_argument("--grpo", default=None,
+                        help="g4rl spec (json): one GRPO iteration on --grpo-train (arm G4-7), the reference the model "
+                             "with its LoRA at zero")
+    parser.add_argument("--grpo-train", default=None, help="with --grpo: the packed training file of g4rl.py iter7")
+    parser.add_argument("--passes-only", action="store_true",
+                        help="with --grpo: only the passes over the training batches, to grpo-passes.npz/.json")
+    parser.add_argument("--passes-in", default=None,
+                        help="with --grpo: the passes from a run's grpo-passes.npz (its .json beside it, checked)")
     args = parser.parse_args(own)
     if args.resume_step < 0 or bool(args.resume_step) != bool(args.resume_adapter):
         raise SystemExit("--resume-step N (> 0) and --resume-adapter go together")
@@ -931,6 +1001,7 @@ def main(argv=None):
         temps = temperature_grid(args.temperatures)
     if combine_spec and combine_spec["objective_mode"] == "calibrated" and not temps:
         raise SystemExit("--combine: the calibrated objective needs --temperatures (addendum G4-5.7b A)")
+    grpo_opts = grpo_args(args, evals_wanted)
     dpo_opts, prefs_wanted = dpo_args(args, evals_wanted)
     base_spec = base_adapter_arg(args.base_adapter) if args.base_adapter else None
     if prefs_wanted and not evals_wanted:
@@ -980,6 +1051,14 @@ def main(argv=None):
         own_steps = count["batches"] if args.steps == "auto" else int(args.steps)
         if not 1 <= own_steps <= count["batches"]:
             raise SystemExit(f"--dpo: {own_steps} steps, the packed file has {count['batches']} batches")
+    elif grpo_opts:
+        # --grpo (arm G4-7): one step per global batch of the packed file, the same on every process
+        import g4rl
+
+        count = {**g4rl.packed_info7(args.grpo_train, pref_rows, config.max_target_length), "file": args.grpo_train}
+        own_steps = count["batches"] if args.steps == "auto" else int(args.steps)
+        if not 1 <= own_steps <= count["batches"]:
+            raise SystemExit(f"--grpo: {own_steps} steps, the packed file has {count['batches']} batches")
     # A multi-host job counts also when given a number of steps, to hold that number to step_limit
     elif args.steps == "auto" or jax.process_count() > 1:
         mesh = maxtext_utils.get_mesh_from_config(config)
@@ -1008,7 +1087,7 @@ def main(argv=None):
             batches_per_process = [int(x) for x in np.asarray(counts).reshape(-1)]
             count["batches_per_process"] = batches_per_process
             count["step_limit"] = step_limit(batches_per_process)
-    if not dpo_opts:
+    if not dpo_opts and not grpo_opts:
         own_steps = choose_steps(args.steps, batches_per_process)
     # --resume-step: MaxText's steps (Tunix's max_steps) and the schedule count from the restored step
     steps = args.resume_step + own_steps
@@ -1078,11 +1157,36 @@ def main(argv=None):
             ref_in = g4dpo.read_reference(args.ref_in, identity)
             print(f"REF_IN {json.dumps({'file': args.ref_in, 'sha256': ref_in[1]['sha256'], 'shape': ref_in[1]['shape']})}",
                   flush=True)
+    grpo_identity, passes_in = None, None
+    if grpo_opts:
+        # arm G4-7: what this run's passes are the passes of; --passes-in's file checked before the model is set up
+        grpo_identity = passes_identity(args.grpo_train, own_steps, pref_rows, base_spec, args.init_adapter,
+                                        args.resume_step, args.resume_adapter, config,
+                                        lora_utils._get_lora_module_path(config),  # noqa: SLF001
+                                        {"count": jax.device_count(), "processes": jax.process_count(),
+                                         "kind": jax.devices()[0].device_kind})
+        if args.passes_in:
+            passes_in = g4rl.read_passes(args.passes_in, grpo_identity, own_steps * pref_rows, config.max_target_length)
+            print(f"PASSES_IN {json.dumps({'file': args.passes_in, 'sha256': passes_in[1]['sha256'], 'shape': passes_in[1]['shape']})}",
+                  flush=True)
 
     t_setup = time.time()
     trainer, mesh = train_sft.setup_trainer_state(config)
     setup_s = time.time() - t_setup
-    dpo_steps = []
+    dpo_steps, grpo_steps = [], []
+    if grpo_opts:
+        # --grpo: MaxText's loss replaced by the GRPO loss (training; an SFT eval file keeps its loss), MaxText's
+        # training data by the packed file's batches with their passes (below), and every step's sums kept
+        trainer = trainer.with_loss_fn(g4rl.make_grpo_loss(config, grpo_opts, True), has_aux=True)
+        trainer.eval_loss_fn = g4rl.make_grpo_loss(config, grpo_opts, False)
+        post_train_grpo = trainer._post_process_train_step  # noqa: SLF001 - wrapped, not replaced
+
+        def keep_grpo_step(aux):
+            grpo_steps.append({k: aux[f"grpo_{k}"] for k in g4rl.SUMS7})   # device scalars, read after training
+            return post_train_grpo(aux)
+
+        trainer._post_process_train_step = keep_grpo_step  # noqa: SLF001
+        print(f"GRPO {json.dumps({'spec': grpo_opts, 'train': count, 'own_steps': own_steps})}", flush=True)
     if dpo_opts:
         # --dpo: MaxText's loss replaced by the preference loss (training and eval), MaxText's training data by the
         # packed file's batches (below, with the reference), and every step's sums kept
@@ -1114,6 +1218,59 @@ def main(argv=None):
     resumed = check_resume(trainer, args.resume_step, args.resume_adapter) if args.resume_step else None
     if resumed:
         print(f"RESUMED {json.dumps(resumed)}", flush=True)
+    passes_rec, passes_s = None, 0.0
+    if grpo_opts:
+        # arm G4-7: the model is now the one of the first step (merged, loaded or restored): the reference (its LoRA at
+        # zero) and the old policy (as it is) over the batches the run trains on, forward only, in the training's mesh
+        # and rules; then the training data are the packed file's batches with their passes (one all-zero batch after
+        # them for Tunix's look-ahead)
+        from flax.core.spmd import logical_axis_rules
+
+        t_passes = time.time()
+        if passes_in:
+            passes, seconds = passes_in[0], []
+        else:
+            with jax.set_mesh(mesh), logical_axis_rules(config.logical_axis_rules):
+                passes, seconds = g4rl.logp_passes(trainer.model, config, args.grpo_train, mesh, pref_rows, own_steps)
+        passes_s = time.time() - t_passes
+        arrays7, _ = g4rl.read_packed7(args.grpo_train)
+        used = slice(0, own_steps * pref_rows)
+        mask7 = arrays7["targets_segmentation"][used] != 0
+        passes_rec = {**g4rl.pass_record(passes["ref_logp"], passes["old_logp"], arrays7["sampler_logp"][used], mask7),
+                      "batches": own_steps, "seconds": round(sum(seconds), 1),
+                      "batch_s_median": round(statistics.median(seconds), 3) if seconds else None,
+                      "passes_in": args.passes_in, "device_gib": device_bytes()}
+        tis = None
+        if grpo_opts["tis"]:
+            tis = g4rl.tis_weights(passes["old_logp"], arrays7["sampler_logp"][used], mask7, grpo_opts["tis_threshold"])
+            passes_rec["tis_mean"] = float(tis[mask7].mean())
+        print(f"PASSES {json.dumps(passes_rec)}", flush=True)
+        if main_process:
+            meta7 = g4rl.write_passes(out, passes, grpo_identity, passes_rec)
+            passes_rec["file"] = {"sha256": meta7["sha256"], "shape": meta7["shape"]}
+        if args.passes_only:
+            summary = {"passes_only": True, "model": config.model_name, "checkpoint": config.load_parameters_path,
+                       "devices": jax.device_count(), "processes": jax.process_count(),
+                       "device_kind": jax.devices()[0].device_kind, "epoch": count, "own_steps": own_steps,
+                       "times": {"python_to_setup_s": round(t_setup - started, 1), "setup_s": round(setup_s, 1),
+                                 "passes_s": round(passes_s, 1)},
+                       "peak_gib_max": peak_gib(), "base_adapter": base_adapter, "init_adapter": init_adapter,
+                       "resume": resumed,
+                       "grpo": {"spec": grpo_opts, "train": count, "passes": passes_rec, "identity": grpo_identity}}
+            if main_process:
+                (out / "summary.json").write_text(json.dumps(summary, indent=1, default=str) + "\n")
+                print(f"PASSES_ONLY {json.dumps(passes_rec.get('file'))}", flush=True)
+            if jax.process_count() > 1:
+                from jax.experimental import multihost_utils
+
+                multihost_utils.sync_global_devices("sft_lora files written")
+            return
+        hooks_data = trainer.data_hooks
+        close(hooks_data.train_data_iterator)
+        grpo_iter = g4rl.global_iterator7(args.grpo_train, mesh, pref_rows, own_steps, padding=1, passes=passes,
+                                          tis=tis)
+        hooks_data.train_data_iterator = grpo_iter
+        hooks_data.train_data_loader.data_iterator = grpo_iter
     refs, ref_record, ref_s = {}, {}, 0.0
     if dpo_opts:
         # --dpo, amendment G4-6.4a: the model is now the one of the first eval and step (every LoRA B zero, checked):
@@ -1379,7 +1536,7 @@ def main(argv=None):
         "epoch": count, "steps": steps, "steps_done": len(records), "own_steps": own_steps,
         "resume": resumed, "schedule": {"warmup_steps": args.warmup_steps, "decay_fraction": args.decay_fraction},
         "times": {"python_to_setup_s": round(t_setup - started, 1), "setup_s": round(setup_s, 1),
-                  "train_s": round(train_s, 1), "ref_s": round(ref_s, 1),
+                  "train_s": round(train_s, 1), "ref_s": round(ref_s, 1), "passes_s": round(passes_s, 1),
                   "first_step_s": round(first_compile, 1) if first_compile is not None else None,
                   "compile_s_est": round(first_compile - statistics.median(later), 1) if later else None},
         "throughput": throughput(records, tokens, loss_tokens),
@@ -1401,6 +1558,10 @@ def main(argv=None):
         "dpo": ({"spec": dpo_opts, "train": count, "pref_eval": prefs_wanted, "ref": ref_record,
                  "steps": [g4dpo.step_record(k, {n: scalar(v) for n, v in s.items()})
                            for k, s in enumerate(dpo_steps, args.resume_step + 1)]} if dpo_opts else None),
+        # --grpo: the spec, the packed training file, the passes and every step's GRPO measures
+        "grpo": ({"spec": grpo_opts, "train": count, "passes": passes_rec, "identity": grpo_identity,
+                  "steps": [g4rl.step_record7(k, {n: scalar(v) for n, v in s.items()})
+                            for k, s in enumerate(grpo_steps, args.resume_step + 1)]} if grpo_opts else None),
     }
     if summary["throughput"]:
         summary["throughput"]["tokens_per_s_per_chip"] = round(summary["throughput"]["tokens_per_s"] / jax.device_count(), 1)

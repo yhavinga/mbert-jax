@@ -794,6 +794,9 @@ def wait(args):
         print(f"FAILED: the generation has no {absent}", flush=True)
         return 1
     last_done = max(store.mtime(f"{sample_dir(args.job, k)}/DONE") for k in writers)
+    # G4-7.4f: the timeout counts from the later of the last DONE and the start of this wait (a job generated long
+    # before the judges started, as the anchor after a restart), and starts again whenever a score arrives
+    t0, best = max(last_done, time.time()), None
     while True:
         dead = check_judges(store, judges, heartbeat_max=args.heartbeat_max, busy_max=args.busy_max)
         missing, problems, dones = scores_state(store, args.job, writers, judges)
@@ -805,8 +808,11 @@ def wait(args):
         if dead:
             print("FAILED: " + "; ".join(dead) + f"; missing {len(missing)}: " + "; ".join(missing[:20]), flush=True)
             return 1
-        if time.time() - last_done > args.timeout:
-            print(f"FAILED: not every score {args.timeout} s after the last DONE; missing {len(missing)}: "
+        if best is not None and len(missing) < best:
+            t0 = time.time()
+        best = len(missing) if best is None else min(best, len(missing))
+        if time.time() - t0 > args.timeout:
+            print(f"FAILED: not every score {args.timeout} s after the last DONE or the last progress; missing {len(missing)}: "
                   + "; ".join(missing), flush=True)
             return 1
         time.sleep(args.poll)
@@ -960,6 +966,12 @@ def proef(args):
     for job, writers in (("iter/2", "0,1,2,3"), ("anchor", "0,1,2,3"), ("val/2", "3")):
         r = run_wait(job, writers, ("--full",))
         check(f"{job} scored", r.returncode == 0 and "SCORES_OK" in r.stdout)
+    # G4-7.4f: a job generated long before its wait (the anchor after a restart) is not timed out at once
+    write_sample_shards(store, "iter/5", 0, fake_samples("5/0", sources[0], 8), 32, log=log)
+    done5 = root / sample_dir("iter/5", 0) / "DONE"
+    os.utime(done5, (time.time() - 3600, time.time() - 3600))
+    r = run_wait("iter/5", "0", timeout=20)
+    check("a DONE of an hour ago: the timeout counts from the wait", r.returncode == 0 and "SCORES_OK" in r.stdout)
     # a judge that lives but does not get to the job: the timeout names its shards
     procs["w9"] = start("c2", "w9", delay=1000)
     time.sleep(1.5)

@@ -1743,3 +1743,10 @@ knip ±10: FLAN 0,96, WMT24++ 1,13; bij ±12 of geen knip: 1,02 en 1,17.
   −12 zijn gewoon) en zou de RL falen kunnen leren. Een fail blijft zo de slechtste uitkomst, zoals G4-7.3 bedoelt
   (test `test_a_fail_is_below_every_reward_that_is_not_a_fail`).
 - Het eerdere `c2cal7`-rapport (knip ±6) blijft bewaard als `$RL/c2/cal7/report-clip6.{json,md}`. Verder verandert niets.
+
+*G4-7.4f Aanvulling 21 nov 2026 ~23:35 (hoofdsessie; uitvoering, geen methodewijziging).* `g4judge.py wait` telde de
+time-out van 900 s vanaf de laatste DONE van de generatie. Het anker was om 16:29 gegenereerd, de judges startten pas om
+23:21 (de keten liep in delen), zodat `wait_anchor` na 6 s faalde terwijl de judges net begonnen. Nu telt de time-out
+vanaf het latere van de laatste DONE en de start van de wacht, en begint opnieuw bij elke nieuwe score; een dode judge
+(hartslag) faalt zoals voorheen meteen. Proef: `JUDGE_PROEF_OK` 13 controles, waaronder "a DONE of an hour ago". De
+judges van `g4i1121h` (code `706c8d7`, `serve` ongewijzigd) liepen door en worden door de herstart als levend herkend.

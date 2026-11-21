@@ -1409,3 +1409,169 @@ ingelezen referentie, de referentierun, de volle run en het vervolg als G4-6c.11
 `$G/runs/g4arm_G4-6c_s8_ref/` en `$G/runs/g4arm_G4-6c_ref/` (`ref-train.npy`, `ref-train.json`, `summary.json`,
 `dpo_ref.parquet`). De markers `cpuproof6`, `smoke6` en `train-g4arm_G4-6c_s8` van code `20904d4` hernoemd met
 `-g4h1120e`, de smoke-run van `g4h1120e` naar `g4arm_G4-6c_s8-g4h1120e`; nieuwe TAG.
+
+## 14. Amendement G4-7
+
+**Amendement 21 nov 2026 (tijdstip: de commit van deze sectie op branch `en-nl-g4arm7`, vanaf `en-nl-g4arm6c` @
+`71940fe`): arm G4-7, online RL (GRPO) met LoRA op Gemma 4 31B-it** [kader van de hoofdsessie, afgestemd met Yeb op 20
+nov; besluiten van Yeb van 20 nov ~15:25 en 21 nov ~09:10–09:21; de overige keuzes zijn een invulling door de
+hoofdsessie volgens het advies van de spec `mbert-ops/translator-sft/g4-rl-spec.md` (§9); uitwerking door een subagent;
+labels als in de kop]. Vastgelegd vóór de data van C2, vóór de bronnenpool, vóór de CPU-proef, de smoke-test en de
+eerste RL-stap, en vóór elke uitslag van G4-7. Waar deze sectie niets zegt, gelden §1–§8 en de amendementen van §9–§13
+met "G4-7" in plaats van de arm daar; de beslisregel is die van G4-7.8. Wie wat koos, staat in G4-7.0; de onderbouwing
+staat in de spec.
+
+*G4-7.0 Keuzes, en wie ze maakte.*
+- **Yeb (20 nov ~15:25):** C2 is de reward-classifier; C1 (S @ 653k, de classifier van regel (b)) blijft de
+  ongewijzigde meter van (b) en komt nooit in de lus.
+- **Yeb (21 nov ~09:10):** de encoder van C2 is dmbert v2 (`yhavinga/dmbert-230m-fineweb2-optout`; checkpoint
+  `gs://t5-dutch-english-usc2/mbert/v2-fw2optout-230m/ckpt_keep/1306000`). RobBERT-2023 valt af. C2 gaat via hetzelfde
+  pad als C1 (`naturalness.py classifier` en `classify`, de DUMB-fine-tune); er komt geen RoBERTa-pad.
+- **Yeb (21 nov ~09:20):** de lengteregels: bronnen van ten hoogste 256 Gemma 4-tokens; een vertaling met ℓ/ℓ₀ buiten
+  [0,67; 1,5] is een fail (r = −10); C2 scoort de hele tekst en kapt nooit af, en een tekst van meer dan 1.022 tokens is
+  een fail (`c2_overflow`); het poolfilter van 340 RobBERT-tokens vervalt. De stopregels S1–S6 van spec §6.4 (S5
+  vervalt), met S4 ruimer: de mediane ℓ/ℓ₀ op RL-val moet binnen [0,85; 1,15] blijven. De vier grenzen van `c2cal7`
+  (spec §5.3.3): akkoord.
+- **Advies van de hoofdsessie; Yeb maakte geen bezwaar (21 nov):** (a3), COMET-22 ≥ G4-0 − 0,005 per set, blijft in de
+  beslisregel.
+- **Invulling door de hoofdsessie volgens het advies van de spec (21 nov):** route C-fase (per iteratie genereren,
+  beoordelen, trainen); startpunt G4-0, referentie het model met LoRA op nul; de classifierterm is de logit van C2,
+  geknipt op ±6; de QE-term is een grens met anker, gewicht 2; G = 8; 512 bronnen per iteratie; data FLAN 40 / romans
+  30 / BT 30; LR 5e-6; β 0,04 met k2 en sg(ρ); geen overlap van genereren en beoordelen; de rollen op mbert-mix: w0 en w2
+  MetricX-24-QE, w1 C2, w3 de vertalingen van RL-val; G4-7 start na het verslag van G4-6c en als mbert-mix vrij is.
+- **Keuzes van de subagent (techniek):** het bucketprotocol van G4-7.4a (kolommen, markers, de verdeling van MetricX
+  over w0 en w2, de jobs `anchor` en `val/<i>`); de data van C2 met één passage per document en vóór de bronnenpool
+  (G4-7.6); de code van C2 in `g4c2.py` in plaats van `g4rl.py` (de judge-kant en de beleidskant worden op twee branches
+  gebouwd).
+
+*G4-7.1 Aanleiding.* G4-2 t/m G4-6b haalden (b) niet (+1,0 / +0,4 / +0,7 / −0,4 / −1,7 / −4,5 pp). SFT verschuift de
+kansverdeling, niet de greedy modus (temperatuurproef: één T verklaart 62–67% van de lossdaling); bij T = 1 is G4-4's
+uitvoer op WMT24++ 60,9% "origineel" (sampling-proef). DPO verzadigde (G4-6) of ontspoorde (G4-6b). G4-7 beloont het
+model op zijn eigen samples.
+
+*G4-7.2 Data* (`g4rl.py pool7`, `$RL/data/`; `RL=$G/rl/G4-7`). Engelse bronnen van ten hoogste 256 Gemma 4-tokens:
+FLAN-nl-segmenten (40%), het Engels van de `-b1-`-romans zonder de 10 boeken van `novels` (30%), het Engels van de vijf
+`-nl-en-gemma4`-sets (train, gelijk per bron, zonder de documenten van C2; 30%). De documenten van C2 staan in
+`$RL/c2/data/docs.txt` (één documentsleutel per regel, G4-7.6); `pool7` leest die lijst en stopt als hij ontbreekt, dus
+`g4c2.py data7` draait vóór `pool7`. Uit: elke bron met een 13-gram van de evaluatiesets, de FLAN-evaluatierijen of de
+blinde passages. 15.360 bronnen in volgorde `en-nl-g4arm/0/G4-7/order`, RL-val 384 (128 per deel). Anker: G4-0's greedy
+vertaling (klasse `medium`, fork `f4d8615`, `natural-v1`) met QE, lengte ℓ₀ (Gemma 4-tokens) en C2; een bron waarvan het
+anker niet af is, een lus heeft of Engels laat staan, valt weg. Er is geen filter op het aantal tokens van C2 [Yeb 21 nov].
+
+*G4-7.3 Reward en verlies* (`g4rl.py`). fail = niet af, lus, leeg, Engels over, ℓ/ℓ₀ buiten [0,67; 1,5], QE > 7,5 of
+`c2_overflow` (de uitvoer heeft meer dan 1.022 tokens van C2's tokenizer, zonder de speciale tokens; C2 kapt nooit af)
+→ r = −10; anders r = clip(logit C2, −6, 6) − 2·max(0, QE − QE₀) − 2·max(0, |ln(ℓ/ℓ₀)| − ln 1,15). Voordeel = r − het
+groepsgemiddelde (G = 8); groepen met max − min < 0,05 niet in het trainbestand. Verlies per uitvoertoken (inclusief het
+stoptoken): −min(ρA, clip(ρ, 0,8, 1,2)A) + 0,04·sg(ρ)·½(log πθ − log π_ref)², gemiddeld over de tokens van de batch;
+π_old en π_ref per iteratie berekend door de leerder vóór de eerste stap; π_ref = het model met LoRA op nul. Gelijk getest
+tegen Tunix @ `a8d7058` (`compute_advantages` "drgrpo", `compute_kl_divergence` "mse_kl", `grpo_loss_fn`,
+`aggregate_loss` "token-mean"). Is het verschil sampler/leerder (gemiddelde |log π_old − log π_sampler| per token) > 0,05,
+dan vanaf de volgende iteratie × min(π_old/π_sampler, 2) per token.
+
+*G4-7.4 Training* (`sft_lora.py --grpo`, `g4arm7_run.sh`). Per iteratie i: (1) de vier workers van mbert-corpus vertalen
+hun deel van 512 bronnen × 8 met `translate.py --lora` (de adapter van i ingebakken vanaf de fp32-basis; T = 1, seed
+`en-nl-g4arm/0/G4-7/sample/<i>`) en schrijven de shards naar `$RL/iter/<i>/samples/`; (2) de judges van mbert-mix (w0, w2
+MetricX-24-QE hybrid XXL; w1 C2) scoren elke shard (G4-7.4a); (3) `g4rl.py iter7` bouwt het trainbestand; (4) één job
+over 16 chips rekent π_ref en π_old en traint één optimizer-stap per batch van 16 rijen van 4.096, LR 5e-6 (10 stappen
+opwarmen, dan constant), AdamW zoals G4-4.4, de state voortgezet met `--resume-step`; adapter en checkpoint naar
+`$RL/iter/<i>/`. Rank 32 / alpha 16, 410 modules. Ten hoogste 30 iteraties. Na elke iteratie vertaalt w3 van mbert-mix
+RL-val greedy met de nieuwe adapter naar `$RL/val/<i>/samples/w3/`, en scoren de judges die.
+
+*G4-7.4a Het bucketprotocol* (`g4judge.py`; alles in `gs://t5-dutch-english-usc2`, Python-client van GCS; paden onder
+`$RL`). Een **job** is `iter/<i>` (de samples van iteratie i), `val/<i>` (RL-val na iteratie i) of `anchor` (G4-0's
+greedy vertaling van de pool en RL-val, iteratie 0 van C2 en QE). Per job:
+- `<job>/samples/w<k>/shard-<n>.parquet` (k = de schrijvende worker, n = een geheel getal): per sample `uid` (string,
+  `<id>#<j>`), `id` (string, de bron-id), `j` (int; 0 bij `anchor` en `val`), `source` (het Engels), `hypothesis` (het
+  gedecodeerde Nederlands zonder het einde van de beurt), `token_ids` (list<int>), `sampler_logp` (list<float>, per token
+  van `token_ids`), `ended`, `decode_loop`, `english_left`, `empty` (bool), `tokens_out` (int). Een `uid` komt binnen
+  een job één keer voor. De judges lezen alleen `uid`, `source` en `hypothesis`.
+- `<job>/samples/w<k>/DONE`, als laatste: JSON `{"rows": <int>, "shards": {"shard-<n>.parquet": {"rows": <int>,
+  "sha256": "<hex>"}}}`.
+- `<job>/scores/metricx/w<m>/shard-<k>-<n>.parquet`: `uid`, `qe` (float, MetricX-24 hybrid XXL v2p6 bf16 in QE-modus,
+  afgerond op 4 decimalen zoals `metricx_qe.py score`; null bij een lege `hypothesis`). MetricX is verdeeld op `uid`:
+  deel = int(de eerste 8 hextekens van sha256(uid)) mod 2; w0 scoort deel 0, w2 deel 1, in elke job. Een
+  scorebestand bevat alleen de rijen van het eigen deel.
+- `<job>/scores/c2/w1/shard-<k>-<n>.parquet`: `uid`, `p_c2` (float, P(label 1 = origineel) met de softmax van
+  `naturalness.py classify`), `logit_c2` (float, logit₁ − logit₀ in float32, ongeknipt), `c2_tokens` (int, tokens van
+  C2's tokenizer zonder de speciale tokens), `c2_overflow` (bool, `c2_tokens` > 1.022; dan `p_c2` en `logit_c2` null).
+  C2 scoort elke rij; nooit afgekapt.
+- `<job>/scores/<rol>/w<m>/DONE-<k>`, als laatste, zodra elke shard van `samples/w<k>/DONE` gescoord is: JSON `{"rows":
+  <int>, "shards": {"shard-<n>.parquet": {"rows": <int>, "samples_sha256": "<hex>"}}}`, met de sha256 van het
+  samplebestand zoals de judge het las; wijkt die af van `DONE`, dan schrijft de judge geen marker en stopt hij (exit ≠ 0).
+- `judges/<rol>-w<m>.json` (hartslag; het enige object dat overschreven wordt), ten minste elke 60 s: `pid`, `host`,
+  `role`, `worker`, `state`, `time` (UTC, ISO 8601), `epoch`, `last_shard`, `scored_rows`.
+- `judges/STOP`: geschreven door de keten; een judge maakt zijn shard af en stopt met exit 0.
+- Elk ander object wordt één keer geschreven (bij GCS met `if_generation_match=0`) en de marker komt als laatste. Een
+  judge scoort elke shard zodra die verschijnt (streaming), slaat een shard met een bestaand resultaat over (herstartbaar,
+  idempotent) en leest alleen zijn eigen invoer.
+- De keten (`g4judge.py wait`): vóór elke iteratie is elke hartslag hoogstens 5 min oud, anders `FAILED`; na de
+  generatie liggen alle `DONE-<k>` van alle judges er binnen 15 min na de laatste `DONE` van de generatie, anders `FAILED`
+  met de namen van de ontbrekende shards; de `uid`'s van de scores (MetricX: w0 en w2 samen, zonder overlap; C2) zijn
+  precies die van de samples, anders `FAILED`. C1 is geen judge en scoort niets onder `$RL/`.
+
+*G4-7.5 Stopregels* (na elke iteratie; RL-val greedy op w3) [Yeb 21 nov]: S1 niet af + lus + leeg + Engels over op RL-val
+> 2% (8 van 384); S2 gemiddelde QE op RL-val − die van het anker > 0,15 bij twee validaties na elkaar; S3 KL per token
+(k1-schatting op de samples) > 0,30 nats; **S4 mediane ℓ/ℓ₀ op RL-val buiten [0,85; 1,15]**; S6 fail-aandeel van de
+samples van een iteratie > 10% (inclusief `c2_overflow`). Er is geen S5: geen stopregel gebruikt C1. Een stop beëindigt
+de training; technische fouten (NaN, OOM, timeout van een judge): `FAILED`, geen stille terugval.
+
+*G4-7.6 C2, de reward-classifier* (`g4c2.py data7`, `naturalness.py classifier`, `g4c2.py cal7`) [Yeb 20 en 21 nov].
+- **Encoder:** dmbert v2 (`yhavinga/dmbert-230m-fineweb2-optout`), het checkpoint
+  `gs://t5-dutch-english-usc2/mbert/v2-fw2optout-230m/ckpt_keep/1306000`, omgezet met
+  `scripts/convert_gcs_checkpoint.py --params-only` zoals C1's checkpoint; zijn eigen tokenizer (`config.tokenizer_name`).
+- **Data** (`$RL/c2/data/`): Nederlandse originelen (`nl`, label 1) tegen Gemma 4's rondgangvertaling van dezelfde
+  passage (`nl_back`, label 0) uit de vijf `yhavinga/<bron>-nl-en-gemma4`-sets, split `train`, op de revisies van G4-3
+  (`BT_REPOS3`). Een passage komt in aanmerking als `nl` en `nl_back` niet leeg zijn, `hard_fails` leeg is,
+  `back_ended` waar is, `back_decode_loop` en `back_english_left` onwaar zijn, en `nl` en `nl_back` allebei ten hoogste
+  1.022 tokens van C2's tokenizer hebben (zonder de speciale tokens; heel, niet afgekapt). Uit: de documenten van C1's
+  2.000 passages en elke passage met dezelfde `nl`-tekst; elke passage met een 13-gram uit WMT24++, FLORES, NTREX,
+  Europarl-direct, de FLAN-evaluatierijen of de blinde passages (`nl` of `en`); `btval`, `btlong` en `own` komen uit de
+  split `validation` en vallen daarmee weg (gecontroleerd). Documentsleutel: de `id` zonder de laatste twee velden
+  (`<bron>:<document>`). Per bron 1.000 documenten in een geseede volgorde (`en-nl-g4arm/0/G4-7/c2/<bron>`), van elk
+  document één passage (ook geseed); de eerste 100 documenten in een tweede geseede volgorde
+  (`en-nl-g4arm/0/G4-7/c2/<bron>/test`) zijn de testsplit, de andere 900 train: 9.000 + 1.000 teksten per klasse samen,
+  beide versies van een passage aan dezelfde kant. Heeft een bron minder dan 1.000 documenten die in aanmerking komen,
+  dan stopt `data7`. Het bestand heeft de kolommen van C1's data (`pid`, `id`, `source`, `rank`, `split`, `label`,
+  `text`); `docs.txt` heeft de 5.000 documentsleutels voor `pool7` (G4-7.2).
+- **Training** (`$RL/c2/model/`), op w1 in `~/mbert-dumb/.venv` met `~/mbert-dumbx` @ `ae11478`, zoals C1:
+  `naturalness.py classifier` ongewijzigd, 3 epochs, LR 5e-5, seed 42, 8 per chip, `--max-length 1024`; geen
+  validatiesplit en geen keuze van een epoch.
+- **Bruikbaar als reward** (`g4c2.py cal7`, `$RL/c2/cal7/`, vóór het anker en de eerste RL-stap; alle vier moeten gelden,
+  anders geen RL en aan Yeb): (1) nauwkeurigheid op de eigen testsplit ≥ 0,75; (2) aandeel "origineel" (P ≥ 0,5) op de
+  Nederlandse originelen van Europarl-direct (de referenties van die set) ≥ 0,75; (3) G4-0's greedy aandeel "origineel" op
+  WMT24++ (goed) + FLAN tussen 0,02 en 0,90; (4) op de 8 samples per bron van de sampling-proef van G4-0
+  (`$G/sampling/G4-0/t10s1…t10s8/`) per set (WMT24++, FLAN) de mediaan over de bronnen van de sd (ddof 0) van
+  clip(logit C2, −6, 6) binnen de groep ≥ 0,25 en ≥ de mediaan-sd van 2·max(0, QE − QE₀) in dezelfde groepen (QE₀ = de QE
+  van G4-0's greedy vertaling van dat segment uit zijn evaluatie). Gerapporteerd, beslist niets: dezelfde maten voor G4-4,
+  het aandeel groepen met max − min van de logit > 1 en met alle 8 geknipt, |Δ logit| `t10s1` tegen `best8`, de Spearman
+  binnen de bron van Δlogit C2 met Δtokens en met ΔQE, de nauwkeurigheid op de testsplit per lengte (≤ 128, 129–256, > 256
+  tokens), de C2-tokens van de samples, en de kalibratie van spec §5.3.5 (C2 op de bestaande uitvoer, de Spearman per
+  segment met C1 uit de bestaande classify-runs).
+- C2 scoort elk sample, het anker en RL-val, als judge op w1 (G4-7.4a); C2 op held-out wordt alleen gerapporteerd. C1 (S @
+  653k, ongewijzigd) scoort alleen de kandidaten en G4-0 op de evaluatieset, in één classify-run, voor G4-7.7 en G4-7.8;
+  nooit de samples, het anker of RL-val, en niet in een stopregel.
+
+*G4-7.7 Keuze (zoekdeel)*, als G4-5.6 en G4-6c.7. Kandidaten: de adapters na iteratie 5, 10, 15, 20, 25, 30 en de
+laatste vóór een stop, elk vertaald en gescoord zoals G4-5.5. Van de kandidaten die op het zoekdeel van G4-5.4 (digest
+`f953c026…f3`) (a1) halen: de grootste (b) (C1 "origineel" − G4-0 op WMT24++ (goed) + FLAN van het zoekdeel); bij
+gelijkheid de eerdere; haalt geen kandidaat (a1), dan de kleinste grootste QE-overschrijding (`select5`).
+
+*G4-7.8 Beslisregel (beslisdeel), tegen G4-0.* (a1) per set QE ≤ die van de menselijke referentie op dezelfde
+segmenten; (a3) per set COMET-22 ≥ G4-0 − 0,005 (WMT24++, FLORES, NTREX); (b) C1 "origineel" − G4-0 ≥ 0,10 op WMT24++
+(goed) + FLAN, ongewijzigd; (a2) en (c) zoals §5, alleen als (a1), (a3) en (b) gelden (pakket `$S/blind/G4-7/`, één
+verse Claude-subagent). Helpt als alle vijf gelden. C2 per set wordt naast C1 gerapporteerd en beslist niets.
+
+*G4-7.9 CPU-proef en smoke-test* (spec §8.2–§8.3): `CPU_PROOF7_OK` vóór de eerste TPU-stap; `smoke7` met twee
+mini-iteraties; faalt een controle, dan stoppen vóór de RL-run. In de smoke-test is `c2_overflow` bij meer dan 1 van de
+256 samples een stop.
+
+*G4-7.10 Rapportage* (beslist niets). Vóór de RL: `c2cal7` met de kalibratie (bij een hoge correlatie met C1, Spearman
+≥ 0,5 per segment, de zin dat een C2-hack ook C1 kan misleiden en de blinde beoordeling dan zwaarder weegt). Per
+iteratie: reward en zijn termen, fail-aandelen per soort (ook `c2_overflow`), QE, C2, lengte, KL, clip-fractie, verschil
+sampler/leerder, groepen zonder signaal; per validatie RL-val met C2; per 5 iteraties `books`, `btval`, `own`; alle
+kandidaten op beide delen na de keuze, met C1 en C2 naast elkaar ("C2 stijgt, C1 niet" = signaal van reward hacking);
+MTLD en PLL.
+
+*G4-7.11 Uitvoer.* `$RL/c2/data/`, `$RL/c2/model/`, `$RL/c2/cal7/`, `$RL/data/`, `$RL/anchor/`, `$RL/iter/<i>/`,
+`$RL/val/<i>/`, `$RL/judges/`, `$G/G4-7-i<k>/`, `$G/eval/G4-7-i<k>/`, `$G/naturalness-G4-7/`, `$S/blind/G4-7/`,
+`$G/report-G4-7/` (kopie `mbert-ops/translator-sft/g4-7-report.md`), markers `$G/stages/g4-7/`.

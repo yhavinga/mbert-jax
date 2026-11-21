@@ -67,6 +67,13 @@ Arm G4-6 (draft amendment G4-6: preference training, DPO with LoRA, G4-0 as the 
             translation of 50 segments) and the estimate of the full run
   pairtexts6, pairclass6   the classifier on chosen and rejected per kind (reported, decides nothing)
   report --train-summary of a --dpo run: the preference measures beside the rules
+Arm G4-7 (amendment G4-7, protocol-g4.md §14: online RL, GRPO with LoRA from G4-0; g4rl.py), what comes after the RL:
+  records7  the chain's records.json (gs:// paths of every iteration's report.json, stop.json and summary.json, the
+            stop, smoke7, c2cal7) as the copies into report7's --records layout
+  report7   the candidate chosen on the search part (G4-7.7: select5), the rule (a1), (a3), (b) against G4-0 on its
+            decision part (G4-7.8), (a2) and (c) only after those three; reported: C2 beside C1 per set ("C2 rises,
+            C1 not"), MetricX-ref, COMET-22, length, failures, MTLD, PLL (with --pll), every iteration of the training,
+            the stop, c2cal7 and smoke7
 """
 
 import argparse
@@ -5066,6 +5073,505 @@ def report6c_text(r):
     return "\n".join(L) + "\n"
 
 
+# ---------------------------------------------------------------------------------------------------- G4-7
+
+ARM7 = "G4-7"
+CAND7 = re.compile(r"^G4-7-i([1-9][0-9]*)$")
+EVERY7 = 5                # amendment G4-7.7: the adapters after iteration 5, 10, ..., 30 and the last before a stop
+RULE_A3 = 0.005           # amendment G4-7.8 (a3): per set COMET-22 >= G4-0's - 0.005 on the same segments
+A3_SETS = ("wmt24pp", "flores", "ntrex")
+B_SETS7 = ("wmt24pp", "flan")             # (b)'s texts: WMT24++ (good) + FLAN
+SFT_SETS7 = ("books", "btval", "own")     # spec §6.3: the SFT evals after every 5th iteration (reported)
+SPEARMAN_HIGH7 = 0.5      # amendment G4-7.10 (spec §5.3.5): C2 ~ C1 per segment at or above this, the sentence below
+RULES7 = ("S1", "S2", "S3", "S4", "S6")   # amendment G4-7.5 (no S5)
+HIGH_SPEARMAN_TEXT7 = ("Bij deze hoge correlatie (Spearman per segment ≥ 0,5) duwt wat C2 omhoog duwt waarschijnlijk "
+                       "ook C1 omhoog. Een hack van C2 kan dan ook C1 misleiden; (b) zegt dan minder, en de blinde "
+                       "beoordeling ((a2), (c)) weegt zwaarder bij het lezen van de uitslag (de lezing van spec "
+                       "§5.3.5 en G4-7.10; beslist niets).")
+
+
+def iterations_max7():
+    import g4rl
+
+    return g4rl.ITERATIONS7
+
+
+def cand_n7(name):
+    """n of a candidate G4-7-i<n>: the adapter after n iterations (1..30)"""
+    m = CAND7.match(name)
+    if not m or not 1 <= int(m.group(1)) <= iterations_max7():
+        raise SystemExit(f"{name} is no candidate of G4-7 (G4-7-i<n>, n = 1..{iterations_max7()})")
+    return int(m.group(1))
+
+
+def check_candidates7(names, last):
+    """amendment G4-7.7: the candidates in the order of n, at most the iterations done (last + 1); every adapter after
+    a multiple of 5 iterations among them; one more only as the largest (the last before a stop)"""
+    ns_ = [cand_n7(n) for n in names]
+    if ns_ != sorted(set(ns_)):
+        raise SystemExit(f"the candidates {names}: not in the order of their iterations")
+    done = last + 1
+    want = list(range(EVERY7, done + 1, EVERY7))
+    missing = [k for k in want if k not in ns_]
+    extra = [k for k in ns_ if k not in want]
+    if missing or ns_[-1] > done or len(extra) > 1 or (extra and extra[0] != ns_[-1]):
+        raise SystemExit(f"the candidates {names} after {done} iterations: G4-7.7 takes the adapters after "
+                         f"{', '.join(map(str, want)) or 'no multiple of 5'} iterations and the last before a stop")
+    return ns_
+
+
+def records7_list(listing, out_dir):
+    """records.json of the chain -> [(gs:// source, local destination)] in report7's --records layout
+    (DIR/iter-<i>/report.json, stop.json, summary.json; DIR/cal7.json; DIR/smoke7.json) and DIR/stopped.json; the
+    iterations 0, 1, ... in order, the stop's last iteration the last of them"""
+    its = listing.get("iterations")
+    if not isinstance(its, list) or not its:
+        raise SystemExit("records: no iterations")
+    got = [x.get("i") if isinstance(x, dict) else None for x in its]
+    if got != list(range(len(its))) or len(its) > iterations_max7():
+        raise SystemExit(f"records: the iterations {got}, not 0, 1, ... (at most {iterations_max7()})")
+    stopped = listing.get("stopped")
+    if (not isinstance(stopped, dict) or stopped.get("last_iteration") != len(its) - 1
+            or not isinstance(stopped.get("stop"), list) or not set(stopped["stop"]) <= set(RULES7)
+            or "reason" not in stopped):
+        raise SystemExit(f"records: stopped {stopped!r}: not {{'last_iteration': {len(its) - 1}, 'stop': [rules of "
+                         f"{', '.join(RULES7)}], 'reason': ...}}")
+
+    def uri(value, what):
+        if not isinstance(value, str) or not value.startswith("gs://") or any(c.isspace() for c in value):
+            raise SystemExit(f"records: {what} is {value!r}, not a gs:// path")
+        return value
+
+    out = Path(out_dir)
+    pairs = []
+    for x in its:
+        d = out / f"iter-{x['i']}"
+        d.mkdir(parents=True, exist_ok=True)
+        for k in ("report", "stop", "summary"):
+            pairs.append((uri(x.get(k), f"iteration {x['i']}'s {k}"), d / f"{k}.json"))
+    pairs.append((uri(listing.get("cal7"), "cal7"), out / "cal7.json"))
+    if listing.get("smoke") is not None:
+        pairs.append((uri(listing["smoke"], "smoke"), out / "smoke7.json"))
+    (out / "stopped.json").write_text(json.dumps(stopped, indent=1) + "\n")
+    return pairs
+
+
+def records7(args):
+    for src, dst in records7_list(json.loads(Path(args.list).read_text()), args.out):
+        print(f"{src} {dst}")
+
+
+def iterations7(records, stopped):
+    """amendment G4-7.10, per iteration (reported, decides nothing): from g4rl.py iter7's report the reward and its
+    terms, the failure shares per kind (c2_overflow too), QE, C2, l / l0, the groups without signal; from the run's
+    summary (sft_lora.py --grpo) the k1 KL old - ref, the sampler/learner gap, TIS, the clip fraction and the KL term
+    (token-weighted over the steps [choice of the subagent]), the SFT evals (at the last eval step of the run); from
+    stop7 RL-val and the rules with their values. Every iteration before the last stopped nothing; the last one's
+    rules are the chain's stop."""
+    last = stopped["last_iteration"]
+    out = []
+    for i in range(last + 1):
+        d = Path(records) / f"iter-{i}"
+        rep, stop, summary = (json.loads((d / f"{k}.json").read_text()) for k in ("report", "stop", "summary"))
+        if rep.get("iteration") != i or stop.get("iteration") != i:
+            raise SystemExit(f"{d}: the report of iteration {rep.get('iteration')} and the stop of "
+                             f"{stop.get('iteration')}, not {i}")
+        grpo = summary.get("grpo") or {}
+        if not grpo.get("passes") or not grpo.get("steps") or not grpo.get("spec"):
+            raise SystemExit(f"{d}/summary.json: no GRPO spec, passes or steps (sft_lora.py --grpo)")
+        if set(stop.get("rules") or {}) != set(RULES7):
+            raise SystemExit(f"{d}/stop.json: the rules {sorted(stop.get('rules') or {})}, not {list(RULES7)}")
+        hits = [k for k in RULES7 if stop["rules"][k]["hit"]]
+        if hits != stop["stop"]:
+            raise SystemExit(f"{d}/stop.json: stop {stop['stop']}, its rules hit {hits}")
+        if i < last and hits:
+            raise SystemExit(f"{d}/stop.json: iteration {i} stopped ({hits}), the chain went on to iteration {last}")
+        if i == last and hits != sorted(stopped["stop"], key=RULES7.index):
+            raise SystemExit(f"{d}/stop.json: the last iteration stopped on {hits}, the chain says {stopped['stop']}")
+        steps = grpo["steps"]
+        tokens = sum(s["tokens"] for s in steps)
+
+        def weighted(key, steps=steps, tokens=tokens):
+            return sum(s[key] * s["tokens"] for s in steps) / tokens if tokens else None
+
+        evals = last_evals(summary)
+        n = rep["samples"]
+        out.append({
+            "i": i, "n": i + 1, "samples": n, "sources": rep["sources"],
+            "groups_without_signal": rep["groups_without_signal"],
+            **{k: rep[k] for k in ("reward_mean", "reward_mean_ok", "logit_mean_ok", "qe_pen_mean_ok", "len_pen_mean_ok",
+                                   "qe_mean", "p_c2_mean", "origineel_share", "ratio_median", "fail_share")},
+            "fails": {k: v / n for k, v in rep["fails"].items()},
+            "train_samples": (rep.get("train") or {}).get("samples"),
+            "k1_old_ref": grpo["passes"]["k1_old_ref"], "sampler_gap": grpo["passes"]["sampler_gap"],
+            "tis": bool(grpo["spec"]["tis"]), "steps": len(steps), "step_first": steps[0]["step"],
+            "step_last": steps[-1]["step"], "clip_frac": weighted("clip_frac"), "kl": weighted("kl"),
+            "loss": weighted("loss"),
+            "val": {k: stop["validation"].get(k) for k in ("sources", "fail_share", "qe_delta", "ratio_median",
+                                                           "c2_overflow", "p_c2_mean", "c2_origineel_share")},
+            "rules": {k: {"value": stop["rules"][k]["value"], "hit": stop["rules"][k]["hit"]} for k in RULES7},
+            "stop": stop["stop"], "tis_next": stop.get("tis_next"),
+            "sft": {k: evals[k]["loss"] for k in SFT_SETS7 if k in evals},
+            "sft_step": max((evals[k]["step"] for k in SFT_SETS7 if k in evals), default=None)})
+    return out
+
+
+def rule_a3(scored, ids, name, base):
+    """amendment G4-7.8 (a3): per set (WMT24++ without is_bad_source as (a1), FLORES, NTREX) the mean COMET-22 with
+    reference of the model at least the base's on the same segments - RULE_A3"""
+    sets = {}
+    for s in A3_SETS:
+        m = [scored[name][i]["comet22"] for i in ids[s]]
+        b = [scored[base][i]["comet22"] for i in ids[s]]
+        if not ids[s] or any(v is None for v in m + b):
+            raise SystemExit(f"(a3) {s}: {name} or {base} has no COMET-22 score of every one of {len(ids[s])} segments")
+        mm, bm = statistics.fmean(m), statistics.fmean(b)
+        sets[s] = {"n": len(ids[s]), "model": mm, "base": bm, "delta": mm - bm,
+                   "holds": mm - bm >= -RULE_A3 - TOLERANCE}
+    return {"sets": sets, "holds": all(v["holds"] for v in sets.values())}
+
+
+def c2_part7(c1, c2, ids, models, base):
+    """C1 and C2 side by side on one part (amendment G4-7.8, G4-7.10; C2 decides nothing): per model the share
+    "original" (p >= 0.5) of each on WMT24++ (good), FLAN and both pooled, the differences to the base, and the flag
+    "C2 rises, C1 not" [choice of the subagent: C2's pooled difference reaches (b)'s bound of 0.10, C1's does not]"""
+    out = {}
+    for name in models:
+        x = {}
+        for label, preds in (("c1", c1), ("c2", c2)):
+            per = {}
+            for s in B_SETS7:
+                missing = [i for i in ids[s] if (name, s, i) not in preds]
+                if missing:
+                    raise SystemExit(f"{label.upper()}: no prediction of {name} on {len(missing)} {s} texts of the part, "
+                                     f"e.g. {missing[:3]}")
+                per[s] = sum(preds[(name, s, i)] >= 0.5 for i in ids[s]) / len(ids[s])
+            per["pooled"] = sum(per[s] * len(ids[s]) for s in B_SETS7) / sum(len(ids[s]) for s in B_SETS7)
+            x[label] = per
+        out[name] = x
+    for x in out.values():
+        for label in ("c1", "c2"):
+            x[f"{label}_delta"] = {k: x[label][k] - out[base][label][k] for k in (*B_SETS7, "pooled")}
+        x["c2_up_c1_not"] = (x["c2_delta"]["pooled"] >= RULE_B - TOLERANCE
+                             and x["c1_delta"]["pooled"] < RULE_B - TOLERANCE)
+    return out
+
+
+def part_counts7(scored, ids):
+    """part_counts6c with the mean MetricX-24 with reference, COMET-22 and MTLD (armeval.mtld per output) per model and
+    set of a part"""
+    import armeval
+
+    out = part_counts6c(scored, ids)
+    for name, per in out.items():
+        for s, c in per.items():
+            rows = [scored[name][i] for i in ids[s]]
+            c["metricx_ref"] = mean(r["metricx_ref"] for r in rows)
+            c["comet22"] = mean(r["comet22"] for r in rows)
+            c["mtld"] = mean(armeval.mtld(r["hypothesis"] or "") for r in rows)
+    return out
+
+
+def pll_part7(pll, ids, models):
+    """naturalness.py pll (S @ 653k, PLL-word-l2r) on the classify run's texts, per model and set of a part: the texts
+    scored and left out (longer than its row), the mean PLL per text and per token, as armeval.py report reads it"""
+    out = {}
+    for name in models:
+        out[name] = {}
+        for s in B_SETS7:
+            missing = [i for i in ids[s] if (name, s, i) not in pll]
+            if missing:
+                raise SystemExit(f"--pll: no row of {name} on {len(missing)} {s} texts of the part, e.g. {missing[:3]}")
+            rows = [pll[(name, s, i)] for i in ids[s]]
+            kept = [r for r in rows if r["pll"] is not None]
+            out[name][s] = {"n": len(kept), "skipped": len(rows) - len(kept), "pll": mean(r["pll"] for r in kept),
+                            "pll_per_token": mean(r["pll"] / r["tokens"] for r in kept)}
+    return out
+
+
+def cal7_short(c):
+    """c2cal7's report (g4c2.py cal7): passed (else no RL should have run, G4-7.6), its four conditions, and per
+    calibration run the Spearman per segment of C2 with C1"""
+    if not c.get("ok"):
+        failed = [n for n, v in (c.get("conditions") or {}).items() if not v.get("ok")]
+        raise SystemExit(f"c2cal7 did not pass ({failed}): amendment G4-7.6 runs no RL then")
+    calib = {n: {"segments": v.get("segments"), "spearman_c2_c1": v.get("spearman_c2_c1")}
+             for n, v in (c.get("calibration") or {}).items()}
+    high = [n for n, v in calib.items() if v["spearman_c2_c1"] is not None and v["spearman_c2_c1"] >= SPEARMAN_HIGH7]
+    return {"ok": True, "conditions": c["conditions"], "calibration": calib, "high": high,
+            "over_1022_tokens": c.get("over_1022_tokens")}
+
+
+def verdict7(r):
+    """amendment G4-7.8: (a1), (a3) and (b) first; (a2) and (c) only after them; helps if all five hold"""
+    if not (r["a1"]["holds"] and r["a3"]["holds"] and r["b"]["holds"]):
+        return "helpt niet"
+    if r.get("blind") is None:
+        return "wacht op de blinde beoordeling ((a2), (c))"
+    return "helpt" if r["a2"] and r["c"] else "helpt niet"
+
+
+def report7(args):
+    """amendment G4-7.7-G4-7.10: the candidate chosen on the search part (G4-5.6's rule, select5, unchanged), the rule
+    (a1), (a3), (b) against G4-0 on its decision part, (a2) and (c) from the blind tally only after those three; per
+    candidate on both parts C2 beside C1 and the other measures; every iteration of the training, the stop, c2cal7,
+    smoke7 (reported, deciding nothing)"""
+    import g4mix
+
+    evalsets = {r["id"]: r for r in read_rows(args.evalsets)}
+    split = json.loads(Path(args.split).read_text())
+    assign = split["assign"]
+    if g4mix.digest(assign) != split["digest"] or split["digest"] != SPLIT_DIGEST6C:
+        raise SystemExit(f"{args.split}: not the split of G4-5.4 (digest {split['digest']}, want {SPLIT_DIGEST6C})")
+    stopped = json.loads(Path(args.stopped).read_text())
+    last = stopped.get("last_iteration")
+    if (not isinstance(last, int) or not 0 <= last < iterations_max7() or not isinstance(stopped.get("stop"), list)
+            or not set(stopped["stop"]) <= set(RULES7)):
+        raise SystemExit(f"{args.stopped}: last_iteration {last!r}, stop {stopped.get('stop')!r} (rules of "
+                         f"{', '.join(RULES7)})")
+    cands = [c.split("=", 1) for c in args.candidate]
+    names = [n for n, _ in cands]
+    ns_ = check_candidates7(names, last)
+    refs = [c.split("=", 1) for c in args.reference or []]
+    scored = {name: scored_dir(d) for name, d in cands + [(BASE, args.base)] + refs}
+    for name, rows in scored.items():
+        if set(rows) != set(evalsets):
+            raise SystemExit(f"{name}: scores for {len(rows)} of {len(evalsets)} segments")
+    refqe = {r["id"]: r["qe_source_reference"] for r in read_rows(args.refqe)}
+    missing = [i for i, r in evalsets.items() if r["set"] in HUMAN_QE and refqe.get(i) is None]
+    if missing:
+        raise SystemExit(f"{args.refqe}: no QE of the human reference of {len(missing)} segments, e.g. {missing[:3]}")
+    check = {}
+    for s in HUMAN_QE:
+        ids = [i for i, r in evalsets.items() if r["set"] == s and not (s == "wmt24pp" and bad_source(r["meta"]))]
+        got = mean(refqe[i] for i in ids)
+        check[s] = {"again": got, "protocol": HUMAN_QE[s], "diff": got - HUMAN_QE[s]}
+        if abs(got - HUMAN_QE[s]) > REFQE_MAX_DIFF5:
+            raise SystemExit(f"the human references' QE of {s} again: {got:.4f}, the protocol's {HUMAN_QE[s]:.4f}")
+    predictions = read_rows(args.predictions)
+    predictions_c2 = read_rows(args.predictions_c2)
+    keys = [(r["model"], r["set"], r["id"]) for r in predictions]
+    keys_c2 = [(r["model"], r["set"], r["id"]) for r in predictions_c2]
+    if len(set(keys_c2)) != len(keys_c2) or set(keys_c2) != set(keys):
+        raise SystemExit(f"{args.predictions_c2}: not C2 on the texts of {args.predictions} (each once)")
+    part_ids = {p: part_ids5(evalsets, assign, p) for p in ("search", "decision")}
+    parts = {p: part_measures5(scored, predictions, refqe, part_ids[p], BASE) for p in ("search", "decision")}
+    # the choice reads the search part alone (amendment G4-7.7)
+    chosen, why = select5(names, parts["search"])
+    d = parts["decision"]["models"][chosen]
+    a3 = {p: {name: rule_a3(scored, part_ids[p], name, BASE) for name in scored} for p in parts}
+    c1 = {k: r["p_original"] for k, r in zip(keys, predictions)}
+    c2 = {k: r["p_original"] for k, r in zip(keys_c2, predictions_c2)}
+    truncated = {label: {name: sum(bool(r.get("truncated")) for r in rows if r["model"] == name) for name in scored}
+                 for label, rows in (("c1", predictions), ("c2", predictions_c2))}
+    iterations = iterations7(args.records, stopped)
+    result = {"arm": ARM7, "base": BASE, "candidates": names, "iterations_of": dict(zip(names, ns_)),
+              "selected": chosen, "selection": why, "refqe_check": check,
+              "split": {k: split[k] for k in ("seed", "share", "sets", "digest")}, "parts": parts,
+              "a1": {"holds": d["a1"], "sets": d["a1_sets"]},
+              "a3": a3["decision"][chosen], "b": {"holds": d["b"], "delta": d["b_delta"]},
+              "a3_all": a3, "c2": {p: c2_part7(c1, c2, part_ids[p], list(scored), BASE) for p in parts},
+              "truncated": truncated,
+              "counts": {p: part_counts7(scored, part_ids[p]) for p in parts},
+              "pll": ({p: pll_part7({(r["model"], r["set"], r["id"]): r for r in read_rows(args.pll)}, part_ids[p],
+                                    list(scored)) for p in parts} if args.pll else None),
+              "references": [n for n, _ in refs], "iterations": iterations, "stopped": stopped,
+              "cal7": cal7_short(json.loads(Path(args.cal7).read_text())),
+              "smoke7": json.loads(Path(args.smoke).read_text()) if args.smoke else None}
+    result["blind_due"] = result["a1"]["holds"] and result["a3"]["holds"] and result["b"]["holds"]
+    if args.tally:
+        t = json.loads(Path(args.tally).read_text())
+        if not result["blind_due"]:
+            raise SystemExit(f"{args.tally}: a blind tally, but (a1), (a3) and (b) do not all hold for {chosen} "
+                             "(amendment G4-7.8: the blind review only after them)")
+        if t.get("arm") != chosen:
+            raise SystemExit(f"{args.tally}: a tally of {t.get('arm')}, the selected candidate is {chosen}")
+        result["blind"], result["a2"], result["c"] = t, t["a2"], t["c"]
+    else:
+        result["blind"] = None
+    result["verdict"] = verdict7(result)
+    Path(args.out).with_suffix(".json").write_text(json.dumps(result, indent=1, ensure_ascii=False, default=str) + "\n")
+    Path(args.out).write_text(report7_text(result), encoding="utf-8")
+    print(f"REPORT7 {json.dumps({'selected': chosen, 'a1': d['a1'], 'a3': result['a3']['holds'], 'b': d['b_delta'], 'b_holds': d['b'], 'blind_due': result['blind_due'], 'verdict': result['verdict']})}",
+          flush=True)
+
+
+def f4(x, signed=False):
+    if x is None:
+        return "–"
+    return (f"{x:+.4f}" if signed else f"{x:.4f}").replace(".", ",")
+
+
+def report7_text(r):
+    sets = list(HUMAN_QE)
+    dec = r["parts"]["decision"]
+    sel, base = r["selected"], r["base"]
+    m, b0 = dec["models"][sel], dec["models"][base]
+    L = [f"# Arm {r['arm']}: uitslag volgens amendement G4-7 (protocol-g4.md §14)", "",
+         "Gemaakt door `g4arm.py report7`. Online RL (GRPO) met LoRA vanaf G4-0, C2 als reward-classifier; de "
+         "kandidaten (adapters na iteratie 5, 10, … en de laatste vóór een stop) vertaald en gescoord zoals G4-5.5; de "
+         "keuze op het zoekdeel van G4-5.4 (regel van G4-5.6, `select5`, G4-7.7), het besluit met (a1), (a3) en (b) tegen "
+         "G4-0 op het beslisdeel (G4-7.8); (a2) en (c) alleen als die drie gelden. Alle getallen hieronder zijn gemeten "
+         "op de genoemde bestanden; C2 en alles na \"rapporteren\" beslist niets.", "",
+         f"**Uitslag: {r['verdict']}.** Gekozen kandidaat: **{sel}** ({r['selection']}); kandidaten "
+         f"{', '.join(r['candidates'])}.", "",
+         "## Besluit op het beslisdeel (G4-7.8)", "",
+         "(a1) MetricX-24-QE niet hoger dan de menselijke referentie op dezelfde segmenten.", "",
+         f"| set | n | {sel} | G4-0 | mens (zelfde segmenten) | (a1) |", "|---|---:|---:|---:|---:|---|"]
+    for s in sets:
+        L.append(f"| {s} | {dec['n'][s]} | {f3(m['qe'][s])} | {f3(b0['qe'][s])} | {f3(dec['human'][s])} | "
+                 f"{'ja' if m['a1_sets'][s] else 'nee'} |")
+    L += ["", f"(a1) **{'gehaald' if r['a1']['holds'] else 'niet gehaald'}**.", "",
+          "(a3) COMET-22 met referentie niet lager dan G4-0 − 0,005 op dezelfde segmenten (WMT24++ zonder "
+          "`is_bad_source`, als (a1) [keuze subagent]).", "",
+          f"| set | n | {sel} | G4-0 | verschil | (a3) |", "|---|---:|---:|---:|---:|---|"]
+    for s, v in r["a3"]["sets"].items():
+        L.append(f"| {s} | {v['n']} | {f4(v['model'])} | {f4(v['base'])} | {f4(v['delta'], True)} | "
+                 f"{'ja' if v['holds'] else 'nee'} |")
+    L += ["", f"(a3) **{'gehaald' if r['a3']['holds'] else 'niet gehaald'}**. (b) C1: aandeel \"origineel\" "
+          f"{pct(m['share'])} tegen G4-0 {pct(b0['share'])} (WMT24++ {dec['n']['wmt24pp']} + FLAN {dec['n']['flan']}), "
+          f"verschil {f3(m['b_delta'], True)} (grens +0,10) → **{'gehaald' if r['b']['holds'] else 'niet gehaald'}**.", ""]
+    if r.get("blind"):
+        b = r["blind"]
+        L += [f"Blind tegen G4-0: {b['arm_better']} beter, {b['base_better']} slechter, {b['equal']} gelijk; fouten "
+              f"{b['errors_arm']} tegen {b['errors_base']} → (a2) {'ja' if r['a2'] else 'nee'}, (c) "
+              f"{'ja' if r['c'] else 'nee'}.", ""]
+    elif r["blind_due"]:
+        L += ["(a2) en (c): (a1), (a3) en (b) gelden; de blinde beoordeling (pakket `$S/blind/G4-7/`) is nog niet "
+              "geteld.", ""]
+    else:
+        L += ["(a2) en (c): niet beoordeeld; de blinde beoordeling gebeurt alleen als (a1), (a3) en (b) gelden.", ""]
+    for part, title in (("search", "Zoekdeel (de keuze, G4-7.7)"),
+                        ("decision", "Beslisdeel, alle modellen (na de keuze, rapporteren)")):
+        p = r["parts"][part]
+        L += [f"## {title}", "", "(a3) staat erbij om te rapporteren; de keuze gebruikt alleen (a1) en (b).", "",
+              "| model | " + " | ".join(f"QE {s}" for s in sets) + " | (a1) | max. QE-overschrijding | (a3) | "
+              "C1 origineel | verschil met G4-0 |", "|---|" + "---:|" * len(sets) + "---|---:|---|---:|---:|"]
+        L.append("| mens | " + " | ".join(f3(p["human"][s]) for s in sets) + " | | | | | |")
+        for name, x in p["models"].items():
+            L.append(f"| {name} | " + " | ".join(f3(x["qe"][s]) for s in sets) +
+                     f" | {'ja' if x['a1'] else 'nee'} | {f3(x['excess'], True)} | "
+                     f"{'ja' if r['a3_all'][part][name]['holds'] else 'nee'} | {pct(x['share'])} | "
+                     f"{f3(x['b_delta'], True)} |")
+        L.append("")
+    L += ["## C1 en C2 per set (rapporteren, beslist niets)", "",
+          "Aandeel \"origineel\" (p ≥ 0,5) van C1 (de classifier van regel (b), S @ 653k) en C2 (de reward-classifier, "
+          "dmbert v2) op dezelfde teksten. Signaal van reward hacking: \"C2 stijgt, C1 niet\" = C2 − G4-0 ≥ +0,10 "
+          "(de grens van (b)) en C1 − G4-0 < +0,10, op WMT24++ (goed) + FLAN samen [keuze subagent].", "",
+          "| deel | model | C1 WMT24++ | C1 FLAN | C1 samen | C1 − G4-0 | C2 WMT24++ | C2 FLAN | C2 samen | C2 − G4-0 | "
+          "C2 stijgt, C1 niet |", "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|"]
+    for part, label in (("search", "zoek"), ("decision", "beslis")):
+        for name, x in r["c2"][part].items():
+            L.append(f"| {label} | {name} | {pct(x['c1']['wmt24pp'])} | {pct(x['c1']['flan'])} | {pct(x['c1']['pooled'])} | "
+                     f"{f3(x['c1_delta']['pooled'], True)} | {pct(x['c2']['wmt24pp'])} | {pct(x['c2']['flan'])} | "
+                     f"{pct(x['c2']['pooled'])} | {f3(x['c2_delta']['pooled'], True)} | "
+                     f"{'**ja**' if x['c2_up_c1_not'] else 'nee'} |")
+    L += ["", "Teksten afgekapt op 1.024 tokens (alle teksten van het model in de classify-run): " + "; ".join(
+        f"{name} C1 {r['truncated']['c1'][name]}, C2 {r['truncated']['c2'][name]}" for name in r["truncated"]["c2"]) + ".",
+        "", "## Per model: MetricX, COMET, niet af, lussen, lengte, MTLD (rapporteren, beslist niet)", "",
+        "Uitvoer / ref: mediaan van de woorden van de uitvoer per woord van de referentie; > 1,5 × ref: aandeel uitvoer "
+        "met meer dan 1,5 keer de woorden van de referentie; MTLD: gemiddelde per uitvoer (`armeval.mtld`). FLAN heeft "
+        "geen referentie.", "",
+        "| deel | model | set | n | QE | MetricX-ref | COMET-22 | niet af | lus | Engels over | leeg | uitvoer / ref | "
+        "> 1,5 × ref | MTLD |", "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
+    for part, label in (("search", "zoek"), ("decision", "beslis")):
+        for name, per in r["counts"][part].items():
+            for s, c in per.items():
+                L.append(f"| {label} | {name} | {s} | {c['n']} | {f3(c['metricx_qe'])} | {f3(c['metricx_ref'])} | "
+                         f"{f4(c['comet22'])} | {c['not_ended']} | {c['decode_loop']} | {c['english_left']} | "
+                         f"{c['empty']} | {f3(c['out_per_ref'])} | {pct(c['over_1_5_ref'])} | {f3(c['mtld'])} |")
+    L += ["", "## PLL (rapporteren, beslist niet)", ""]
+    if r["pll"] is None:
+        L += ["PLL: **niet gemeten** (geen `naturalness.py pll`-uitvoer bij dit verslag).", ""]
+    else:
+        L += ["PLL-word-l2r onder S @ 653k (`naturalness.py pll`) op de teksten van de classify-run; hoger (minder "
+              "negatief) = waarschijnlijker onder S.", "",
+              "| deel | model | set | n | weggelaten | PLL per vertaling | PLL per token |", "|---|---|---|---:|---:|---:|---:|"]
+        for part, label in (("search", "zoek"), ("decision", "beslis")):
+            for name, per in r["pll"][part].items():
+                for s, v in per.items():
+                    L.append(f"| {label} | {name} | {s} | {v['n']} | {v['skipped']} | {f3(v['pll'])} | "
+                             f"{f3(v['pll_per_token'])} |")
+        L.append("")
+    its = r["iterations"]
+    kinds = list(its[0]["fails"]) if its else []
+    L += ["## De training per iteratie (rapporteren, beslist niets)", "",
+          "Iteratie i (0, 1, …) traint de adapter G4-7-i<i+1>. Reward en termen: gemiddelde over alle samples en over "
+          "de samples zonder fail; logit = clip(logit C2, −6, 6), QE-straf 2·max(0, QE − QE₀), lengtestraf "
+          "2·max(0, |ln ℓ/ℓ₀| − ln 1,15). Fail-aandelen per soort over alle samples (een sample kan meer soorten "
+          "hebben).", "",
+          "| i | samples | reward | reward (geen fail) | logit | QE-straf | lengtestraf | fail | " +
+          " | ".join(kinds) + " | QE | C2 p | C2 origineel | ℓ/ℓ₀ mediaan |",
+          "|---:|---:|---:|---:|---:|---:|---:|---:|" + "---:|" * len(kinds) + "---:|---:|---:|---:|"]
+    for x in its:
+        L.append(f"| {x['i']} | {x['samples']} | {f3(x['reward_mean'])} | {f3(x['reward_mean_ok'])} | "
+                 f"{f3(x['logit_mean_ok'])} | {f3(x['qe_pen_mean_ok'])} | {f3(x['len_pen_mean_ok'])} | "
+                 f"{pct(x['fail_share'])} | " + " | ".join(pct(x["fails"][k]) for k in kinds) +
+                 f" | {f3(x['qe_mean'])} | {f3(x['p_c2_mean'])} | {pct(x['origineel_share'])} | {f3(x['ratio_median'])} |")
+    L += ["", "Leerder: k1-KL old − ref per token (S3), verschil sampler/leerder (gemiddelde |log π_old − log π_sampler| "
+          "per token), TIS in deze iteratie en voor de volgende, clip-fractie en KL-term van het verlies "
+          "(token-gewogen over de stappen [keuze subagent]), groepen zonder signaal (max − min < 0,05).", "",
+          "| i | stappen | k1 old − ref | sampler/leerder | TIS | TIS volgende | clip-fractie | KL-term | verlies | "
+          "groepen zonder signaal | samples getraind |", "|---:|---|---:|---:|---|---|---:|---:|---:|---:|---:|"]
+    for x in its:
+        L.append(f"| {x['i']} | {x['step_first']}–{x['step_last']} ({x['steps']}) | {f4(x['k1_old_ref'])} | "
+                 f"{f4(x['sampler_gap'])} | {'aan' if x['tis'] else 'uit'} | {'aan' if x['tis_next'] else 'uit'} | "
+                 f"{f4(x['clip_frac'])} | {f4(x['kl'])} | {f4(x['loss'])} | {x['groups_without_signal']} van "
+                 f"{x['sources']} | {x['train_samples']} |")
+    L += ["", "RL-val (greedy, de nieuwe adapter) en de stopregels (G4-7.5) met hun waarden; * = geraakt.", "",
+          "| i | RL-val fail | QE − anker | ℓ/ℓ₀ mediaan | C2 p | C2 origineel | c2_overflow | S1 | S2 | S3 | S4 | S6 |",
+          "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
+    for x in its:
+        v = x["val"]
+        L.append(f"| {x['i']} | {pct(v['fail_share'])} | {f3(v['qe_delta'], True)} | {f3(v['ratio_median'])} | "
+                 f"{f3(v['p_c2_mean'])} | {pct(v['c2_origineel_share'])} | {v['c2_overflow']} | " +
+                 " | ".join(f"{f3(x['rules'][k]['value'])}{'*' if x['rules'][k]['hit'] else ''}" for k in RULES7) + " |")
+    with_sft = [x for x in its if x["sft"]]
+    L += ["", "SFT-evaluaties (verlies per token, op de laatste eval-stap van de run; na elke 5e iteratie).", ""]
+    if with_sft:
+        L += ["| i | stap | " + " | ".join(SFT_SETS7) + " |", "|---:|---:|" + "---:|" * len(SFT_SETS7)]
+        for x in with_sft:
+            L.append(f"| {x['i']} | {x['sft_step']} | " + " | ".join(f3(x["sft"].get(k)) for k in SFT_SETS7) + " |")
+    else:
+        L.append("Geen SFT-evaluatie in de samenvattingen van de runs.")
+    st = r["stopped"]
+    L += ["", "## De stop", "",
+          (f"Gestopt na iteratie {st['last_iteration']} (adapter G4-7-i{st['last_iteration'] + 1}) op "
+           f"{', '.join(st['stop'])}: " if st["stop"] else
+           f"Geen stopregel geraakt; de training eindigde na iteratie {st['last_iteration']} "
+           f"(adapter G4-7-i{st['last_iteration'] + 1}): ") + f"{st['reason']}.", ""]
+    c = r["cal7"]
+    L += ["## C2 bruikbaar als reward (`c2cal7`, vóór de RL)", "",
+          "| voorwaarde | waarde | grens | gehaald |", "|---|---:|---|---|"]
+    for n, v in c["conditions"].items():
+        extra = f" (QE-straf {f4(v['qe_penalty'])})" if "qe_penalty" in v else ""
+        L.append(f"| {n} | {f4(v['value'])}{extra} | {v['bound']} | {'ja' if v['ok'] else 'nee'} |")
+    L.append("")
+    if c["calibration"]:
+        for n, v in c["calibration"].items():
+            L.append(f"Kalibratie `{n}`: Spearman per segment C2~C1 {f4(v['spearman_c2_c1'])} over {v['segments']} "
+                     "segmenten.")
+        L.append("")
+        if c["high"]:
+            L += [HIGH_SPEARMAN_TEXT7, ""]
+    else:
+        L += ["Geen kalibratie tegen C1 in het verslag van `c2cal7` (Spearman niet gemeten).", ""]
+    L += ["## Smoke-test (`smoke7`)", ""]
+    s = r["smoke7"]
+    if s is None:
+        L += ["Geen verslag van `smoke7` bij dit verslag.", ""]
+    else:
+        passed = s.get("passed", s.get("ok"))
+        checks = s.get("checks") if isinstance(s.get("checks"), dict) else {}
+        failed = [k for k, v in checks.items() if isinstance(v, dict) and not v.get("holds", v.get("ok", True))]
+        L += [f"Geslaagd: {'ja' if passed else 'nee' if passed is not None else '–'}; controles {len(checks)}, niet "
+              f"gehaald: {', '.join(failed) or 'geen'}" +
+              (f"; schatting {json.dumps(s['estimate'], ensure_ascii=False)}" if s.get("estimate") is not None else "") +
+              ".", ""]
+    L += [f"Controle menselijke referenties (QE opnieuw, hele set): {json.dumps(r['refqe_check'])}", ""]
+    return "\n".join(L) + "\n"
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -5338,6 +5844,18 @@ def main(argv=None):
     p.add_argument("--reference", action="append", default=[], help="NAME=DIR, reported beside")
     p.add_argument("--beside-summary", action="append", default=[], help="NAME=summary.json of another run, reported")
     p.add_argument("--tally", default=None)
+    p = sub.add_parser("records7")
+    p.add_argument("--list", required=True, help="the chain's records.json (gs:// paths)")
+    p.add_argument("--out", required=True, help="report7's --records directory (made here, with stopped.json)")
+    p = sub.add_parser("report7")
+    for name in ("evalsets", "split", "refqe", "base", "predictions", "predictions-c2", "records", "stopped", "cal7",
+                 "out"):
+        p.add_argument(f"--{name}", required=True)
+    p.add_argument("--candidate", action="append", required=True, help="G4-7-i<n>=DIR (pairs/, scores/), in the order of n")
+    p.add_argument("--reference", action="append", default=[], help="NAME=DIR, reported beside (G4-4)")
+    p.add_argument("--smoke", default=None, help="smoke7's json (reported)")
+    p.add_argument("--pll", default=None, help="naturalness.py pll of the classify run's texts (reported)")
+    p.add_argument("--tally", default=None, help="tally's json of the selected candidate against G4-0")
     args = parser.parse_args(argv)
     {"fetch": fetch, "build": build, "check": check, "evaldata": evaldata, "texts": texts, "report": report,
      "tally": tally, "smoke": smoke, "heldout": heldout, "own": own, "replay": replay_candidates, "build2": build2,
@@ -5346,7 +5864,7 @@ def main(argv=None):
      "report5": report5, "temp5": temp5, "samples5": samples5_cli, "sampledata5": sampledata5, "best8": best8,
      "sample5": sample5, "samplejoin": samplejoin, "samplesplit": samplesplit, "cands6": cands6, "build6": build6,
      "check6": check6, "smoke6": smoke6, "pairtexts6": pairtexts6, "pairclass6": pairclass6, "ends6c": ends6c,
-     "report6c": report6c}[args.command](args)
+     "report6c": report6c, "records7": records7, "report7": report7}[args.command](args)
 
 
 if __name__ == "__main__":

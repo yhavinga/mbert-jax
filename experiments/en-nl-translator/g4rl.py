@@ -282,6 +282,270 @@ def pool7(args, counter=None):
     return report
 
 
+# ---------------------------------------------------------------------------------------------------- the candidates
+
+CANDS_MARGIN7 = 2.0                  # cands7 draws this many times what pool7 takes of a part (RL-val and pool)
+CANDS_CHUNK7 = 16384                 # texts per call of the token counter in cands7's draw
+CANDS_SCHEMA = (("id", "string"), ("en", "string"), ("doc", "string"), ("stratum", "string"))
+# arm F's pool, and so FLAN-nl, has no task named after SICK or DBRD (flan-nl/protocol.md): checked, a hit stops cands7
+FLAN_BARRED_TASKS = ("sick", "dbrd")
+
+
+def pool_need(iterations=ITERATIONS7, per_iter=SOURCES7, rlval=RLVAL_PER_PART7, reserve=RESERVE7):
+    """{part: the sources draw_pool takes of it}: RL-val and the pool, each with its reserve"""
+    counts = part_counts(per_iter)
+    return {p: math.ceil(rlval * (1 + reserve)) + math.ceil(iterations * counts[p] * (1 + reserve)) for p in PARTS7}
+
+
+def draw_candidates(rows, n, counter, seed, max_tokens=MAX_SOURCE7, chunk=CANDS_CHUNK7):
+    """(rows, funnel): of rows in a seeded order (sorted by id, then shuffled with seed) the first n whose English,
+    stripped, is not empty, not a text looked at before and of at most max_tokens Gemma 4 tokens (pool7's count of the
+    same text). The tokens are counted a chunk at a time, so about as many texts as the draw needs."""
+    order = sorted(rows, key=lambda r: r["id"])
+    if len({r["id"] for r in order}) != len(order):
+        raise SystemExit(f"cands7: an id twice among the rows of {seed}")
+    random.Random(seed).shuffle(order)
+    out, seen, i = [], set(), 0
+    funnel = {"looked_at": 0, "empty": 0, "duplicate": 0, "tokens": 0}
+    while len(out) < n and i < len(order):
+        part = order[i:i + chunk]
+        i += len(part)
+        texts = sorted({(r["en"] or "").strip() for r in part} - seen - {""})
+        lengths = dict(zip(texts, counter.lengths(texts)))
+        for r in part:
+            if len(out) == n:
+                break
+            funnel["looked_at"] += 1
+            text = (r["en"] or "").strip()
+            if not text:
+                funnel["empty"] += 1
+            elif text in seen:
+                funnel["duplicate"] += 1
+            else:
+                seen.add(text)
+                if lengths[text] > max_tokens:
+                    funnel["tokens"] += 1
+                else:
+                    out.append({**r, "en": text})
+    funnel["drawn"] = len(out)
+    return out, funnel
+
+
+def published_key(row_id):
+    """(host, position) of a FLAN-nl row id w<host>-<position>"""
+    host, sep, position = str(row_id)[1:].partition("-")
+    if str(row_id)[:1] != "w" or not sep or not host.isdigit() or not position.isdigit():
+        raise SystemExit(f"cands7: {row_id!r} is not a FLAN-nl row id w<host>-<position>")
+    return int(host), int(position)
+
+
+def flan_cands(plan_dir, kept_dir, build_report, flan_eval):
+    """(rows, info): FLAN-nl's English segments of the examples in the published set. An example is in it when the plan
+    has it to translate (status translate), assemble kept it (kept_dir/w<host>.parquet, its position) and no check of
+    the publication's build left it out (build_report.json, checks.<check>.ids); its segments are the S pieces of its
+    instruction and answer that are not one of the plan's template strings. A segment is one distinct text of the plan
+    and can be in several examples: its doc is the first of them by (host, position), flan:w<host>-<position> (the
+    published row's id). Out: the segments of the FLAN evaluation rows and every segment of their examples."""
+    import pyarrow as pa
+    import pyarrow.compute as pc
+    import pyarrow.parquet as pq
+
+    plan_dir, kept_dir = Path(plan_dir), Path(kept_dir)
+    files = sorted(kept_dir.glob("w*.parquet"))
+    if not files:
+        raise SystemExit(f"cands7: no w<host>.parquet in {kept_dir}")
+    kept, assembled = set(), 0
+    for path in files:
+        host = int(path.stem[1:])
+        positions = pq.read_table(path, columns=["position"]).column("position").to_pylist()
+        assembled += len(positions)
+        kept |= {(host, int(p)) for p in positions}
+    if len(kept) != assembled:
+        raise SystemExit(f"cands7: an example twice in {kept_dir}")
+    build = json.loads(Path(build_report).read_text())
+    left = {published_key(x): check for check, entry in build["checks"].items() for x in entry["ids"]}
+    if (assembled, assembled - len(left)) != (build["rows_of_the_experiment"], build["rows"]) or not set(left) <= kept:
+        raise SystemExit(f"cands7: {kept_dir} has {assembled} rows and {build_report} leaves out {len(left)} of them "
+                         f"({len(set(left) - kept)} not among them); the build has {build['rows_of_the_experiment']} "
+                         f"and {build['rows']}: not the published set's examples")
+    published = kept - set(left)
+    templates = {int(v) for v in json.loads((plan_dir / "plan.json").read_text()).get("template_segments", {}).values()}
+    ev = read_rows(flan_eval, columns=["host", "position", "segments"])
+    eval_examples = {(int(r["host"]), int(r["position"])) for r in ev}
+    eval_segments = {int(s) for r in ev for s in r["segments"]}
+    ex = pq.read_table(plan_dir / "examples.parquet",
+                       columns=["host", "position", "source", "status", "instruction", "answer"]).to_pydict()
+    doc_of, examples_of = {}, {}
+    info = {"assembled": assembled, "left_by_checks": {c: sum(v == c for v in left.values()) for c in build["checks"]},
+            "published": len(published), "published_to_translate": 0, "published_other_status": {},
+            "template_pieces": 0}
+    for h, p, source, status, ins, ans in zip(*(ex[c] for c in ("host", "position", "source", "status", "instruction",
+                                                                 "answer"))):
+        key = (int(h), int(p))
+        is_eval, is_published = key in eval_examples, key in published
+        if not (is_eval or is_published):
+            continue
+        segments = [int(v) for kind, v in json.loads(ins) + json.loads(ans) if kind == "S"]
+        if is_eval:
+            eval_segments.update(segments)
+        if not is_published:
+            continue
+        if status != "translate":
+            info["published_other_status"][status] = info["published_other_status"].get(status, 0) + 1
+            continue
+        if any(t in str(source).lower() for t in FLAN_BARRED_TASKS):
+            raise SystemExit(f"cands7: w{key[0]}-{key[1]} is of {source}, a task FLAN-nl does not have (SICK, DBRD)")
+        info["published_to_translate"] += 1
+        for s in segments:
+            if s in templates:
+                info["template_pieces"] += 1
+                continue
+            examples_of[s] = examples_of.get(s, 0) + 1
+            if s not in doc_of or key < doc_of[s]:
+                doc_of[s] = key
+    del ex
+    missing = len(published) - info["published_to_translate"] - sum(info["published_other_status"].values())
+    if missing:
+        raise SystemExit(f"cands7: {missing} published examples are not in {plan_dir}/examples.parquet")
+    want = sorted(set(doc_of) - eval_segments)
+    rows = []
+    for path in sorted(plan_dir.glob("segments-w*.parquet")):
+        t = pq.read_table(path, columns=["id", "text"])
+        t = t.filter(pc.is_in(t["id"], value_set=pa.array(want, pa.int64()))).to_pydict()
+        for i, text in zip(t["id"], t["text"]):
+            h, p = doc_of[int(i)]
+            rows.append({"id": f"flan:{int(i)}", "en": text, "doc": f"flan:w{h}-{p}", "stratum": ""})
+    if len(rows) != len(want) or len({r["id"] for r in rows}) != len(rows):
+        raise SystemExit(f"cands7: {len(want)} segments wanted, {len(rows)} texts in {plan_dir}/segments-w*.parquet")
+    info.update({"eval_examples": len(eval_examples), "segments": len(doc_of),
+                 "segments_in_several_examples": sum(n > 1 for n in examples_of.values()),
+                 "segments_of_the_eval_rows_out": len(doc_of) - len(want), "candidates": len(rows)})
+    return rows, info
+
+
+def novels_cands(b1, g44_report, novels_eval):
+    """(rows, info): the English passages (group en_orig) of the -b1- novels as G4-4 took them, build4's steps (arm RE's
+    checks, one Dutch edition per English book, one English id per work, no near duplicate) that must give G4-4's books
+    and rows (its data report), without the books of the eval set novels (G4-4.10); id novels:<row id>, doc
+    novels:<English book id>"""
+    import g4arm
+
+    report4 = json.loads(Path(g44_report).read_text())
+    sha = g4arm.sha256_file(b1)
+    if report4.get("arm") != g4arm.ARM4 or sha != report4["novels"]["sha256"]:
+        raise SystemExit(f"cands7: {b1} is not the -b1- file of G4-4's set ({g44_report})")
+    rows, groups = g4arm.read_b1(b1)
+    chosen, _ = g4arm.b1_editions(rows)
+    chosen, _ = g4arm.same_works(rows, chosen)
+    del rows
+    chosen, near = g4arm.near_duplicates(chosen)
+    want = report4["novels"]["near_duplicates"]
+    if (near["books_left"], near["rows_left"]) != (want["books_left"], want["rows_left"]):
+        raise SystemExit(f"cands7: build4's steps give {near['books_left']} books, {near['rows_left']} rows; G4-4's "
+                         f"report {want['books_left']}, {want['rows_left']}")
+    books = {str(en): rs for en, rs in chosen.items()}
+    held = {str(b["en_book_id"]) for b in json.loads(Path(novels_eval).read_text())["draw"]["books"]}
+    if len(held) != g4arm.NOVELS_EVAL_BOOKS or not held <= set(books):
+        raise SystemExit(f"cands7: {novels_eval} names {len(held)} books, {len(held - set(books))} of them not G4-4's; "
+                         f"the eval set novels has {g4arm.NOVELS_EVAL_BOOKS}")
+    out = [{"id": f"novels:{r['id']}", "en": r["en"], "doc": f"novels:{en}", "stratum": ""}
+           for en, rs in books.items() if en not in held for r in rs]
+    info = {"sha256": sha, "groups": groups, "books": len(books), "rows": near["rows_left"],
+            "books_of_the_eval_set_out": sorted(held, key=int), "rows_of_the_eval_set_out": sum(len(books[b]) for b in held),
+            "candidates": len(out)}
+    return out, info
+
+
+def bt_cands(bt):
+    """({source: rows}, revisions, info): the English (en) of the train split of the five <source>-nl-en-gemma4 sets at
+    G4-3's revisions (fetch --arm G4-3, every file's sha256 checked), without the rows with hard_fails (a check of the
+    English failed: not_ended, decode_loop, dutch_left, len_ratio, structure, newline_doubled, chatter); id bt:<id>,
+    stratum the source. The doc comes after the draw (g4c2.doc_key, C2's key)."""
+    import g4arm
+
+    revisions = g4arm.revisions3(bt)
+    out = {s: [] for s in g4arm.BT_REPOS3}
+    info = {s: {"rows": 0, "hard_fails": 0} for s in g4arm.BT_REPOS3}
+    for r in g4arm.read_bt(bt, revisions, split="train"):
+        info[r["source"]]["rows"] += 1
+        if r["hard_fails"]:
+            info[r["source"]]["hard_fails"] += 1
+        else:
+            out[r["source"]].append({"id": f"bt:{r['pid']}", "en": r["en"], "pid": r["pid"], "stratum": r["source"]})
+    for s, rows in out.items():
+        info[s]["candidates"] = len(rows)
+    return out, revisions, info
+
+
+def cands7(args, counter=None):
+    """pool7's candidates (G4-7.2, spec §6.2): cands-flan, cands-novels, cands-bt .parquet (id, en, doc, stratum) and
+    cands.json (the inputs with their sha256, the counts, what fell out and why). Per part, and per source for BT in
+    equal numbers, margin x what pool7 takes of it, drawn in a seeded order (SEED7/cands/<part>[/<source>]) from the
+    texts that pass pool7's own filters on the English: not empty, a text once, at most MAX_SOURCE7 Gemma 4 tokens (the
+    same counter on the same text, so pool7 drops none of them for these). Left to pool7: the 13-grams, C2's documents
+    and RL-val's documents."""
+    import g4arm
+    import g4c2
+
+    counter = counter or g4arm.TokenCounter(args.tokenizer)
+    need = pool_need(args.iterations, args.per_iter, args.rlval)
+    want = {p: math.ceil(args.margin * n) for p, n in need.items()}
+    out = Path(args.out)
+    report = {"arm": ARM7, "seed": f"{SEED7}/cands", "margin": args.margin, "max_tokens": MAX_SOURCE7,
+              "pool7_takes": need, "wanted": want, "parts": {},
+              "left_to_pool7": ["13-grams of the evaluation sets, the blind passages and the FLAN evaluation rows",
+                                "C2's documents (docs.txt)", "RL-val's documents in the pool"]}
+    drawn = {}
+    print("PROGRESS flan", flush=True)
+    rows, info = flan_cands(args.flan_plan, args.flan_kept, args.flan_build_report, args.flan_eval)
+    drawn["flan"], info["draw"] = draw_candidates(rows, want["flan"], counter, f"{SEED7}/cands/flan")
+    report["parts"]["flan"] = info
+    print("PROGRESS novels", flush=True)
+    rows, info = novels_cands(args.novels, args.novels_report, args.novels_eval)
+    drawn["novels"], info["draw"] = draw_candidates(rows, want["novels"], counter, f"{SEED7}/cands/novels")
+    report["parts"]["novels"] = info
+    print("PROGRESS bt", flush=True)
+    by_source, revisions, info = bt_cands(args.bt)
+    per_source = math.ceil(want["bt"] / len(by_source))
+    drawn["bt"] = []
+    for source, rows in by_source.items():
+        got, info[source]["draw"] = draw_candidates(rows, per_source, counter, f"{SEED7}/cands/bt/{source}")
+        drawn["bt"] += [{**r, "doc": g4c2.doc_key(r["pid"])} for r in got]
+    report["parts"]["bt"] = {"per_source": per_source, "sources": info}
+    del rows, by_source
+    short = {p: len(drawn[p]) for p in PARTS7 if len(drawn[p]) < want[p]}
+    short.update({f"bt/{s}": i["draw"]["drawn"] for s, i in info.items() if i["draw"]["drawn"] < per_source})
+    if short:
+        raise SystemExit(f"cands7: too few candidates {short}; wanted {want}, {per_source} per BT source")
+    ids = [r["id"] for p in PARTS7 for r in drawn[p]]
+    if len(set(ids)) != len(ids):
+        raise SystemExit("cands7: an id in two parts")
+    report["files"] = {}
+    for part in PARTS7:
+        path = out / f"cands-{part}.parquet"
+        write_parquet([{k: r[k] for k, _ in CANDS_SCHEMA} for r in sorted(drawn[part], key=lambda r: r["id"])], path,
+                      schema(CANDS_SCHEMA))
+        report["files"][path.name] = {"rows": len(drawn[part]), "sha256": file_sha256(path)}
+    def files(d, pattern):
+        return {f.name: g4arm.sha256_file(f) for f in sorted(Path(d).glob(pattern))}
+
+    report["inputs"] = {
+        "flan_plan": {"path": str(args.flan_plan), "sha256": {**files(args.flan_plan, "examples.parquet"),
+                                                              **files(args.flan_plan, "plan.json"),
+                                                              **files(args.flan_plan, "segments-w*.parquet")}},
+        "flan_kept": {"path": str(args.flan_kept), "sha256": files(args.flan_kept, "w*.parquet")},
+        **{k: {"path": str(getattr(args, k)), "sha256": g4arm.sha256_file(getattr(args, k))}
+           for k in ("flan_build_report", "flan_eval", "novels_report", "novels_eval")},
+        "novels": {"path": str(args.novels), "sha256": report["parts"]["novels"]["sha256"]},
+        "bt": {"path": str(args.bt), "revisions": revisions},
+        "tokenizer": {"path": str(args.tokenizer),
+                      "sha256": g4arm.sha256_file(Path(args.tokenizer) / "tokenizer.json")
+                      if (Path(args.tokenizer) / "tokenizer.json").is_file() else None}}
+    (out / "cands.json").write_text(json.dumps(report, indent=1) + "\n")
+    print(f"CANDS7 {json.dumps({'wanted': want, 'files': report['files']})}", flush=True)
+    return report
+
+
 def anchor_rows(samples, scores):
     """{source id: anchor} from the anchor's translations (the job anchor, one sample #0 per source, greedy) and their
     scores: the flags, l0 (tokens_out), qe0 (null for an empty one), C2's logit (null with c2_overflow)"""
@@ -1050,6 +1314,25 @@ def make_grpo_loss(config, opts, is_train):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sub = parser.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("cands7")
+    p.add_argument("--flan-plan", required=True, help="FLAN-nl's plan (mbert/flan-nl/plan2: examples.parquet, plan.json, "
+                                                       "segments-w*.parquet)")
+    p.add_argument("--flan-kept", required=True, help="the examples assemble kept for the publication "
+                                                       "(mbert/flan-nl/nl-g4b: w<host>.parquet)")
+    p.add_argument("--flan-build-report", required=True,
+                   help="the published build's build_report.json (mbert/flan-nl/nl-g4b/checks/build/): rows left out")
+    p.add_argument("--flan-eval", required=True, help="FLAN's evaluation rows (mainset/flan-eval/eval-rows.parquet)")
+    p.add_argument("--novels", required=True, help="the -b1- inventory's b1-selected.parquet ($S/data/books-b1/)")
+    p.add_argument("--novels-report", required=True, help="G4-4's data report ($G/data/report-G4-4.json)")
+    p.add_argument("--novels-eval", required=True, help="the eval set novels' manifest ($G/data/heldout4/manifest.json)")
+    p.add_argument("--bt", required=True, help="fetch --arm G4-3's train directory ($G/input/bt3: revisions.json, "
+                                                "<source>/data/train-*.parquet)")
+    p.add_argument("--tokenizer", required=True, help="Gemma 4's tokenizer directory (tokenizer.json), as pool7's")
+    p.add_argument("--iterations", type=int, default=ITERATIONS7, help="pool7's")
+    p.add_argument("--per-iter", type=int, default=SOURCES7, help="pool7's")
+    p.add_argument("--rlval", type=int, default=RLVAL_PER_PART7, help="pool7's")
+    p.add_argument("--margin", type=float, default=CANDS_MARGIN7, help="candidates per part over what pool7 takes")
+    p.add_argument("--out", required=True)
     p = sub.add_parser("pool7")
     p.add_argument("--cands", required=True, help="a directory with cands-flan, cands-novels, cands-bt .parquet (id, en, "
                                                    "doc, optionally stratum)")
@@ -1097,7 +1380,7 @@ def main(argv=None):
     p.add_argument("--previous", default=None, help="the previous iteration's stop7 result (S2)")
     p.add_argument("--out", required=True)
     args = parser.parse_args(argv)
-    {"pool7": pool7, "plan7": plan7, "segments7": segments7, "iter7": iter7, "stop7": stop7}[args.cmd](args)
+    {"cands7": cands7, "pool7": pool7, "plan7": plan7, "segments7": segments7, "iter7": iter7, "stop7": stop7}[args.cmd](args)
 
 
 if __name__ == "__main__":

@@ -792,3 +792,206 @@ def test_pool7_needs_c2s_documents_and_keeps_them_out(tmp_path, monkeypatch):
     assert report["parts"]["bt"]["drops"]["excluded_doc"] == 40
     assert not {r["doc"] for r in pool} & {f"bt:{k}" for k in range(0, 80, 4)}
     assert report["pool"] == {p: math.ceil(2 * n * 1.03) for p, n in g4rl.part_counts(20).items()}
+
+
+# ---------------------------------------------------------------------------------------------------- cands7
+
+def text_of(rng, tag, n):
+    """A text of n words (FakeCounter7: n tokens) that starts with a word of its own"""
+    return f"{tag} {sentence(rng, EN, n - 1)}"
+
+
+def write_bt7(d, rows_of, reverse=False):
+    """fetch --arm G4-3's train directory: per source one train file and revisions.json with its sha256"""
+    import g4arm
+
+    revisions = {}
+    for source, (repo, revision) in g4arm.BT_REPOS3.items():
+        rows = rows_of[source][::-1] if reverse else rows_of[source]
+        f = d / source / "data" / "train-00000-of-00001.parquet"
+        f.parent.mkdir(parents=True)
+        pq.write_table(pa.Table.from_pylist([{**r, **({"dump": "CC-MAIN-2024-10"} if source == "fineweb" else {})}
+                                             for r in rows]), f)
+        revisions[source] = {"repo": repo, "revision": revision, "files": {f.name: g4arm.sha256_file(f)}}
+    (d / "revisions.json").write_text(json.dumps(revisions))
+
+
+def cands7_inputs(root, reverse=False):
+    """Small inputs of cands7 of the real kind (FakeCounter7 counts a word as a token): FLAN-nl's plan, the examples
+    assemble kept, the build report, the FLAN evaluation rows; the -b1- novels, G4-4's report, the eval set's manifest;
+    the five BT sets. `reverse` writes every file's rows in the opposite order."""
+    import g4arm
+
+    rng = random.Random(7)
+    flip = (lambda xs: xs[::-1]) if reverse else (lambda xs: xs)
+    root.mkdir(parents=True)
+    # FLAN: segment 0 is a template string; 1..3 of example w0-1, 2 and 4 of w0-2 (2 in both: its doc is w0-1), 5 of
+    # w1-5 (left out by a publication check), 6 of w1-6 (dropped by assemble), 8 and 10 of the evaluation row w0-9,
+    # 10 also of w0-3; 20.. one each of w0-100.. and w1-100.., some longer than 256 tokens
+    texts = {0: "Question:", **{s: text_of(rng, f"seg{s}", 6) for s in range(1, 13)}}
+    examples = [(0, 2, "translate", [2, 4]), (0, 1, "translate", [0, 1, 2, 3]), (1, 5, "translate", [5]),
+                (1, 6, "translate", [6]), (1, 7, "dutch_task", []), (0, 9, "translate", [8, 10]),
+                (0, 3, "translate", [10, 11, 12])]
+    for k in range(120):
+        s = 20 + k
+        texts[s] = text_of(rng, f"seg{s}", 300 if k % 10 == 0 else rng.randint(4, 30))
+        examples.append((k % 2, 100 + k, "translate", [s]))
+    plan = root / "plan2"
+    plan.mkdir()
+    ex = [{"host": h, "position": p, "source": f"flan/task{p % 7}", "status": status,
+           "instruction": json.dumps([["T", "Question:"]] + [["S", s] for s in segs[:-1]] + [["L", " "]]),
+           "answer": json.dumps([["S", s] for s in segs[-1:]])} for h, p, status, segs in examples]
+    pq.write_table(pa.Table.from_pylist(flip(ex)), plan / "examples.parquet")
+    (plan / "plan.json").write_text(json.dumps({"template_segments": {"Question:": 0}}))
+    for w in (0, 1):
+        seg = [{"id": s, "text": t, "tokens": len(t.split())} for s, t in sorted(texts.items()) if s % 2 == w]
+        pq.write_table(pa.Table.from_pylist(flip(seg)), plan / f"segments-w{w}.parquet")
+    kept = root / "nl-g4b"
+    kept.mkdir()
+    rows = [(h, p) for h, p, _, _ in examples if (h, p) != (1, 6)]
+    for h in (0, 1):
+        pq.write_table(pa.table({"position": flip([p for x, p in rows if x == h])}), kept / f"w{h}.parquet")
+    (root / "build_report.json").write_text(json.dumps({"rows_of_the_experiment": len(rows), "rows": len(rows) - 1,
+                                                        "checks": {"decode_loop": {"ids": []},
+                                                                   "english_left": {"ids": ["w1-5"]}}}))
+    pq.write_table(pa.Table.from_pylist([{"host": 0, "position": 9, "segments": [8], "inputs": texts[8],
+                                          "targets": "x"}]), root / "eval-rows.parquet")
+    # the novels: 30 English books of 12 rows each, one row failing arm RE's checks; 10 books are the eval set's
+    b1 = []
+    for b in range(30):
+        for k in range(12):
+            en = text_of(rng, f"book{b}row{k}", 400 if k == 0 else rng.randint(5, 40))
+            b1.append({"id": f"{b}-{k}", "book": f"9{b}-{101 + b}", "nl_book_id": f"9{b}", "en_book_id": str(101 + b),
+                       "group": "en_orig", "author": f"author {b}", "en": en, "nl": f"nl {en}", "en_raw": None,
+                       "nl_raw": None, "passes": (b, k) != (13, 1), "dup_id": False, "dup_nl": False})
+    b1.append({**b1[0], "id": "x-0", "group": "nl_orig_extra"})
+    pq.write_table(pa.Table.from_pylist(flip(b1)), root / "b1-selected.parquet")
+    (root / "report-G4-4.json").write_text(json.dumps({"arm": "G4-4", "novels": {
+        "sha256": g4arm.sha256_file(root / "b1-selected.parquet"),
+        "near_duplicates": {"books_left": 30, "rows_left": 30 * 12 - 1}}}))
+    (root / "heldout4.json").write_text(json.dumps({"draw": {"books": [{"en_book_id": str(101 + b)}
+                                                                       for b in range(10)]}}))
+    # BT: per source 24 passages of 8 documents, every 5th with hard_fails, one long passage (its id p<a>-<b>)
+    bt_rows = {}
+    for source in g4arm.BT_REPOS3:
+        rows = [{"id": f"{source}:doc{k // 3}:{'d' if source != 'handelingen' else 't1'}:{k % 3}",
+                 "nl": "nl", "en": text_of(rng, f"{source}{k}", rng.randint(5, 40)),
+                 "hard_fails": ["dutch_left"] if k % 5 == 4 else [], "chrf": 0.5, "model": "gemma-4"} for k in range(24)]
+        rows.append({**rows[0], "id": f"{source}:docL:d:p0-3", "en": text_of(rng, f"{source}L", 600),
+                     "hard_fails": []})
+        bt_rows[source] = rows
+    write_bt7(root / "bt3", bt_rows, reverse)
+    return ns(flan_plan=str(plan), flan_kept=str(kept), flan_build_report=str(root / "build_report.json"),
+              flan_eval=str(root / "eval-rows.parquet"), novels=str(root / "b1-selected.parquet"),
+              novels_report=str(root / "report-G4-4.json"), novels_eval=str(root / "heldout4.json"),
+              bt=str(root / "bt3"), tokenizer="t", iterations=2, per_iter=20, rlval=3, margin=2.0,
+              out=str(root / "out")), texts
+
+
+def test_pool_need_is_what_draw_pool_takes():
+    data = {p: cands(400, p, strata=("x", "y")) for p in g4rl.PARTS7}
+    rows = g4rl.draw_pool(data, iterations=3, per_iter=20, rlval=5)
+    assert g4rl.pool_need(3, 20, 5) == {p: sum(r["part"] == p for r in rows) for p in g4rl.PARTS7}
+    assert g4rl.pool_need() == {"flan": 132 + 6335, "novels": 132 + 4759, "bt": 132 + 4728}
+
+
+def test_draw_candidates_takes_the_first_short_new_texts_of_a_seeded_order():
+    counter = FakeCounter7()
+    rows = [{"id": f"r{k}", "en": " ".join(["the"] * (300 if k % 4 == 0 else 3)) + f" w{k % 30}"} for k in range(60)]
+    rows += [{"id": "e1", "en": "  "}, {"id": "e2", "en": None}]
+    got, funnel = g4rl.draw_candidates(rows, 10, counter, "s", chunk=7)
+    again, _ = g4rl.draw_candidates(rows[::-1], 10, counter, "s", chunk=50)
+    assert [r["id"] for r in got] == [r["id"] for r in again]
+    assert len(got) == 10 and all(len(r["en"].split()) <= g4rl.MAX_SOURCE7 for r in got)
+    assert len({r["en"] for r in got}) == 10
+    assert funnel["looked_at"] == sum(funnel[k] for k in ("empty", "duplicate", "tokens", "drawn"))
+    assert [r["id"] for r in g4rl.draw_candidates(rows, 10, counter, "t")[0]] != [r["id"] for r in got]
+    every, funnel = g4rl.draw_candidates(rows, 1000, counter, "s")
+    assert funnel == {"looked_at": 62, "empty": 2, "duplicate": 15, "tokens": 15, "drawn": 30} and len(every) == 30
+    with pytest.raises(SystemExit, match="an id twice"):
+        g4rl.draw_candidates(rows + rows[:1], 10, counter, "s")
+
+
+def test_cands7_draws_published_flan_segments_novels_without_the_eval_books_and_bt_per_source(tmp_path):
+    import g4arm
+    import g4c2
+
+    args, texts = cands7_inputs(tmp_path / "a")
+    report = g4rl.cands7(args, FakeCounter7())
+    out = Path(args.out)
+    want = {p: math.ceil(2 * n) for p, n in g4rl.pool_need(2, 20, 3).items()}
+    files = {p: pq.read_table(out / f"cands-{p}.parquet") for p in g4rl.PARTS7}
+    for p, t in files.items():
+        assert t.schema.names == ["id", "en", "doc", "stratum"] and all(str(x) == "string" for x in t.schema.types)
+        assert report["files"][f"cands-{p}.parquet"]["sha256"] == g4arm.sha256_file(out / f"cands-{p}.parquet")
+    rows = {p: t.to_pylist() for p, t in files.items()}
+    ids = [r["id"] for p in g4rl.PARTS7 for r in rows[p]]
+    assert len(ids) == len(set(ids)) and all(r["id"].startswith(f"{p}:") for p in g4rl.PARTS7 for r in rows[p])
+    assert all(r["en"] == r["en"].strip() and 0 < len(r["en"].split()) <= g4rl.MAX_SOURCE7
+               for p in g4rl.PARTS7 for r in rows[p])
+    # FLAN: the segments of published examples to translate, no template, nothing of the evaluation row's example
+    flan = {int(r["id"].split(":")[1]): r for r in rows["flan"]}
+    assert len(flan) == want["flan"] and not set(flan) & {0, 5, 6, 8, 10}
+    allowed = {1, 2, 3, 4, 11, 12} | {20 + k for k in range(120) if k % 10}
+    assert set(flan) <= allowed and all(r["en"] == texts[s] and r["stratum"] == "" for s, r in flan.items())
+    docs = {s: f"flan:w{(s - 20) % 2}-{100 + s - 20}" for s in range(20, 140)} | {
+        1: "flan:w0-1", 2: "flan:w0-1", 3: "flan:w0-1", 4: "flan:w0-2", 11: "flan:w0-3", 12: "flan:w0-3"}
+    assert all(r["doc"] == docs[s] for s, r in flan.items())
+    info = report["parts"]["flan"]
+    assert info["left_by_checks"] == {"decode_loop": 0, "english_left": 1}
+    assert info["published_other_status"] == {"dutch_task": 1} and info["published_to_translate"] == 124
+    assert info["segments_in_several_examples"] == 2 and info["segments_of_the_eval_rows_out"] == 2
+    assert info["candidates"] == 126 and info["draw"]["tokens"] >= 1
+    assert info["draw"] == {"looked_at": 42 + info["draw"]["tokens"], "empty": 0, "duplicate": 0,
+                            "tokens": info["draw"]["tokens"], "drawn": 42}
+    # the novels: no row of the eval set's books, none failing a check, doc the English book
+    novels = rows["novels"]
+    assert len(novels) == want["novels"] and {r["doc"] for r in novels} <= {f"novels:{101 + b}" for b in range(10, 30)}
+    assert "novels:13-1" not in {r["id"] for r in novels} and "novels:x-0" not in {r["id"] for r in novels}
+    assert report["parts"]["novels"]["rows_of_the_eval_set_out"] == 120
+    # BT: equal per source, doc as C2's, stratum the source, no hard_fails, the long passage never drawn
+    bt = rows["bt"]
+    per = math.ceil(want["bt"] / 5)
+    assert {s: sum(r["stratum"] == s for r in bt) for s in g4arm.BT_REPOS3} == {s: per for s in g4arm.BT_REPOS3}
+    assert all(r["doc"] == g4c2.doc_key(r["id"][3:]) and r["doc"].startswith(f"{r['stratum']}:") for r in bt)
+    assert not any(int(r["id"].rsplit(":", 1)[1]) % 5 == 4 for r in bt)
+    assert report["parts"]["bt"]["sources"]["dpc"]["hard_fails"] == 4
+    assert report["inputs"]["bt"]["revisions"]["dpc"]["revision"] == g4arm.BT_REPOS3["dpc"][1]
+    # the same inputs with their rows in another order: the same files
+    args2, _ = cands7_inputs(tmp_path / "b", reverse=True)
+    report2 = g4rl.cands7(args2, FakeCounter7())
+    assert report2["files"] == report["files"]
+    # pool7 takes them: none dropped for its tokens, emptiness or a repeated text
+    (tmp_path / "docs.txt").write_text(f"{bt[0]['doc']}\n")
+    blocked = {"evalsets": None}
+
+    def no_grams(evalsets, blind):
+        blocked["evalsets"] = evalsets
+        return set()
+
+    import unittest.mock as um
+
+    with um.patch.object(g4arm, "checked_blocked", no_grams):
+        pool = g4rl.pool7(ns(cands=str(out), evalsets="e", blind="b", flan_eval=args.flan_eval,
+                             c2_docs=str(tmp_path / "docs.txt"), exclude_docs=[], tokenizer="t", iterations=2,
+                             per_iter=20, rlval=3, out=str(tmp_path / "pool")), FakeCounter7())
+    for p in g4rl.PARTS7:
+        assert {k: pool["parts"][p]["drops"][k] for k in ("empty", "tokens", "duplicate")} == {
+            "empty": 0, "tokens": 0, "duplicate": 0}
+    assert pool["parts"]["bt"]["drops"]["excluded_doc"] >= 1
+
+
+def test_cands7_stops_on_inputs_that_are_not_the_published_set_or_g4_4s_novels_or_too_few(tmp_path):
+    args, _ = cands7_inputs(tmp_path / "a")
+    report = json.loads(Path(args.flan_build_report).read_text())
+    Path(args.flan_build_report).write_text(json.dumps({**report, "rows": report["rows"] + 1}))
+    with pytest.raises(SystemExit, match="not the published set"):
+        g4rl.cands7(args, FakeCounter7())
+    Path(args.flan_build_report).write_text(json.dumps(report))
+    novels = json.loads(Path(args.novels_report).read_text())
+    Path(args.novels_report).write_text(json.dumps({**novels, "novels": {**novels["novels"], "sha256": "0" * 64}}))
+    with pytest.raises(SystemExit, match="not the -b1- file"):
+        g4rl.cands7(args, FakeCounter7())
+    Path(args.novels_report).write_text(json.dumps(novels))
+    with pytest.raises(SystemExit, match="too few candidates"):
+        g4rl.cands7(ns(**{**vars(args), "margin": 20.0}), FakeCounter7())

@@ -104,6 +104,8 @@ if [ "$MULTIHOST" != 1 ] || [ "$WORKER" = 0 ]; then
   COPY="$COPY; if [ -s $OUT/dpo_ref.parquet ]; then gsutil -q cp $OUT/dpo_ref.parquet $ROOT/runs/$NAME/; fi"
   # sft_lora.py --save-steps: the adapters after those steps (amendment G4-6c)
   COPY="$COPY; if ls $OUT/adapter-step*.npz > /dev/null 2>&1; then gsutil -m -q cp $OUT/adapter-step* $ROOT/runs/$NAME/; fi"
+  # sft_lora.py --grpo (arm G4-7): the passes over the iteration's batches (reference and old log-probabilities)
+  COPY="$COPY; if [ -s $OUT/grpo-passes.npz ]; then gsutil -m -q cp $OUT/grpo-passes.npz $OUT/grpo-passes.json $ROOT/runs/$NAME/; fi"
 fi
 setsid nohup bash -c "bash ~/run_$NAME.sh > ~/logs/$NAME.log 2>&1; echo EXIT \$? >> ~/logs/$NAME.log; $COPY" > /dev/null 2>&1 < /dev/null &
 echo "started $NAME on $(hostname): ~/logs/$NAME.log, output in $OUT"

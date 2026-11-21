@@ -369,16 +369,25 @@ def assign_workers7(rows, workers):
 
 
 def segments7(args):
-    """translate.py's segments (id, text, tokens) of an iteration (or RL-val: --iteration -1), per worker"""
-    plan = read_rows(args.plan)
-    rows = [r for r in plan if r["iteration"] == args.iteration]
+    """translate.py's segments (id, text, tokens) per worker: of an iteration of the plan (or RL-val: --iteration -1),
+    or with --pool of every source of pool7's pool.parquet, RL-val's included (the job anchor, G4-7.4a: G4-0's greedy
+    translation of the pool and RL-val, before plan7)"""
+    if bool(args.plan) == bool(args.pool) or (args.plan and args.iteration is None) or (args.pool and
+                                                                                         args.iteration is not None):
+        raise SystemExit("segments7: --plan with --iteration, or --pool alone")
+    if args.pool:
+        rows, what = read_rows(args.pool), "anchor"
+    else:
+        rows, what = [r for r in read_rows(args.plan) if r["iteration"] == args.iteration], args.iteration
     if not rows:
-        raise SystemExit(f"segments7: no source of iteration {args.iteration}")
+        raise SystemExit(f"segments7: no source of {'the pool' if args.pool else f'iteration {args.iteration}'}")
+    if len({r["id"] for r in rows}) != len(rows):
+        raise SystemExit("segments7: a source id twice")
     for k, part in assign_workers7(rows, args.workers).items():
         write_parquet([{"id": r["id"], "text": r["en"], "tokens": r["tokens"]} for r in part],
                       Path(args.out) / f"segments-w{k}.parquet",
                       schema((("id", "string"), ("text", "string"), ("tokens", "int64"))))
-    print(f"SEGMENTS7 {json.dumps({'iteration': args.iteration, 'sources': len(rows), 'workers': args.workers})}")
+    print(f"SEGMENTS7 {json.dumps({'iteration': what, 'sources': len(rows), 'workers': args.workers})}")
 
 
 # ---------------------------------------------------------------------------------------------------- the bucket protocol
@@ -1064,8 +1073,9 @@ def main(argv=None):
     p.add_argument("--rlval", type=int, default=RLVAL_PER_PART7, help="RL-val's sources per part")
     p.add_argument("--out", required=True)
     p = sub.add_parser("segments7")
-    p.add_argument("--plan", required=True, help="plan7's plan.parquet")
-    p.add_argument("--iteration", type=int, required=True, help="the iteration (-1: RL-val)")
+    p.add_argument("--plan", default=None, help="plan7's plan.parquet (with --iteration)")
+    p.add_argument("--iteration", type=int, default=None, help="the iteration (-1: RL-val)")
+    p.add_argument("--pool", default=None, help="pool7's pool.parquet: every source, the job anchor (no --iteration)")
     p.add_argument("--workers", type=int, default=4)
     p.add_argument("--out", required=True)
     p = sub.add_parser("iter7")

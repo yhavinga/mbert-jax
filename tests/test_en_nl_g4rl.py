@@ -199,6 +199,21 @@ def test_assign_workers_balances_tokens():
     assert abs(loads[0] - loads[1]) <= 10 and sum(len(v) for v in out.values()) == 8
 
 
+def test_segments7_takes_an_iteration_of_the_plan_or_the_whole_pool_for_the_anchor(tmp_path):
+    rows = [{"id": f"s{k}", "en": f"text {k}", "tokens": 10 + k, "iteration": k % 3 - 1, "role": "pool"}
+            for k in range(12)]
+    pq.write_table(pa.Table.from_pylist(rows), tmp_path / "rows.parquet")
+    g4rl.main(["segments7", "--plan", str(tmp_path / "rows.parquet"), "--iteration", "-1", "--workers", "1",
+               "--out", str(tmp_path / "val")])
+    assert sorted(pq.read_table(tmp_path / "val/segments-w0.parquet").column("id").to_pylist()) == ["s0", "s3", "s6", "s9"]
+    g4rl.main(["segments7", "--pool", str(tmp_path / "rows.parquet"), "--out", str(tmp_path / "anchor")])
+    got = [i for k in range(4) for i in pq.read_table(tmp_path / f"anchor/segments-w{k}.parquet").column("id").to_pylist()]
+    assert sorted(got) == sorted(r["id"] for r in rows)
+    for bad in (["--plan", str(tmp_path / "rows.parquet")], ["--pool", str(tmp_path / "rows.parquet"), "--iteration", "0"]):
+        with pytest.raises(SystemExit):
+            g4rl.main(["segments7", *bad, "--out", str(tmp_path / "x")])
+
+
 # ---------------------------------------------------------------------------------------------------- the bucket protocol
 
 def write_samples(root, rows, shard_size=8):

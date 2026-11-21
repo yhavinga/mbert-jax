@@ -1754,6 +1754,6 @@ judges van `g4i1121h` (code `706c8d7`, `serve` ongewijzigd) liepen door en worde
 *G4-7.4g Aanvulling 21 nov 2026 ~23:59 (hoofdsessie; uitvoering).* De trainfase van `smoke7` (iteratie 900, 2 stappen)
 faalde op "warmup 10 and decay 0 steps do not fit a schedule of 2": de warmup van 10 stappen (G4-7.3) past niet in de
 2 + 2 stappen van de smoke-test, en ook niet in een eerste RL-iteratie met minder dan 10 stappen (veel groepen zonder
-signaal). `sft_lora.py` neemt nu min(warmup, stappen − decay) en meldt dat (`WARMUP … clipped`); runs met ≥ 10 stappen
-veranderen niet. In de smoke-test is de warmup dus 2 (iteratie 900) en 4 (901); de smoke-test toetst mechaniek en
+signaal). `sft_lora.py` neemt nu min(warmup, stappen − decay − 1) (MaxText's fracties vragen een stap na de warmup) en meldt dat (`WARMUP … clipped`); runs met ≥ 11 stappen
+veranderen niet. In de smoke-test is de warmup dus 1 (eerste mini-iteratie, 2 stappen) en 3 (tweede, 4 stappen); de smoke-test toetst mechaniek en
 geheugen, niet het leren.

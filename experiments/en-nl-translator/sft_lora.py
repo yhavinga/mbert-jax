@@ -1100,7 +1100,7 @@ def main(argv=None):
         decay = int(args.decay_fraction * own_steps)
         # G4-7.4g: a schedule shorter than the warmup (G4-7's smoke test, 2 + 2 steps; a first RL iteration with few
         # groups that carry signal) warms up over all its steps instead of failing; longer schedules are unchanged
-        warmup = min(args.warmup_steps, steps - decay)
+        warmup = max(0, min(args.warmup_steps, steps - decay - 1))   # schedule_overrides needs a step after the warmup
         if warmup != args.warmup_steps:
             print(f"WARMUP {args.warmup_steps} steps clipped to {warmup}: the schedule has {steps} steps", flush=True)
         base = base + schedule_overrides(steps, warmup, decay)

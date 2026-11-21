@@ -1092,6 +1092,7 @@ def drop_own(data):
     (lambda d: edit_parquet(d / "translate" / "S" / "pairs-w0.parquet", s_not_ended), {"translate_ended"}),
     (lambda d: (d / "iter-A" / "scores" / "c2" / "w1" / "DONE-2").unlink(),
      {"scores_A", "c2_overflow", "qe_loose", "c2_loose", "rewards_A"}),
+    (lambda d: set_in(d / "timings.json", ["judge_tail_s", "A"], 901.0), {"scores_A"}),
 ])
 def test_smoke7_fails_each_check_on_its_own(tmp_path, change, failed, capsys):
     kw = {"overflow2": {"overflow": 2}, "not_ended9": {"not_ended": 9}, "nan_logp": {"nan_logp": True}}

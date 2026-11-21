@@ -1066,7 +1066,8 @@ CHECKS7 = {
     "gen_A_ended": (1, f">= {SMOKE_MIN_OK7} van 256", "af (stoptoken), geen lus, niet leeg"),
     "gen_A_setup": (1, "geen LORA-regel, MAXTEXT lora null, T = 1, zaad sample_seed(N, k)",
                     "G4-0 zonder adapter, met de zaden van de keten"),
-    "scores_A": (2, "read_scores zonder fout", "alle scores van A er (markers, sha256, uid's, eindig of null volgens G4-7.4a)"),
+    "scores_A": (2, "read_scores zonder fout; staart na de laatste DONE van de generatie <= 900 s (g4judge's timeout)",
+                 "alle scores van A er, binnen de timeout (markers, sha256, uid's, eindig of null volgens G4-7.4a)"),
     "qe_loose": (2, f"max |verschil| <= {SMOKE_QE_TOL7}, null op dezelfde rijen",
                  "QE van de judges gelijk aan een losse metricx_qe.py score op dezelfde rijen"),
     "c2_loose": (2, f"max |verschil| <= {SMOKE_C2_TOL7} (rijen zonder c2_overflow); truncated = c2_overflow",
@@ -1590,7 +1591,9 @@ def smoke_verdict7(d, counter):
     # (2) the judges
     def scores_a():
         samples, scores = job("A")
-        put("scores_A", True, {role: len(v) for role, v in scores.items()})
+        tail = json.loads((d / "timings.json").read_text())["judge_tail_s"]["A"]
+        put("scores_A", finite(tail) and tail <= g4judge.SCORE_TIMEOUT,
+            {**{role: len(v) for role, v in scores.items()}, "tail_s": tail})
         n = sum(bool(r["c2_overflow"]) for r in scores["c2"].values())
         put("c2_overflow", n <= SMOKE_OVERFLOW_MAX7, {"overflow": n, "of": len(scores["c2"]),
                                                       "c2_tokens_max": max(r["c2_tokens"] for r in scores["c2"].values())})
@@ -1830,7 +1833,7 @@ def smoke7_md(r):
               f"(⌈S × {f3_7(e['tokens_per_sample'])} getrainde tokens per sample / (16 × 4.096 × {e['fill']})⌉), "
               f"stap {f3_7(e['step_s'])} s.", "",
               "- generatie = opstart (wandtijd − decodeertijd van de traagste worker) + decodeertijd per sample × S / 4: "
-              f"{f3_7(e['generation']['startup_s'])} + {f3_7(e['generation']['per_sample_s'])} × {e['samples'] // 4} s;",
+              f"{f3_7(e['generation']['startup_s'])} + {f3_7(e['generation']['per_sample_s'])} × {e['samples'] // WORKERS7} s;",
               "- judges = staart na de laatste DONE + max(0, scoortijd per sample × S − decodeertijd): "
               f"{f3_7(e['judges']['tail_s'])} s staart, {f3_7(e['judges']['s_per_sample'])} s per sample;",
               "- iter7 = wandtijd per sample × S (lineair, ook het vaste deel);",

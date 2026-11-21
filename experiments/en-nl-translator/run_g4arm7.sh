@@ -31,7 +31,7 @@
 #                                      smoke segments, class small, greedy; collect and MetricX-24 -> $RL/smoke7/$STAG/translate/<M>/
 #   STAG=... I=<N> bash run_g4arm7.sh smoke7-loose       mbert-mix w3: MetricX-24-QE and C2 apart on iteration N's samples
 #   STAG=... I=<N> AB=A|B bash run_g4arm7.sh check7      w1 (CPU, the SFT venv): g4rl.py check7 on the iteration's file
-#   STAG=... NA=<N> RUN1=... RUN2=... LOGS_A=... LOGS_B=... bash run_g4arm7.sh smoke7-report   w1 (CPU): g4rl.py smoke7
+#   STAG=... NA=<N> RUN1=... RUN2=... LOGS_A=... LOGS_B=... LOG_S=... bash run_g4arm7.sh smoke7-report   w1 (CPU): g4rl.py smoke7
 # The code is beside this script (a copy of $G/scripts-<c7>/); TAG names the jobs of one chain.
 set -euo pipefail
 
@@ -40,6 +40,7 @@ S=$R/sft
 E=$R/eval
 G=$S/g4arm
 H=$G/data/heldout
+FNL=gs://t5-dutch-english-usc2/mbert/flan-nl
 RL=${RL:-$G/rl/G4-7}
 SHM=/dev/shm/translator
 G_SHM=$SHM/g4arm
@@ -88,7 +89,7 @@ absent() {  # absent GS_OBJECT: a write-once output is not there yet
 }
 
 g7() {  # g7 NAME: a constant of g4rl.py, so that the stages and the code agree
-  $SFT_PY -I -c "import sys; sys.path.insert(0, '$CODE'); import g4rl; print(g4rl.$1)"
+  JAX_PLATFORMS=cpu $SFT_PY -I -c "import sys; sys.path.insert(0, '$CODE'); import g4rl; print(g4rl.$1)"
 }
 
 body() {  # body NAME: the job's script from stdin, returns its path
@@ -132,10 +133,20 @@ cands7)
   f=$(body g4a7_cands7_$TAG <<EOF
 set -euo pipefail
 $CPU
-mkdir -p $X/in $X/out
-CANDS7_FETCH
-nice -n 19 ionice -c3 $SFT_PY -I -u $CODE/g4rl.py cands7 CANDS7_ARGS --out $X/out
+mkdir -p $X/in/flan/plan2 $X/in/flan/nl-g4b $X/in/novels $X/in/bt3 $X/out
+# ~2.4 GB, all from the bucket (the region's): FLAN-nl's plan2 and the examples kept for the publication, the -b1-
+# inventory with G4-4's report and novels' manifest, G4-3's stored BT fetch
+gsutil -m -q cp $FNL/plan2/examples.parquet $FNL/plan2/plan.json '$FNL/plan2/segments-w[0-3].parquet' $X/in/flan/plan2/
+gsutil -m -q cp '$FNL/nl-g4b/w[0-3].parquet' $X/in/flan/nl-g4b/
+gsutil -m -q cp $FNL/nl-g4b/checks/build/build_report.json $R/mainset/flan-eval/eval-rows.parquet $X/in/
+gsutil -m -q cp $S/data/books-b1/b1-selected.parquet $G/data/report-G4-4.json $X/in/novels/
+gsutil -q cp $G/data/heldout4/manifest.json $X/in/novels/heldout4-manifest.json
+gsutil -m -q rsync -r $G/input/bt3 $X/in/bt3
+nice -n 19 ionice -c3 $SFT_PY -I -u $CODE/g4rl.py cands7 --flan-plan $X/in/flan/plan2 --flan-kept $X/in/flan/nl-g4b --flan-build-report $X/in/build_report.json --flan-eval $X/in/eval-rows.parquet --novels $X/in/novels/b1-selected.parquet --novels-report $X/in/novels/report-G4-4.json --novels-eval $X/in/novels/heldout4-manifest.json --bt $X/in/bt3 --tokenizer $TOK_SFT --out $X/out
 gsutil -m -q cp $X/out/cands-flan.parquet $X/out/cands-novels.parquet $X/out/cands-bt.parquet $X/out/cands.json $RL/data/cands/
+# this job's own copies of the inputs (~2.4 GB; the bucket has them)
+echo "removing $X/in"
+rm -rf -- $X/in
 echo "CANDS7_DONE $RL/data/cands/"
 EOF
 )
@@ -196,7 +207,7 @@ generate)
     # sources (a multiple of 8: a source's samples in one shard)
     iter/*) i=${JOB#iter/}
             K=$W; SEG=segments-w$W.parquet; OUT="$RL/$JOB/{sample}/w$K"
-            SEED=$($SFT_PY -I -c "import sys; sys.path.insert(0, '$CODE'); import g4rl; print(g4rl.sample_seed($i, $W))")
+            SEED=$(JAX_PLATFORMS=cpu $SFT_PY -I -c "import sys; sys.path.insert(0, '$CODE'); import g4rl; print(g4rl.sample_seed($i, $W))")
             EXTRA="--copies $(g7 G7) --sample samples=1.0:$SEED"; SS=256 ;;
     # RL-val after an iteration: greedy with the new adapter, on mbert-mix w3 (the writer 3 of G4-7.4a)
     val/*) only 3
@@ -326,7 +337,7 @@ train7)
   # sides and template, as G4-6c's multi-host runs had them; the SFT evals' template is the same (sft_build.py)
   gsutil -m -q cp "$TRAIN" "$D/train.parquet"
   gsutil -m -q cp "$G/data/G4-6b/train-chosen.parquet" "$G/data/G4-6b/template.jinja" "$D/"
-  $SFT_PY -I -c "import json, sys; sys.path.insert(0, '$CODE'); import g4rl; json.dump(g4rl.grpo_spec(tis=bool(int(sys.argv[2]))), open(sys.argv[1], 'w'))" "$D/grpo.json" "${TIS:-0}"
+  JAX_PLATFORMS=cpu $SFT_PY -I -c "import json, sys; sys.path.insert(0, '$CODE'); import g4rl; json.dump(g4rl.grpo_spec(tis=bool(int(sys.argv[2]))), open(sys.argv[1], 'w'))" "$D/grpo.json" "${TIS:-0}"
   ARGS="--grpo $D/grpo.json --grpo-train $D/train.parquet --warmup-steps $(g7 WARMUP7) --decay-fraction 0"
   if [ -n "${PREV:-}" ]; then
     # the optimizer state continued (G4-5): the previous run's last step, which resume7 copied into this run's place
@@ -476,16 +487,27 @@ smoke7-loose)
   STAG=${STAG:?the tag of the smoke test}; I=${I:?the first iteration of the smoke test}
   [ -x "$DPY" ] && [ "$(git -C "$DUMB" rev-parse HEAD 2> /dev/null)" = "$DUMB_COMMIT" ] || { echo "w$W: no DUMB venv or $DUMB not at $DUMB_COMMIT"; exit 1; }
   X=$W7/loose-$STAG
+  [ -d "$MX_ROOT/metricx-24-hybrid-xxl-v2p6-bfloat16" ] && [ -x "$FPY" ] || { echo "w$W: no MetricX-24 in $MX_ROOT or no $FPY"; exit 1; }
   f=$(body g4a7_smoke7_loose_$TAG <<EOF
 set -euo pipefail
-$ONE_HOST
-mkdir -p $X/out $X/c2
+mkdir -p $X/loose $X/c2model
 gsutil -m -q rsync -r $RL/iter/$I/samples $X/samples
-gsutil -m -q cp $RL/c2/model/params.pkl $RL/c2/model/config.json $X/c2/
-JAX_PLATFORMS=cpu nice -n 19 $SFT_PY -I -u $CODE/g4rl.py smoke7-loose --samples $X/samples --out $X/in
-SMOKE7_LOOSE_METRICX
-SMOKE7_LOOSE_C2
-gsutil -m -q cp $X/out/* $RL/smoke7/$STAG/loose/
+gsutil -m -q cp $RL/c2/model/params.pkl $RL/c2/model/config.json $X/c2model/
+JAX_PLATFORMS=cpu nice -n 19 $SFT_PY -I -u $CODE/g4rl.py smoke7-loose --samples $X/samples --out $X/loose
+# MetricX-24 hybrid XXL in QE mode on the same rows as the judges (no --empty-candidates, as g4judge.py)
+(
+$ONE_HOST
+export JAX_COMPILATION_CACHE_DIR=$G_SHM/jax_cache_metricx
+$FPY -I -u $CODE/metricx_qe.py score --pairs $X/loose/pairs.parquet --pair source:hypothesis --model xxl --root $MX_ROOT --out $X/loose/metricx.parquet
+)
+# C2 as naturalness.py classify runs it (run_g4arm7_judges.sh classify)
+(
+$ONE_HOST
+export JAX_COMPILATION_CACHE_DIR=$C2_W/jax_cache PYTHONPATH=src
+cd $DUMB
+$DPY -u $CODE/naturalness.py classify --dumb-code $DUMB --model $X/c2model --texts $X/loose/texts.parquet --max-length 1024 --out $X/loose/c2.parquet
+)
+gsutil -m -q cp $X/loose/pairs.parquet $X/loose/texts.parquet $X/loose/loose.json $X/loose/metricx.parquet $X/loose/c2.parquet $RL/smoke7/$STAG/loose/
 echo "SMOKE7_LOOSE_DONE $RL/smoke7/$STAG/loose/"
 EOF
 )
@@ -497,9 +519,10 @@ check7)
   f=$(body g4a7_check7_${AB}_$TAG <<EOF
 set -euo pipefail
 $CPU
-mkdir -p $X
-gsutil -q cp $RL/iter/$I/train/train.parquet $X/train.parquet
-nice -n 19 $SFT_PY -I -u $CODE/g4rl.py check7 --train $X/train.parquet --tokenizer $TOK_SFT --out $X/check.json
+mkdir -p $X/train
+gsutil -m -q cp $RL/iter/$I/train/train.parquet $RL/iter/$I/train/samples.parquet $X/train/
+gsutil -m -q rsync -r $RL/iter/$I/samples $X/samples
+nice -n 19 $SFT_PY -I -u $CODE/g4rl.py check7 --train $X/train/train.parquet --samples $X/samples --tokenizer $TOK_SFT --out $X/check.json
 gsutil -q cp $X/check.json $RL/smoke7/$STAG/check7-$AB.json
 echo "CHECK7_DONE $AB"
 EOF
@@ -539,12 +562,13 @@ done
 k=0; for l in ${LOGS_A:-}; do gsutil -q cp \$l $D/logs/gen-A-w\$k.log; k=\$((k + 1)); done
 k=0; for l in ${LOGS_B:-}; do gsutil -q cp \$l $D/logs/gen-B-w\$k.log; k=\$((k + 1)); done
 for m in G4-0 S; do mkdir -p $D/translate/\$m; gsutil -m -q cp $SM/translate/\$m/pairs-w0.parquet $SM/translate/\$m/metricx-w0.parquet $D/translate/\$m/; done
+gsutil -q cp ${LOG_S:?the log of the smoke translation with the adapter} $D/logs/translate-S.log
 gsutil -q cp $SM/val-stop.json $D/val/stop.json
 gsutil -m -q cp "$RL/judges/*.json" $D/heartbeats/
 python3 -c "import json, time; print(json.dumps({'epoch': time.time()}))" > $D/now.json
 gsutil -q cp $SM/timings.json $D/timings.json
 set +e
-nice -n 19 $SFT_PY -I -u $CODE/g4rl.py smoke7 --dir $D --out $X/out
+nice -n 19 $SFT_PY -I -u $CODE/g4rl.py smoke7 --dir $D --tokenizer $TOK_SFT --out $X/out
 code=\$?
 set -e
 gsutil -m -q cp $X/out/smoke7.json $X/out/smoke7.md $SM/

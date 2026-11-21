@@ -1600,3 +1600,82 @@ G4-7.6 toevoegt:
   fetch van G4-3 (`$G/input/bt3-val`); de trainsplit komt uit `$G/input/bt3` (beide `BT_REPOS3`). Het checkpoint van v2
   wordt op de CPU van w1 omgezet zoals C1's S @ 653k (`convert_gcs_checkpoint.py --params-only`, tokenizer
   `yhavinga/dutch-llama-tokenizer`, `--global-attn-every-n-layers 3`, kop 0).
+
+*G4-7.4c Aanvulling 21 nov 2026 (subagent van de keten; vóór elke stap van de keten `g4arm7_run.sh` op een worker;
+geen methodewijziging).* Wat de samenvoeging van de beleidskant (`en-nl-g4arm7-policy`) en de judge-kant op
+`en-nl-g4arm7`, de evaluatie (`run_g4arm.sh` met `ARM=G4-7`, `g4arm.py report7`) en de keten aan G4-7.2–G4-7.11
+toevoegen, of waarin de code van de letter van de spec afwijkt:
+- **De samples.** Een sampleshard heeft naast de kolommen van G4-7.4a ook `tokens_in` (de lengte van de prompt van de
+  sampler); `iter7` stopt als de prompt van `g4lora.prompt_text` een andere lengte heeft. De judges lezen alleen `uid`,
+  `source`, `hypothesis`. Het zaad van worker k in iteratie i is de eerste 8 bytes van
+  sha256(`en-nl-g4arm/0/G4-7/sample/<i>/w<k>`) (`g4rl.sample_seed`), niet één zaad `…/sample/<i>` voor alle vier
+  workers: dan zou de ruis van het samplen per slot en stap op de vier workers gelijk zijn. Generatie met
+  `translate.py --copies 8 --sample samples=1.0:<zaad> --shard-size 256` (32 bronnen per shard, de samples van een bron in
+  één shard), klasse `medium` met zijn eigen slots; het anker en RL-val greedy met `--copies 1`. Een geheugenfout is
+  `FAILED`; de keten halveert geen slots.
+- **De pool.** `pool7` trekt per deel 3% meer bronnen (reserve voor wat het anker laat vallen); `plan7` houdt daarna
+  precies 512 bronnen per iteratie (205/154/153) en 128 per deel voor RL-val. Het anker vertaalt dus ~3% meer dan 15.744
+  bronnen. De documenten van RL-val komen niet in de pool (strenger dan de spec), en een bron met een leeg anker valt ook
+  weg (een leeg anker zegt evenmin iets als een anker dat niet af is).
+- **Kandidaten** (`g4rl.py cands7`, `$RL/data/cands/`; keuzes van een subagent, techniek): `cands-flan|novels|bt.parquet`
+  (`id`, `en`, `doc`, `stratum`) en `cands.json`. FLAN: de segmenten van `mbert/flan-nl/plan2` van de voorbeelden die in
+  de gepubliceerde set bleven (`nl-g4b` min de 6.120 die de publicatiecontroles weglieten; de tellingen gelijk aan de
+  build, 1.032.592 rijen), zonder templatestrings en zonder de segmenten van de 1.035 evaluatievoorbeelden; `doc` = het
+  eerste voorbeeld met dat segment (`flan:w<h>-<p>`). Romans: de passages zoals `build4` ze maakt (gecontroleerd tegen
+  het rapport van G4-4: 2.931 boeken), zonder de 10 boeken van `novels`; `doc` = het boek. BT: het Engels van de
+  trainsplit op de revisies van G4-3, zonder de rijen met `hard_fails` (een controle op het Engels faalde); `doc` =
+  `g4c2.doc_key`, `stratum` = de bron. Per deel (BT per bron) een geseede trekking (`en-nl-g4arm/0/G4-7/cands/<deel>`)
+  van 2× wat `pool7` neemt; lege, dubbele en te lange teksten laat `cands7` al weg, zoals `pool7`. [Gemeten op mbert-corpus
+  w1, met een nep-`docs.txt`: na de filters van `pool7` FLAN 11.719, romans 9.782, BT 9.264 kandidaten, tegen 132 + 6.335,
+  132 + 4.759 en 132 + 4.728 nodig.] `g4c2.doc_key` herkent ook de lange passages van de revisies van G4-3
+  (`…:d:p<a>-<b>`, 21.368 rijen van de trainsplit); `data7` zou er anders op stoppen.
+- **Verlies.** TIS vermenigvuldigt alleen de beleidsterm (zoals Tunix' `sampler_is_weights`), niet de KL-term; de spec
+  zei "het verlies per token". Is het verschil sampler/leerder (gemiddelde |log π_old − log π_sampler| per token) in de
+  smoke-test of in een iteratie > 0,05, dan staat TIS aan vanaf de iteratie erna tot het eind ("vanaf de volgende
+  iteratie", spec §4.4). `sft_lora.py --passes-only`/`--passes-in` dienen alleen de CPU-proef (punt (c): één
+  ononderbroken run met de passes van twee iteraties); de keten gebruikt ze niet. De CPU-proef draait rijen van 1.024
+  (niet 4.096), zodat 64 samples ≥ 4 batches geven, in zeven runs (a, c, d, e0, e, f, g; (b) via de passes-only-runs f
+  en g; (d) 2 stappen met 1 warmup-stap). LR 5e-6 met precies 10 warmup-stappen en geen decay (`--warmup-steps 10
+  --decay-fraction 0`), geteld over de globale stappen (`--resume-step`). MaxText's datahooks krijgen de gekozen kanten en
+  de template van G4-6b (zoals de multi-host-runs van G4-6c) en worden nooit gelezen: `--grpo` vervangt de iterator.
+- **Nummering.** Iteratie i (0..29) samplet met adapter A_i (A_0 = G4-0, geen LoRA) en traint A_{i+1}: run
+  `g4a7_i<i>_<TAG>` onder `$RL/iter/<i>/runs/`, met de optimizer-state van de run van i − 1 (zijn Tunix-checkpoint van de
+  laatste stap gekopieerd naar de checkpointmap van de nieuwe run, zoals `resume5`). `val/<i>` is RL-val greedy met
+  A_{i+1}. De stopregels na iteratie i: S1, S2 en S4 op `val/<i>` (A_{i+1}), S6 op de samples van iteratie i (A_i), S3 op
+  de passes van de training van iteratie i (k1 van A_i tegen de referentie): S3 loopt dus één iteratie achter. S2 rekent
+  over de RL-val-vertalingen met een QE (een lege vertaling heeft geen QE en telt in S1). Kandidaat `G4-7-i<n>` is A_n
+  (n = 5, 10, …, 30), in `$G/G4-7-i<n>/`; "de laatste vóór een stop" is A_{i+1} als een regel na iteratie i raakt (de
+  laatste adapter die de training maakte).
+- **Overlap van RL-val en de volgende generatie.** Na de training van iteratie i vertaalt mbert-mix w3 RL-val met A_{i+1}
+  terwijl mbert-corpus de samples van iteratie i + 1 met A_{i+1} maakt; de training van i + 1 begint pas na `stop7` van
+  i. Stopt de training na iteratie i, dan worden die samples niet gebruikt.
+- **SFT-evaluaties.** `books`, `btval` en `own` (spec §6.3, G4-7.10) in de trainrun van elke 5e iteratie
+  ((i + 1) mod 5 = 0), vóór zijn eerste en na zijn laatste stap (`--eval-every 1000000`).
+- **Volgorde.** De data van C2 (`convert`, `g4c2.py data7`) draait op de CPU van mbert-corpus w1, met dezelfde venv en
+  code (`~/mbert-dumb/.venv`, `~/mbert-dumbx` @ `ae11478`) als op mbert-mix, zodra mbert-corpus vrij is en vóór mbert-mix
+  vrij is; daarna `cands7`, `pool7` en de vertalingen van het anker (G4-0 greedy, de vier workers van mbert-corpus). G4-7.6
+  zet `c2cal7` "vóór het anker": de scores van het anker (QE₀, C2), `plan7` en alles daarna komen pas na `C2CAL7_OK`; de
+  vertalingen zelf hangen niet van C2 af. Faalt `c2cal7`, dan worden ze niet gebruikt en komt er geen RL.
+- **Kalibratie** (spec §5.3.5, gerapporteerd): tegen de bestaande classify-runs van C1 `naturalness-G4-6b` (G4-6b, G4-0,
+  G4-4, G4-5c2, G4-6, G4-v6e, TG op WMT24++ en FLAN), `sampling/naturalness` (G4-0 en G4-4 greedy, T 0,7, T 1, best8,
+  G4-v6e, TG) en `naturalness-G4-6c` als die er dan is. De menselijke referenties zitten er niet in: C1's scores daarvan
+  bestaan alleen als voorspellingen zonder tekstbestand in dit formaat (`$S/re/classify/targets-predictions.parquet`).
+- **Smoke-test.** De twee mini-iteraties zijn de jobs `iter/<N>` en `iter/<N+1>` (N het eerste vrije even getal ≥ 900)
+  en `val/<N>` onder `$RL`, zodat de persistente judges ze scoren; hun bronnen zijn de eerste 32 (op `position`) van
+  planiteraties 0 en 1 (`g4rl.py smokeplan7`), met de ankers van het plan; de rest onder `$RL/smoke7/<TAG>/`. De RL
+  gebruikt er niets van. Trainfase 2 draait met de SFT-evaluaties (het geheugen van een 5e iteratie); de losse MetricX- en
+  C2-scores op mbert-mix w3. `smoke7` toetst ook dat de generatie van A geen LoRA heeft en het zaad `g4rl.sample_seed(N, k)` bij T = 1, dat
+  de 50 smoke-segmenten met de adapter van fase 2 een `LORA`-regel hebben (anders zegt |ΔQE| niets) en dat de judges
+  binnen 900 s na de laatste `DONE` klaar waren; "af" is af, geen lus en niet leeg (zoals de eerdere smoke-tests). De
+  schatting (≤ 24 u) telt per iteratie generatie, judge-staart, `iter7`, RL-val en training uit de gemeten fasen
+  (`g4rl.smoke_estimate7`). Een gefaalde controle of een geheugenfout: `FAILED` vóór de RL, zonder
+  terugval.
+- **Herstart.** Elke stap heeft een marker in `$G/stages/g4-7/`; een herstart (nieuwe TAG) begint bij de eerste stap
+  zonder marker. Een generatie houdt de shards en `DONE`-markers die al in de bucket staan (`translate.py` slaat ze
+  over); een training die niet af is, draait opnieuw onder een nieuwe naam (`g4a7_i<i>_<nieuwe TAG>`), hervat vanaf de
+  gemarkeerde run van i − 1. Een smoke-test zonder marker begint opnieuw met een nieuwe N.
+- **Judges.** Ze draaien tot de keten `judges/STOP` schrijft, na de laatste RL-val; daarna geeft de keten mbert-mix vrij.
+- **Rapport** (`g4arm.py report7`, beslist niets buiten G4-7.7 en G4-7.8): (a3) per set op dezelfde segmenten van het
+  beslisdeel als (a1) (WMT24++ zonder de slechte bronnen, zoals (a1)); de vlag "C2 stijgt, C1 niet" is ΔC2 ≥ +0,10 en
+  ΔC1 < +0,10 op WMT24++ (goed) + FLAN samen; PLL (protocol.md §4.2.3) met `naturalness.py pll` onder S @ 653k op de
+  teksten van de classify-run (`run_g4arm.sh pll`).

@@ -156,15 +156,29 @@
 #                                 (a3), (b) on the decision part, C2 beside C1, the training per iteration from the
 #                                 chain's $REP/records.json), to $G/report-G4-7/
 #   SELECTED=<report7's choice> bash run_g4arm.sh blind   w0 (CPU): only if (a1), (a3) and (b) hold (G4-7.8)
+# The measurement G4-bon (protocol-g4.md §15: best-of-8 with the choice on C2 + QE, the search part of G4-5.4 only;
+# g4bon.py; mbert-ops/scripts/g4bon_run.sh on mbert-mix), with ARM=G4-bon, its places under $GB = $G/bon/:
+#   bash run_g4arm.sh bon-data     w0 (CPU): g4bon.py bondata, the sampling probe's segments of the search part on their
+#                                 workers, to $GB/data/
+#   MODEL=G4-7-i<n> bash run_g4arm.sh bon-translate|bon-score   every worker: the candidate's 8 samples of the search
+#                                 part as the probe made G4-0's (translate.py --sample t10s<k>=1:<k>, the candidate's
+#                                 LoRA merged); collect, MetricX-24 (ref, QE), COMET-22, to $GB/<MODEL>/t10s<k>/
+#   MODEL=G4-7-i<n> bash run_g4arm.sh bon-c2texts | bon-c2     w0: C2's texts (the samples, the candidate's and G4-0's
+#                                 greedy translations; g4bon.py c2texts) and C2 on them, to $GB/<MODEL>/c2/
+#   MODEL=G4-0|G4-7-i<n> bash run_g4arm.sh bon-select   w0 (CPU): g4bon.py select (G4-0: the probe's samples and C2 of
+#                                 c2cal7), to $GB/<MODEL>/select/
+#   KEY=<key> MODELS="G4-0 [G4-7-i<n>]" bash run_g4arm.sh bon-texts | bon-classify | bon-report   w0: C1's texts of
+#                                 every output, C1 (run_arms.sh classify, job arms_classify_<TAG>b), g4bon.py report, to
+#                                 $GB/naturalness/<key>/ and $GB/report/<key>/
 # The code is beside this script (a copy of $G/scripts/). TAG names the jobs of one chain.
 set -euo pipefail
-STAGE=${1:?a stage: fetchbt, build, check, evaldata, setup, train, adapter, translate, score, texts, classify, blind, report, smoke-translate, smoke-score, smoke-report, fetchval, heldout, own, smoke2-report, replay, build2, heldout3, build3, smoke3-report, build4, smoke4-report, novels4, build5, split5, refqe5, resume5, report5, smoke5-report, cands6, build6, check6, cpuproof6, smoke6-report, pairtexts6, pairclassify6, pairclass6, ends6c, report6c, classify-c2, pll, report7}
+STAGE=${1:?a stage: fetchbt, build, check, evaldata, setup, train, adapter, translate, score, texts, classify, blind, report, smoke-translate, smoke-score, smoke-report, fetchval, heldout, own, smoke2-report, replay, build2, heldout3, build3, smoke3-report, build4, smoke4-report, novels4, build5, split5, refqe5, resume5, report5, smoke5-report, cands6, build6, check6, cpuproof6, smoke6-report, pairtexts6, pairclassify6, pairclass6, ends6c, report6c, classify-c2, pll, report7, bon-data, bon-translate, bon-score, bon-c2texts, bon-c2, bon-select, bon-texts, bon-classify, bon-report}
 R=gs://t5-dutch-english-usc2/mbert/translator
 S=$R/sft
 E=$R/eval
 G=$S/g4arm
 ARM=${ARM:-G4-1}
-case $ARM in G4-1|G4-2|G4-3|G4-4|G4-5|G4-6|G4-6b|G4-6c|G4-7) ;; *) echo "ARM is G4-1, G4-2, G4-3, G4-4, G4-5, G4-6, G4-6b, G4-6c or G4-7, not $ARM"; exit 1 ;; esac
+case $ARM in G4-1|G4-2|G4-3|G4-4|G4-5|G4-6|G4-6b|G4-6c|G4-7|G4-bon) ;; *) echo "ARM is G4-1, G4-2, G4-3, G4-4, G4-5, G4-6, G4-6b, G4-6c, G4-7 or G4-bon, not $ARM"; exit 1 ;; esac
 SMOKE_RUN=g4arm_${ARM}_s8
 FULL_RUN=g4arm_$ARM
 # G4-6 (draft amendment G4-6.4): rows of 4,096, or of 2,048 if the smoke test at 4,096 does not fit (its own smoke run)
@@ -248,6 +262,15 @@ if [ "$ARM" = G4-7 ]; then
   [ "$SET" = eval ] || { echo "ARM=G4-7: SET=eval only"; exit 1; }
 fi
 [ "$ARM" = G4-7 ] || case $STAGE in classify-c2|pll|report7) echo "$STAGE is G4-7's"; exit 1 ;; esac
+# The measurement G4-bon (protocol-g4.md §15): its own stages and places; it trains nothing and reads G4-7's adapters
+GB=$G/bon
+if [ "$ARM" = G4-bon ]; then
+  case $STAGE in
+    setup|bon-*) ;;
+    *) echo "$STAGE is no stage of G4-bon (setup, bon-data, bon-translate, bon-score, bon-c2texts, bon-c2, bon-select, bon-texts, bon-classify, bon-report)"; exit 1 ;;
+  esac
+fi
+[ "$ARM" = G4-bon ] || case $STAGE in bon-*) echo "$STAGE is G4-bon's (ARM=G4-bon)"; exit 1 ;; esac
 # The Gemma 4 FLAN-nl after its post step (flan_g4_full_run.sh), the replay's only source (amendment G4-2.3)
 FNL=gs://t5-dutch-english-usc2/mbert/flan-nl
 TRAIN_CKPT=$R/gemma4-ckpt/gemma-4-31b-it                       # run_sft.sh's gemma4-31b (MaxText 0.2.5 conversion)
@@ -2015,6 +2038,230 @@ gsutil -m -q cp $X/report.md $X/report.json $REP/
 echo "REPORT7_DONE $REP/report.md"
 EOF
   detach "g4a_report7_$TAG" bash ~/job_body_g4a_report7_$TAG.sh
+  ;;
+bon-data)
+  only 0
+  # protocol-g4.md §15: the sampling probe's segments (G4-5.7b B, $GS/data/) kept to G4-5.4's search part
+  X=$G_SHM/bondata-$TAG
+  cat > ~/job_body_g4b_data_$TAG.sh <<EOF
+set -euo pipefail
+mkdir -p $X/in $X/out
+gsutil -m -q cp $GS/data/evalsets.parquet '$GS/data/segments-w*.parquet' '$GS/data/classes-w*.txt' $G5S/split.json $X/in/
+$FPY -I -u $CODE/g4bon.py bondata --evalsets $X/in/evalsets.parquet --split $X/in/split.json --segments $X/in --out $X/out
+gsutil -m -q cp $X/out/* $X/in/evalsets.parquet $GB/data/
+echo "BONDATA_DONE $GB/data/"
+EOF
+  detach "g4b_data_$TAG" bash ~/job_body_g4b_data_$TAG.sh
+  ;;
+bon-translate|bon-score)
+  MODEL=${MODEL:?a candidate of G4-7, G4-7-i<n>}
+  # G4-0's 8 samples are the sampling probe's ($GS/G4-0/); new samples only for G4-7's candidate (§15)
+  cand7 "$MODEL" || { echo "$STAGE: new samples for a candidate of G4-7 (G4-7-i<n>) only, not $MODEL"; exit 1; }
+  tpu_free
+  # the probe's T = 1 settings (g4bon.SAMPLES): t10s<k> at T 1 with seed k, written as the probe's chain wrote them
+  BON_SAMPLES=""
+  for k in 1 2 3 4 5 6 7 8; do BON_SAMPLES="$BON_SAMPLES t10s$k=1:$k"; done
+  if [ "$STAGE" = bon-translate ]; then
+    NAME=g4b_translate_${MODEL}_$TAG
+    CLASSES=$(echo $(gsutil cat "$GB/data/classes-w$W.txt"))
+    adapter_local "$G/$MODEL" "$G_SHM/adapter-$NAME"
+    # amendment G4-7.4: a candidate's LoRA is rank 32 / alpha 16 from G4-0 (nothing stacked)
+    if ! python3 -c "import json, sys; a = json.load(open(sys.argv[1])); assert (a['rank'], a['alpha'], a['scale']) == (32, 16.0, 0.5), a" \
+        "$G_SHM/adapter-$NAME/adapter.json"; then
+      rm -rf -- "$G_SHM/adapter-$NAME"
+      echo "$G/$MODEL/adapter.json is not rank 32, alpha 16"
+      exit 1
+    fi
+    EXTRA="--lora $G_SHM/adapter-$NAME"
+    for x in $BON_SAMPLES; do EXTRA="$EXTRA --sample $x"; done
+    {
+      echo "set -uo pipefail"
+      echo "$VARS"
+      echo "$ONE_HOST"
+      echo "export JAX_COMPILATION_CACHE_DIR=$G_SHM/jax_cache"
+      echo "mkdir -p $G_SHM/bseg-$TAG $G_SHM/work"
+      echo "gsutil -q cp $GB/data/segments-w$W.parquet $G_SHM/bseg-$TAG/segments-w$W.parquet || exit 1"
+      echo "$PREFLIGHT"
+      echo "$TRANSLATE_CLASS"
+      for cls in $CLASSES; do
+        # {sample}: translate.py writes each sample's shards under $GB/$MODEL/<sample>/
+        echo "translate_class $G_SHM/bseg-$TAG/segments-w$W.parquet $cls '$GB/$MODEL/{sample}/translations/w$W/$cls' ~/logs/${NAME}_$cls.log $EXTRA || exit 1"
+      done
+      echo "rm -rf -- $G_SHM/adapter-$NAME"
+      echo "echo \"TRANSLATED w$W $MODEL: $CLASSES ($BON_SAMPLES)\""
+    } > ~/job_body_$NAME.sh
+  else
+    NAME=g4b_score_${MODEL}_$TAG
+    L=$G_SHM/score-$NAME
+    NAMES=""
+    for x in $BON_SAMPLES; do NAMES="$NAMES ${x%%=*}"; done
+    {
+      echo "set -euo pipefail"
+      echo "$ONE_HOST"
+      echo "export JAX_COMPILATION_CACHE_DIR=$G_SHM/jax_cache_metricx"
+      echo "mkdir -p $L/data"
+      echo "gsutil -q cp $GB/data/evalsets.parquet $GB/data/segments-w$W.parquet $L/data/"
+      echo "n=\$($FPY -I -c 'import pyarrow.parquet as pq, sys; print(pq.read_metadata(sys.argv[1]).num_rows)' $L/data/segments-w$W.parquet)"
+      echo "if [ \"\$n\" = 0 ]; then echo \"SCORED w$W $MODEL: no search segment on this worker\"; exit 0; fi"
+      JOIN=""
+      for n in $NAMES; do
+        O=$GB/$MODEL/$n
+        echo "mkdir -p $L/$n/translations"
+        echo "gsutil -m -q rsync -r $O/translations/w$W $L/$n/translations"
+        echo "$FPY -I $CODE/evalsets.py collect --data $L/data --worker $W --shards $L/$n/translations --out $L/$n/pairs-w$W.parquet"
+        echo "gsutil -q cp $L/$n/pairs-w$W.parquet $O/pairs/pairs-w$W.parquet"
+        JOIN="$JOIN --pairs $n=$L/$n/pairs-w$W.parquet"
+      done
+      # one MetricX and one COMET pass over all samples of this worker (ids NAME|ID), split back per sample (as the probe)
+      echo "$FPY -I -u $CODE/g4arm.py samplejoin $JOIN --out $L/all-pairs.parquet"
+      echo "timeout 600 $FPY -c \"import jax; assert (jax.device_count(), jax.process_count()) == (4, 1)\""
+      echo "$FPY -I -u $CODE/metricx_qe.py score --pairs $L/all-pairs.parquet --pair source:hypothesis:reference --pair source:hypothesis --model xxl --root $MX_ROOT --empty-candidates --out $L/all-metricx.parquet"
+      echo "$FPY -I -u $CODE/g4arm.py samplesplit --scores $L/all-metricx.parquet --out '$L/{sample}/metricx-w$W.parquet'"
+      echo "r=\$($FPY -I -c \"import pyarrow.parquet as pq, pyarrow.compute as pc, sys; t = pq.read_table(sys.argv[1]); t = t.filter(pc.is_valid(t['reference'])); pq.write_table(t, sys.argv[2]); print(t.num_rows)\" $L/all-pairs.parquet $L/all-pairs-ref.parquet)"
+      echo "if [ \"\$r\" != 0 ]; then"
+      echo "  $SHM/comet-venv/bin/python -I -u $CODE/comet_score.py score --root $SHM/comet --pairs $L/all-pairs-ref.parquet --out $L/all-comet.parquet"
+      echo "  $FPY -I -u $CODE/g4arm.py samplesplit --scores $L/all-comet.parquet --out '$L/{sample}/comet-w$W.parquet'"
+      echo "fi"
+      for n in $NAMES; do
+        echo "gsutil -q cp $L/$n/metricx-w$W.parquet $GB/$MODEL/$n/scores/metricx-w$W.parquet"
+        echo "if [ -e $L/$n/comet-w$W.parquet ]; then gsutil -q cp $L/$n/comet-w$W.parquet $GB/$MODEL/$n/scores/comet-w$W.parquet; fi"
+      done
+      echo "echo \"SCORED w$W $MODEL: $NAMES\""
+    } > ~/job_body_$NAME.sh
+  fi
+  detach "$NAME" bash ~/job_body_$NAME.sh
+  ;;
+bon-c2texts|bon-c2)
+  only 0
+  MODEL=${MODEL:?a candidate of G4-7, G4-7-i<n>}
+  # G4-0's samples have C2's scores of c2cal7 ($RL/c2/cal7/); a candidate's samples get theirs here (§15)
+  cand7 "$MODEL" || { echo "$STAGE: C2 of a candidate of G4-7 (G4-7-i<n>) only, not $MODEL"; exit 1; }
+  dumb_ready
+  for f in "$RL/c2/model/params.pkl" "$RL/c2/model/config.json"; do
+    gsutil -q stat "$f" || { echo "no $f (C2's model)"; exit 1; }
+  done
+  if [ "$STAGE" = bon-c2texts ]; then
+    X=$G_SHM/bonc2texts-${MODEL}-$TAG
+    SAMPLE_ARGS=""
+    for k in 1 2 3 4 5 6 7 8; do SAMPLE_ARGS="$SAMPLE_ARGS --sample t10s$k='$X/t10s$k/pairs-w*.parquet'"; done
+    {
+      echo "set -euo pipefail"
+      echo "mkdir -p $X/c2-config $X/greedy $X/g40"
+      for k in 1 2 3 4 5 6 7 8; do echo "mkdir -p $X/t10s$k && gsutil -m -q cp '$GB/$MODEL/t10s$k/pairs/pairs-w*.parquet' $X/t10s$k/"; done
+      echo "gsutil -m -q cp '$G/eval/$MODEL/pairs/pairs-w*.parquet' $X/greedy/"
+      echo "gsutil -m -q cp '$G/eval/G4-0/pairs/pairs-w*.parquet' $X/g40/"
+      echo "gsutil -q cp $GB/data/evalsets.parquet $G5S/split.json $X/"
+      echo "gsutil -q cp $RL/c2/model/config.json $X/c2-config/config.json"
+      echo "nice -n 19 $DPY -I -u $CODE/g4bon.py c2texts --model $MODEL $SAMPLE_ARGS --greedy '$X/greedy/pairs-w*.parquet' --g40 '$X/g40/pairs-w*.parquet' --evalsets $X/evalsets.parquet --split $X/split.json --checkpoint $X/c2-config --out $X/texts.parquet"
+      echo "gsutil -q cp $X/texts.parquet $GB/$MODEL/c2/texts.parquet"
+      echo "echo \"BON_C2TEXTS: $GB/$MODEL/c2/texts.parquet\""
+    } > ~/job_body_g4b_c2texts_${MODEL}_$TAG.sh
+    detach "g4b_c2texts_${MODEL}_$TAG" bash ~/job_body_g4b_c2texts_${MODEL}_$TAG.sh
+  else
+    tpu_free
+    gsutil -q stat "$GB/$MODEL/c2/texts.parquet" || { echo "no $GB/$MODEL/c2/texts.parquet (bon-c2texts)"; exit 1; }
+    X=$G_SHM/bonc2-${MODEL}-$TAG
+    # C2 as classify-c2 and the judge side run it: C1's venv and checkout, --max-length 1024
+    cat > ~/job_body_g4b_c2_${MODEL}_$TAG.sh <<EOF
+set -euo pipefail
+$ONE_HOST_DUMB
+export JAX_COMPILATION_CACHE_DIR=$G_SHM/jax_cache_dumb PYTHONPATH=src
+cd $DUMB
+mkdir -p $X/model $G_SHM/jax_cache_dumb
+gsutil -m -q cp $RL/c2/model/params.pkl $RL/c2/model/config.json $X/model/
+gsutil -q cp $GB/$MODEL/c2/texts.parquet $X/texts.parquet
+$DPY -u $CODE/naturalness.py classify --dumb-code $DUMB --model $X/model --texts $X/texts.parquet --max-length 1024 --out $X/predictions.parquet
+gsutil -q cp $X/predictions.parquet $GB/$MODEL/c2/predictions.parquet
+echo "BON_C2: $GB/$MODEL/c2/predictions.parquet"
+EOF
+    detach "g4b_c2_${MODEL}_$TAG" bash ~/job_body_g4b_c2_${MODEL}_$TAG.sh
+  fi
+  ;;
+bon-select)
+  only 0
+  MODEL=${MODEL:?G4-0 or a candidate of G4-7, G4-7-i<n>}
+  X=$G_SHM/bonselect-${MODEL}-$TAG
+  RUNS=""
+  for k in 1 2 3 4 5 6 7 8; do RUNS="$RUNS --sample t10s$k=$X/t10s$k"; done
+  if [ "$MODEL" = G4-0 ]; then
+    # the sampling probe's samples and best8, C2 of c2cal7 (G4-7.6, the same model as the reward's)
+    SRC=$GS/G4-0
+    C2P=$RL/c2/cal7/predictions.parquet
+    C2T=$RL/c2/cal7/texts.parquet
+    CHECKS="--best8 $X/best8-choice.parquet --probe-report $X/probe-report.json"
+    FETCH="gsutil -q cp $GS/G4-0/best8/choice.parquet $X/best8-choice.parquet && gsutil -q cp $GS/report/report.json $X/probe-report.json"
+  elif cand7 "$MODEL"; then
+    SRC=$GB/$MODEL
+    C2P=$GB/$MODEL/c2/predictions.parquet
+    C2T=$GB/$MODEL/c2/texts.parquet
+    CHECKS=""
+    FETCH="true"
+  else
+    echo "bon-select: G4-0 or a candidate of G4-7 (G4-7-i<n>), not $MODEL"; exit 1
+  fi
+  for f in "$C2P" "$C2T"; do gsutil -q stat "$f" || { echo "no $f (C2's scores of $MODEL)"; exit 1; }; done
+  {
+    echo "set -euo pipefail"
+    for k in 1 2 3 4 5 6 7 8; do echo "mkdir -p $X/t10s$k && gsutil -m -q rsync -r -x 'translations/.*' $SRC/t10s$k $X/t10s$k"; done
+    echo "mkdir -p $X/anchor && gsutil -m -q rsync -r -x 'translations/.*' $G/eval/G4-0 $X/anchor"
+    echo "gsutil -q cp $GB/data/evalsets.parquet $G5S/split.json $X/"
+    echo "gsutil -q cp $C2P $X/c2-predictions.parquet && gsutil -q cp $C2T $X/c2-texts.parquet"
+    echo "$FETCH"
+    echo "$FPY -I -u $CODE/g4bon.py select --model $MODEL $RUNS --anchor $X/anchor --c2-predictions $X/c2-predictions.parquet --c2-texts $X/c2-texts.parquet --evalsets $X/evalsets.parquet --split $X/split.json $CHECKS --out $X/out"
+    echo "gsutil -m -q rsync -r $X/out $GB/$MODEL/select"
+    echo "echo \"BONSELECT_DONE $GB/$MODEL/select/\""
+  } > ~/job_body_g4b_select_${MODEL}_$TAG.sh
+  detach "g4b_select_${MODEL}_$TAG" bash ~/job_body_g4b_select_${MODEL}_$TAG.sh
+  ;;
+bon-texts|bon-classify|bon-report)
+  only 0
+  KEY=${KEY:?the key of the classify run, e.g. G4-0 or G4-0_G4-7-i15}
+  MODELS=${MODELS:?G4-0 first, then the candidate of G4-7 if there is one}
+  [ "${MODELS%% *}" = G4-0 ] || { echo "MODELS: G4-0 first (the deltas are against its greedy translation), not '$MODELS'"; exit 1; }
+  for m in ${MODELS#G4-0}; do cand7 "$m" || { echo "MODELS: $m is no candidate of G4-7"; exit 1; }; done
+  BNAT=$GB/naturalness/$KEY
+  if [ "$STAGE" = bon-classify ]; then
+    gsutil -q stat "$BNAT/texts.parquet" || { echo "no $BNAT/texts.parquet (bon-texts)"; exit 1; }
+    # C1: run_arms.sh's classify, unchanged, on this measurement's texts; its job is arms_classify_<TAG>b
+    NAT=$BNAT TAG=${TAG}b bash "$CODE/run_arms.sh" classify
+    exit 0
+  fi
+  X=$G_SHM/${STAGE}-$TAG
+  PAIRS=""
+  OUTS=""
+  {
+    echo "set -euo pipefail"
+    echo "mkdir -p $X"
+    echo "gsutil -q cp $GB/data/evalsets.parquet $G5S/split.json $G5S/refqe.parquet $X/"
+    for m in $MODELS; do
+      if [ "$m" = G4-0 ]; then T1=$GS/G4-0/t10s1; else T1=$GB/$m/t10s1; fi
+      echo "mkdir -p $X/$m/greedy $X/$m/t10s1 $X/$m/select"
+      echo "gsutil -m -q rsync -r -x 'translations/.*' $G/eval/$m $X/$m/greedy"
+      echo "gsutil -m -q rsync -r -x 'translations/.*' $T1 $X/$m/t10s1"
+      echo "gsutil -m -q rsync -r $GB/$m/select $X/$m/select"
+      PAIRS="$PAIRS --pairs '$m=$X/$m/greedy/pairs/pairs-w*.parquet' --pairs '$m/t10s1=$X/$m/t10s1/pairs/pairs-w*.parquet'"
+      for sel in qe r7 c2q c2; do PAIRS="$PAIRS --pairs '$m/$sel=$X/$m/select/$sel/pairs/pairs-w*.parquet'"; done
+      OUTS="$OUTS --model $m=$X/$m/greedy,$X/$m/t10s1,$X/$m/select"
+      if [ "$m" != G4-0 ]; then
+        echo "gsutil -q cp $GB/$m/c2/predictions.parquet $X/$m/c2-predictions.parquet"
+        OUTS="$OUTS --c2-check $m=$X/$m/c2-predictions.parquet,$X/cal7-predictions.parquet"
+      fi
+    done
+    if [ "$STAGE" = bon-texts ]; then
+      echo "$FPY -I -u $CODE/g4bon.py texts --evalsets $X/evalsets.parquet --split $X/split.json $PAIRS --out $X/texts.parquet"
+      echo "gsutil -q cp $X/texts.parquet $BNAT/texts.parquet"
+      echo "echo '$MODELS' | gsutil -q cp - $BNAT/models.txt"
+      echo "echo \"BONTEXTS_DONE $BNAT/texts.parquet ($MODELS)\""
+    else
+      echo "gsutil -q cp $BNAT/predictions.parquet $X/predictions.parquet"
+      echo "gsutil -q cp $GS/naturalness/predictions.parquet $X/probe-predictions.parquet"
+      echo "gsutil -q cp $RL/c2/cal7/predictions.parquet $X/cal7-predictions.parquet"
+      echo "$FPY -I -u $CODE/g4bon.py report --evalsets $X/evalsets.parquet --split $X/split.json --refqe $X/refqe.parquet --anchor $X/G4-0/greedy --predictions $X/predictions.parquet --probe-predictions $X/probe-predictions.parquet$OUTS --out $X/report.md"
+      echo "gsutil -m -q cp $X/report.md $X/report.json $GB/report/$KEY/"
+      echo "echo \"BONREPORT_DONE $GB/report/$KEY/report.md\""
+    fi
+  } > ~/job_body_g4b_${STAGE#bon-}_$TAG.sh
+  detach "g4b_${STAGE#bon-}_$TAG" bash ~/job_body_g4b_${STAGE#bon-}_$TAG.sh
   ;;
 *)
   echo "unknown stage $STAGE"

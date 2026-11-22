@@ -1797,3 +1797,13 @@ liep licht op (S2 +0,007 → +0,022). **LR 5e-5** (10×), verder alles gelijk; d
 De RL begint opnieuw bij iteratie 0: de iteraties, RL-val-jobs en hun markers van de eerste poging staan onder
 `$RL/archive-lr5e-6/` en `$G/stages/g4-7/archive-lr5e-6/` (verplaatst, niets verwijderd); C2, `c2cal7`, het anker, `pool7`,
 `plan7` en `smoke7` blijven gelden.
+
+*G4-7.4l Aanvulling 22 nov 2026 ~13:00 (besluit van Yeb; vóór de kandidatenfase).* De blinde beoordeling ((a2) en (c),
+G4-7.8) draait ook als (a1) en (a3) op het beslisdeel gelden en (b) niet, **als rapportage**: ze beslist dan niets, en
+"G4-7 helpt" vraagt nog steeds alle vijf. Reden (review door Gemini 4 Neon, 22 nov): +10 pp op C1 is met deze opzet
+nauwelijks eerlijk haalbaar (FLAN is de helft van (b) maar ~2% van de trainingstokens), en zonder blinde beoordeling blijft
+bij een bescheiden echte winst onbekend of het Nederlands natuurlijker werd en of C2 als reward iets meet wat telt. De
+lopende keten (`g4i1122p`, code `2f8119c`) blijft ongewijzigd: geldt (b) niet, dan draait de hoofdsessie na `DONE` de stap
+`blind` van `run_g4arm7.sh` met de hand (`ARM=G4-7 SELECTED=<gekozen kandidaat>`, mbert-corpus w0, vóór T3 de TPU krijgt)
+en daarna de beoordeling door één verse Claude-subagent volgens G4-7.8 (rubriek protocol.md §4.2.4, de 100 passages,
+twijfelgevallen naar Yeb). Bij (a1) of (a3) niet gehaald: geen blinde beoordeling.

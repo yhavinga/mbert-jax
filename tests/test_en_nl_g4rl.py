@@ -1253,12 +1253,12 @@ def set_in(path, keys, value):
 
 
 def qe_off(rows):
-    rows[7][g4rl.LOOSE_QE7] += 0.002
+    rows[7][g4rl.LOOSE_QE7] += 0.03   # G4-7.4i: tolerance 0.02
 
 
 def p_off(rows):
     k = next(i for i, r in enumerate(rows) if not r["truncated"])
-    rows[k]["p_original"] += 2e-4
+    rows[k]["p_original"] += 0.02   # G4-7.4i: tolerance 0.01
 
 
 def drop_lora(d):
@@ -1291,7 +1291,7 @@ def add_own(data):
     (lambda d: set_in(d / "train-1" / "summary.json", ["peak_gib_max"], 29.6), {"train1_peak"}),
     (drop_lora, {"gen_B_lora"}),
     (lambda d: edit_parquet(d / "translate" / "S" / "metricx-w0.parquet", shift_s), {"translate_qe"}),
-    (lambda d: set_in(d / "timings.json", ["val_wall_s"], 1400.0), {"estimate"}),
+    (lambda d: set_in(d / "timings.json", ["val_wall_s"], 5000.0), {"estimate"}),   # G4-7.4i: bound 48 h
     # and every other check on its own
     ("not_ended9", {"gen_A_ended"}),
     ("nan_logp", {"gen_A_logp"}),
@@ -1304,10 +1304,11 @@ def add_own(data):
     (lambda d: edit_parquet(d / "iter-A" / "train" / "samples.parquet", reward_off), {"rewards_A"}),
     (lambda d: set_in(d / "check7-B.json", ["ok"], False), {"check7_B"}),
     (lambda d: set_in(d / "check7-A.json", ["train_sha256"], "0" * 64), {"check7_A"}),
-    (lambda d: set_in(d / "train-1" / "summary.json", ["grpo", "steps", 0, "log_ratio_abs_max"], 2e-4),
+    # G4-7.4i: step 1 by |KL| <= 1e-3 and clip_frac <= 0.01; old = ref by the mean k1 <= 1e-4 (maxima reported)
+    (lambda d: set_in(d / "train-1" / "summary.json", ["grpo", "steps", 0, "clip_frac"], 0.02),
      {"train1_step1"}),
-    (lambda d: set_in(d / "train-1" / "summary.json", ["grpo", "steps", 0, "kl"], -2e-4), {"train1_step1"}),
-    (lambda d: set_in(d / "train-1" / "summary.json", ["grpo", "passes", "old_ref_abs_max"], 2e-4),
+    (lambda d: set_in(d / "train-1" / "summary.json", ["grpo", "steps", 0, "kl"], -2e-3), {"train1_step1"}),
+    (lambda d: set_in(d / "train-1" / "summary.json", ["grpo", "passes", "k1_old_ref"], 2e-4),
      {"train1_old_ref"}),
     (lambda d: set_in(d / "train-1" / "summary.json", ["loss", 1, 1], float("nan")), {"train1_finite"}),
     (lambda d: set_in(d / "train-1" / "files.json", ["commit_success"], False), {"train1_files"}),

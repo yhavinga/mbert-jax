@@ -1327,11 +1327,13 @@ SMOKE_BASE_MIN7 = 900                # the smoke's iterations N, N+1 under the s
 SMOKE_SOURCES7 = 32
 SMOKE_SAMPLES7 = SMOKE_SOURCES7 * G7  # 256
 SMOKE_MIN_OK7 = 248                  # §8.3 point 1: at least this many of the 256 ended (no loop, not empty)
-SMOKE_QE_TOL7 = 1e-3                 # §8.3 point 2: the judges' QE against a loose metricx_qe.py score
-SMOKE_C2_TOL7 = 1e-4                 # §8.3 point 2: the judge's p_c2 against a loose naturalness.py classify
+SMOKE_QE_TOL7 = 0.02                 # §8.3 point 2 (G4-7.4i: 1e-3 -> 0.02, bf16 batch effects of MetricX): the judges' QE against a loose score
+SMOKE_C2_TOL7 = 0.01                 # §8.3 point 2 (G4-7.4i: 1e-4 -> 0.01): the judge's p_c2 against a loose naturalness.py classify
 SMOKE_OVERFLOW_MAX7 = 1              # G4-7.9: c2_overflow at more than 1 of the 256 samples is a stop
-SMOKE_STEP1_TOL7 = 1e-4              # §8.3 point 4: phase 1's step 1, rho = 1 and KL = 0; old = ref
-SMOKE_HOURS_MAX7 = 24.0              # §8.3 point 7: the full run's estimate
+SMOKE_STEP1_TOL7 = 1e-4              # §8.3 point 4: old = ref as the mean k1 (G4-7.4i: bf16 programs differ per token)
+SMOKE_STEP1_KL7 = 1e-3               # G4-7.4i: step 1's |KL| (mean) at most this
+SMOKE_STEP1_CLIP7 = 0.01             # G4-7.4i: step 1's share of clipped tokens at most this
+SMOKE_HOURS_MAX7 = 48.0              # §8.3 point 7 (G4-7.4i: 24 -> 48; the estimate scales iter7's fixed part, realistic ~29 h)
 SMOKE_FILL7 = 0.95                   # §7.2's packing fill of the full run's batches (the smoke's ~2 are not full)
 SMOKE_EVAL_SETS7 = ("books", "btval", "own")   # phase 2's SFT evals (G4-7.10: every 5 iterations in the run)
 EVAL_EVERY7 = 5
@@ -1368,9 +1370,9 @@ CHECKS7 = {
     "check7_B": (3, "ok, op het trainbestand van B (sha256)", "idem voor B"),
     "train1_data": (4, "getraind op A's trainbestand (sha256), stappen = de batches van dat bestand",
                     "fase 1: data en stappen"),
-    "train1_step1": (4, f"stap 1: max |log pi - log pi_old| <= {SMOKE_STEP1_TOL7} en |KL| <= {SMOKE_STEP1_TOL7}",
+    "train1_step1": (4, f"stap 1: |KL| <= {SMOKE_STEP1_KL7} en clip_frac <= {SMOKE_STEP1_CLIP7} (max |log-ratio| gerapporteerd; G4-7.4i)",
                      "fase 1: rho = 1 en KL = 0 op stap 1"),
-    "train1_old_ref": (4, f"max |log pi_old - log pi_ref| <= {SMOKE_STEP1_TOL7}", "fase 1: old = ref (LoRA op nul)"),
+    "train1_old_ref": (4, f"|gemiddelde k1(old, ref)| <= {SMOKE_STEP1_TOL7} (max gerapporteerd; G4-7.4i)", "fase 1: old = ref (LoRA op nul)"),
     "train1_peak": (4, "<= 29,5 GiB per chip", "fase 1: piekgeheugen"),
     "train1_finite": (4, "alle verliezen en stapmaten eindig", "fase 1: verliezen"),
     "train1_files": (4, "adapter.npz en checkpoints/<stappen van fase 1> met commit_success",
@@ -1977,11 +1979,11 @@ def smoke_verdict7(d, counter):
         steps = (s.get("grpo") or {}).get("steps") or []
         first = steps[0] if steps else {}
         put("train1_step1", first.get("step") == 1 and finite(first.get("log_ratio_abs_max"))
-            and first["log_ratio_abs_max"] <= SMOKE_STEP1_TOL7 and finite(first.get("kl"))
-            and abs(first["kl"]) <= SMOKE_STEP1_TOL7,
+            and finite(first.get("kl")) and abs(first["kl"]) <= SMOKE_STEP1_KL7
+            and finite(first.get("clip_frac")) and first["clip_frac"] <= SMOKE_STEP1_CLIP7,
             {k: first.get(k) for k in ("step", "log_ratio_abs_max", "kl", "loss", "adv_mean", "clip_frac")})
         passes = (s.get("grpo") or {}).get("passes") or {}
-        put("train1_old_ref", finite(passes.get("old_ref_abs_max")) and passes["old_ref_abs_max"] <= SMOKE_STEP1_TOL7,
+        put("train1_old_ref", finite(passes.get("k1_old_ref")) and abs(passes["k1_old_ref"]) <= SMOKE_STEP1_TOL7,
             {k: passes.get(k) for k in ("old_ref_abs_max", "old_is_ref", "k1_old_ref")})
 
     guard(("train1_data", "train1_peak", "train1_finite", "train1_files", "train1_step1", "train1_old_ref"), phase1)

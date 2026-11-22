@@ -1767,3 +1767,15 @@ De SFT-evaluaties `books`/`btval`/`own` in de trainruns (G4-7.10, rapportage, be
 géén evaluaties. Drift en kwaliteit blijven bewaakt door S1–S4 en S6 (RL-val, KL), en de kandidaten worden na de RL
 geëvalueerd zoals in G4-7.7/7.8. Tests: de fixture van fase 2 zonder evaluaties (wandtijd 800 → 680 s, de 2 × 3 × 20 s
 evaluaties eruit), en een evaluatie in de run laat `train2_finite` falen.
+
+*G4-7.4i Aanvulling 22 nov 2026 ~03:55 (hoofdsessie volgens G4-7.9; versoepeling achteraf van technische controles van
+de smoke-test, niet van een beslisregel; voor Yeb gemarkeerd).* `smoke7` `g4i1122m` (iteraties 908/909) haalde alle
+functionele controles (decoderen, logprobs, rewards en voordelen gelijk, check7, hervatten, piek 24,1/24,1 GiB, vertalen,
+QE S − G4-0 +0,04) maar niet vijf numerieke: `qe_loose` max 0,014 (grens 0,001), `c2_loose` max 0,006 (grens 1e-4),
+`train1_step1` max |log-ratio| 0,89 bij KL 4e-4 en clip_frac 0,18% (grens 1e-4), `train1_old_ref` max 1,18 bij gemiddelde
+k1 8,6e-6 (grens 1e-4), `estimate` 44,0 u (grens 24 u). De max-grenzen van 1e-4 kwamen uit de CPU-proef in float32 (daar
+exact 0); op de TPU in bf16 geven verschillend gecompileerde programma's (judge tegen losse score, met tegen zonder
+LoRA-pad) per token afrondingsverschillen, zonder systematische afwijking (gemiddelden ~0; sampler/leerder 0,006, spec-grens
+0,05). De schatting schaalt de vaste opstarttijd van `iter7` lineair mee (37,6 min per iteratie); realistisch ~58 min per
+iteratie, ~29 u. Nieuwe grenzen: QE 0,02; p_c2 0,01; stap 1: |KL| ≤ 1e-3 en clip_frac ≤ 0,01; old = ref: |gemiddelde k1|
+≤ 1e-4 (maxima gerapporteerd); schatting ≤ 48 u. 30 iteraties blijven. De smoke-test draait opnieuw (`g4i1122n`).

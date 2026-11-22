@@ -346,7 +346,7 @@ def test_proefrun(tmp_path):
     r = subprocess.run([sys.executable, str(CODE / "g4judge.py"), "proef", "--dir", str(tmp_path / "bucket")],
                        capture_output=True, text=True, timeout=240)
     assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-3000:]
-    assert "JUDGE_PROEF_OK 12 checks" in r.stdout
+    assert "JUDGE_PROEF_OK 13 checks" in r.stdout
 
 
 C2_CASE = r"""

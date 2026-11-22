@@ -1757,3 +1757,13 @@ faalde op "warmup 10 and decay 0 steps do not fit a schedule of 2": de warmup va
 signaal). `sft_lora.py` neemt nu min(warmup, stappen − decay − 1) (MaxText's fracties vragen een stap na de warmup) en meldt dat (`WARMUP … clipped`); runs met ≥ 11 stappen
 veranderen niet. In de smoke-test is de warmup dus 1 (eerste mini-iteratie, 2 stappen) en 3 (tweede, 4 stappen); de smoke-test toetst mechaniek en
 geheugen, niet het leren.
+
+*G4-7.4h Aanvulling 22 nov 2026 ~01:40 (hoofdsessie, volgens G4-7.9: "de hoofdsessie beslist" bij geheugen in de
+smoke-test; geen wijziging van wat beslist).* Trainfase 2 van `smoke7` (`g4a7_s905_g4i1122k`) liep in zijn eerste
+SFT-evaluatie op stap 2 tegen `RESOURCE_EXHAUSTED` ("Attempting to allocate 21.00M … 5.01M free"), dezelfde fout als G4-6c's
+evaluaties (G4-6c.6b–.6f); de training zelf paste (fase 1: piek 23,9 GiB, 10,7 s/stap, verschil sampler/leerder 0,0062).
+De SFT-evaluaties `books`/`btval`/`own` in de trainruns (G4-7.10, rapportage, beslissen niets) **vervallen**: geen
+`--eval` in `train7` (`g4arm7_run.sh` EVALS=0, `g4rl.SFT_EVALS7 = False`); `smoke7` eist voor fase 2 eindige verliezen en
+géén evaluaties. Drift en kwaliteit blijven bewaakt door S1–S4 en S6 (RL-val, KL), en de kandidaten worden na de RL
+geëvalueerd zoals in G4-7.7/7.8. Tests: de fixture van fase 2 zonder evaluaties (wandtijd 800 → 680 s, de 2 × 3 × 20 s
+evaluaties eruit), en een evaluatie in de run laat `train2_finite` falen.

@@ -1335,6 +1335,9 @@ SMOKE_HOURS_MAX7 = 24.0              # §8.3 point 7: the full run's estimate
 SMOKE_FILL7 = 0.95                   # §7.2's packing fill of the full run's batches (the smoke's ~2 are not full)
 SMOKE_EVAL_SETS7 = ("books", "btval", "own")   # phase 2's SFT evals (G4-7.10: every 5 iterations in the run)
 EVAL_EVERY7 = 5
+# G4-7.4h: no SFT evals in the GRPO runs: their eval program does not fit beside the training state (smoke7 s905:
+# RESOURCE_EXHAUSTED, 21 MB asked, 5 MB free, as G4-6c's evals); they decided nothing (G4-7.10)
+SFT_EVALS7 = False
 WORKERS7 = 4                         # the generating workers of mbert-corpus
 JUDGES7 = (("metricx", "w0", 0), ("metricx", "w2", 1), ("c2", "w1", None))
 # smoke7-loose's inputs of the loose scorers and the names their outputs get in D/loose/
@@ -1381,7 +1384,7 @@ CHECKS7 = {
     "train2_resume": (5, "hervat op stap = de stappen van fase 1, eerste stap die + 1",
                       "fase 2: --resume-step (optimizer-state doorgezet)"),
     "train2_peak": (5, "<= 29,5 GiB per chip", "fase 2: piekgeheugen"),
-    "train2_finite": (5, "alle verliezen eindig; evals books, btval, own aanwezig en eindig", "fase 2: verliezen en evals"),
+    "train2_finite": (5, "alle verliezen eindig; geen SFT-evals in de run (G4-7.4h)", "fase 2: verliezen"),
     "train2_files": (5, "adapter.npz en checkpoints/<stappen na fase 2> met commit_success",
                      "fase 2: adapter en Tunix-checkpoint in de bucket"),
     "translate_S_lora": (6, "LORA met 410 modules en norm > 0", "de 50 segmenten met de adapter van fase 2 ingebakken"),
@@ -1949,7 +1952,10 @@ def smoke_verdict7(d, counter):
         if k == "2":
             evals = s.get("eval") or []
             names = {e["set"] for e in evals}
-            holds = holds and set(SMOKE_EVAL_SETS7) <= names and all(finite(e.get("loss")) for e in evals)
+            if SFT_EVALS7:
+                holds = holds and set(SMOKE_EVAL_SETS7) <= names and all(finite(e.get("loss")) for e in evals)
+            else:
+                holds = holds and not evals
             value["eval"] = [[e["set"], e["step"], e.get("loss")] for e in evals]
         put(f"train{k}_finite", holds, value)
         files = json.loads((d / f"train-{k}" / "files.json").read_text())

@@ -1160,7 +1160,7 @@ def smoke_world7(tmp_path, overflow=0, not_ended=0, nan_logp=False):
         report = json.loads((root / "train" / "report.json").read_text())
         k = "1" if phase == "A" else "2"
         resume = 0 if phase == "A" else json.loads((d / "train-1" / "summary.json").read_text())["steps"]
-        s = smoke_summary7(train, report, resume=resume, evals=phase == "B")
+        s = smoke_summary7(train, report, resume=resume, evals=False)   # G4-7.4h: no SFT evals in the runs
         (d / f"train-{k}").mkdir()
         (d / f"train-{k}" / "summary.json").write_text(json.dumps(s))
         (d / f"train-{k}" / "files.json").write_text(json.dumps({
@@ -1201,7 +1201,7 @@ def smoke_world7(tmp_path, overflow=0, not_ended=0, nan_logp=False):
     (d / "val" / "stop.json").write_text(json.dumps({"stop": [], "tis_next": False, "sampler_gap": 0.02}))
     (d / "timings.json").write_text(json.dumps({
         "gen_wall_s": {"A": 150.0, "B": 170.0}, "judge_tail_s": {"A": 60.0, "B": 55.0},
-        "iter7_wall_s": {"A": 20.0, "B": 20.0}, "train_wall_s": {"1": 900.0, "2": 800.0}, "val_wall_s": 300.0}))
+        "iter7_wall_s": {"A": 20.0, "B": 20.0}, "train_wall_s": {"1": 900.0, "2": 680.0}, "val_wall_s": 300.0}))   # G4-7.4h: phase 2 without its 2 x 3 x 20 s of evals
     return d, counter
 
 
@@ -1280,8 +1280,8 @@ def s_not_ended(rows):
         r["ended"] = False
 
 
-def drop_own(data):
-    data["eval"] = [e for e in data["eval"] if e["set"] != "own"]
+def add_own(data):
+    data["eval"] = [{"step": 2, "set": "own", "batches": 2, "tokens": 900, "loss": 0.5, "seconds": 20.0}]
 
 
 @pytest.mark.parametrize("change, failed", [
@@ -1316,8 +1316,9 @@ def drop_own(data):
      {"train2_data"}),
     (lambda d: set_in(d / "train-2" / "summary.json", ["resume", "step"], 1), {"train2_resume"}),
     (lambda d: set_in(d / "train-2" / "summary.json", ["peak_gib_max"], 29.6), {"train2_peak"}),
-    (lambda d: edit_json(d / "train-2" / "summary.json", drop_own), {"train2_finite"}),
-    (lambda d: set_in(d / "train-2" / "summary.json", ["eval", 0, "loss"], float("inf")), {"train2_finite"}),
+    # G4-7.4h: an SFT eval in the run is an error now (their program does not fit beside the training state)
+    (lambda d: edit_json(d / "train-2" / "summary.json", add_own), {"train2_finite"}),
+    (lambda d: set_in(d / "train-2" / "summary.json", ["loss", 0, 1], float("inf")), {"train2_finite"}),
     (lambda d: (d / "logs" / "translate-S.log").write_text(gen_log7(SMOKE_BASE, 0, 50)), {"translate_S_lora"}),
     (lambda d: edit_parquet(d / "translate" / "S" / "pairs-w0.parquet", s_not_ended), {"translate_ended"}),
     (lambda d: (d / "iter-A" / "scores" / "c2" / "w1" / "DONE-2").unlink(),

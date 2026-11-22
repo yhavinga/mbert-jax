@@ -96,6 +96,44 @@ def test_the_smoke_leg_has_its_own_name_checkpoints_and_eval():
     assert done.returncode != 0 and "set LEG_TAG for a smoke run" in done.stderr
 
 
+def test_the_float32_piece_of_the_smoke_test_logs_the_memory_within_its_steps():
+    """Amendment 1: after the resume to 400, a piece in float32 (fix and z-loss kept) with system metrics every 25 steps,
+    so that the peak per chip is logged within it; SYSTEM_METRICS_EVERY changes only the smoke leg."""
+    piece = flags(run_script(T3 / "start_t3.sh", "smoke", LEG_TAG="t3a1122b", STOP_AT="450", COMPUTE_DTYPE="float32",
+                             SYSTEM_METRICS_EVERY="25"))
+    assert (piece["--stop-at-step"], piece["--compute-dtype"], piece["--system-metrics-every"]) == ("450", "float32", "25")
+    assert piece["--wandb-run-name"] == "t3-culturax-317m-smoke-t3a1122b" and piece["--log-every"] == "10"
+    assert piece["--z-loss"] == "1e-4" and piece["--attention-float32"] is True
+    main = flags(run_script(T3 / "start_t3.sh", "main", SYSTEM_METRICS_EVERY="25"))
+    assert main["--system-metrics-every"] == "1000"
+
+
+def test_eval_t3_takes_seeds_45_and_46_for_five_tasks_and_not_for_pos(tmp_path):
+    """Amendment 1: seeds 42-46 for DBRD@1024, DBRD@512, SICK-NL, SQuAD-NL and CoNLL-2002; POS stays on 42-44. A job that
+    passes the check runs into the next one (no venv here); one that does not is refused as not a job."""
+    fake = tmp_path / "bin"
+    fake.mkdir()
+    (fake / "sudo").write_text("#!/bin/bash\nexit 1\n")
+    (fake / "sudo").chmod(0o755)
+    env = {"PATH": f"{fake}:{os.environ['PATH']}", "HOME": str(tmp_path), "COMMIT": "ae11478", "T3_COMMIT": "c0ffee",
+           "SHAPE": " ".join(f"{k} {v}" for k, v in SHAPE.items()), "WORKER": "0"}
+
+    def out(*jobs):
+        done = subprocess.run(["bash", str(T3 / "eval_t3.sh"), "t3-1959000", "gs://b/ckpt", *jobs],
+                              capture_output=True, text=True, env=env, timeout=60)
+        return done.returncode, done.stdout
+
+    for task in ("dbrd1024", "dbrd512", "sicknl", "squadnl", "conll2002"):
+        for seed in (42, 45, 46):
+            code, text = out(f"{task}:{seed}")
+            assert code == 1 and "not a job" not in text, (task, seed, text)
+    for job in ("pos-lassysmall:44", "pos-alpino:42", "blimp"):
+        assert "not a job" not in out(job)[1], job
+    for job in ("pos-lassysmall:45", "pos-alpino:46", "sicknl:47", "squadnl:41"):
+        code, text = out("dbrd1024:45", job)
+        assert code == 1 and text.startswith("w0: not a job") and job in text, (job, text)
+
+
 @pytest.fixture(scope="module")
 def tm():
     # Other test modules may have started JAX already, after which its module-level initialize() can't run

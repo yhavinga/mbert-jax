@@ -9,7 +9,9 @@
 #              1,040,000 and its data state (t3_run.sh copies them into the branch's ckpt/ and ckpt_data_state/) to
 #              1,306,000 with T2's tak 2 schedule (1-sqrt over the last 266,000 steps); STOP_AT only for a float32 piece
 #      smoke   the main leg's command as t3-culturax-317m-smoke-LEG_TAG to STOP_AT (default 300), a checkpoint every
-#              CHECKPOINT_EVERY (default 100), eval at 200, system metrics every 100; a second start resumes it
+#              CHECKPOINT_EVERY (default 100), eval at 200, system metrics every SYSTEM_METRICS_EVERY (default 100); a
+#              second start resumes it (the float32 piece of the smoke test: COMPUTE_DTYPE=float32, protocol.md
+#              amendment 1)
 # The command is T2's (experiments/final/start_final.sh culturax stable at 1c8f2c7: CulturaX nl, 15% single tokens,
 # 1,024 tokens with packing, --url-blocklist hebban.nl, batch 8 per chip, AdamW, peak 4.8e-4 after 1,250 warmup steps,
 # WSD 1-sqrt to 1e-6, eval on ~/heldout.parquet every 25,000 steps) with T3's shape (18 x 1152, 18 heads, GeGLU 2944,
@@ -18,7 +20,8 @@
 # its names. PRINT_RUN_SCRIPT=1 prints the trainer's script and starts nothing. A checkpoint in the run's bucket
 # directory makes it a resume (also after a preemption); one of another data setup is refused by the data state.
 # Environment: COMMIT (required, ~/mbert-t3 must be at it), PY, STOP_AT, LEG_TAG (smoke), CHECKPOINT_EVERY (smoke),
-# COMPUTE_DTYPE (float32 for a piece after a burst, protocol.md section 7; the fix and the z-loss stay), M.
+# SYSTEM_METRICS_EVERY (smoke), COMPUTE_DTYPE (float32 for a piece after a burst, protocol.md section 7; the fix and the
+# z-loss stay), M.
 set -euo pipefail
 LEG=${1:?usage: start_t3.sh main or branch or smoke}
 COMMIT=${COMMIT:?set COMMIT to the commit of branch t3}
@@ -39,7 +42,7 @@ case $LEG in
   main) RUN=$BASE; STOP=${STOP_AT:-} ;;
   branch) RUN=$BASE-epoch2; MAX=1306000; DECAY=266000; STOP=${STOP_AT:-}; BRANCH_STEP=1040000 ;;
   smoke) RUN=$BASE-smoke-${LEG_TAG:?set LEG_TAG for a smoke run}; STOP=${STOP_AT:-300}
-    CHECKPOINT_EVERY_LEG=${CHECKPOINT_EVERY:-100}; EVAL_EVERY=200; SYSTEM_EVERY=100 ;;
+    CHECKPOINT_EVERY_LEG=${CHECKPOINT_EVERY:-100}; EVAL_EVERY=200; SYSTEM_EVERY=${SYSTEM_METRICS_EVERY:-100} ;;
   *) echo "leg must be main, branch or smoke, not $LEG"; exit 1 ;;
 esac
 OUT=$T/$RUN

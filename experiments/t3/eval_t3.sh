@@ -14,7 +14,8 @@
 #   COMMIT=<dumb-extra code commit> T3_COMMIT=<t3 commit> SHAPE="--hidden-size H ..." bash eval_t3.sh NAME CKPT JOB...
 # JOB is <task>:<seed> with task dbrd1024, dbrd512 or sicknl (scripts/dumb/finetune.py), squadnl, conll2002,
 # pos-lassysmall or pos-alpino (scripts/dumb/finetune_extra.py), or "blimp" (scripts/eval_blimp_nl.py), "memtest"
-# (experiments/final-v2/memtest.py) or "heldout" (scripts/eval_windows.py on both held-out sets):
+# (experiments/final-v2/memtest.py) or "heldout" (scripts/eval_windows.py on both held-out sets). Seeds 42-46 for
+# dbrd1024, dbrd512, sicknl, squadnl and conll2002, 42-44 for the POS tasks (protocol.md, amendment 1):
 #   dbrd1024  finetune.py --task dbrd --max-length 1024, 12 per chip x 4 chips x 4 accumulation = 192, padding to 128
 #   dbrd512   the same at --max-length 512 (the command of eval_robbert.sh at 5398bb9 for T2's DBRD@512)
 #   sicknl    finetune.py --task sicknl --max-length 512, 64 x 4 x 1 = 256, no padding
@@ -67,7 +68,7 @@ BUSY='[t]rain_minimal.py|[f]inetune.py|[f]inetune_extra.py|[e]val_windows.py|[e]
 [[ "$NAME" =~ ^[a-z0-9][a-z0-9-]*$ ]] || { echo "w$WORKER: not a name: $NAME"; exit 1; }
 [[ "$CKPT" == gs://* ]] || { echo "w$WORKER: not a gs:// step directory: $CKPT"; exit 1; }
 for job in "$@"; do
-  [[ "$job" =~ ^(dbrd1024|dbrd512|sicknl|squadnl|conll2002|pos-lassysmall|pos-alpino):(42|43|44)$ || "$job" =~ ^(blimp|memtest|heldout)$ ]] || {
+  [[ "$job" =~ ^(dbrd1024|dbrd512|sicknl|squadnl|conll2002):(42|43|44|45|46)$ || "$job" =~ ^(pos-lassysmall|pos-alpino):(42|43|44)$ || "$job" =~ ^(blimp|memtest|heldout)$ ]] || {
     echo "w$WORKER: not a job (<task>:<seed>, blimp, memtest or heldout): $job"; exit 1; }
 done
 mkdir -p "$LOGDIR"

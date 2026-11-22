@@ -474,4 +474,109 @@ onder de 32 GiB van een v4-chip. De smoke-test meet het; grens 30 GiB (§8).
 
 ## Amendementen
 
-(geen)
+### Amendement 1 (22 nov 2026): Yebs besluiten van 22 nov ~12:45
+
+Vastgelegd door een subagent in opdracht van de hoofdsessie, vóór elke stap op een worker: de keten `t3a1122a` wachtte
+nog op G4-7 en had op geen worker en in de bucket iets gedaan. De hoofdsessie stopt die keten en start hem opnieuw met
+een nieuwe TAG, met deze commit als `T3_COMMIT` en als `PROTOCOL_COMMIT`. De tekst hierboven blijft staan; dit amendement
+vervangt wat het noemt. Markering als in de kop: **[Yeb]**, **[keuze hoofdsessie]** (uit de opdracht van de hoofdsessie),
+**[eigen keuze]** (van de opsteller van dit amendement), **[gemeten]**, **[afgeleid]**.
+
+**1. Na de tak (§14.1) [Yeb].** De hoofdrun loopt na de tak door, ook als T3-tak tegen T2 "schaadt" (de standaard van
+§6 en §9, bevestigd; geen wijziging).
+
+**2. Derde burst (§14.2) [Yeb].** De rest van de training in float32, automatisch (§7.3, bevestigd; geen wijziging).
+
+**3. G4-7 eindigt niet op `EXIT 0` (§14.3) [Yeb].** Zo laten. `mbert-ops/t3.corpus-hold` staat (sinds 22 nov 00:41),
+dus T3 neemt mbert-corpus alleen na `EXIT 0` van G4-7 of met `mbert-ops/t3.corpus-go` (§9.2; geen wijziging).
+
+**4. DBRD@1024 (§14.4) [Yeb].** Krijgt de ruismaat van DBRD@512; zo laten (geen wijziging).
+
+**5. T3 is een nieuw model, geen vervanging van T2 (§14.5, §11; vervangt ook de uitkomsten in §1) [Yeb].** T3 komt,
+op Yebs woord, op Hugging Face onder een eigen naam met een grootteterm, zoals T2 "230m" in zijn naam heeft. De
+uitkomsten "vervangt T2", "naast T2" en "niet publiceren" vervallen, met de tabel van vraag 1 in §11 en de alinea
+**[eigen keuze]** eronder. Invulling **[keuze hoofdsessie, minimaal]**:
+- **Vraag 1, gerapporteerd: T3-hoofd tegen T2.** Het oordeel (helpt / geen verschil / schaadt, `decide.primary_rule` op
+  DBRD@1024 en SICK-NL) en per taak beter / gelijk / slechter, met de rekenregels van §11 (en punt 7 hieronder); geen
+  publicatielabel. Publiceren als nieuw model alleen op Yebs woord.
+- Vraag 2 (T3-tak tegen T2) en vraag 3 (T3-hoofd tegen T3-tak) zoals in §11, zonder publicatielabel. Bij "schaadt" in
+  vraag 3 geeft het rapport als alternatief het oordeel van vraag 2 en de taken waarop de tak beter en slechter is
+  (in plaats van "de uitkomst van de regel van vraag 1 voor T3-tak"); Yeb kiest dan of de tak in plaats van de hoofdtak
+  het nieuwe model wordt **[eigen keuze]**.
+- `decide_t3.py`: `OUTCOMES` zijn nu de drie oordelen; de functie met de publicatielabels is weg. De keten krijgt de
+  regel `VRAAG 1 (T3-hoofd tegen T2): <oordeel>; beter op …; slechter op …` (in de `DONE`-regel in plaats van
+  `UITKOMST …`); na de tak `VOORLOPIG (vraag 2, tak tegen T2, beslist niets): …`.
+- Controle van de code (§11, laatste alinea): met T2's uitslagen als beide T3-armen geeft `decide_t3.py` op vraag 1 nu
+  "geen verschil", op elke taak "gelijk", zonder label (`test_t2s_results_as_both_t3_arms_give_no_difference`).
+
+**6. Smoke-test (§8) met een stuk in float32 [Yeb; uitwerking eigen keuze].** Na de hervatting tot 400 en nadat de
+criteria van de bf16-delen gehaald zijn (ongewijzigd; een fout daarin blijft `FAILED`), start de keten de smoke-run
+(dezelfde naam `t3-culturax-317m-smoke-<TAG>` en bucketmap; niets van de hoofdrun) nog eens vanaf checkpoint 400 met
+`COMPUTE_DTYPE=float32` (de fix en de z-loss blijven: `--attention-float32 --z-loss 1e-4`), systeemmetrieken elke 25
+stappen (`SYSTEM_METRICS_EVERY=25`, nieuw in `start_t3.sh`, alleen voor de smoke-run), tot **450**.
+- **450 in plaats van 420 [eigen keuze, technisch].** De trainer drukt de Step-regel met de staptijd alleen elke 50
+  stappen af (`--log-every 10`, de regel op elk 5e logpunt; `scripts/train_minimal.py`); een stuk tot 420 logt dus geen
+  staptijd. Tot 450 geeft één staptijd, over de stappen 440–450, hetzelfde venster van 10 stappen als de bf16-meting op
+  100/150/200. Elke 25 stappen in plaats van elke 10: de `SYSTEM`-regels (met de piek per chip) komen op 425 en 450, en
+  het verzamelen ervan valt buiten het venster 440–450. Kost ~5 min (compilatie, 50 stappen, checkpoint 450). Vóór de
+  start schrijft de keten op elke worker een markeerregel in het log van de smoke-run
+  (`--- t3_run.sh <TAG>: the float32 piece of the smoke test starts here`); alleen de regels daarna tellen.
+- **Criterium:** de piek per chip (`system/host<h>_chip<c>_peak_bytes_in_use`, `SYSTEM`-regels met stap 401–450) ten
+  hoogste 30,0 GiB (`max_peak_gib` van `smoke_reference.json`), geen `RESOURCE_EXHAUSTED` of `Out of memory`, en het stuk
+  hervatte op 400 in float32 (`Resuming from micro_step: 400`, `Compute dtype: float32`).
+- **Niet gehaald, of het stuk eindigt niet binnen 40 min met `EXIT 0` op alle workers: geen `FAILED`.** De keten stopt
+  de trainers van de smoke-run (op hun pids), schrijft in het ketenlog en in `dx/t3/events.txt` de regel
+  `WARN float32 past niet: <reden>; een burst geeft dan FAILED, Yeb beslist (protocol.md, amendement 1); T3 start in bf16`
+  en gaat door (memorisatietest en held-out-eval op checkpoint 400, dan de hoofdrun in bf16). §7 verandert niet: een
+  burst geeft dan een float32-stuk dat niet past, en die geheugenfout is `FAILED` (§7.7).
+- **Staptijd in float32:** gerapporteerd (`dx/t3/smoke_f32_check.txt`, de gebeurtenis, de marker van de smoke-test en
+  het rapport), met de verhouding tot de bf16-mediaan; geen grens. Een start die door de preflight van `start_t3.sh`
+  geweigerd wordt (TPU bezet, verkeerde commit) blijft `FAILED`, zoals bij elk ander deel: dezelfde preflight zou de
+  hoofdrun ook weigeren.
+- Checkpoint 450 komt in de map van de smoke-run; de trainer houdt de laatste drie (300, 400, 450), dus 400 blijft voor
+  de memorisatietest en de held-out-eval. Na het stuk wacht de keten tot de TPU vrij is (`tpu_free`).
+
+**7. Vijf fine-tune-seeds (§10, §11, §12) [Yeb; rekenregel keuze hoofdsessie].** Vervangt "seeds 42, 43, 44" van §10:
+- **Seeds 42–46** voor DBRD@1024, DBRD@512, SICK-NL, SQuAD-NL v1.1 en CoNLL-2002; **42–44** voor POS LassySmall en POS
+  Alpino; BLiMP-NL, memorisatietest en held-out-evals ongewijzigd. Voor T3-tak en T3-hoofd, en voor T2.
+- **T2:** de uitslagen van 42–44 bestaan en worden hergebruikt (`gs://…/mbert/final/dumb/`, `final/dumb-extra/<taak>/`,
+  DBRD@512 in `final/robbert/dumb/`; daar leest `decide_t3.py` ze, zoals `decide_v2.py`). T2 krijgt 45 en 46 van die
+  vijf taken erbij: `eval_t3.sh` met T2's vorm (`SHAPE_T2`) op `gs://…/mbert/final-culturax-230m-epoch2/ckpt_keep/1306000`,
+  naam `epoch2-1306000`, dezelfde code (`ae11478`), venvs en vingerafdruk (`91a3c3a5f544`, door de keten gecontroleerd),
+  in de evaluatie van de tak (§9, stap 8) op de VM van die evaluatie (`EVAL_VM`), na de jobs van T3-tak; daarna
+  hergebruikt. Uitslagen in `gs://…/mbert/t3/dumb/epoch2-1306000--<taak>--seed{45,46}.json` en
+  `gs://…/mbert/t3/dumb-extra/<taak>/…`; T2's eigen mappen blijven ongewijzigd. **[gemeten, 22 nov]** T2's uitslagen van
+  42–44 hebben de instellingen van de commando's van `eval_t3.sh` (DBRD@1024 12 × 4 × 4, lengte 1.024, opvulling 128;
+  SICK-NL 64 × 4 × 1, opvulling 1; DBRD@512 12 × 4 × 4, lengte 512, opvulling 128; SQuAD-NL en CoNLL-2002 update 32, LR
+  5e-5 lineair naar 0, 3 epochs), en `eval_v2.sh` (dezelfde conversie) zette T2's checkpoint op 13 nov om met 230.110.592
+  parameters (`gs://…/mbert/final-v2/eval/logs/epoch2-1306000/`).
+- **Rekenregel [keuze hoofdsessie; Yeb kan hem omdraaien].** De drempel per taak blijft die van §11 (de grootste van de
+  twee seed-ranges en de ruis |A − A2|; BLiMP-NL 0,5 punt of de ruis), met de seed-ranges **over 42–44**: zo blijft de
+  drempel vergelijkbaar met die van de ablatie (drie seeds); de range over vijf seeds is vanzelf groter (~1,4× bij
+  normale spreiding). Het verschil X − Y is het verschil van de **gemiddelden over 42–46** voor de vijf taken met vijf
+  seeds, over 42–44 voor POS. Een ontbrekende seed is `FOUT`. `decide_t3.py` geeft de range over alle seeds ook
+  (`range_all` in `decision.json`); die telt niet mee.
+- **`eval_t3.sh`** neemt de seeds 45 en 46 voor die vijf taken (POS blijft 42–44).
+- **Telling:** per T3-arm **32 uitslagen** (31 fine-tunes: 5 × 5 + 2 × 3, plus BLiMP-NL), in plaats van 22; T2 10
+  fine-tunes erbij.
+- **Verdeling over de workers** (`PLAN` en `PLAN_T2` in `t3_run.sh`): per T3-arm w0 SQuAD-NL 42–44 en POS LassySmall
+  42–44; w1 SQuAD-NL 45–46 en DBRD@512 42–46; w2 DBRD@1024 42–45 en SICK-NL 42–43; w3 DBRD@1024 46, SICK-NL 44–46,
+  CoNLL-2002 42–46, POS Alpino 42–44, BLiMP-NL, memorisatietest, held-out. T2: w0 SQuAD-NL 45 en SICK-NL 45–46; w1
+  SQuAD-NL 46 en CoNLL-2002 45–46; w2 DBRD@1024 45 en DBRD@512 45; w3 DBRD@1024 46 en DBRD@512 46.
+- **Rekentijd (§12).** **[gemeten]** De jobs van v2's evaluatie (230M, 20 nov, wachtrijlogs
+  `gs://…/mbert/final-v2/eval/logs/v2-1306000/`): SQuAD-NL 11,7 min, DBRD@1024 8,8, DBRD@512 3,7 (de eerste 5,3),
+  SICK-NL 2,0, CoNLL-2002 1,9, POS LassySmall 1,6, POS Alpino 1,45, BLiMP-NL 0,9, memorisatietest 1,4, held-out 5,2 min.
+  **[afgeleid]** Voor T3 × ~1,35 (rekenwerk per token, §12): per worker ~50–60 min voor een T3-arm (was ~50 min met de
+  oude verdeling), T2's tien fine-tunes ~15 min per worker plus omzetting. In de tabel van §12: evaluatie tak (31
+  fine-tunes + BLiMP-NL + memtest + held-out van T3-tak, plus T2's tien) **~2–2,5 u** (was ~1,5–2 u); evaluatie
+  hoofdtak + T2's memtest/held-out **~2 u** (ongewijzigd); smoke-test + ~5 min. Samen ~204 u, nog steeds **~8,5 dagen**.
+
+**8. Burstdrempel (b) (§7.2) [Yeb].** Blijft ≥ 500 overgeslagen stappen per 1.000 (geen wijziging).
+
+**Code bij dit amendement** (één commit met dit amendement; tests `tests/test_t3_decide.py`, `tests/test_t3_start.py`):
+`decide_t3.py` (punten 5 en 7); `experiments/final/decide.py`: `load_primary` en `load_extra` nemen een optionele
+`seeds` (standaard de drie van het protocol; T2's regel en zijn tests ongewijzigd); `eval_t3.sh` (punt 7);
+`start_t3.sh` (`SYSTEM_METRICS_EVERY`, punt 6). Op co1 `mbert-ops/scripts/t3_run.sh`: het stuk in float32, `PLAN` en
+`PLAN_T2`, de `DONE`-regel met `VRAAG 1`, en een gegeven `T3_COMMIT` vervangt nu de vastgepinde commit in
+`dx/t3/commit.txt` (de eerste start schreef daar `d31b234`; zonder deze wijziging nam een latere herstart zonder
+`T3_COMMIT` weer de oude code).

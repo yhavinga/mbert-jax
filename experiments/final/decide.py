@@ -109,10 +109,10 @@ def check_settings(result, settings, where):
             raise Fout(f"{where}: {key} is {result[key]!r}, the protocol's is {expected!r}")
 
 
-def load_primary(read, root, name, task, spec):
-    """The k of the three seeds of one arm on one primary task."""
+def load_primary(read, root, name, task, spec, seeds=SEEDS):
+    """The k of the seeds (the protocol's three unless given) of one arm on one primary task."""
     ks = []
-    for seed in SEEDS:
+    for seed in seeds:
         relative = f"dumb/{name}--{task}--seed{seed}.json"
         where = f"{root}/{relative}"
         result = read(root, relative)
@@ -127,10 +127,11 @@ def load_primary(read, root, name, task, spec):
     return ks
 
 
-def load_extra(read, root, name, task, spec):
-    """("words", ks, n) or ("f1", fractions, None) of the three seeds of one arm on one extra task."""
+def load_extra(read, root, name, task, spec, seeds=SEEDS):
+    """("words", ks, n) or ("f1", fractions, None) of the seeds (the protocol's three unless given) of one arm on one
+    extra task."""
     values, words = [], set()
-    for seed in SEEDS:
+    for seed in seeds:
         relative = f"dumb-extra/{task}/{name}--{task}--seed{seed}.json"
         where = f"{root}/{relative}"
         result = read(root, relative)

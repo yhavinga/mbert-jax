@@ -72,7 +72,7 @@ LENGTH_CLASS7 = "medium"             # prefill 256/384, decode limit 448, 52 slo
 RESERVE7 = 0.03                      # pool7 draws this share more per part, for the sources plan7 drops
 SEQ7 = 4096
 ROWS7 = 16                           # a global batch: 16 rows of 4,096 (per_device_batch_size 1 on 16 chips)
-LR7 = 5e-6
+LR7 = 5e-5                           # G4-7.4k (Yeb 22 Nov): 5e-6 did not move the LoRA (KL ~0 after 6 iterations)
 WARMUP7 = 10                         # linear warmup steps, then constant (decay 0)
 # the reward (spec §4.1)
 FAIL_REWARD = -30.0                  # G4-7.4e: below the lowest non-fail reward, -12 - 2 x 7.5 - 2 (ln 1.5 - ln 1.15) = -27.5

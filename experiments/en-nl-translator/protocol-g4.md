@@ -1789,3 +1789,11 @@ geslaagd en de RL start** (marker `smoke7` met de hand gezet, in het formaat van
 tis 0, hours 43.8). Een gemiddeld verschil old/ref van 1,7e-4 nats per token is verwaarloosbaar tegen de KL-stopregel
 S3 (0,30); een QE-verschil van 0,026 (schaal 0–25) verandert de reward niet merkbaar. De grenzen in de code blijven die
 van G4-7.4i.
+
+*G4-7.4k Aanvulling 22 nov 2026 ~09:00 (besluit van Yeb; een methodewijziging van G4-7.3/§6.3).* De RL met LR 5e-6
+(`g4i1122o`, iteraties 0–5 voltooid, 6 gestopt) bewoog het beleid niet: gemiddelde C2-logit van de samples −7,89 → −7,93,
+p_c2 op RL-val 0,0997 → 0,0989, KL (S3) ~0 (k1 old/ref −3e-4), relatieve update van de LoRA 1,4e-4 na ~84 stappen; de QE
+liep licht op (S2 +0,007 → +0,022). **LR 5e-5** (10×), verder alles gelijk; de KL-stopregel S3 (0,30) blijft het vangnet.
+De RL begint opnieuw bij iteratie 0: de iteraties, RL-val-jobs en hun markers van de eerste poging staan onder
+`$RL/archive-lr5e-6/` en `$G/stages/g4-7/archive-lr5e-6/` (verplaatst, niets verwijderd); C2, `c2cal7`, het anker, `pool7`,
+`plan7` en `smoke7` blijven gelden.

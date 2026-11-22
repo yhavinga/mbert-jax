@@ -1927,3 +1927,33 @@ kandidaat doet de keten alleen G4-0 en zegt dat in de `DONE`-regel; een herstart
 stappen over en maakt voor `G4-0_K` een nieuwe classify-run en een nieuw rapport. Vóór elke start op een worker: de
 TPU vrij op die worker(s); elke ssh met `timeout 900` en de ssh-opties van de eerdere ketens; per stap `EXIT 0`, anders
 `FAILED` en stoppen. De keten schrijft niets over wat G4-7 of de sampling-proef schreef.
+
+*G4-bon.10 Aanvulling: G4-4 als extra model* **(vastgelegd 23 nov 2026 ~00:35; tijdstip: de commit van deze alinea op
+branch `en-nl-g4bon`)**, vóór elke stap van deze aanvulling op een worker en vóór elke uitslag over G4-4 in deze meting
+[advies Gemini 4 Neon 22/23 nov, via de hoofdsessie: G4-4 is de nuttigste extra meting vóór Yebs besluit over G4-8; Yeb
+vroeg mbert-mix bezig te houden en staat zulke metingen toe; uitwerking door een subagent]. Een meting, geen arm: zij
+beslist niets, ook niet over G4-8.
+- **Uitvoer van G4-4** [keuze: het hergebruikpad van G4-0, G4-bon.3]: de 8 samples van de sampling-proef
+  (`$G/sampling/G4-4/t10s1…t10s8/`: G4-4's eindadapter ingebakken, verder dezelfde instellingen als G4-0's samples) met
+  hun MetricX-24 (met referentie en QE) en COMET-22; C2 van de samples uit `c2cal7` (rijen `G4-4/t10s<k>`); de greedy
+  vertaling uit G4-4's evaluatie (`$G/eval/G4-4/`), haar C2 uit de kalibratierijen `calib:sampling:G4-4` van `c2cal7`
+  (de teksten van de classify-run van de proef, die G4-4's greedy vertaling uit `$G/eval/G4-4/` nam). Niets wordt
+  opnieuw vertaald of gescoord; nieuw zijn alleen de selectie, één C1-run en het rapport. [gemeten 23 nov, alleen
+  namen en tellingen: `c2cal7` heeft `G4-4/t10s1…t10s8` en `calib:sampling:G4-4` met elk 1.960 rijen en geen rij `G4-4`;
+  de classify-run van de proef heeft `G4-4`, `G4-4/t10s1` en `G4-4/best8` met elk 1.960 rijen; elke
+  `$G/sampling/G4-4/t10s<k>/` heeft pairs en MetricX op w0–w3 en COMET op w0–w2, zoals die van G4-0.]
+- **Controles** (`select` stopt bij een afwijking): de keuze van qe is per segment `$G/sampling/G4-4/best8/choice.parquet`;
+  de instellingen t10s1…t10s8 die van het rapport van de proef; de tekst van `calib:sampling:G4-4` in `c2cal7` is op elk
+  segment van het zoekdeel gelijk aan G4-4's greedy vertaling in `$G/eval/G4-4/`. Gerapporteerd: C1 van G4-4 greedy,
+  G4-4/t10s1 en G4-4/qe (= best8) tegen de classify-run van de proef, zoals voor G4-0.
+- **Selecties, maten, anker, tabellen**: G4-bon.4–G4-bon.7 ongewijzigd, met G4-4 als model naast G4-0 (key
+  `G4-0_G4-4`). Anker en QE₀ blijven G4-0's greedy vertaling (de grens van c2q is dus QE ≤ QE₀ van G4-0, niet van G4-4).
+  Tabel 1 geeft voor G4-4 ΔC1 tegen zijn eigen greedy vertaling en tegen G4-0 greedy en de vlag "C2 stijgt, C1 niet";
+  tabel 2 QE, MetricX-ref en COMET-22; tabel 3 de contrasten binnen G4-4.
+- **Wat het niet zegt** (naast G4-bon.8): G4-4 is niet op dit zoekdeel gekozen; C2 van G4-4's greedy vertaling en van
+  zijn samples komt uit dezelfde run (`c2cal7`), de kandidaat van G4-7 staat niet in dit rapport (zijn cijfers staan in
+  het rapport onder key `G4-0_G4-7-i15`, uit een andere C1-run).
+- **Keten**: `g4bon_run.sh` met `BON_MODEL=G4-4` (niet samen met `BON_CANDIDATE`): de gemarkeerde stappen (setup, data,
+  select van G4-0) overgeslagen, dan `bon-select` (MODEL=G4-4, w0, CPU), `bon-texts`, `bon-classify` (C1) en `bon-report`
+  onder key `G4-0_G4-4`; geen kandidaat. Het rapport gaat naar `translator-sft/g4-bon-G4-0_G4-4.md/.json` en
+  `g4-bon-G4-4.md/.json`; `g4-bon.md` blijft het rapport van de kandidaat.

@@ -1807,3 +1807,123 @@ lopende keten (`g4i1122p`, code `2f8119c`) blijft ongewijzigd: geldt (b) niet, d
 `blind` van `run_g4arm7.sh` met de hand (`ARM=G4-7 SELECTED=<gekozen kandidaat>`, mbert-corpus w0, vóór T3 de TPU krijgt)
 en daarna de beoordeling door één verse Claude-subagent volgens G4-7.8 (rubriek protocol.md §4.2.4, de 100 passages,
 twijfelgevallen naar Yeb). Bij (a1) of (a3) niet gehaald: geen blinde beoordeling.
+
+## 15. Meting G4-bon: het plafond van best-of-8 met selectie op C2 + QE
+
+**Vastgelegd 22 nov 2026 (tijdstip: de commit van deze sectie op branch `en-nl-g4bon`, vanaf `en-nl-g4arm7` @
+`e6c22b7`)**, vóór elke stap van de keten `mbert-ops/scripts/g4bon_run.sh` op een worker en vóór elke uitslag van deze
+meting [besluit Yeb 22 nov ~13:00: mbert-mix wordt na G4-7 gebruikt voor een plafondmeting best-of-N, geen training;
+uitwerking door een subagent; labels als in de kop]. Een meting, geen arm: er is geen beslisregel en er wordt niets
+getraind; de tabellen van G4-bon.7 liggen vooraf vast. Geen Claude of GPT als generator of maat; de TEST-split van
+hammond blijft dicht.
+
+*G4-bon.1 Vraag.* Hoeveel "origineel" (C1, P ≥ 0,5) haalt best-of-8, en tegen welke kwaliteitsprijs (QE, COMET-22,
+MetricX-ref, lengte, niet af, lus, Engels over), als de keuze uit de 8 samples van een bron op C2 (de reward-classifier
+van G4-7) en QE gebeurt in plaats van op QE alleen? Voor G4-0 en voor de kandidaat die G4-7 kiest (G4-7.7).
+Aanleiding [gemeten, `mbert-ops/translator-sft/g4-sampling.md`, hele sets]: best-of-8 op QE gaf G4-0 MetricX-ref 2,284
+→ 1,850, COMET-22 0,853 → 0,855 en +2,1 pp C1. De vervolgrichting G4-8 (SFT op de eigen geselecteerde samples, spec
+`mbert-ops/translator-sft/g4-8-spec.md`) vraagt eerst wat er in de 8 samples te vinden is.
+
+*G4-bon.2 Sets.* Alleen het **zoekdeel** van G4-5.4 (digest `f953c026…f3`, `g4arm.SPLIT_DIGEST6C`): WMT24++ zonder
+slechte bronnen (480) en FLAN (500), de sets van (b). Het beslisdeel wordt niet gelezen (geen nieuwe uitvoer, geen
+score, geen selectie), zodat het schoon blijft voor latere besluiten. FLORES en NTREX niet: de sampling-proef samplede ze
+niet.
+
+*G4-bon.3 Uitvoer per model.*
+- **G4-0**: de 8 samples van de sampling-proef (G4-5.7b B; `$G/sampling/G4-0/t10s1…t10s8/`: T = 1, seed k, MaxText
+  `weighted`, fork `f4d8615`, prompt `natural-v1`, de lengteklassen en de verdeling over de workers van de evaluatie) met
+  hun MetricX-24 (met referentie en QE) en COMET-22; C2 uit `c2cal7` (`$RL/c2/cal7/predictions.parquet` en de
+  tokens van C2 uit `texts.parquet`; hetzelfde model als de reward van G4-7). Niets wordt opnieuw vertaald of gescoord.
+  [gemeten 22 nov, alleen metadata gelezen: de proef dekt alle 960 + 1.000 segmenten van (b), dus het hele zoekdeel; de
+  prompt en de fork in `run_g4arm.sh` zijn ongewijzigd sinds de commit van de proef `03286d6`, en `translate.py` zonder
+  `--copies` samplet zoals toen; `$G/sampling/data/evalsets.parquet` is byte-gelijk aan `$G/data/eval/evalsets.parquet`
+  (md5); `bondata` toetst de sha256 tegen `split.json` en `select` de instellingen t10s1…t10s8 tegen het rapport van de
+  proef.]
+- **De kandidaat K van G4-7** (`selected` in `$G/report-G4-7/report.json`): 8 nieuwe samples per bron van het zoekdeel
+  met de instellingen van de proef (`translate.py --sample t10s<k>=1:<k>`, k = 1…8, de LoRA van K ingebakken zoals bij
+  G4-7.7 en gecontroleerd op rank 32 / alpha 16, de klassen en de verdeling over de workers van de proef), gescoord zoals
+  de proef (collect, MetricX-24 met referentie en QE, COMET-22) en door C2 (hetzelfde model, `naturalness.py classify
+  --max-length 1024`, zoals `classify-c2`), samen met K's en G4-0's greedy vertaling (de laatste als controle tegen
+  `c2cal7`). K's greedy vertaling komt uit zijn evaluatie door G4-7 (`$G/eval/K/`).
+- **Uitgangspunten** per model: de greedy vertaling en één willekeurig sample (`t10s1`).
+
+*G4-bon.4 Selecties (vooraf vastgelegd; `g4bon.py choose`)*, per bron één van de 8 samples. Fail = de fail van G4-7
+(G4-7.3 met G4-7.4e: niet af, lus, leeg, Engels over, ℓ/ℓ₀ buiten [0,67; 1,5], QE > 7,5, `c2_overflow`); anker = G4-0's
+greedy vertaling van het segment (QE₀ uit zijn evaluatie, ℓ₀ = zijn `tokens_out`), voor beide modellen (de reward van
+G4-7 had G4-0 als anker).
+1. **qe**: de laagste QE; gelijk: het eerdere sample. Dit is de best-of-8 van de sampling-proef; voor G4-0 stopt `select`
+   als de keuze op een segment afwijkt van `$G/sampling/G4-0/best8/choice.parquet`.
+2. **r7**: de hoogste reward van G4-7 (`g4rl.reward7`, ongewijzigd: clip(logit C2, −12, 12) − 2·max(0, QE − QE₀) −
+   2·max(0, |ln(ℓ/ℓ₀)| − ln 1,15), een fail −30); gelijk: de lagere QE, dan het eerdere sample.
+3. **c2q**: de hoogste geknipte logit van C2 onder de samples die geen fail zijn en QE ≤ QE₀ hebben (op QE niet slechter
+   dan G4-0's greedy vertaling); gelijk: de lagere QE, dan het eerdere sample. Is er zo'n sample niet, dan de keuze van
+   qe (het aantal staat in tabel 4).
+4. **c2** [keuze, de toegestane extra variant]: de hoogste geknipte logit van C2 onder de samples die geen fail zijn,
+   zonder QE-grens; is er geen, dan de keuze van qe. Onderbouwing: (i) het is het plafond van een selectie op C2 binnen
+   de harde grenzen van G4-7 (lengteband, QE > 7,5): het laat zien hoeveel C1 een C2-selectie hoogstens oplevert en wat
+   de QE-grens van c2q daarvan kost; (ii) hier zijn QE (op de grens 7,5 na), MetricX-ref en COMET-22 onafhankelijke
+   toetsen, en daarmee is c2 de enige selectie waarvan de kwaliteitsprijs op FLAN met een maat buiten de selectie
+   gemeten wordt; (iii) "C2 stijgt, C1 niet" is hier het duidelijkst te zien. Waarom niet MBR met COMET-22 zonder
+   referentie: COMET draait op de CPU [gemeten in eerdere ketens: `COMET_TIMING` 100 rijen in 40–82 s per worker]; MBR
+   vraagt 8 × 7 paren per bron, ~55.000 per model op het zoekdeel, ~1,5–3 u per model over vier workers [schatting];
+   een versie met gecachte embeddings is nieuwe code tegen de binnenkant van COMET. MBR kiest bovendien het sample dat
+   het meest op de andere lijkt; of dat de minst "originele" is, is niet gemeten [gevolgtrekking].
+
+C1 kiest nooit: C1 scoort alleen de gekozen uitvoer en de uitgangspunten. C2 kiest wel (r7, c2q, c2), en is daarom voor
+die uitvoer geen toets.
+
+*G4-bon.5 Maten.* C1 (S @ 653k, ongewijzigd) in **één classify-run** over alle uitvoer van het zoekdeel (`run_arms.sh
+classify`), per set en samen zoals (b); C2: aandeel logit ≥ 0 (P ≥ 0,5) en de gemiddelde geknipte logit;
+MetricX-24-QE per set, met de QE van de menselijke referentie op WMT24++ van het zoekdeel (`$G/data/G4-5-split/
+refqe.parquet`); MetricX-24 met referentie en COMET-22 op WMT24++; het fail-aandeel van G4-7 en per soort (niet af, lus,
+Engels over, leeg); tekens per bron en per referentie; de mediane ℓ/ℓ₀. Verschillen tegen de eigen greedy vertaling, tegen
+G4-0's greedy vertaling en tussen selecties: gepaard per segment, met een 95%-interval uit een gepaarde bootstrap
+(10.000 trekkingen, per set binnen de set, zaad uit `en-nl-g4arm/0/G4-bon/boot/<vergelijking>`).
+
+*G4-bon.6 Wat niet onafhankelijk is.* Een maat waarop gekozen is, toetst die uitvoer niet: **qe**: QE en MetricX-ref
+(hetzelfde model als QE); **r7**: C2, QE, MetricX-ref, lengte, de fail-vlaggen; **c2q**: C2, QE, MetricX-ref, de
+fail-vlaggen; **c2**: C2 en de fail-vlaggen (QE alleen via de grens 7,5 en lengte alleen via de band). Onafhankelijk zijn
+bij elke selectie C1 en COMET-22 (alleen WMT24++). Op FLAN is er geen referentie: de kwaliteitsprijs op FLAN is voor qe,
+r7 en c2q alleen met een selectiemaat gemeten. Het rapport noemt de selectiematen per rij.
+
+*G4-bon.7 Rapport (vooraf vastgelegde tabellen; `g4bon.py report`, `$G/bon/report/<key>/`, kopie
+`mbert-ops/translator-sft/g4-bon.md` en `.json`).*
+- **Tabel 1, C1**: per model × uitvoer (greedy, t10s1, qe, r7, c2q, c2): "origineel" WMT24++ / FLAN / samen; Δ tegen de
+  eigen greedy vertaling [95%-BI]; Δ tegen G4-0 greedy [95%-BI]; C2 samen; ΔC2 tegen de eigen greedy vertaling; de vlag
+  "C2 stijgt, C1 niet" (ΔC2 ≥ +0,10 en ΔC1 < +0,10 tegen de eigen greedy vertaling, de regel van `report7`, G4-7.4c).
+- **Tabel 2, kwaliteit en vorm**: per model × uitvoer × set: QE, MetricX-ref, COMET-22, fail (G4-7), niet af, lus,
+  Engels over, leeg, tekens / bron, tekens / referentie, mediane ℓ/ℓ₀, gemiddelde C2-logit, de selectiematen; in de kop
+  de QE van de menselijke referentie.
+- **Tabel 3, contrasten binnen een model**: r7 − qe, c2q − qe en c2 − qe: ΔC1 samen, ΔCOMET-22 en ΔMetricX-ref op
+  WMT24++, elk met 95%-BI; en voor elke selectie ΔCOMET-22 en ΔMetricX-ref tegen de eigen greedy vertaling.
+- **Tabel 4, de selectie**: per set en selectie het aantal terugvallen op qe, het aandeel gelijk aan de keuze van qe, de
+  verdeling over t10s1…t10s8; voor c2q het gemiddelde aantal toegelaten samples; het aantal bronnen waar alle 8 falen.
+- **Controles** (gerapporteerd): C1 van G4-0/t10s1, G4-0/qe (= best8) en G4-0 greedy in deze run tegen de classify-run
+  van de sampling-proef op dezelfde segmenten (aandelen en het aantal omgeslagen labels); C2 van G4-0 greedy in de C2-run
+  van de kandidaat tegen `c2cal7` (aandelen, omgeslagen labels, grootste |Δlogit|).
+- De vraag van G4-bon.1 beantwoorden tabel 1 en 3 (r7 en c2q tegen qe); c2 is het plafond van de C2-selectie.
+
+*G4-bon.8 Wat de meting niet zegt.*
+- Een selectie uit 8 samples is geen getraind model: de meting zegt wat er in de verdeling zit en met deze maten te
+  vinden is, niet hoeveel een fine-tune daarvan naar greedy decoding overbrengt (dat is de vraag van G4-8).
+- C1 en C2 hangen samen (Spearman per segment 0,60 en 0,62, `c2cal7`): een C1-winst na een selectie op C2 is geen bewijs
+  van natuurlijker Nederlands; een blinde beoordeling hoort niet bij deze meting.
+- n = 480 + 500: een verschil in C1 van een paar procentpunten kan ruis zijn (het interval staat erbij); de intervallen
+  zijn per vergelijking, zonder correctie voor het aantal vergelijkingen.
+- De kandidaat van G4-7 is op dit zoekdeel gekozen, op C1 van zijn greedy vertaling (G4-7.7, de grootste (b) van ten
+  hoogste 7 kandidaten): zijn cijfers hier zijn optimistisch, zijn greedy vertaling het meest; de contrasten tussen zijn
+  eigen uitvoer minder [gevolgtrekking].
+- C2 van G4-0's samples komt uit `c2cal7`, die van de kandidaat uit een eigen run; de controle in het rapport meet het
+  verschil op G4-0's greedy vertaling.
+- Een uitslag beslist niets; G4-8 heeft een eigen, vooraf vastgelegde drempel (spec §2).
+
+*G4-bon.9 Keten* (`mbert-ops/scripts/g4bon_run.sh`, alleen mbert-mix; code `en-nl-g4bon`, `g4bon.py` en de stages
+`bon-*` van `run_g4arm.sh` met `ARM=G4-bon`; plaatsen `$G/bon/`, markers `$G/stages/g4-bon/`). Wacht tot de log van
+G4-7 (`logs/g4arm7_run.log`) eindigt op `EXIT 0` of `g4bon.mix-go` bestaat, neemt `final_eval_mix.lock` tot het eind;
+code, HF-token, TPU vrij, setup; `bon-data`; `bon-select` voor G4-0; is de kandidaat bekend (`selected` in het rapport
+van G4-7, of `BON_CANDIDATE`): `bon-translate`, `bon-score`, `bon-c2texts`, `bon-c2`, `bon-select` voor K; dan
+`bon-texts`, `bon-classify` (C1) en `bon-report` over G4-0 en (als die er is) K, onder key `G4-0` of `G4-0_K`. Zonder
+kandidaat doet de keten alleen G4-0 en zegt dat in de `DONE`-regel; een herstart met een nieuwe TAG slaat de gemarkeerde
+stappen over en maakt voor `G4-0_K` een nieuwe classify-run en een nieuw rapport. Vóór elke start op een worker: de
+TPU vrij op die worker(s); elke ssh met `timeout 900` en de ssh-opties van de eerdere ketens; per stap `EXIT 0`, anders
+`FAILED` en stoppen. De keten schrijft niets over wat G4-7 of de sampling-proef schreef.

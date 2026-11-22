@@ -440,6 +440,117 @@ def test_report_needs_g4_0(tmp_path, monkeypatch):
                     "--out", str(tmp_path / "r.md")])
 
 
+def add_g4_4(w, p_greedy=0.7):
+    """G4-4 in the world as the probe left it (G4-bon.10): its 8 samples and best8 (G4-0's files), its evaluation (G4-0's
+    with other texts), C2 of c2cal7 for its samples (G4-4/t10s<k>) and for its greedy translation only under the
+    calibration name calib:sampling:G4-4, with the probe's texts of it"""
+    import shutil
+
+    shutil.copytree(w / "sampling" / "G4-0", w / "sampling" / "G4-4")
+    for f in (w / "eval" / "G4-0" / "pairs").glob("pairs-w*.parquet"):
+        rows = [{**r, "hypothesis": r["hypothesis"].replace("greedy", "g44 greedy")} for r in g4arm.read_rows(f)]
+        g4arm.write_parquet(rows, w / "eval" / "G4-4" / "pairs" / f.name)
+    shutil.copytree(w / "eval" / "G4-0" / "scores", w / "eval" / "G4-4" / "scores")
+    greedy = armeval.read_rows(f"{w}/eval/G4-4/pairs/pairs-w*.parquet")
+    preds = g4arm.read_rows(w / "cal7" / "predictions.parquet")
+    texts = g4arm.read_rows(w / "cal7" / "texts.parquet")
+    preds += [{**r, "model": r["model"].replace("G4-0/", "G4-4/"), "p_original": 1 - r["p_original"]}
+              for r in preds if r["model"].startswith("G4-0/")]
+    texts += [{**r, "model": r["model"].replace("G4-0/", "G4-4/")} for r in texts if r["model"].startswith("G4-0/")]
+    for r in [r for r in preds if r["model"] == "G4-0"]:
+        preds.append({**r, "model": "calib:sampling:G4-4", "p_original": p_greedy})
+        texts.append({"model": "calib:sampling:G4-4", "set": r["set"], "id": r["id"], "text": greedy[r["id"]]["hypothesis"],
+                      "tokens": 30})
+    g4arm.write_parquet(preds, w / "cal7" / "predictions.parquet")
+    g4arm.write_parquet(texts, w / "cal7" / "texts.parquet")
+
+
+def g44_args(w, out, **extra):
+    return select_args(w, out, model="G4-4", sampling=w / "sampling" / "G4-4", best8=w / "sampling/G4-4/best8/choice.parquet",
+                       probe_report=w / "probe-report.json", **extra)
+
+
+def test_select_of_g4_4_reuses_the_probe_and_takes_c2_of_its_greedy_translation_from_the_calibration_rows(
+        tmp_path, monkeypatch, capsys):
+    w = make_world(tmp_path, monkeypatch)
+    add_g4_4(w)
+    out = tmp_path / "sel-g44"
+    g4bon.main(g44_args(w, out, c2_greedy="calib:sampling:G4-4", greedy=w / "eval" / "G4-4"))
+    assert '"model": "G4-4"' in capsys.readouterr().out
+    choice = {r["id"]: r for r in g4arm.read_rows(out / "choice.parquet")}
+    ids = g4bon.search_ids(g4bon.load_evalsets(w / "evalsets.parquet"), g4bon.load_split(w / "split.json"))
+    assert set(choice) == set(ids["wmt24pp"] + ids["flan"])
+    for r in choice.values():
+        assert r["greedy_logit"] == pytest.approx(math.log(0.7 / 0.3))       # calib:sampling:G4-4, not G4-0's 0.2
+        assert r["qe0"] == 2.0                                                # the anchor stays G4-0's greedy translation
+    stats = json.loads((out / "select.json").read_text())
+    assert stats["model"] == "G4-4" and stats["c2_greedy"] == "calib:sampling:G4-4"
+    assert stats["best8_checked"] and stats["greedy_texts_checked"]
+    # the samples' C2 is G4-4's (1 - p of G4-0's), so the C2 choices may differ from G4-0's; QE's equals best8 (checked)
+    for i, r in choice.items():
+        k = g4bon.SAMPLE_NAMES.index(r["qe_choice"])
+        assert r["qe"][k] == min(r["qe"])
+    # without the calibration name G4-4's greedy translation has no C2; the name without the evaluation is refused
+    with pytest.raises(SystemExit, match="C2 scored"):
+        g4bon.main(g44_args(w, tmp_path / "s1"))
+    with pytest.raises(SystemExit, match="--greedy"):
+        g4bon.main(g44_args(w, tmp_path / "s2", c2_greedy="calib:sampling:G4-4"))
+    # a text of the calibration rows that is not G4-4's greedy translation: refused
+    texts = g4arm.read_rows(w / "cal7" / "texts.parquet")
+    k = next(n for n, r in enumerate(texts) if r["model"] == "calib:sampling:G4-4" and r["id"] in choice)
+    texts[k] = {**texts[k], "text": "another text"}
+    g4arm.write_parquet(texts, w / "cal7" / "texts.parquet")
+    with pytest.raises(SystemExit, match="not the greedy translations at 1 of the"):
+        g4bon.main(g44_args(w, tmp_path / "s3", c2_greedy="calib:sampling:G4-4", greedy=w / "eval" / "G4-4"))
+
+
+def test_report_puts_g4_4_beside_g4_0_with_its_checks_against_the_probe(tmp_path, monkeypatch, capsys):
+    w = make_world(tmp_path, monkeypatch)
+    add_g4_4(w)
+    g4bon.main(select_args(w, tmp_path / "sel-g40"))
+    g4bon.main(g44_args(w, tmp_path / "sel-g44", c2_greedy="calib:sampling:G4-4", greedy=w / "eval" / "G4-4"))
+    shares = {("G4-0", "greedy"): 0.2, ("G4-4", "greedy"): 0.4, ("G4-4", "c2"): 0.6}
+    c1, _ = c1_predictions(w, tmp_path, ("G4-0", "G4-4"), lambda m, o, s: shares.get((m, o), 0.3))
+    # the probe's classify run: G4-0 and G4-4 greedy, t10s1 and best8 (= qe here), with one G4-4/best8 label flipped
+    rows = [x for x in g4arm.read_rows(c1) if x["model"].split("/")[-1] in ("G4-0", "G4-4", "t10s1", "qe")]
+    probe = [{**x, "model": x["model"].replace("/qe", "/best8")} for x in rows]
+    k = next(n for n, x in enumerate(probe) if x["model"] == "G4-4/best8")
+    probe[k] = {**probe[k], "p_original": 1 - probe[k]["p_original"]}
+    g4arm.write_parquet(probe, tmp_path / "probe-c1.parquet")
+    g4arm.write_parquet([{"id": i, "qe_source_reference": 2.5} for i in ids_of("wmt24pp", 2 * N_W + 2)],
+                        tmp_path / "refqe.parquet")
+    out = tmp_path / "rep" / "report.md"
+    out.parent.mkdir()
+    g4bon.main(["report", "--evalsets", str(w / "evalsets.parquet"), "--split", str(w / "split.json"),
+                "--refqe", str(tmp_path / "refqe.parquet"), "--anchor", str(w / "eval" / "G4-0"),
+                "--predictions", str(c1), "--probe-predictions", str(tmp_path / "probe-c1.parquet"),
+                "--model", f"G4-0={w}/eval/G4-0,{w}/sampling/G4-0/t10s1,{tmp_path}/sel-g40",
+                "--model", f"G4-4={w}/eval/G4-4,{w}/sampling/G4-4/t10s1,{tmp_path}/sel-g44", "--out", str(out)])
+    assert "BONREPORT" in capsys.readouterr().out
+    r = json.loads(out.with_suffix(".json").read_text())
+    n = N_W + N_F
+    g = r["models"]["G4-4"]["outputs"]
+    # 0.4: 3 of 6 WMT24++ and 2 of 5 FLAN original; G4-0 greedy 0.2: 2 and 1; c2 0.6: 4 and 3
+    assert g["greedy"]["c1_pooled"] == pytest.approx(5 / n)
+    assert g["greedy"]["c1_vs_g40"]["delta"] == pytest.approx(2 / n)
+    assert g["c2"]["c1_vs_greedy"]["delta"] == pytest.approx(2 / n) and g["c2"]["c1_vs_g40"]["delta"] == pytest.approx(4 / n)
+    # C2 of G4-4's greedy translation is the calibration rows' (p 0.7: all original)
+    assert g["greedy"]["c2_pooled"] == 1.0
+    for o in g4bon.OUTPUTS[1:]:
+        assert g[o]["hack_flag"] == (g[o]["c2_vs_greedy"] >= 0.10 and g[o]["c1_vs_greedy"]["delta"] < 0.10)
+    assert set(r["models"]["G4-4"]["contrasts"]) == set(r["models"]["G4-0"]["contrasts"])
+    checks = r["checks"]["c1_against_probe"]
+    assert set(checks) == {f"{m}{o} ~ probe {m}{p}" for m in ("G4-0", "G4-4")
+                           for o, p in (("/t10s1", "/t10s1"), ("/qe", "/best8"), ("", ""))}
+    assert checks["G4-4/qe ~ probe G4-4/best8"]["flipped"] == 1 and checks["G4-0/qe ~ probe G4-0/best8"]["flipped"] == 0
+    assert not any(k.startswith("c2_") for k in r["checks"])
+    md = out.read_text()
+    assert "| G4-4 | greedy |" in md and "| G4-4 | c2-qe |" in md
+    assert "- C2 van de samples van G4-0 en G4-4 komt uit c2cal7." in md
+    assert "- C2 van G4-4 greedy komt uit de rijen `calib:sampling:G4-4` van c2cal7" in md
+    assert md.endswith("zoekdeel.\n\n") or md.rstrip().endswith("zoekdeel.")
+
+
 # ---------------------------------------------------------------------------------------------------- run_g4arm.sh
 
 def bon_world(tmp_path):
@@ -521,7 +632,8 @@ def test_bon_c2_select_texts_classify_report(tmp_path):
     (g / "bon/G4-7-i5/c2/texts.parquet").unlink()
     out, _ = run("bon-select", ARM="G4-bon", MODEL="G4-7-i5", TAG="s3")
     assert out.returncode != 0 and "C2's scores of G4-7-i5" in out.stdout
-    for models in ("G4-7-i5 G4-0", "G4-0 G4-4"):
+    # G4-bon.10 allows G4-4 after G4-0 (test_bon_select_and_texts_of_g4_4); another model is refused
+    for models in ("G4-7-i5 G4-0", "G4-0 G4-5", "G4-4 G4-0"):
         out, _ = run("bon-texts", ARM="G4-bon", KEY="k", MODELS=models, TAG="t0")
         assert out.returncode != 0
     out, _ = run("bon-texts", ARM="G4-bon", KEY="G4-0_G4-7-i5", MODELS="G4-0 G4-7-i5", TAG="t1")
@@ -540,3 +652,36 @@ def test_bon_c2_select_texts_classify_report(tmp_path):
     for x in ("g4bon.py report", "--c2-check G4-7-i5=", "/sampling/naturalness/predictions.parquet",
               "/data/G4-5-split/refqe.parquet", "/bon/report/G4-0_G4-7-i5/", "--model G4-0="):
         assert x in body, x
+
+
+def test_bon_select_and_texts_of_g4_4(tmp_path):
+    """G4-bon.10: G4-4 reuses the probe as G4-0 does (its samples, best8, C2 of c2cal7 with its greedy translation's
+    calibration name, checked against its evaluation); no new samples, no C2 run of its own"""
+    run, shm, home, g = bon_world(tmp_path)
+    out, _ = run("bon-select", ARM="G4-bon", MODEL="G4-4", TAG="s4")
+    assert out.returncode == 0 and "started g4b_select_G4-4_s4 on w0" in out.stdout, out.stdout + out.stderr
+    body = (home / "job_body_g4b_select_G4-4_s4.sh").read_text()
+    for x in ("/sampling/G4-4/t10s1 ", "/sampling/G4-4/t10s8 ", "/sampling/G4-4/best8/choice.parquet",
+              "/sampling/report/report.json", "rl/G4-7/c2/cal7/predictions.parquet", "rl/G4-7/c2/cal7/texts.parquet",
+              "--best8", "--probe-report", "--c2-greedy calib:sampling:G4-4", "/eval/G4-0 ", "/bon/G4-4/select",
+              "g4bon.py select --model G4-4 "):
+        assert x in body, x
+    greedy = f"{shm}/translator/g4arm/bonselect-G4-4-s4/greedy"
+    assert f"--greedy {greedy} " in body and "rsync -r -x 'translations/.*' " in body and f"/eval/G4-4 {greedy}" in body
+    assert "/sampling/G4-0/" not in body and "/bon/G4-4/c2/" not in body
+    for stage in ("bon-translate", "bon-score", "bon-c2texts", "bon-c2"):
+        out, _ = run(stage, ARM="G4-bon", MODEL="G4-4", TAG="s5")
+        assert out.returncode != 0 and "candidate of G4-7" in out.stdout, stage
+    (g / "bon/naturalness/G4-0_G4-4").mkdir(parents=True)
+    (g / "bon/naturalness/G4-0_G4-4/texts.parquet").write_text("x")
+    out, _ = run("bon-texts", ARM="G4-bon", KEY="G4-0_G4-4", MODELS="G4-0 G4-4", TAG="t4")
+    assert out.returncode == 0, out.stdout + out.stderr
+    body = (home / "job_body_g4b_texts_t4.sh").read_text()
+    for x in ("'G4-4=", "'G4-4/t10s1=", "'G4-4/c2=", "/sampling/G4-4/t10s1 ", "/eval/G4-4 ", "/bon/G4-4/select ",
+              "/bon/naturalness/G4-0_G4-4/texts.parquet"):
+        assert x in body, x
+    assert "/bon/G4-4/t10s1" not in body
+    out, _ = run("bon-report", ARM="G4-bon", KEY="G4-0_G4-4", MODELS="G4-0 G4-4", TAG="t5")
+    assert out.returncode == 0, out.stdout + out.stderr
+    body = (home / "job_body_g4b_report_t5.sh").read_text()
+    assert "--model G4-4=" in body and "--c2-check" not in body and "/bon/report/G4-0_G4-4/" in body

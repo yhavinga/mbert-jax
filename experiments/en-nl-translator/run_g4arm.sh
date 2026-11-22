@@ -165,9 +165,9 @@
 #                                 LoRA merged); collect, MetricX-24 (ref, QE), COMET-22, to $GB/<MODEL>/t10s<k>/
 #   MODEL=G4-7-i<n> bash run_g4arm.sh bon-c2texts | bon-c2     w0: C2's texts (the samples, the candidate's and G4-0's
 #                                 greedy translations; g4bon.py c2texts) and C2 on them, to $GB/<MODEL>/c2/
-#   MODEL=G4-0|G4-7-i<n> bash run_g4arm.sh bon-select   w0 (CPU): g4bon.py select (G4-0: the probe's samples and C2 of
-#                                 c2cal7), to $GB/<MODEL>/select/
-#   KEY=<key> MODELS="G4-0 [G4-7-i<n>]" bash run_g4arm.sh bon-texts | bon-classify | bon-report   w0: C1's texts of
+#   MODEL=G4-0|G4-4|G4-7-i<n> bash run_g4arm.sh bon-select   w0 (CPU): g4bon.py select (G4-0 and G4-4: the probe's
+#                                 samples and C2 of c2cal7, G4-bon.10), to $GB/<MODEL>/select/
+#   KEY=<key> MODELS="G4-0 [G4-4] [G4-7-i<n>]" bash run_g4arm.sh bon-texts | bon-classify | bon-report   w0: C1's texts of
 #                                 every output, C1 (run_arms.sh classify, job arms_classify_<TAG>b), g4bon.py report, to
 #                                 $GB/naturalness/<key>/ and $GB/report/<key>/
 # The code is beside this script (a copy of $G/scripts/). TAG names the jobs of one chain.
@@ -2179,17 +2179,23 @@ EOF
   ;;
 bon-select)
   only 0
-  MODEL=${MODEL:?G4-0 or a candidate of G4-7, G4-7-i<n>}
+  MODEL=${MODEL:?G4-0, G4-4 or a candidate of G4-7, G4-7-i<n>}
   X=$G_SHM/bonselect-${MODEL}-$TAG
   RUNS=""
   for k in 1 2 3 4 5 6 7 8; do RUNS="$RUNS --sample t10s$k=$X/t10s$k"; done
-  if [ "$MODEL" = G4-0 ]; then
+  if [ "$MODEL" = G4-0 ] || [ "$MODEL" = G4-4 ]; then
     # the sampling probe's samples and best8, C2 of c2cal7 (G4-7.6, the same model as the reward's)
-    SRC=$GS/G4-0
+    SRC=$GS/$MODEL
     C2P=$RL/c2/cal7/predictions.parquet
     C2T=$RL/c2/cal7/texts.parquet
     CHECKS="--best8 $X/best8-choice.parquet --probe-report $X/probe-report.json"
-    FETCH="gsutil -q cp $GS/G4-0/best8/choice.parquet $X/best8-choice.parquet && gsutil -q cp $GS/report/report.json $X/probe-report.json"
+    FETCH="gsutil -q cp $GS/$MODEL/best8/choice.parquet $X/best8-choice.parquet && gsutil -q cp $GS/report/report.json $X/probe-report.json"
+    if [ "$MODEL" = G4-4 ]; then
+      # G4-bon.10: c2cal7 has G4-4's greedy translation only among its calibration rows (the probe's classify texts,
+      # from $G/eval/G4-4/); select checks those texts against G4-4's evaluation
+      CHECKS="$CHECKS --c2-greedy calib:sampling:G4-4 --greedy $X/greedy"
+      FETCH="$FETCH && mkdir -p $X/greedy && gsutil -m -q rsync -r -x 'translations/.*' $G/eval/G4-4 $X/greedy"
+    fi
   elif cand7 "$MODEL"; then
     SRC=$GB/$MODEL
     C2P=$GB/$MODEL/c2/predictions.parquet
@@ -2197,7 +2203,7 @@ bon-select)
     CHECKS=""
     FETCH="true"
   else
-    echo "bon-select: G4-0 or a candidate of G4-7 (G4-7-i<n>), not $MODEL"; exit 1
+    echo "bon-select: G4-0, G4-4 or a candidate of G4-7 (G4-7-i<n>), not $MODEL"; exit 1
   fi
   for f in "$C2P" "$C2T"; do gsutil -q stat "$f" || { echo "no $f (C2's scores of $MODEL)"; exit 1; }; done
   {
@@ -2216,9 +2222,9 @@ bon-select)
 bon-texts|bon-classify|bon-report)
   only 0
   KEY=${KEY:?the key of the classify run, e.g. G4-0 or G4-0_G4-7-i15}
-  MODELS=${MODELS:?G4-0 first, then the candidate of G4-7 if there is one}
+  MODELS=${MODELS:?G4-0 first, then G4-4 or the candidate of G4-7 if there is one}
   [ "${MODELS%% *}" = G4-0 ] || { echo "MODELS: G4-0 first (the deltas are against its greedy translation), not '$MODELS'"; exit 1; }
-  for m in ${MODELS#G4-0}; do cand7 "$m" || { echo "MODELS: $m is no candidate of G4-7"; exit 1; }; done
+  for m in ${MODELS#G4-0}; do [ "$m" = G4-4 ] || cand7 "$m" || { echo "MODELS: $m is neither G4-4 nor a candidate of G4-7"; exit 1; }; done
   BNAT=$GB/naturalness/$KEY
   if [ "$STAGE" = bon-classify ]; then
     gsutil -q stat "$BNAT/texts.parquet" || { echo "no $BNAT/texts.parquet (bon-texts)"; exit 1; }
@@ -2234,7 +2240,7 @@ bon-texts|bon-classify|bon-report)
     echo "mkdir -p $X"
     echo "gsutil -q cp $GB/data/evalsets.parquet $G5S/split.json $G5S/refqe.parquet $X/"
     for m in $MODELS; do
-      if [ "$m" = G4-0 ]; then T1=$GS/G4-0/t10s1; else T1=$GB/$m/t10s1; fi
+      if [ "$m" = G4-0 ] || [ "$m" = G4-4 ]; then T1=$GS/$m/t10s1; else T1=$GB/$m/t10s1; fi
       echo "mkdir -p $X/$m/greedy $X/$m/t10s1 $X/$m/select"
       echo "gsutil -m -q rsync -r -x 'translations/.*' $G/eval/$m $X/$m/greedy"
       echo "gsutil -m -q rsync -r -x 'translations/.*' $T1 $X/$m/t10s1"
@@ -2242,7 +2248,7 @@ bon-texts|bon-classify|bon-report)
       PAIRS="$PAIRS --pairs '$m=$X/$m/greedy/pairs/pairs-w*.parquet' --pairs '$m/t10s1=$X/$m/t10s1/pairs/pairs-w*.parquet'"
       for sel in qe r7 c2q c2; do PAIRS="$PAIRS --pairs '$m/$sel=$X/$m/select/$sel/pairs/pairs-w*.parquet'"; done
       OUTS="$OUTS --model $m=$X/$m/greedy,$X/$m/t10s1,$X/$m/select"
-      if [ "$m" != G4-0 ]; then
+      if cand7 "$m"; then
         echo "gsutil -q cp $GB/$m/c2/predictions.parquet $X/$m/c2-predictions.parquet"
         OUTS="$OUTS --c2-check $m=$X/$m/c2-predictions.parquet,$X/cal7-predictions.parquet"
       fi

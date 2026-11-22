@@ -5,7 +5,8 @@ part of G4-5.4 only (WMT24++ without is_bad_source and FLAN); it decides nothing
 the chosen outputs and never chooses.
 
 Models: G4-0 (its 8 samples of the sampling probe, $G/sampling/G4-0/t10s1..t10s8, with C2's scores of c2cal7) and the
-candidate chosen by G4-7 (8 new samples of the search part with the probe's settings, scored the same way).
+candidate chosen by G4-7 (8 new samples of the search part with the probe's settings, scored the same way); G4-4 as G4-0
+(addendum G4-bon.10: the probe's samples, C2 of c2cal7, its greedy translation's C2 under c2cal7's calibration name).
 
 Selections among the 8 samples of a source (fixed in §15 before the first step):
   qe   the lowest QE (ties: the earlier sample), the sampling probe's best8
@@ -16,7 +17,8 @@ Selections among the 8 samples of a source (fixed in §15 before the first step)
 
     python g4bon.py bondata --evalsets E --split S --segments DIR --out DIR
     python g4bon.py select --model G4-0 --sample t10s1=DIR ... --anchor DIR --c2-predictions P --c2-texts T \\
-        --evalsets E --split S [--best8 choice.parquet] [--probe-report report.json] --out DIR
+        --evalsets E --split S [--best8 choice.parquet] [--probe-report report.json] \\
+        [--c2-greedy NAME --greedy DIR] --out DIR
     python g4bon.py c2texts --model M --sample t10s1=GLOB ... --greedy GLOB --g40 GLOB --evalsets E --split S \\
         --checkpoint DIR --out texts.parquet
     python g4bon.py texts --pairs NAME=GLOB ... --evalsets E --split S --out texts.parquet
@@ -53,6 +55,7 @@ SELECTIONS = ("qe", "r7", "c2q", "c2")
 BASELINES = ("greedy", "t10s1")
 OUTPUTS = BASELINES + SELECTIONS
 BASE = g4arm.BASE                                # G4-0
+PROBE_MODELS = (BASE, "G4-4")                    # the sampling probe's models: their samples are reused (G4-bon.10)
 C2_MAX_TOKENS = 1022                             # G4-7.0 (Yeb 21 Nov): more is c2_overflow (g4c2.C2_MAX_TOKENS)
 LOGIT_CLIP = g4rl.LOGIT_CLIP                     # 12 (G4-7.4e)
 QE_TOL = 1e-9
@@ -238,9 +241,15 @@ def select(args):
             raise SystemExit(f"{n}: no scored sample of {len(missing)} search segments, e.g. {missing[:3]}")
     anchor_rows = armeval.scored(args.anchor)
     anchors = {i: anchor_of(anchor_rows[i]) for i in all_ids}
+    greedy_name = args.c2_greedy or args.model
+    if args.c2_greedy and not args.greedy:
+        raise SystemExit(f"--c2-greedy {args.c2_greedy}: --greedy (the model's evaluation) is needed to check its texts")
+    if args.greedy:
+        check_greedy_texts(g4arm.read_rows(args.c2_texts, ["model", "id", "text"]), greedy_name,
+                           pairs_of(f"{args.greedy}/pairs/pairs-w*.parquet", all_ids), all_ids)
     c2 = c2_scores(g4arm.read_rows(args.c2_predictions, ["model", "set", "id", "p_original"]),
                    g4arm.read_rows(args.c2_texts, ["model", "set", "id", "tokens"]),
-                   [args.model] + [f"{args.model}/{n}" for n in SAMPLE_NAMES], all_ids)
+                   [greedy_name] + [f"{args.model}/{n}" for n in SAMPLE_NAMES], all_ids)
     out = Path(args.out)
     chosen_rows = {s: {"pairs": [], "metricx": [], "comet": []} for s in SELECTIONS}
     choice = []
@@ -248,7 +257,7 @@ def select(args):
         rows = [scored[n][i] for n in SAMPLE_NAMES]
         cs = scored_samples(rows, [c2[f"{args.model}/{n}"][i] for n in SAMPLE_NAMES], anchors[i])
         picks, n_bound = choose(cs, anchors[i]["qe0"])
-        g = c2[args.model][i]
+        g = c2[greedy_name][i]
         rec = {"id": i, "set": set_of[i], "qe0": anchors[i]["qe0"], "l0": anchors[i]["l0"],
                "greedy_logit": None if g["logit_c2"] is None else max(-LOGIT_CLIP, min(LOGIT_CLIP, g["logit_c2"])),
                "greedy_overflow": g["c2_overflow"], "qe": [c["qe"] for c in cs], "logit": [c["logit"] for c in cs],
@@ -277,9 +286,25 @@ def select(args):
     g4arm.write_parquet(choice, out / "choice.parquet")
     stats = select_stats(choice)
     (out / "select.json").write_text(json.dumps({"model": args.model, "part": PART, "n": {s: len(v) for s, v in ids.items()},
-                                                 "best8_checked": bool(args.best8), "stats": stats}, indent=1) + "\n")
+                                                 "best8_checked": bool(args.best8), "c2_greedy": greedy_name,
+                                                 "greedy_texts_checked": bool(args.greedy), "stats": stats}, indent=1) + "\n")
     fallbacks = {s: {sel: x[sel]["fallback"] for sel in SELECTIONS} for s, x in stats.items()}
     print(f"BONSELECT {json.dumps({'model': args.model, 'fallbacks': fallbacks})}", flush=True)
+
+
+def check_greedy_texts(texts, name, pairs, ids):
+    """C2's texts named NAME (c2cal7's calibration rows of G4-4) are the model's greedy translations: equal on every
+    search segment, so that their C2 is the C2 of the greedy output in the report"""
+    got = {}
+    for r in texts:
+        if r["model"] == name:
+            if r["id"] in got:
+                raise SystemExit(f"C2's texts: ({name}, {r['id']}) twice")
+            got[r["id"]] = r["text"] or ""
+    differ = [i for i in ids if got.get(i) != (pairs[i]["hypothesis"] or "")]
+    if differ:
+        raise SystemExit(f"C2's texts of {name} are not the greedy translations at {len(differ)} of the {len(ids)} "
+                         f"search segments, e.g. {differ[:3]}")
 
 
 def select_stats(choice):
@@ -469,13 +494,14 @@ def report(args):
     probe = {(r["model"], r["id"]): r["p_original"]
              for r in g4arm.read_rows(args.probe_predictions, ["model", "id", "p_original"])}
     checks = {}
-    for here, there in ((f"{BASE}/t10s1", f"{BASE}/t10s1"), (f"{BASE}/qe", f"{BASE}/best8"), (BASE, BASE)):
-        got = [(c1[(here, i)] >= 0.5, probe[(there, i)] >= 0.5) for i in all_ids if (there, i) in probe]
-        if len(got) != len(all_ids):
-            raise SystemExit(f"the probe's run has {len(got)} of the {len(all_ids)} search segments of {there}")
-        checks[f"{here} ~ probe {there}"] = {"share_here": sum(a for a, _ in got) / len(got),
-                                             "share_probe": sum(b for _, b in got) / len(got),
-                                             "flipped": sum(a != b for a, b in got)}
+    for m in [m for m in views if m in PROBE_MODELS]:
+        for here, there in ((f"{m}/t10s1", f"{m}/t10s1"), (f"{m}/qe", f"{m}/best8"), (m, m)):
+            got = [(c1[(here, i)] >= 0.5, probe[(there, i)] >= 0.5) for i in all_ids if (there, i) in probe]
+            if len(got) != len(all_ids):
+                raise SystemExit(f"the probe's run has {len(got)} of the {len(all_ids)} search segments of {there}")
+            checks[f"{here} ~ probe {there}"] = {"share_here": sum(a for a, _ in got) / len(got),
+                                                 "share_probe": sum(b for _, b in got) / len(got),
+                                                 "flipped": sum(a != b for a, b in got)}
     result["checks"]["c1_against_probe"] = checks
     for spec in args.c2_check or []:
         model, paths = spec.split("=", 1)
@@ -566,8 +592,22 @@ def report_text(r):
           "van natuurlijker Nederlands; daarvoor is een blinde beoordeling nodig, die hier niet gebeurt.",
           "- Alleen het zoekdeel (n = 480 + 500); de kandidaat van G4-7 is op dit deel gekozen (op C1 van zijn greedy "
           "vertaling), dus zijn cijfers hier zijn optimistisch; verschillen tussen zijn eigen uitvoer minder.",
-          "- C2 van de samples van G4-0 komt uit c2cal7, die van de kandidaat uit een eigen run (controle hierboven).", ""]
+          c2_source_text(r), ""]
+    for m, x in r["models"].items():
+        name = x["select"].get("c2_greedy", m)
+        if name != m:
+            L.insert(-1, f"- C2 van {m} greedy komt uit de rijen `{name}` van c2cal7; hun teksten zijn in `select` "
+                         f"getoetst als gelijk aan {m}'s greedy vertaling op elk segment van het zoekdeel.")
     return "\n".join(L) + "\n"
+
+
+def c2_source_text(r):
+    probe = [m for m in r["models"] if m in PROBE_MODELS]
+    others = [m for m in r["models"] if m not in PROBE_MODELS]
+    text = f"- C2 van de samples van {' en '.join(probe)} komt uit c2cal7"
+    if others:
+        text += f", die van {' en '.join(others)} uit een eigen run (controle hierboven)"
+    return text + "."
 
 
 # ---------------------------------------------------------------------------------------------------- CLI
@@ -591,6 +631,9 @@ def main(argv=None):
     a.add_argument("--split", required=True)
     a.add_argument("--best8", help="the probe's best8/choice.parquet: qe's choice must equal it (G4-0)")
     a.add_argument("--probe-report", help="the probe's report.json: its T = 1 settings must be SAMPLES (G4-0)")
+    a.add_argument("--c2-greedy", help="C2's name of the model's greedy translation if not --model (G4-4: "
+                   "calib:sampling:G4-4 of c2cal7); needs --greedy")
+    a.add_argument("--greedy", help="the model's evaluation (pairs/): C2's texts of its greedy translation must equal it")
     a.add_argument("--out", required=True)
     a = sub.add_parser("c2texts")
     a.add_argument("--model", required=True)

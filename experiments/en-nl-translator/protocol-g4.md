@@ -1779,3 +1779,13 @@ LoRA-pad) per token afrondingsverschillen, zonder systematische afwijking (gemid
 0,05). De schatting schaalt de vaste opstarttijd van `iter7` lineair mee (37,6 min per iteratie); realistisch ~58 min per
 iteratie, ~29 u. Nieuwe grenzen: QE 0,02; p_c2 0,01; stap 1: |KL| ≤ 1e-3 en clip_frac ≤ 0,01; old = ref: |gemiddelde k1|
 ≤ 1e-4 (maxima gerapporteerd); schatting ≤ 48 u. 30 iteraties blijven. De smoke-test draait opnieuw (`g4i1122n`).
+
+*G4-7.4j Besluit 22 nov 2026 ~05:00 (hoofdsessie volgens G4-7.9; voor Yeb gemarkeerd).* De herhaalde `smoke7`
+(`g4i1122n`, iteraties 910/911) haalde opnieuw alle functionele controles en de grenzen van G4-7.4i op twee na:
+`qe_loose` max 0,026 (grens 0,02) en `train1_old_ref` gemiddelde k1 1,7e-4 (grens 1e-4; max 2,7); `c2_loose` 0,0067,
+stap 1 KL 6,1e-4 en clip 0,2%, piek ~24 GiB, schatting 43,8 u (grens 48). Dezelfde bf16-ruis als bij `g4i1122m`, met een
+andere steekproef; de grenzen nog eens verschuiven op één meting zegt niets. Besluit: **de smoke-test is functioneel
+geslaagd en de RL start** (marker `smoke7` met de hand gezet, in het formaat van de keten: smoke `$RL/smoke7/g4i1122n/`,
+tis 0, hours 43.8). Een gemiddeld verschil old/ref van 1,7e-4 nats per token is verwaarloosbaar tegen de KL-stopregel
+S3 (0,30); een QE-verschil van 0,026 (schaal 0–25) verandert de reward niet merkbaar. De grenzen in de code blijven die
+van G4-7.4i.

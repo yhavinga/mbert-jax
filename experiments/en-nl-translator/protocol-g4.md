@@ -2320,3 +2320,108 @@ TPU van de worker(s) vrij. `setup` opnieuw (`run_g4arm.sh setup`, `ARM=G4-bon`).
 `rreport` (w0). Markers in `$G/stages/g4-judge/` met nieuwe namen; plaatsen `$G/judge/anchor/`,
 `$G/judge/<model>/select-anchor/`, `$G/judge/reason/`; niets wat stap 1 of 2 schreef wordt overschreven. Elke stap
 eindigt op `EXIT 0`, anders `FAILED` en stoppen.
+
+## 18. G4-8-data: de selectiedata van arm G4-8 (best-of-8 met de judge, janchor)
+
+**Vastgelegd 23 nov 2026 (tijdstip: de commit van deze sectie op branch `en-nl-g4arm8`, vanaf `en-nl-g4judge` @
+`a983e09`)**, vóór elke stap op een worker en vóór elke uitslag [besluit Yeb 23 nov ~16:30: de datavoorbereiding van
+G4-8 bouwen en starten volgens `mbert-ops/translator-sft/g4-8-spec-judge.md` met de standaarden van die spec, zodat
+mbert-mix niet stilstaat; **geen training**: de SFT start pas na Yebs steekproef (V1) en zijn keuze over O6;
+uitwerking door een subagent]. **Besluit Yeb 23 nov ~16:40: FLAN-aandeel als bij G4-7, 10 / 45 / 45 (FLAN / romans /
+BT) van de bronnen; wijkt af van de spec** (die 40 / 40 / 20 adviseerde, §3 en O4). De overige standaarden van de spec
+gelden: startmodel G4-0 (O1), selectie janchor (O2), geen ankerrijen (O3), 24.000 bronnen (O5), alleen mbert-mix (O9),
+één ronde (O10). Vooraf gelezen: alleen tellingen (`g4-7-plan.json`, `pool.json`, `cands.json` van G4-7), geen tekst.
+Claude en GPT zijn geen judge of generator. Deze keten schrijft niets over wat G4-7, G4-bon of G4-judge schreef.
+`RL=$G/rl/G4-7`, `G8=$G/data/G4-8`.
+
+*G4-8-data.1 Bronnen* (24.000; FLAN 2.400, romans 10.800, BT 10.800; BT gelijk per BT-set, 2.160 per set).
+- **Hergebruikt** [keuze]: alle 15.360 bronnen van G4-7's plan (`$RL/data/plan/plan.parquet`, iteratie 0–29: FLAN 1.530,
+  romans 6.930, BT 6.900 = 1.380 per set) met hun anker (de tekst `hypothesis0` en ℓ₀ = `l0`, G4-0 greedy, G4-7.4a).
+  RL-val (384 bronnen, iteratie −1) blijft erbuiten. Ze voldoen aan de filters van G4-7.2 en G4-7.4d (20–256 Gemma
+  4-tokens, geen 13-gram met de evaluatie, de FLAN-evaluatierijen of de blinde passages, niet de documenten van C2 of
+  RL-val).
+- **Vers**: FLAN 870, romans 3.870, BT 3.900 (780 per set), uit dezelfde bronnen en met dezelfde code als `cands7` en
+  `pool7` (G4-7.2, G4-7.4d): FLAN-nl's Engelse segmenten van de gepubliceerde voorbeelden (zonder de FLAN-evaluatierijen
+  en hun voorbeelden), het Engels van de `-b1-`-romans zoals G4-4 ze nam (zonder de boeken van de evaluatieset `novels`),
+  het Engels van de trainsplit van de vijf `-nl-en-gemma4`-sets op G4-3's revisies (zonder `hard_fails`). Vóór de
+  trekking eruit: elk id en elke (gestripte) Engelse tekst van G4-7's `pool.parquet` (pool, reserve en RL-val). Trekking
+  per deel (BT per set) in een geseede volgorde (`draw_candidates`, zaad `en-nl-g4arm/0/G4-8/cands/<deel>[/<set>]`),
+  2 × (behoefte + 3% reserve), alleen teksten van 20–256 Gemma 4-tokens; dan de filters van `pool7`
+  (`candidate_filter`): geen 13-gram met de evaluatiesets (`$E/data/evalsets.parquet`, bron en referentie), de blinde
+  passages (`blind100.jsonl`) en de FLAN-evaluatierijen; niet de documenten van C2 (`$RL/c2/data/docs.txt`) en niet die
+  van G4-7's RL-val; één bron per tekst. Volgorde per deel `g4rl.ordered` met zaad `en-nl-g4arm/0/G4-8/order/<deel>`
+  (de BT-sets om de beurt, dus gelijk per set); de eerste behoefte × 1,03 gaan naar het anker.
+- **Delen** (`c1`, `c2`, `c3`) [keuze]: per deel de 24.000 bronnen op id gesorteerd en geschud met zaad
+  `en-nl-g4arm/0/G4-8/chunk/<deel>`; `c1` de eerste 1/6 (FLAN 400, romans 1.800, BT 1.800; 4.000 bronnen), `c2` en `c3`
+  elk 5/12 (1.000 / 4.500 / 4.500; 10.000). Reden: V3 (G4-8-data.8) heeft na ~2–3 u BT- en romandoelen nodig, en een
+  herstart hoeft dan minder over te doen. Elk deel doorloopt samplen → QE → paren → judge → selectie; de delen geven
+  dezelfde uitkomst als één geheel (de regel is per bron).
+
+*G4-8-data.2 Anker en QE₀.* Hergebruikt: G4-7's anker. Vers: G4-0 greedy zoals G4-7.4a (`translate.py --copies 1`,
+fork `f4d8615`, prompt `natural-v1`, klasse `medium`, geen adapter, 4 workers van mbert-mix). Een verse bron waarvan
+het anker niet af is, lust, leeg is of Engels laat staan valt weg (`g4rl.anchor_ok`, als `plan7`); per deel de eerste
+behoefte die overblijven, in de volgorde van G4-8-data.1 (te weinig: `FAILED`). **QE₀** = MetricX-24-QE (hybrid XXL
+v2p6 bf16, `metricx_qe.py score --pair source:hypothesis`, zonder referentie, een lege vertaling zonder score) van het
+anker, voor alle 24.000 opnieuw berekend in dezelfde jobs als de samples [keuze: QE en QE₀ van dezelfde scorer, want
+bf16-batch-effecten tussen G4-7's judges en een losse run zijn tot ~0,02 (G4-7.4i)]. Controle bij de hergebruikte
+bronnen tegen G4-7's `qe0` (gerapporteerd): mediaan |Δ| > 0,05 of meer dan 2% met |Δ| > 0,5 is `FAILED` (een
+verkeerde koppeling).
+
+*G4-8-data.3 Samples.* 8 per bron bij T = 1 met G4-0 zonder adapter (`translate.py --copies 8 --sample
+samples=1.0:<zaad>`, zaad `g4rl.seed_int("en-nl-g4arm/0/G4-8/sample/<deel>/w<k>")`, verder als het anker; shards van
+32 bronnen; bronnen over de workers op tokens, `g4rl.assign_workers7`). QE per sample als QE₀.
+
+*G4-8-data.4 Fail en kandidaten* (spec §3 stap 1). Fail = de fail van G4-7 (G4-7.3 met G4-7.4e) zonder `c2_overflow`:
+niet af, lus, leeg, Engels over, ℓ/ℓ₀ buiten [0,67; 1,5] (ℓ = `tokens_out` van het sample, ℓ₀ van het anker),
+QE > 7,5. **Kandidaat** = geen fail, QE ≤ QE₀ (+ 1e-9), en tekstueel anders dan het anker na normalisering van
+witruimte (`" ".join(tekst.split())`). Kandidaten met dezelfde genormaliseerde tekst binnen een bron worden één keer
+beoordeeld (sleutel: het eerste sample `j`), en delen die P̄. [gevolgtrekking] Een sample gelijk aan het anker geeft in
+beide volgordes dezelfde prompt, dus P̄(sample beter) = P̄(anker beter) ≤ 0,5: het kan nooit doel worden. Het weglaten
+ervan en het één keer beoordelen van gelijke teksten verandert geen enkele keuze van de regel van de spec; het spaart
+alleen judge-tijd.
+
+*G4-8-data.5 Judge* (spec §3 stap 2): de judge van G4-judge.2–4 ongewijzigd (Gemma 4 31B-it @ `842da37`, de
+MaxText-omzetting, prompt G4-judge.3, één prefill, P(A)/P(B)/P(gelijk) uit de logits, beide volgordes; `ab`: A = sample,
+B = anker), `pairjudge.py score` ongewijzigd, prompts over de 4 workers op sha256 van de uid. P̄ = P̄(sample beter) van
+G4-judge.4. Een prompt boven 4.096 tokens wordt niet gescoord; die kandidaat valt af (geteld).
+
+*G4-8-data.6 Selectie janchor* (spec §3 stap 3–4, G4-judge.12): k = de kandidaat met de hoogste P̄ (gelijk: de lagere
+QE, dan het eerdere sample); **doel = de tekst van k als P̄(k) > 0,5**, anders valt de bron weg (geen ankerrij, O3);
+zonder kandidaat valt de bron ook weg. Hoogstens één doel per bron.
+
+*G4-8-data.7 Rapport vóór de training* (per deel en samen; alleen tellingen en scores, geen tekst): bronnen, samples,
+fail per reden, kandidaten per bron, verschillende samples per groep (mediaan; aandeel met 8 gelijke), beoordeelde en
+niet gescoorde prompts, **aandeel bronnen waar een sample het anker verslaat** (P̄ > 0,5 = gehouden), P̄ van de doelen,
+QE van anker en doel en ΔQE, ℓ/ℓ₀, chrF(doel, anker) (de definitie van sacrebleu 2: tekens-n-grammen 1–6 zonder
+witruimte, β = 2; eigen code), het gekozen sample, de doeltokens en [schatting] het aantal SFT-stappen (2 epochs, rijen
+van 4.096, 16 per stap), de QE₀-controle van G4-8-data.2. Naar `$G8/report/report.md`/`.json`, kopie
+`mbert-ops/translator-sft/g4-8-data.md` (`.json`).
+
+*G4-8-data.8 V3* (spec §7): na de selectie van `c1` een blind pakket `gs://…/sft/blind/G4-8-V3/` van 50 BT- en 50
+romandoelen van `c1` tegen het anker: per deel `random.Random("en-nl-g4arm/0/G4-8/v3/<deel>").sample` van de
+gesorteerde id's met een doel (minder dan 50: alle); `blind_id` `v3-001…v3-100` (BT eerst, in de volgorde van de
+trekking); A/B met `random.Random("en-nl-g4arm/0/G4-8/v3/ab/<blind_id>").random() < 0,5` → A = het anker (`base`),
+anders A = het doel (`G4-8-janchor`). `judge-input.jsonl` (blind_id, source, A, B), apart `key.jsonl` (blind_id, A, B,
+seed, set = deel, item, stratum) en `select-report.json` (aantallen, geen tekst); een bestaande `key.jsonl` wordt niet
+overschreven. De beoordeling (verse Claude-subagent, rubriek protocol.md §4.2.4) en de regel van de spec (een deel met
+< 50% van de niet-gelijke oordelen voor het doel gaat niet in de training; O8) zijn aan de hoofdsessie en Yeb.
+
+*G4-8-data.9 Uitvoer.* `$G8/fresh/` (de verse bronnen, `fresh.json`), `$G8/anchor/samples/`, `$G8/plan/` (`plan.parquet`:
+de 24.000 bronnen met deel, herkomst, anker, ℓ₀; `plan.json`), per deel `$G8/<deel>/{segments,samples,qe,judge/data,
+judge/scores,select}/` (`select/targets.parquet`: id, bron, doel en de maten; `select/choice.parquet` zonder tekst),
+`$G8/targets/targets.parquet` (alle doelen, de invoer van de latere SFT-stap) en het rapport; markers
+`$G/stages/g4-8-data/`.
+
+*G4-8-data.10 Keten* (`mbert-ops/scripts/g4arm8_data_run.sh`, kopie in `gs://t5-dutch-english-usc2/hammond/scratch-scripts/`;
+code `g4arm8.py`, `run_g4arm8.sh` op `en-nl-g4arm8`). Alleen mbert-mix; `final_eval_mix.lock` met `flock` tot het eind;
+mbert-corpus (T3) wordt niet aangeraakt. Code als bundel via de bucket naar de 4 workers; elke ssh met `timeout 900` en
+de ssh-opties van G4-judge.10; vóór elke TPU-stap de TPU van de worker(s) vrij. Volgorde: `setup` (`run_g4arm.sh setup`,
+`ARM=G4-bon`), `fresh` (w0, CPU), het anker (4 workers), `plan` (w0, CPU); per deel `sample` (4), `qe` (4), `pairs`
+(w0, CPU), `judge` (4), `select` (w0, CPU); na `c1` ook `v3` (w0, CPU); tot slot `report` (w0, CPU). Elke stap eindigt
+op `EXIT 0`, anders `FAILED` en stoppen; een gemarkeerde stap wordt bij een herstart overgeslagen. [schatting] ~8–10 u:
+fresh ~15 min, anker ~15 min, `c1` ~1,5–2 u (V3 na ~2–3 u), `c2` en `c3` elk ~3–4 u.
+
+*G4-8-data.11 Wat deze stap niet doet.* Geen training, geen evaluatie, geen C1 of C2 in de lus; de doelen zijn
+ongetoetst tot V3 en V1. De judge is alleen op FLAN, WMT24++ en idioom gevalideerd (G4-judge.5, .12); BT en romans zijn
+90% van de bronnen, dus V3 weegt hier zwaar. De rapportage "de judge op de 500 C2F-paren" (spec §7 V3) is niet in deze
+keten.

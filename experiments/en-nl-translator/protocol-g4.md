@@ -2428,23 +2428,19 @@ keten.
 
 ## 19. G4-8 training: SFT met LoRA op de doelen van G4-8-data
 
-**CONCEPT, NIET GESTART; wacht op Yebs steekproef (V1) en zijn keuze over O6.** Opgesteld 23 nov 2026 (~19:30) door een
-subagent op verzoek van de hoofdsessie [opdracht: de trainings- en evaluatiestap van G4-8 bouwen, testen en droog
-draaien, niet starten], terwijl de datavoorbereiding (§18, keten `g4d8a1123a`) nog loopt; geen uitslag van de training
-of van de doelen gelezen, alleen tellingen (§18-log, de LEARNINGS-regel van G4-8-data). De **definitieve versie** volgt
-vóór de start: dan vervangt de hoofdsessie deze kop door "Vastgelegd <datum>", vult G4-8.0 in met Yebs besluiten en zet
-het startbestand (G4-8.12). De keten weigert een protocol waarin deze conceptregel nog staat. Spec:
+**Vastgelegd 23 nov 2026 ~23:20 door de hoofdsessie, na Yebs steekproef (V1) en zijn keuze over O6.** Opgesteld 23 nov
+(~19:30) door een subagent als concept; nu definitief met Yebs besluiten in G4-8.0. Spec:
 `mbert-ops/translator-sft/g4-8-spec-judge.md` (§4 training, §6 beslisregel, §9 open keuzes) met `g4-8-spec.md` §6–§7
 waar die naar verwijst. `G8=$G/data/G4-8`, `RL=$G/rl/G4-7`.
 
-*G4-8.0 Besluiten vóór de start* [open: Yeb]. De standaarden hieronder zijn die van de spec; wat Yeb anders kiest, gaat
-in de definitieve versie (en, als het de code raakt, in een nieuwe commit). Vast te leggen, elk als één regel:
-- `O1 [besluit Yeb …]: G4-0` (startmodel; spec-advies; i15 als tweede arm is hier niet gebouwd).
-- `O5 [besluit Yeb …]: 2 epochs, LR 5e-5` (spec-advies; 24.000 bronnen liggen vast door §18).
-- `O6 [besluit Yeb …]: R-oud` of `O6 [besluit Yeb …]: R-nieuw` (G4-8.9). **De keten leest deze regel.**
-- V1 (Yebs steekproef, spec §7) met de uitslag; O7 (60%) en O8 (V3 blokkerend per deel) ter kennisname: V3 gaf BT
-  31 / 3 / 16 en romans 28 / 6 / 16 (doel / anker / gelijk) [gemeten, LEARNINGS G4-8-data], dus onder O8 valt geen deel
-  af; FLAN is in V3 niet getoetst.
+*G4-8.0 Besluiten vóór de start* [Yeb, 23 nov 2026].
+- `O1 [besluit Yeb 23 nov 2026]: G4-0` (startmodel; spec-standaard, Yeb koos geen andere).
+- `O5 [besluit Yeb 23 nov 2026]: 2 epochs, LR 5e-5` (spec-standaard, Yeb koos geen andere).
+- `O6 [besluit Yeb 23 nov 2026]: R-nieuw`
+- V1 (Yebs steekproef, 23 nov ~23:10; 40 paren uit `G4-judge-i15` en `G4-judge-anchor-i15`): Yeb kiest de judge-keuze in
+  25 van 40 (62,5%, eenzijdig p = 0,077; judgeq 13 / 7, judge-of-anker 12 / 8; FLAN 14 / 6, WMT24++ 11 / 9; nooit
+  "gelijk"): haalt O7 (≥ 60%). O8: V3 gaf BT 31 / 3 / 16 en romans 28 / 6 / 16, dus er valt geen deel af; FLAN is in V3
+  niet getoetst. FLAN-aandeel 10% (besluit Yeb 23 nov ~16:40, §18).
 
 *G4-8.1 Startmodel en LoRA.* G4-0 (Gemma 4 31B-it @ `842da37`, run_sft.sh's MaxText-omzetting `gemma4-ckpt/gemma-4-31b-it`)
 zonder adapter [spec O1, standaard]. LoRA rank 32 / alpha 16 (schaal 0,5) op de 410 modules van `run_sft.sh` (attention

@@ -1527,10 +1527,11 @@ def reasonreport_text(r):
     if t["base"]:
         L += [f"Ter vergelijking de judge van stap 1 (één prefill per prompt; de shards van stap 2 zonder de "
               f"COMPILE-regels, {sum(x['prompts'] for x in t['base'])} prompts): {num(t['base_per_pair'], 3)} s per paar."]
-    L += ["", f"[gevolgtrekking] Bij deze instelling kost een selectie op {SELECTION_SAMPLES:,} samples (elk tegen het "
+    samples = f"{SELECTION_SAMPLES:,}".replace(",", ".")
+    L += ["", f"[gevolgtrekking] Bij deze instelling kost een selectie op {samples} samples (elk tegen het "
           f"anker, beide volgordes) ~{num(t['hours_one_v4_8'], 1)} uur op één v4-8 of ~{num(t['hours_four'], 1)} uur op de "
           "4 workers van mbert-mix, zonder engine laden en opwarmen; er is niet naar een snellere instelling gezocht "
-          "(meer slots met lengteklassen).".replace(",", "."), "",
+          "(meer slots met lengteklassen).", "",
           "## Wat dit niet zegt", "",
           "- Claude's oordelen zijn geen grondwaarheid; overeenstemming kan ook gedeelde voorkeuren van taalmodellen "
           "weerspiegelen. De redenering volgt de rubriek waarmee ook Claude oordeelde.",

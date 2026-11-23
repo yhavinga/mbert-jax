@@ -844,6 +844,8 @@ def test_reasonreport_against_step_1(tmp_path, monkeypatch, capsys):
     assert x["n"] == 500 and x["no_verdict_line"] == sum(1 for n, rr in enumerate(rows) if n % 25 == 0 and rr["uid"].endswith("/ab"))
     assert x["own_differs"] == 0
     assert "aanvulling B" in md and "| D1 |" in md and "Tabel 8" in md and "[gevolgtrekking]" in md
+    hours = f"{pj.SELECTION_SAMPLES * t['per_pair'] / 3600:.1f}".replace(".", ",")
+    assert f"op 100.000 samples (elk tegen het anker, beide volgordes) ~{hours} uur op één v4-8" in md
     assert "RREPORT" in capsys.readouterr().out
 
 

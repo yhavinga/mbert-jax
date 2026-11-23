@@ -2029,3 +2029,174 @@ tellingen en scores, geen teksten. Keten: `mbert-ops/scripts/c2fiction_run.sh`.
 De meting liep als run `c2f1123a` met `c2fiction.py` @ `a4128e3`; het rapport op co1 is uit `report.json` opnieuw
 opgemaakt met de getalnotatie van `c2fiction.py` @ de commit van deze correctie (mediaan tokens met één decimaal, |ΔP|
 met komma); de getallen zijn dezelfde.
+
+## 17. Meting G4-judge: Gemma 4 31B-it als judge van twee vertalingen
+
+**Vastgelegd 23 nov 2026 (tijdstip: de commit van deze sectie op branch `en-nl-g4judge`, vanaf `en-nl-g4bon` @
+`f30c1a8`)**, vóór elke stap op een worker en vóór elke uitslag van deze meting [besluit Yeb 23 nov ~08:15: een kleine
+proef met een open LLM-judge op mbert-mix; uitwerking door een subagent; labels als in de kop]. Vooraf is van de
+blinde pakketten alleen gelezen: de veldnamen, de aantallen per oordeel, zekerheid, set en sleutelnaam, en het aantal
+tokens van bron en vertalingen (geen tekst). Een meting, geen arm: er wordt niets getraind en zij beslist niets over een
+arm of over G4-8. Claude en GPT zijn geen judge, generator of trainingsdata; de bestaande Claude-oordelen dienen hier
+alleen als validatie. De TEST-split van hammond blijft dicht; het beslisdeel van G4-5.4 wordt niet gelezen.
+
+*G4-judge.1 Vraag.* C2 bleek als reward en als selectiemaat een zwakke proxy (G4-7; G4-bon: selectie op C2 verdubbelt
+C2 en verhoogt C1 weinig; blind 29 / 22 / 49, niet significant). Een judge die de bron en twee vertalingen naast elkaar
+ziet, kan betekenis en natuurlijkheid samen wegen. (1) Volgt Gemma 4 31B-it, zero-shot met de rubriek van protocol.md
+§4.2.4, het oordeel van de Claude-beoordelaar op de bestaande blinde pakketten, en hoe groot is zijn positiebias?
+(2) Alleen als (1) de drempel van G4-judge.6 haalt: wat geeft best-of-8 met de keuze op deze judge (elk sample tegen
+het anker G4-0 greedy) voor C1, QE, COMET-22 en MetricX-ref, naast de selecties qe en c2q van G4-bon?
+
+*G4-judge.2 De judge.* Gemma 4 31B-it (`google/gemma-4-31B-it` @ `842da37`, Apache 2.0), de MaxText-omzetting die
+elke Gemma 4-decodering gebruikt (`$R/judge/gemma-4-31b-it-maxtext/0/items`), in MaxText's MaxEngine op de fork @
+`f4d8615` met `translate.make_engine` (model `gemma4-31b`: bf16, logits in fp32, tensor 4 over de 4 chips van één
+worker van mbert-mix). Per prompt één prefill en geen decodering: de logits van de eerste antwoordpositie
+(`prefix["logits"]` van `MaxEngine.prefill`); prefill-lengtes 512, 1.024, 1.536, 2.048, 3.072, 4.096 (een prompt van
+meer dan 4.096 tokens wordt niet gescoord en geteld). Het chat-template van het model met één gebruikersbeurt en een
+lege denkruimte (de `turn` van `gemma4-31b` in `translate_models.yml`, voor de eerste prompts per worker getoetst tegen
+`apply_chat_template`). Antwoordtokens [gemeten in `tokenizer.json` @ `842da37`]: A = {`A`, `▁A`} (236776, 562),
+B = {`B`, `▁B`} (236799, 603), gelijk = {`gelijk`, `▁gelijk`} (161224, 190506); "gelijk" is één token, "Gelijk" niet
+(`G` + `elijk`) en telt niet mee. Per prompt: log P van elke set (logsumexp over haar ids), de massa
+m = P(A) + P(B) + P(gelijk), de vijf waarschijnlijkste tokens en het eerste token van de engine (greedy); genormaliseerd
+p_X = P(X) / m.
+
+*G4-judge.3 Prompt* (letterlijk de tekst van de gebruikersbeurt; `{bron}`, `{A}` en `{B}` gestript ingevuld):
+
+```
+Je beoordeelt vertalingen uit het Engels in het Nederlands. Je krijgt de Engelse bron en twee Nederlandse vertalingen, A en B. Je weet niet hoe of door wie ze zijn gemaakt; probeer dat niet te raden.
+
+Oordeel eerst op juistheid: de vertaling zonder betekenisfout, of met de minst ernstige, is beter. Een betekenisfout is:
+- een weglating: iets uit de bron ontbreekt in de vertaling;
+- een toevoeging: de vertaling zegt iets wat niet in de bron staat;
+- een verkeerde betekenis: de vertaling zegt iets anders dan de bron;
+- een misplaatste uitdrukking: een idioom of vaste uitdrukking uit de bron is letterlijk vertaald waar dat in het Nederlands niet werkt, of vertaald met een Nederlandse uitdrukking die iets anders betekent.
+Woordkeus, stijl en zinsbouw zijn geen betekenisfout zolang de betekenis klopt.
+
+Zijn ze even juist, oordeel dan op natuurlijk, oorspronkelijk klinkend Nederlands: de vertaling die het meest leest als tekst die in het Nederlands is geschreven en niet als vertaling. "gelijk" als er op beide punten geen duidelijk verschil is.
+
+Engelse bron:
+{bron}
+
+Vertaling A:
+{A}
+
+Vertaling B:
+{B}
+
+Welke vertaling is beter? Antwoord met één woord: A, B of gelijk.
+```
+
+Dit is de rubriek van §4.2.4 (de definities van een betekenisfout en de volgorde juistheid → natuurlijkheid →
+gelijk letterlijk), zonder de aparte vragen naar betekenisfouten, zekerheid en uitleg en zonder JSON. [keuze] Geen
+betekenisfoutvragen vooraf: (i) dan moet het model eerst tekst genereren en hangt de kans op het antwoord af van zijn
+eigen, gesampelde of greedy gegenereerde tussenantwoorden; een kans uit één prefill is dan niet meer te lezen; (ii) stap
+2 vraagt ~30.000 prompts, en decoderen kost een veelvoud van één prefill; (iii) de rubriek staat in de prompt als
+instructie. Er wordt geen prompt gezocht of bijgesteld op de validatieset: deze ene prompt ligt hier vast.
+
+*G4-judge.4 Beide volgordes.* Elk paar twee keer: in de volgorde van het pakket (`ab`: A is pakket-A) en verwisseld
+(`ba`). In het kader van het pakket: P̄(A beter) = ½·[p_A(ab) + p_B(ba)], P̄(B beter) = ½·[p_B(ab) + p_A(ba)],
+P̄(gelijk) = ½·[p_gelijk(ab) + p_gelijk(ba)]. **Oordeel van de judge** = de grootste van de drie (bij exact gelijke
+waarden "gelijk"); **richting** = het teken van P̄(A beter) − P̄(B beter). Het greedy oordeel per volgorde is de grootste
+van p_A, p_B, p_gelijk in die volgorde, teruggezet in het kader van het pakket.
+
+*G4-judge.5 Stap 1: validatie.* Sets: de blinde pakketten met een oordeel van een verse Claude-subagent volgens de
+rubriek van §4.2.4, elk 100 paren (`gs://…/sft/blind/<pakket>/`: `judge-input.jsonl`, `key.jsonl`, de oordelen):
+`G4-7` (G4-7-i15 tegen G4-0, `review-74l`), `G4-7-tg` (G4-7-i15 tegen TranslateGemma 27B, `review-74l`),
+`G4-bon-i15c2q` (de doeltekst (i15, c2q) tegen G4-0 greedy, `review`), `RB3` en `RB2` (armen op TranslateGemma tegen
+TranslateGemma 27B, `review-exploratory/judgments.jsonl`); samen 500 paren, 1.000 prompts. Referentie = die oordelen
+(Claude, vóór elke vervanging van twijfelgevallen); daarnaast gerapporteerd voor RB3 en RB2 de `final-judgments.jsonl`
+(twijfelgevallen daar opnieuw beoordeeld; de zekere oordelen zijn dezelfde). Aantallen [gelezen, alleen labels]: niet
+gelijk 340, waarvan zeker 125 (G4-7 15, G4-7-tg 30, G4-bon-i15c2q 17, RB3 31, RB2 32); gelijk 160. Maten, per pakket en
+samen:
+1. **Richtingsovereenstemming** op Claude's niet-gelijke paren: het aandeel waar de richting van de judge Claude's
+   winnaar is (P̄ precies gelijk: ½); voor alle niet-gelijke en alleen de zekere; met een 95%-Wilson-interval.
+2. Overeenstemming over de drie klassen (oordeel van de judge tegen Claude) en **Cohen's κ** (drie klassen), op alle
+   500 paren en op de zekere; de kruistabel.
+3. **Positiebias**: *omklappen* = het aandeel paren waar de greedy oordelen in `ab` en `ba`, teruggezet, tegengestelde
+   winnaars noemen (de een A, de ander B; dezelfde positie twee keer gekozen); *inconsistent* = het aandeel waar ze
+   op enige manier verschillen (ook gelijk tegen een winnaar); het aandeel greedy-antwoorden "A" (eerste positie) en
+   "gelijk" per volgorde; gemiddeld p_A − p_B over alle prompts.
+4. **Massa** m per volgorde: mediaan, aantal < 0,5; de meest voorkomende top-tokens.
+5. Gerapporteerd, beslist niet mee: (a) op paren waar Claude precies één kant een betekenisfout gaf, het aandeel waar de
+   richting van de judge de kant zonder fout kiest; (b) het aandeel niet-gelijke oordelen van de judge voor het
+   niet-basissysteem (sleutel) tegen dat van Claude, per pakket (G4-7-tg: Gemma 4 tegen TranslateGemma; een maat voor
+   een voorkeur voor de eigen modelfamilie); (c) per set (FLAN, WMT24++, idioom) de richtingsovereenstemming.
+
+*G4-judge.6 Drempel voor stap 2* (vooraf; alle drie moeten gelden):
+- **D1**: richtingsovereenstemming op de **zekere** niet-gelijke paren, samen over de vijf pakketten (n = 125), ≥ 70%;
+- **D2**: richtingsovereenstemming op **alle** niet-gelijke paren van de twee pakketten met twee Gemma 4-uitvoeren die
+  dicht bij elkaar liggen (`G4-7` en `G4-bon-i15c2q`, n = 43 + 51 = 94), ≥ 60%;
+- **D3**: omklappen (maat 3) over alle 500 paren ≤ 20%.
+
+Onderbouwing [keuze]: D1 volgt het voorstel van Yeb (≥ 70% op de zekere niet-gelijke paren); bij n = 125 ligt de
+ondergrens van het 95%-interval dan rond 61%, dus ruim boven toeval. D1 wordt gedragen door de pakketten met een groot
+kwaliteitsverschil (G4-7-tg 60 / 16, RB2, RB3); stap 2 kiest echter tussen samples van één model tegen zijn eigen
+greedy vertaling, dicht bij elkaar. Daarom D2 op de twee pakketten van dat soort; de zekere paren zijn daar te weinig
+(15 + 17), dus alle niet-gelijke, met een lagere grens omdat Claude daar zelf meestal twijfelde (62 van 94); bij n = 94
+is 60% eenzijdig p ≈ 0,03 tegen 50%. D3 volgt het voorstel (≤ 20%): het middelen over beide volgordes neemt een
+constante positievoorkeur weg, maar klapt het oordeel bij meer dan een op de vijf paren om, dan is het signaal vooral
+positie en is de selectie in stap 2 ruis.
+
+*G4-judge.7 Stap 2: herselectie* (alleen als D1–D3 gelden; anders eindigt de keten na het rapport van stap 1).
+- **Modellen en samples**: G4-0 (de 8 samples van de sampling-proef, `$G/sampling/G4-0/t10s1…t10s8/`, zoals G4-bon ze
+  hergebruikt) en G4-7-i15 (`$G/bon/G4-7-i15/t10s1…t10s8/`), op het zoekdeel van G4-bon (WMT24++ 480 + FLAN 500). Anker
+  = G4-0's greedy vertaling (`$G/eval/G4-0/pairs/`). Fail, QE en QE₀ per sample uit G4-bon's `choice.parquet`
+  (`$G/bon/<model>/select/`, de fail van G4-7: niet af, lus, leeg, Engels over, ℓ/ℓ₀ buiten [0,67; 1,5], QE > 7,5,
+  `c2_overflow`); er wordt niets opnieuw vertaald of door MetricX/COMET gescoord.
+- **Judge-paren**: elk sample dat geen fail is tegen het anker, in beide volgordes (`ab`: A = sample, B = anker; `ba`
+  omgekeerd), prompt en judge als in stap 1 [schatting: ~14.600 paren, ~29.000 prompts, verdeeld over de 4 workers op
+  sha256 van de uid]. P(sample beter dan anker) = P̄(sample beter) van G4-judge.4. Een fail-sample of een niet
+  gescoorde prompt (> 4.096 tokens) komt niet in aanmerking.
+- **Selecties** (per bron één van de 8): **judge**: het hoogste P̄(sample beter) onder de samples die geen fail zijn;
+  **judgeq**: idem onder de samples die geen fail zijn én QE ≤ QE₀ hebben (zoals c2q); gelijk: de lagere QE, dan het
+  eerdere sample; is er geen kandidaat, dan de keuze van qe (het aantal staat in het rapport). Ter vergelijking, uit
+  G4-bon's `choice.parquet` ongewijzigd: greedy (het model zelf), t10s1, qe en c2q.
+- **Maten**: C1 (S @ 653k, `run_arms.sh classify` ongewijzigd) in **één classify-run** over de 12 uitvoeren (2 modellen ×
+  greedy, t10s1, qe, c2q, judge, judgeq) van het zoekdeel; QE, MetricX-ref, COMET-22 (WMT24++), fail en de vlaggen uit de
+  bestaande scores van de gekozen samples; C2 (geknipte logit uit G4-bon's `choice.parquet`). Rapport in de vorm van
+  G4-bon.7 (`g4bon.py`'s maten en gepaarde bootstrap, 10.000 trekkingen, per set binnen de set, zaad
+  `en-nl-g4arm/0/G4-bon/boot/G4-judge/<vergelijking>`): tabel 1 C1 per model × uitvoer met Δ tegen de eigen greedy
+  vertaling en tegen G4-0 greedy (95%-BI); tabel 2 kwaliteit en vorm; tabel 3 de contrasten judge − qe, judgeq − qe,
+  judge − c2q en judgeq − c2q (ΔC1 samen, ΔCOMET-22 en ΔMetricX-ref op WMT24++, 95%-BI) en elke selectie tegen de eigen
+  greedy; tabel 4 de selectie (terugvallen, gelijk aan qe/c2q, verdeling over t10s1…t10s8, gemiddeld P̄(sample beter)
+  van de keuze, het aandeel bronnen waar de keuze P̄(sample beter) > P̄(anker beter) heeft, niet gescoorde prompts).
+  Controles (gerapporteerd): C1 van G4-0 greedy, G4-0/t10s1 en G4-0/qe tegen de classify-run van de sampling-proef, en
+  van de G4-7-i15-uitvoer (greedy, t10s1, qe, c2q) tegen G4-bon's run `G4-0_G4-7-i15` (aandelen, omgeslagen labels);
+  de keuzes qe en c2q gelijk aan G4-bon's.
+- **Niet onafhankelijk**: judge: de fail-vlaggen (QE > 7,5, lengteband); judgeq: QE, MetricX-ref (zelfde model als QE)
+  en de fail-vlaggen. Onafhankelijk van beide: C1, C2, COMET-22. Op FLAN geen referentie.
+- **Blind pakket** `gs://…/sft/blind/G4-judge-i15/` (zoals `G4-bon-i15c2q`): 50 WMT24++ + 50 FLAN van het zoekdeel waar
+  de tekst van (G4-7-i15, judgeq) verschilt van G4-0's greedy vertaling (gestript vergeleken); per set
+  `random.Random("g4judge/blind/<set>").sample` van de verschillende id's in gesorteerde volgorde (minder dan 50: alle);
+  `blind_id` `judge-001…judge-100` (WMT24++ eerst, in de volgorde van de trekking); A/B per paar met
+  `random.Random("g4judge/blind/ab/<blind_id>").random() < 0,5` → A = G4-0 greedy (`base`), anders A = de doeltekst
+  (`G4-7-i15-judgeq`). `judge-input.jsonl` (blind_id, source, A, B) en apart `key.jsonl` (blind_id, A, B, seed, set,
+  item) en `select-report.json` (aantallen, geen tekst) in de bucket; de beoordeling doet de hoofdsessie met een verse
+  Claude-subagent (rubriek §4.2.4), niet deze keten.
+
+*G4-judge.8 Rapporten.* Stap 1: `$G/judge/val/report.md`/`.json`, kopie `mbert-ops/translator-sft/g4-judge-validation.md`
+(`.json`); stap 2: `$G/judge/bon/report/report.md`/`.json`, kopie `mbert-ops/translator-sft/g4-judge-bon.md` (`.json`).
+Alleen tabellen met tellingen en scores; geen teksten. Prompts en teksten blijven in de bucket en op de VM.
+
+*G4-judge.9 Wat de proef niet zegt.*
+- Claude's oordelen zijn geen grondwaarheid: de validatie meet overeenstemming met een andere taalmodel-beoordelaar met
+  dezelfde rubriek, die bij 284 van de 500 paren twijfelde; Yebs oordeel over die twijfelgevallen is er voor G4-7 en
+  G4-bon niet. Hoge overeenstemming kan ook gedeelde voorkeuren van taalmodellen weerspiegelen.
+- Gemma 4 31B-it beoordeelt uitvoer van zichzelf (G4-0) en van LoRA's erop; een voorkeur voor de eigen stijl is niet
+  uitgesloten (maat 5b meet alleen de voorkeur tegen TranslateGemma in G4-7-tg).
+- Eén prompt, zero-shot, geen zoektocht: een andere prompt of een judge die eerst redeneert kan beter of slechter zijn.
+- Stap 2 is een selectie uit 8 samples, geen getraind model; C1 meet, de judge kiest; een C1-winst na selectie op de
+  judge is geen bewijs van natuurlijker Nederlands. De blinde controle van het pakket gebeurt door een Claude-subagent
+  met de rubriek waartegen de judge in stap 1 gevalideerd is: een voorkeur daar is deels door die validatie te
+  verwachten [gevolgtrekking].
+- G4-7-i15 is op dit zoekdeel gekozen (G4-7.7); n = 480 + 500; intervallen per vergelijking, zonder correctie voor het
+  aantal vergelijkingen. Een uitslag beslist niets.
+
+*G4-judge.10 Keten* (`mbert-ops/scripts/g4judge_run.sh`, alleen mbert-mix; code `en-nl-g4judge`: `pairjudge.py` en
+`run_pairjudge.sh`; plaatsen `$G/judge/`). Neemt `final_eval_mix.lock` met `flock` tot het eind; mbert-corpus wordt
+niet aangeraakt. Code als bundel via de bucket naar de 4 workers; elke ssh met `timeout 900` en de ssh-opties van de
+eerdere ketens; vóór elke TPU-stap de TPU van de worker(s) vrij. Stap 1: `setup` (`run_g4arm.sh setup` met
+`ARM=G4-bon`), `valdata` (w0, CPU), `score` (4 workers), `valreport` (w0) met de toets van D1–D3. Stap 2 alleen bij
+"gehaald": `bonpairs` (w0, CPU), `score` (4 workers), `select` per model, `texts`, `classify` (w0, C1), `bonreport`,
+`blind` (w0). Elke stap eindigt op `EXIT 0`, anders `FAILED` en stoppen; de keten schrijft niets over wat G4-bon, G4-7 of
+de sampling-proef schreef.

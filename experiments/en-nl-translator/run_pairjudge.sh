@@ -18,9 +18,22 @@
 #   bash run_pairjudge.sh bonreport    w0 (CPU): pairjudge.py bonreport, to $GJ/bon/report/
 #   bash run_pairjudge.sh blind        w0 (CPU): pairjudge.py blind (G4-7-i15, judgeq against G4-0 greedy), to
 #                                      $S/blind/G4-judge-i15/ (refused if a key.jsonl is there)
+# A, judge or anchor (G4-judge.12), from step 2's scores:
+#   MODEL=G4-0|G4-7-i15 bash run_pairjudge.sh aselect   w0 (CPU): pairjudge.py anchorselect, to $GJ/<MODEL>/select-anchor/
+#   bash run_pairjudge.sh atexts       w0 (CPU): g4bon.py texts of the 14 outputs, to $GJ/anchor/naturalness/texts.parquet
+#   bash run_pairjudge.sh aclassify    w0 (its TPU): C1, run_arms.sh classify with NAT=$GJ/anchor/naturalness (job
+#                                      arms_classify_<TAG>c), unchanged
+#   bash run_pairjudge.sh areport      w0 (CPU): pairjudge.py bonreport with janchor, to $GJ/anchor/report/
+#   bash run_pairjudge.sh ablind       w0 (CPU): pairjudge.py blind --kind janchor (G4-7-i15), to
+#                                      $S/blind/G4-judge-anchor-i15/ (refused if a key.jsonl is there)
+# B, a judge that reasons first (G4-judge.13), validation and time only:
+#   bash run_pairjudge.sh rvaldata     w0 (CPU): pairjudge.py valdata --prompt reason, to $GJ/reason/val/data/
+#   bash run_pairjudge.sh reason       every worker (its TPU): pairjudge.py reason of its prompts, to
+#                                      $GJ/reason/val/scores/w<k>/ (shards with the reasoning, timing-*.json)
+#   bash run_pairjudge.sh rreport      w0 (CPU): pairjudge.py reasonreport, to $GJ/reason/val/report.md/.json
 # The code is beside this script (a copy of $G/scripts-g4j-<commit>/). TAG names the jobs of one chain.
 set -euo pipefail
-STAGE=${1:?a stage: valdata, score, valreport, bonpairs, select, texts, classify, bonreport, blind}
+STAGE=${1:?a stage: valdata, score, valreport, bonpairs, select, texts, classify, bonreport, blind, aselect, atexts, aclassify, areport, ablind, rvaldata, reason, rreport}
 R=gs://t5-dutch-english-usc2/mbert/translator
 S=$R/sft
 G=$S/g4arm
@@ -37,6 +50,9 @@ FPY=$GEN/venv-fork-${FORK_COMMIT:0:9}/bin/python
 TOK_DEC=$GEN/tokenizer-gemma4
 WORK=$G_SHM/judge-work                                          # MaxText's output and the compilation cache
 BLIND_OUT=$S/blind/G4-judge-i15
+ABLIND_OUT=$S/blind/G4-judge-anchor-i15
+GA=$GJ/anchor
+GR=$GJ/reason/val
 PACKAGES="G4-7 G4-7-tg G4-bon-i15c2q RB3 RB2"
 MODELS="G4-0 G4-7-i15"
 CODE=$(cd "$(dirname "$0")" && pwd)
@@ -166,10 +182,12 @@ select)
   } > ~/job_body_pj_select_${MODEL}_$TAG.sh
   detach "pj_select_${MODEL}_$TAG" bash ~/job_body_pj_select_${MODEL}_$TAG.sh
   ;;
-texts|bonreport)
+texts|bonreport|atexts|areport)
   only 0
   fork_ready
   X=$G_SHM/judge-$STAGE-$TAG
+  # A (atexts, areport): janchor beside the 12 outputs of step 2, C1 of A's own classify run
+  case $STAGE in a*) NATDIR=$GA/naturalness ;; *) NATDIR=$GJ/naturalness ;; esac
   PAIRS=""
   OUTS=""
   {
@@ -187,22 +205,129 @@ texts|bonreport)
       PAIRS="$PAIRS --pairs '$m/qe=$X/$m/bon/qe/pairs/pairs-w*.parquet' --pairs '$m/c2q=$X/$m/bon/c2q/pairs/pairs-w*.parquet'"
       PAIRS="$PAIRS --pairs '$m/judge=$X/$m/judge/judge/pairs/pairs-w*.parquet' --pairs '$m/judgeq=$X/$m/judge/judgeq/pairs/pairs-w*.parquet'"
       OUTS="$OUTS --model $m=$X/$m/greedy,$X/$m/t10s1,$X/$m/bon,$X/$m/judge"
+      case $STAGE in
+      a*)
+        echo "mkdir -p $X/$m/anchor && gsutil -m -q rsync -r $GJ/$m/select-anchor $X/$m/anchor"
+        PAIRS="$PAIRS --pairs '$m/janchor=$X/$m/anchor/janchor/pairs/pairs-w*.parquet'"
+        OUTS="$OUTS,$X/$m/anchor"
+        ;;
+      esac
     done
-    if [ "$STAGE" = texts ]; then
+    case $STAGE in
+    texts|atexts)
       echo "JAX_PLATFORMS=cpu $FPY -I -u $CODE/g4bon.py texts --evalsets $X/evalsets.parquet --split $X/split.json$PAIRS --out $X/texts.parquet"
-      echo "gsutil -q cp $X/texts.parquet $GJ/naturalness/texts.parquet"
-      echo "echo '$MODELS' | gsutil -q cp - $GJ/naturalness/models.txt"
-      echo "echo \"JTEXTS_DONE $GJ/naturalness/texts.parquet\""
-    else
-      echo "gsutil -q cp $GJ/naturalness/predictions.parquet $X/predictions.parquet"
+      echo "gsutil -q cp $X/texts.parquet $NATDIR/texts.parquet"
+      echo "echo '$MODELS' | gsutil -q cp - $NATDIR/models.txt"
+      echo "echo \"JTEXTS_DONE $NATDIR/texts.parquet\""
+      ;;
+    *)
+      REPORT=$GJ/bon/report
+      JUDGEC1=""
+      if [ "$STAGE" = areport ]; then
+        REPORT=$GA/report
+        echo "gsutil -q cp $GJ/naturalness/predictions.parquet $X/judge-predictions.parquet"
+        JUDGEC1=" --judge-predictions $X/judge-predictions.parquet"
+      fi
+      echo "gsutil -q cp $NATDIR/predictions.parquet $X/predictions.parquet"
       echo "gsutil -q cp $GS/naturalness/predictions.parquet $X/probe-predictions.parquet"
       echo "gsutil -q cp $GB/naturalness/G4-0_G4-7-i15/predictions.parquet $X/bon-predictions.parquet"
-      echo "JAX_PLATFORMS=cpu $FPY -I -u $CODE/pairjudge.py bonreport --evalsets $X/evalsets.parquet --split $X/split.json --refqe $X/refqe.parquet --anchor $X/G4-0/greedy --predictions $X/predictions.parquet --probe-predictions $X/probe-predictions.parquet --bon-predictions $X/bon-predictions.parquet$OUTS --out $X/report.md"
-      echo "gsutil -m -q cp $X/report.md $X/report.json $GJ/bon/report/"
-      echo "echo \"JBONREPORT_DONE $GJ/bon/report/report.md\""
-    fi
+      echo "JAX_PLATFORMS=cpu $FPY -I -u $CODE/pairjudge.py bonreport --evalsets $X/evalsets.parquet --split $X/split.json --refqe $X/refqe.parquet --anchor $X/G4-0/greedy --predictions $X/predictions.parquet --probe-predictions $X/probe-predictions.parquet --bon-predictions $X/bon-predictions.parquet$JUDGEC1$OUTS --out $X/report.md"
+      echo "gsutil -m -q cp $X/report.md $X/report.json $REPORT/"
+      echo "echo \"JBONREPORT_DONE $REPORT/report.md\""
+      ;;
+    esac
   } > ~/job_body_pj_${STAGE}_$TAG.sh
   detach "pj_${STAGE}_$TAG" bash ~/job_body_pj_${STAGE}_$TAG.sh
+  ;;
+aselect)
+  only 0
+  fork_ready
+  MODEL=${MODEL:?G4-0 or G4-7-i15}
+  src=$(samples_of "$MODEL")
+  X=$G_SHM/judge-aselect-$MODEL-$TAG
+  {
+    echo "set -euo pipefail"
+    echo "mkdir -p $X/select $X/anchor"
+    echo "$INPUTS $X/"
+    for k in 1 2 3 4 5 6 7 8; do echo "mkdir -p $X/t10s$k && gsutil -m -q rsync -r $NOTEXT $src/t10s$k $X/t10s$k"; done
+    echo "gsutil -m -q rsync -r $NOTEXT $G/eval/G4-0 $X/anchor"
+    echo "gsutil -q cp $GJ/$MODEL/select/choice.parquet $X/select/choice.parquet"
+    echo "JAX_PLATFORMS=cpu $FPY -I -u $CODE/pairjudge.py anchorselect --model $MODEL --select $X/select --samples $X --anchor $X/anchor --evalsets $X/evalsets.parquet --split $X/split.json --out $X/out"
+    echo "gsutil -m -q rsync -r $X/out $GJ/$MODEL/select-anchor"
+    echo "echo \"ASELECT_DONE $GJ/$MODEL/select-anchor/\""
+  } > ~/job_body_pj_aselect_${MODEL}_$TAG.sh
+  detach "pj_aselect_${MODEL}_$TAG" bash ~/job_body_pj_aselect_${MODEL}_$TAG.sh
+  ;;
+aclassify)
+  only 0
+  gsutil -q stat "$GA/naturalness/texts.parquet" || { echo "no $GA/naturalness/texts.parquet (atexts)"; exit 1; }
+  # C1: run_arms.sh's classify, unchanged, on A's texts; its job is arms_classify_<TAG>c
+  NAT=$GA/naturalness TAG=${TAG}c bash "$CODE/run_arms.sh" classify
+  ;;
+ablind)
+  only 0
+  fork_ready
+  ! gsutil -q stat "$ABLIND_OUT/key.jsonl" || { echo "$ABLIND_OUT has a key.jsonl: the package stays as it is"; exit 1; }
+  X=$G_SHM/judge-ablind-$TAG
+  {
+    echo "set -euo pipefail"
+    echo "mkdir -p $X/select $X/anchor"
+    echo "$INPUTS $X/"
+    echo "gsutil -m -q rsync -r $GJ/G4-7-i15/select-anchor $X/select"
+    echo "gsutil -m -q rsync -r $PAIRSONLY $G/eval/G4-0 $X/anchor"
+    echo "gsutil -q cp $BLIND_OUT/key.jsonl $X/earlier-key.jsonl"
+    echo "JAX_PLATFORMS=cpu $FPY -I -u $CODE/pairjudge.py blind --kind janchor --model G4-7-i15 --select $X/select --anchor $X/anchor --evalsets $X/evalsets.parquet --split $X/split.json --overlap $X/earlier-key.jsonl --overlap-name G4-judge-i15 --out $X/out"
+    echo "gsutil -m -q cp $X/out/judge-input.jsonl $X/out/key.jsonl $X/out/select-report.json $ABLIND_OUT/"
+    echo "echo \"JBLIND_DONE $ABLIND_OUT/\""
+  } > ~/job_body_pj_ablind_$TAG.sh
+  detach "pj_ablind_$TAG" bash ~/job_body_pj_ablind_$TAG.sh
+  ;;
+rvaldata)
+  only 0
+  fork_ready
+  X=$G_SHM/judge-rvaldata-$TAG
+  {
+    echo "set -euo pipefail"
+    echo "mkdir -p $X/blind"
+    for p in $PACKAGES; do echo "gsutil -m -q cp -r $S/blind/$p $X/blind/"; done
+    echo "HF_HUB_OFFLINE=1 JAX_PLATFORMS=cpu $FPY -I -u $CODE/pairjudge.py valdata --prompt reason --blind $X/blind --out $X/out"
+    echo "gsutil -m -q cp $X/out/* $GR/data/"
+    echo "echo \"VALDATA_DONE $GR/data/\""
+  } > ~/job_body_pj_rvaldata_$TAG.sh
+  detach "pj_rvaldata_$TAG" bash ~/job_body_pj_rvaldata_$TAG.sh
+  ;;
+reason)
+  tpu_free
+  fork_ready
+  X=$G_SHM/judge-reason-$TAG
+  cat > ~/job_body_pj_reason_$TAG.sh <<EOF
+set -euo pipefail
+$ONE_HOST
+mkdir -p $X $WORK
+gsutil -q cp $GR/data/prompts-w$W.parquet $X/prompts.parquet
+$PREFLIGHT
+$FPY -u $CODE/pairjudge.py reason --prompts $X/prompts.parquet --out $GR/scores/w$W --ckpt $DECODE_CKPT --tokenizer $TOK_DEC --work-dir $WORK
+EOF
+  detach "pj_reason_$TAG" bash ~/job_body_pj_reason_$TAG.sh
+  ;;
+rreport)
+  only 0
+  fork_ready
+  X=$G_SHM/judge-rreport-$TAG
+  {
+    echo "set -euo pipefail"
+    echo "mkdir -p $X/logs"
+    echo "gsutil -q cp $GR/data/refs.parquet $X/"
+    for k in 0 1 2 3; do
+      echo "mkdir -p $X/scores/w$k $X/base/w$k && gsutil -m -q cp '$GR/scores/w$k/shard-*.parquet' '$GR/scores/w$k/timing-*.json' $X/scores/w$k/"
+      echo "gsutil -m -q cp '$GJ/val/scores/w$k/shard-*.parquet' $X/base/w$k/"
+    done
+    echo "gsutil -m -q cp '$GJ/logs/pj_score_bon_*-w*.log' $X/logs/"
+    echo "JAX_PLATFORMS=cpu $FPY -I -u $CODE/pairjudge.py reasonreport --refs $X/refs.parquet --scores '$X/scores/w*/shard-*.parquet' --base-scores '$X/base/w*/shard-*.parquet' --timing '$X/scores/w*/timing-*.json' --base-logs '$X/logs/pj_score_bon_*-w*.log' --out $X/report.md"
+    echo "gsutil -m -q cp $X/report.md $X/report.json $GR/"
+    echo "echo \"RREPORT_DONE $GR/report.md\""
+  } > ~/job_body_pj_rreport_$TAG.sh
+  detach "pj_rreport_$TAG" bash ~/job_body_pj_rreport_$TAG.sh
   ;;
 classify)
   only 0

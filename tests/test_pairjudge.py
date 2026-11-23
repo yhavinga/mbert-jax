@@ -480,3 +480,414 @@ def test_run_pairjudge_stages_render_their_jobs(tmp_path):
     key.write_text("x")
     out, _ = run("blind", TAG="z2")
     assert out.returncode != 0 and "stays as it is" in out.stdout
+
+
+# ---------------------------------------------------------------------------------------------------- A: judge or anchor
+
+def test_reason_prompt_is_the_protocols_text_letter_for_letter():
+    text = (CODE / "protocol-g4.md").read_text(encoding="utf-8")
+    section = text[text.index("*G4-judge.13 B:"):]
+    block = re.search(r"\*\*Prompt B\*\*.*?```\n(.*?)\n```", section, re.S).group(1)
+    assert block == pj.REASON_PROMPT
+    head = pj.PROMPT[:pj.PROMPT.index("Welke vertaling is beter?")]
+    assert pj.REASON_PROMPT.startswith(head) and pj.REASON_PROMPT != pj.PROMPT
+    filled = pj.user_text("src", "a", "b", pj.REASON_PROMPT)
+    assert filled.endswith('alleen: "Oordeel: A", "Oordeel: B" of "Oordeel: gelijk".') and "Vertaling A:\na\n" in filled
+    (u1, t1, _), _ = pj.pair_prompts("p/b1", "src", "first", "second", pj.REASON_PROMPT)
+    assert u1 == "p/b1/ab" and t1.startswith(head[:40]) and "Noem eerst" in t1
+
+
+def anchor_flow(tmp_path, monkeypatch):
+    """Step 2 in the synthetic world (bonpairs, scores, select), then janchor for both models"""
+    w = bon_setup(tmp_path, monkeypatch)
+    ev, sp = str(w / "evalsets.parquet"), str(w / "split.json")
+    data = tmp_path / "bondata"
+    margs = []
+    for m in pj.BON_MODELS:
+        margs += ["--model", f"{m}={samples_of(w, m)},{tmp_path / f'bon-{m}' / 'choice.parquet'}"]
+    pj.main(["bonpairs", *margs, "--anchor", str(w / "eval" / "G4-0"), "--evalsets", ev, "--split", sp, "--out", str(data)])
+    fake_bon_scores(data, tmp_path / "bonscores" / "w0")
+    for m in pj.BON_MODELS:
+        pj.main(["select", "--model", m, "--samples", str(samples_of(w, m)), "--choice",
+                 str(tmp_path / f"bon-{m}" / "choice.parquet"), "--scores", str(tmp_path / "bonscores/w*/shard-*.parquet"),
+                 "--evalsets", ev, "--split", sp, "--out", str(tmp_path / f"j-{m}")])
+        pj.main(["anchorselect", "--model", m, "--select", str(tmp_path / f"j-{m}"), "--samples", str(samples_of(w, m)),
+                 "--anchor", str(w / "eval" / "G4-0"), "--evalsets", ev, "--split", sp, "--out", str(tmp_path / f"a-{m}")])
+    return w, ev, sp
+
+
+def test_anchorselect_keeps_the_anchor_unless_the_judge_prefers_a_sample(tmp_path, monkeypatch, capsys):
+    import armeval
+
+    w, ev, sp = anchor_flow(tmp_path, monkeypatch)
+    assert "ASELECT" in capsys.readouterr().out
+    anchor = armeval.scored(w / "eval" / "G4-0")
+    for m in pj.BON_MODELS:
+        j = {r["id"]: r for r in g4arm.read_rows(tmp_path / f"j-{m}" / "choice.parquet")}
+        a = {r["id"]: r for r in g4arm.read_rows(tmp_path / f"a-{m}" / "choice.parquet")}
+        rows = armeval.scored(tmp_path / f"a-{m}" / "janchor")
+        judgeq = armeval.scored(tmp_path / f"j-{m}" / "judgeq")
+        assert set(a) == set(j) == set(rows)
+        kinds = collections_counter(r["reason"] for r in a.values())
+        assert kinds["sample"] and kinds["p"], kinds      # the synthetic judge gives both
+        for i, r in a.items():
+            k = pj.SAMPLE_NAMES.index(j[i]["judgeq_choice"])
+            if j[i]["judgeq_fallback"]:
+                assert r["janchor_choice"] == "anchor" and r["reason"] == "fallback"
+            elif j[i]["p_sample"][k] > 0.5:
+                assert r["janchor_choice"] == j[i]["judgeq_choice"] and r["reason"] == "sample"
+                assert rows[i]["hypothesis"] == judgeq[i]["hypothesis"] and rows[i]["metricx_qe"] == judgeq[i]["metricx_qe"]
+            else:
+                assert r["janchor_choice"] == "anchor" and r["reason"] == "p" and r["p_judgeq"] == j[i]["p_sample"][k]
+            if r["janchor_choice"] == "anchor":
+                assert rows[i]["hypothesis"] == anchor[i]["hypothesis"] and rows[i]["comet22"] == anchor[i]["comet22"]
+        stats = json.loads((tmp_path / f"a-{m}" / "anchorselect.json").read_text())["stats"]
+        for s, x in stats.items():
+            assert x["anchor"] + x["sample"] == x["n"] and x["fallback"] + x["p_at_most"] == x["anchor"]
+            assert x["anchor"] == sum(r["janchor_choice"] == "anchor" for r in a.values() if r["set"] == s)
+    # exactly 0.5 keeps the anchor; a missing score of the judgeq choice is refused
+    rec = {"id": "x", "judgeq_fallback": False, "judgeq_choice": "t10s2", "p_sample": [None, 0.5] + [None] * 6}
+    assert pj.anchor_pick(rec) == (None, "p")
+    assert pj.anchor_pick({**rec, "p_sample": [None, 0.5000001] + [None] * 6}) == (1, "sample")
+    with pytest.raises(SystemExit, match="no judge score"):
+        pj.anchor_pick({**rec, "p_sample": [None] * 8})
+
+
+def collections_counter(values):
+    import collections
+
+    return collections.Counter(values)
+
+
+def test_anchor_report_and_blind(tmp_path, monkeypatch, capsys):
+    import armeval
+
+    w, ev, sp = anchor_flow(tmp_path, monkeypatch)
+    targs = []
+    for m in pj.BON_MODELS:
+        targs += ["--pairs", f"{m}={w / 'eval' / m}/pairs/pairs-w*.parquet",
+                  "--pairs", f"{m}/t10s1={samples_of(w, m) / 't10s1'}/pairs/pairs-w*.parquet",
+                  "--pairs", f"{m}/qe={tmp_path / f'bon-{m}'}/qe/pairs/pairs-w*.parquet",
+                  "--pairs", f"{m}/c2q={tmp_path / f'bon-{m}'}/c2q/pairs/pairs-w*.parquet",
+                  "--pairs", f"{m}/judge={tmp_path / f'j-{m}'}/judge/pairs/pairs-w*.parquet",
+                  "--pairs", f"{m}/judgeq={tmp_path / f'j-{m}'}/judgeq/pairs/pairs-w*.parquet",
+                  "--pairs", f"{m}/janchor={tmp_path / f'a-{m}'}/janchor/pairs/pairs-w*.parquet"]
+    g4bon.main(["texts", "--evalsets", ev, "--split", sp, *targs, "--out", str(tmp_path / "texts.parquet")])
+    texts = g4arm.read_rows(tmp_path / "texts.parquet")
+    assert len({r["model"] for r in texts}) == 14
+    # C1 a function of the text: the same text has the same label in both runs
+    c1 = [{"model": r["model"], "set": r["set"], "id": r["id"],
+           "p_original": 0.9 if sum(map(ord, r["text"])) % 3 == 0 else 0.1} for r in texts]
+    g4arm.write_parquet(c1, tmp_path / "c1.parquet")
+    g4arm.write_parquet([r for r in c1 if not r["model"].endswith("/janchor")], tmp_path / "step2.parquet")
+    probe = [{**r, "model": r["model"].replace("G4-0/qe", "G4-0/best8")} for r in c1 if r["model"].startswith("G4-0")]
+    g4arm.write_parquet(probe, tmp_path / "probe.parquet")
+    g4arm.write_parquet([r for r in c1 if r["model"].startswith("G4-7-i15")], tmp_path / "bonc1.parquet")
+    refqe = [{"id": r["id"], "qe_source_reference": 2.3} for r in g4arm.read_rows(tmp_path / "bon-G4-0/choice.parquet", ["id"])]
+    g4arm.write_parquet(refqe, tmp_path / "refqe.parquet")
+    rargs = []
+    for m in pj.BON_MODELS:
+        rargs += ["--model", f"{m}={w / 'eval' / m},{samples_of(w, m) / 't10s1'},{tmp_path / f'bon-{m}'},"
+                             f"{tmp_path / f'j-{m}'},{tmp_path / f'a-{m}'}"]
+    common = ["bonreport", "--evalsets", ev, "--split", sp, "--refqe", str(tmp_path / "refqe.parquet"), "--anchor",
+              str(w / "eval" / "G4-0"), "--predictions", str(tmp_path / "c1.parquet"), "--probe-predictions",
+              str(tmp_path / "probe.parquet"), "--bon-predictions", str(tmp_path / "bonc1.parquet")]
+    with pytest.raises(SystemExit, match="judge-predictions"):
+        pj.main([*common, *rargs, "--out", str(tmp_path / "x.md")])
+    with pytest.raises(SystemExit, match="four directories"):
+        pj.main([*common, *rargs[:2], "--model", rargs[3].rsplit(",", 1)[0], "--judge-predictions",
+                 str(tmp_path / "step2.parquet"), "--out", str(tmp_path / "x.md")])
+    pj.main([*common, *rargs, "--judge-predictions", str(tmp_path / "step2.parquet"), "--out", str(tmp_path / "rep.md")])
+    rep = json.loads((tmp_path / "rep.json").read_text())
+    md = (tmp_path / "rep.md").read_text()
+    assert rep["anchor_mode"] and rep["outputs"][-1] == "janchor"
+    for m in pj.BON_MODELS:
+        x = rep["models"][m]
+        a = {r["id"]: r for r in g4arm.read_rows(tmp_path / f"a-{m}" / "choice.parquet")}
+        assert {"janchor-greedy", "janchor-judgeq", "janchor-qe", "janchor-c2q"} <= set(x["contrasts"])
+        assert ("janchor-G4-0 greedy" in x["contrasts"]) == (m != "G4-0")
+        # janchor's C1 share by hand from the composition
+        lab = {(r["model"], r["id"]): r["p_original"] >= 0.5 for r in c1}
+        assert x["outputs"]["janchor"]["c1_pooled"] == pytest.approx(
+            sum(lab[(f"{m}/janchor", i)] for i in a) / len(a))
+        jq = armeval.scored(tmp_path / f"a-{m}" / "janchor")
+        g0 = armeval.scored(w / "eval" / "G4-0")
+        wmt = [i for i in a if a[i]["set"] == "wmt24pp"]
+        assert x["outputs"]["janchor"]["sets"]["wmt24pp"]["comet22"] == pytest.approx(
+            sum(jq[i]["comet22"] for i in wmt) / len(wmt))
+        assert any(jq[i]["hypothesis"] == g0[i]["hypothesis"] for i in a)
+        assert x["anchor"] == json.loads((tmp_path / f"a-{m}" / "anchorselect.json").read_text())["stats"]
+    assert all(v["flipped"] == 0 for v in rep["checks"].values())
+    assert len(rep["checks"]) == 7 + 2 * (6 + 1)
+    assert "aanvulling A: judge of anker" in md and "## Tabel 5: judge of anker" in md and "janchor-judgeq" in md
+    assert "JBONREPORT" in capsys.readouterr().out
+    # without the fifth directory the report is step 2's, unchanged in form
+    pj.main([*common, *[x if not x.startswith("G4") else x.rsplit(",", 1)[0] for x in rargs], "--out", str(tmp_path / "rep2.md")])
+    rep2 = json.loads((tmp_path / "rep2.json").read_text())
+    assert not rep2["anchor_mode"] and "janchor" not in rep2["models"]["G4-0"]["outputs"]
+    assert rep2["models"]["G4-0"]["outputs"]["judgeq"]["c1_vs_g40"] == rep["models"]["G4-0"]["outputs"]["judgeq"]["c1_vs_g40"]
+    assert "stap 2: best-of-8" in (tmp_path / "rep2.md").read_text()
+    # the blind package of janchor; the overlap with an earlier package, by item ids only
+    earlier = tmp_path / "earlier-key.jsonl"
+    earlier.write_text("".join(json.dumps({"blind_id": f"judge-{n:03d}", "item": i}) + "\n"
+                               for n, i in enumerate(sorted(armeval.scored(tmp_path / "a-G4-7-i15" / "janchor"))[:3])))
+    pj.main(["blind", "--kind", "janchor", "--model", "G4-7-i15", "--select", str(tmp_path / "a-G4-7-i15"), "--anchor",
+             str(w / "eval" / "G4-0"), "--evalsets", ev, "--split", sp, "--overlap", str(earlier), "--overlap-name",
+             "G4-judge-i15", "--out", str(tmp_path / "ablind")])
+    keys = [json.loads(x) for x in (tmp_path / "ablind" / "key.jsonl").read_text().splitlines()]
+    inputs = [json.loads(x) for x in (tmp_path / "ablind" / "judge-input.jsonl").read_text().splitlines()]
+    sel = json.loads((tmp_path / "ablind" / "select-report.json").read_text())
+    target = armeval.scored(tmp_path / "a-G4-7-i15" / "janchor")
+    g0 = armeval.scored(w / "eval" / "G4-0")
+    differ = [i for i in target if (target[i]["hypothesis"] or "").strip() != (g0[i]["hypothesis"] or "").strip()]
+    assert len(keys) == len(inputs) == len(differ) > 0 and sel["target"] == "G4-7-i15-janchor"
+    assert all(k["blind_id"].startswith("anchor-") and k["seed"].startswith("g4judge-anchor/blind/ab/anchor-") for k in keys)
+    assert sel["sets"]["wmt24pp"]["seed"] == "g4judge-anchor/blind/wmt24pp"
+    assert sel["overlap"] == {"package": "G4-judge-i15", "items": sum(k["item"] in {
+        json.loads(x)["item"] for x in earlier.read_text().splitlines()} for k in keys)}
+    for x, k in zip(inputs, keys):
+        assert (random.Random(k["seed"]).random() < 0.5) == (k["A"] == "base")
+        assert (x["A"] if k["A"] == "base" else x["B"]) == g0[k["item"]]["hypothesis"]
+
+
+# ---------------------------------------------------------------------------------------------------- B: reasoning first
+
+def test_split_reasoning_finds_the_verdict_line_and_the_own_answer():
+    assert pj.split_reasoning("A laat iets weg; B klopt.\n\nOordeel: B") == ("A laat iets weg; B klopt.", True, "B")
+    assert pj.split_reasoning("Geen fouten.\n**Oordeel:** gelijk") == ("Geen fouten.", True, "gelijk")
+    assert pj.split_reasoning("x\n## Oordeel: Vertaling A\nmeer") == ("x", True, "A")
+    assert pj.split_reasoning("Oordeel: A") == ("", True, "A")
+    assert pj.split_reasoning("x\n- oordeel: beide goed") == ("x", True, "anders")
+    assert pj.split_reasoning("Alleen redenering, geen regel.  \n") == ("Alleen redenering, geen regel.", False, None)
+    # "Oordeel" inside a line does not count
+    assert pj.split_reasoning("Mijn Oordeel volgt.\nOordeel: A")[0] == "Mijn Oordeel volgt."
+    assert pj.answer_text("r") == "r\n\nOordeel:" and pj.answer_text("") == "Oordeel:"
+
+
+@pytest.mark.skipif(not TOKENIZER, reason="no Gemma 4 tokenizer in the local Hugging Face cache")
+def test_the_answer_position_extends_the_prompt_and_takes_the_answer_ids():
+    import translate
+    from tokenizers import Tokenizer
+
+    tok = Tokenizer.from_file(TOKENIZER[0])
+    turn = translate.MODELS[pj.MODEL]["turn"]
+    head = turn["prefix"] + pj.user_text("The cat sat.", "De kat zat.", "De poes zat.", pj.REASON_PROMPT) + turn["suffix"]
+    ids = tok.encode(head, add_special_tokens=False).ids
+    for reasoning in ("", "A en B kloppen; B klinkt natuurlijker.", "**A**: geen fout.\n- B: weglating"):
+        full = tok.encode(head + pj.answer_text(reasoning), add_special_tokens=False).ids
+        assert full[:len(ids)] == ids
+    for answer, want in (("A", 562), ("B", 603), ("gelijk", 190506)):
+        assert tok.encode(f"x\n\nOordeel: {answer}", add_special_tokens=False).ids[-1] == want
+
+
+class FakeTok:
+    """A character tokenizer (ids = code points) with the calls reason() makes"""
+
+    def __call__(self, texts, add_special_tokens=False):
+        return {"input_ids": [[ord(c) for c in t] for t in texts] if isinstance(texts, list) else [ord(c) for c in texts]}
+
+    def decode(self, ids, skip_special_tokens=True):
+        return "".join(chr(i) for i in ids)
+
+
+def fake_reason_env(tmp_path, monkeypatch, completion_of):
+    """reason() without a TPU: translate, jax and transformers replaced; the engine's answer logits favour the own
+    answer the completion wrote; the bucket is a local directory"""
+    import types
+
+    import numpy as np
+
+    bucket = tmp_path / "bucket"
+
+    def local(url):
+        return bucket / url[len("gs://"):]
+
+    def decode_all(prompts, slots, device, max_decode, sync, eos):
+        assert (slots, max_decode, sync) == (pj.REASON_SLOTS, pj.REASON_MAX_DECODE, pj.REASON_SYNC)
+        out = []
+        for p in prompts:
+            text = completion_of("".join(chr(i) for i in p))
+            out.append(([ord(c) for c in text], not text.endswith("…")))
+        return out
+
+    class Engine:
+        def prefill(self, params, padded_tokens, true_length):
+            text = "".join(chr(int(i)) for i in np.asarray(padded_tokens)[:true_length])
+            assert text.endswith(pj.ANSWER_CUE)
+            own = pj.split_reasoning(completion_of(text))[2]
+            logits = np.full(262144, -4.0, np.float32)
+            hot = {"A": 562, "B": 603, "gelijk": 190506}.get(own, 7)
+            logits[hot] = 6.0
+            return {"logits": logits, "tokens": np.asarray([[hot]])}, None
+
+    class Slots:
+        def __init__(self, engine, params, lengths):
+            assert lengths == list(pj.REASON_PREFILL)
+
+        def prefill(self, tokens):
+            return {}, 0
+
+        def insert(self, prefix, slot):
+            pass
+
+        def generate(self):
+            return np.zeros(pj.REASON_SLOTS)
+
+        @staticmethod
+        def fetch(x):
+            return x
+
+    def upload(path, url, client=None):
+        local(url).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(path, local(url))
+
+    tr = types.SimpleNamespace(
+        MODELS={pj.MODEL: {"turn": {"prefix": "<bos>U:", "suffix": "<channel|>", "check": True}, "eos_ids": [1, 106, 50]}},
+        gcs_client=lambda: None, upload=upload, maxtext_source=lambda: {}, patch_maxtext=lambda: [],
+        done_shards=lambda out, client=None: {p.name for p in local(out).glob("*.parquet")} if local(out).exists() else set(),
+        make_engine=lambda ns, shapes, chips: (Engine(), None), EngineSlots=Slots, decode_all=decode_all)
+    jax = types.SimpleNamespace(device_count=lambda: 4, process_count=lambda: 1, device_get=lambda x: x)
+    monkeypatch.setitem(sys.modules, "translate", tr)
+    monkeypatch.setitem(sys.modules, "jax", jax)
+    monkeypatch.setitem(sys.modules, "jax.numpy", types.SimpleNamespace(asarray=np.asarray))
+    jax.numpy = sys.modules["jax.numpy"]
+    monkeypatch.setitem(sys.modules, "transformers", types.SimpleNamespace(
+        AutoTokenizer=types.SimpleNamespace(from_pretrained=lambda path: FakeTok())))
+    monkeypatch.setattr(pj, "check_answer_tokens", lambda tok: None)
+    monkeypatch.setattr(pj, "check_template", lambda tok, turn, texts: None)
+    return local
+
+
+def completion_for(text):
+    """The synthetic judge's completion: it follows the A/B mark in the prompt's texts"""
+    if "LONGLONG" in text:
+        return "eindeloos…"
+    if "Vertaling A:\nQQTEXTQQ A" in text and "blind-0" in text and int(re.search(r"blind-(\d+)", text).group(1)) % 3 == 0:
+        return "Beide goed.\nOordeel: gelijk"
+    first = re.search(r"Vertaling A:\n\S+ (\w)", text)
+    return f"{first.group(1) if first else 'A'} is beter.\n\n**Oordeel:** A"
+
+
+def test_reason_scores_the_answer_position_and_times_both_phases(tmp_path, monkeypatch, capsys):
+    local = fake_reason_env(tmp_path, monkeypatch, completion_for)
+    rows = [{"uid": f"P/b{n}/ab", "text": f"Vertaling A:\nQQTEXTQQ A {n}\nVertaling B:\nx"} for n in range(5)]
+    rows.append({"uid": "P/long/ab", "text": "y" * (pj.REASON_MAX_PROMPT + 1)})
+    rows.append({"uid": "P/loop/ab", "text": "LONGLONG"})
+    pj.write_rows(rows, tmp_path / "prompts.parquet")
+    out = "gs://b/reason/scores/w0"
+    args = ["reason", "--prompts", str(tmp_path / "prompts.parquet"), "--out", out, "--ckpt", "c", "--tokenizer", "t",
+            "--work-dir", str(tmp_path / "work")]
+    pj.main(args)
+    log = capsys.readouterr().out
+    assert "WARMUP" in log and "TIMING" in log and "REASONED" in log
+    got = {r["uid"]: r for r in pj.read_rows(local(out) / "shard-00000.parquet")}
+    assert set(got) == {r["uid"] for r in rows}
+    assert got["P/long/ab"]["skipped"] == "too_long" and got["P/long/ab"]["p_a"] is None
+    r = got["P/b1/ab"]
+    assert r["skipped"] is None and r["verdict_line"] and r["own_answer"] == "A" and r["ended"]
+    assert r["p_a"] > 0.9 and r["first_token"] == 562 and r["completion"].endswith("**Oordeel:** A")
+    assert r["reasoning_tokens"] == len("A is beter.") + len("\n\nOordeel:")
+    loop = got["P/loop/ab"]
+    assert loop["ended"] is False and loop["verdict_line"] is False and loop["skipped"] is None
+    t = json.loads((local(out) / "timing-shard-00000.json").read_text())
+    assert t["prompts"] == 6 and t["not_scored"] == 1 and t["slots"] == pj.REASON_SLOTS
+    assert t["gen_tokens"] == sum(got[u]["gen_tokens"] for u in got if got[u]["gen_tokens"] is not None)
+    # a restart skips the shard that is there
+    pj.main(args)
+    assert "TIMING" not in capsys.readouterr().out
+
+
+def test_reasonreport_against_step_1(tmp_path, monkeypatch, capsys):
+    d = make_packages(tmp_path)
+    monkeypatch.setattr(pj, "EXPECTED", expected_counts(d))
+    data = tmp_path / "data"
+    pj.main(["valdata", "--blind", str(d), "--out", str(data)])
+    rdata = tmp_path / "rdata"
+    pj.main(["valdata", "--prompt", "reason", "--blind", str(d), "--out", str(rdata)])
+    assert json.loads((rdata / "valdata.json").read_text())["prompt"] == "reason"
+    assert pj.read_rows(rdata / "refs.parquet") == pj.read_rows(data / "refs.parquet")
+    rp = {r["uid"]: r["text"] for k in range(4) for r in pj.read_rows(rdata / f"prompts-w{k}.parquet")}
+    assert all("Noem eerst" in t for t in rp.values()) and len(rp) == 1000
+    # step 1: wrong at every 4th pair; the reasoning judge: wrong at every 8th, with the extra columns
+    fake_val_scores(data, tmp_path / "base" / "w0")
+    fake_val_scores(data, tmp_path / "rs" / "w0", agree_every=8)
+    rows = pj.read_rows(tmp_path / "rs/w0/shard-00000.parquet")
+    for n, r in enumerate(rows):
+        r.update({"gen_tokens": 40 + n % 7, "ended": n % 50 != 0, "verdict_line": n % 25 != 0,
+                  "own_answer": "anders" if n % 25 == 0 else pj.verdict_of({"A": r["p_a"], "B": r["p_b"], "gelijk": r["p_eq"]}),
+                  "reasoning_tokens": 30, "completion": f"{MARK} redenering"})
+    pj.write_rows(rows, tmp_path / "rs/w0/shard-00000.parquet")
+    for k, (dec, ans, n) in enumerate([(100.0, 20.0, 600), (90.0, 10.0, 400)]):
+        (tmp_path / "rs" / "w0" / f"timing-shard-0000{k}.json").write_text(json.dumps(
+            {"out": f"gs://b/scores/w{k}", "prompts": n, "decode_seconds": dec, "answer_seconds": ans, "gen_tokens": 40 * n,
+             "engine_seconds": 150.0, "warmup_seconds": 200.0, "not_scored": 0}))
+    (tmp_path / "logs").mkdir()
+    (tmp_path / "logs" / "pj_score_bon_t-w0.log").write_text(
+        'PROMPTS {"rows": 10}\nengine ready in 150 s\nCOMPILE {"bucket": 512, "seconds": 30.0}\n'
+        'SHARD {"shard": "s", "rows": 100, "seconds": 50.0}\nSHARD {"shard": "t", "rows": 100, "seconds": 20.0}\n')
+    pj.main(["reasonreport", "--refs", str(data / "refs.parquet"), "--scores", str(tmp_path / "rs/w*/shard-*.parquet"),
+             "--base-scores", str(tmp_path / "base/w*/shard-*.parquet"), "--timing", str(tmp_path / "rs/w*/timing-*.json"),
+             "--base-logs", str(tmp_path / "logs/*.log"), "--out", str(tmp_path / "rr.md")])
+    r = json.loads((tmp_path / "rr.json").read_text())
+    md = (tmp_path / "rr.md").read_text()
+    assert MARK not in md and MARK not in (tmp_path / "rr.json").read_text()
+    assert r["paired"]["D1"]["delta"] > 0 and r["paired"]["noneq"]["new"] > r["paired"]["noneq"]["old"]
+    assert r["paired"]["D1"]["new"] == pytest.approx(r["gate"]["D1"]["share"])
+    assert r["paired"]["D1"]["old"] == pytest.approx(r["base"]["gate"]["D1"]["share"])
+    assert r["paired"]["fault"]["new"] == pytest.approx(r["fault"]["share"])
+    assert r["paired"]["idiom"]["n"] == r["sets"]["idiom"]["direction_noneq"]["n"]
+    t = r["timing"]
+    assert t["per_pair"] == pytest.approx(2 * (100 + 20 + 90 + 10) / 1000)
+    assert t["hours_one_v4_8"] == pytest.approx(pj.SELECTION_SAMPLES * t["per_pair"] / 3600)
+    assert t["base_per_pair"] == pytest.approx(2 * (70 - 30) / 200)
+    x = r["reasoning"]["ab"]
+    assert x["n"] == 500 and x["no_verdict_line"] == sum(1 for n, rr in enumerate(rows) if n % 25 == 0 and rr["uid"].endswith("/ab"))
+    assert x["own_differs"] == 0
+    assert "aanvulling B" in md and "| D1 |" in md and "Tabel 8" in md and "[gevolgtrekking]" in md
+    assert "RREPORT" in capsys.readouterr().out
+
+
+def test_run_pairjudge_a_and_b_stages_render_their_jobs(tmp_path):
+    run, shm, home, g = pj_world(tmp_path)
+    out, _ = run("aselect", MODEL="G4-7-i15", TAG="a1")
+    assert out.returncode == 0 and "started pj_aselect_G4-7-i15_a1 on w0" in out.stdout, out.stdout + out.stderr
+    body = (home / "job_body_pj_aselect_G4-7-i15_a1.sh").read_text()
+    assert "pairjudge.py anchorselect --model G4-7-i15" in body and "/judge/G4-7-i15/select/choice.parquet" in body
+    assert "/bon/G4-7-i15/t10s8 " in body and "/judge/G4-7-i15/select-anchor" in body and "/eval/G4-0 " in body
+    out, _ = run("atexts", TAG="a2")
+    body = (home / "job_body_pj_atexts_a2.sh").read_text()
+    assert body.count("--pairs ") == 14 and "/janchor/pairs/" in body and "/judge/anchor/naturalness/texts.parquet" in body
+    out, _ = run("areport", TAG="a3")
+    body = (home / "job_body_pj_areport_a3.sh").read_text()
+    assert "--judge-predictions" in body and "/judge/naturalness/predictions.parquet" in body
+    assert "/judge/anchor/naturalness/predictions.parquet" in body and "/judge/anchor/report/" in body
+    assert body.count("/select-anchor ") == 2 and body.count(",/") >= 8
+    out, _ = run("bonreport", TAG="a4")
+    body = (home / "job_body_pj_bonreport_a4.sh").read_text()
+    assert "--judge-predictions" not in body and "select-anchor" not in body and "/judge/bon/report/" in body
+    out, _ = run("aclassify", TAG="a5")
+    assert out.returncode != 0 and "atexts" in out.stdout
+    out, _ = run("ablind", TAG="a6")
+    assert out.returncode == 0, out.stdout + out.stderr
+    body = (home / "job_body_pj_ablind_a6.sh").read_text()
+    assert "blind --kind janchor --model G4-7-i15" in body and "/sft/blind/G4-judge-anchor-i15/" in body
+    assert "/sft/blind/G4-judge-i15/key.jsonl" in body and "--overlap-name G4-judge-i15" in body
+    out, _ = run("rvaldata", TAG="r1")
+    body = (home / "job_body_pj_rvaldata_r1.sh").read_text()
+    assert "valdata --prompt reason" in body and "/judge/reason/val/data/" in body
+    for host in "0123":
+        out, _ = run("reason", host=host, TAG="r2")
+        assert out.returncode == 0 and f"started pj_reason_r2 on w{host}" in out.stdout, out.stdout + out.stderr
+        body = (home / "job_body_pj_reason_r2.sh").read_text()
+        assert f"/judge/reason/val/data/prompts-w{host}.parquet" in body and f"/judge/reason/val/scores/w{host} " in body
+        assert "pairjudge.py reason" in body and "TPU_VISIBLE_CHIPS=0,1,2,3" in body and "preflight failed" in body
+        (home / "logs" / "pj_reason_r2.log").unlink(missing_ok=True)
+    out, _ = run("rreport", TAG="r3")
+    body = (home / "job_body_pj_rreport_r3.sh").read_text()
+    assert "pairjudge.py reasonreport" in body and "/judge/val/scores/w3/shard-*.parquet" in body
+    assert "/judge/reason/val/scores/w2/timing-*.json" in body and "pj_score_bon_*-w*.log" in body
+    key = g.parent / "blind" / "G4-judge-anchor-i15" / "key.jsonl"
+    key.parent.mkdir(parents=True)
+    key.write_text("x")
+    out, _ = run("ablind", TAG="a7")
+    assert out.returncode != 0 and "stays as it is" in out.stdout

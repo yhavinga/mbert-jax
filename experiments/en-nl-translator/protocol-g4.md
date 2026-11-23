@@ -2552,3 +2552,12 @@ training ~45 min, per kandidaat vertalen + scoren ~47 min (3×), RL-val-samples 
 
 *G4-8.13 Wat deze stap niet doet.* Geen tweede arm vanaf i15 (O1), geen tweede ronde (O10), geen judge op
 evaluatie-uitvoer, geen beoordeling van het blinde pakket (die is aan de hoofdsessie en Yeb).
+
+*G4-8.13 Aanvulling 23 nov 2026 ~23:30 (besluit Yeb: "ik ga niets meer beoordelen, kun jij niet zelf beoordelen?").* Onder
+R-nieuw vervangt Yebs oordeel de twijfelgevallen (G4-8.9). Yeb beoordeelt ze niet; in plaats daarvan krijgt elk
+"twijfel"-oordeel van de eerste blinde beoordelaar een **tweede blinde ronde** door een andere verse Claude-subagent (zelfde
+rubriek protocol.md §4.2.4; per passage de bron, A, B en de uitleg van de eerste beoordelaar, geen sleutel, geen andere
+context), die per passage een eindoordeel geeft ("A beter", "B beter" of "gelijk", plus de betekenisfouten). Dat oordeel
+vervangt het twijfeloordeel; daarna pas de sleutel (zoals bij RB3, LEARNINGS 13 nov, toen namens Yeb). De hoofdsessie
+beoordeelt zelf niet (geen blinde beoordelaar). Yeb kan de oordelen later overschrijven; het verslag noemt dan beide
+tellingen. De keten wijzigt niet (het blinde pakket en de telling gebeuren na `DONE` door de hoofdsessie).

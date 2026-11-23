@@ -2561,3 +2561,5 @@ context), die per passage een eindoordeel geeft ("A beter", "B beter" of "gelijk
 vervangt het twijfeloordeel; daarna pas de sleutel (zoals bij RB3, LEARNINGS 13 nov, toen namens Yeb). De hoofdsessie
 beoordeelt zelf niet (geen blinde beoordelaar). Yeb kan de oordelen later overschrijven; het verslag noemt dan beide
 tellingen. De keten wijzigt niet (het blinde pakket en de telling gebeuren na `DONE` door de hoofdsessie).
+Ook de controle van 10 zekere oordelen (G4-8.9, `random.Random("en-nl-g4arm/0/G4-8/yeb10")`) doet de tweede blinde
+beoordelaar in plaats van Yeb: wijkt hij bij meer dan 3 af, dan beoordeelt hij alle 100 en geldt zijn telling.

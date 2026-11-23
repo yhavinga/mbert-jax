@@ -2563,3 +2563,10 @@ beoordeelt zelf niet (geen blinde beoordelaar). Yeb kan de oordelen later oversc
 tellingen. De keten wijzigt niet (het blinde pakket en de telling gebeuren na `DONE` door de hoofdsessie).
 Ook de controle van 10 zekere oordelen (G4-8.9, `random.Random("en-nl-g4arm/0/G4-8/yeb10")`) doet de tweede blinde
 beoordelaar in plaats van Yeb: wijkt hij bij meer dan 3 af, dan beoordeelt hij alle 100 en geldt zijn telling.
+
+*G4-8.14 Aanvulling 24 nov 2026 ~00:15 (hoofdsessie; technische fout in een controle, als G4-7.4i).* De smoke-run
+`g4arm_G4-8_s8` (keten `g4t8a`) faalde alleen op `lr_peak`: de trainer logt de LR in float32, en 5e-5 leest terug als
+4,999999873689376e-05; de controle eiste |max − 5e-5| ≤ 1e-12 (verschil 1,26e-12). Nu: ≤ 1e-6 × 5e-5 (float32-precisie);
+een echte afwijking (bv. 4,9e-5 of 1e-4) faalt nog steeds (tests). De overige controles van de smoke-run slaagden
+(piek 29,13 GiB ≤ 29,5). De smoke-training is gemarkeerd en draait niet opnieuw; de herstart (nieuwe TAG) draait alleen
+`smoke8` opnieuw. De test van §19 controleert nu de definitieve versie (één O6-regel, R-nieuw) in plaats van het concept.

@@ -36,7 +36,10 @@ def test_the_schedule_takes_an_eval_every_sixth_and_the_candidates_after_2e_4e_a
     assert (g8.EPOCHS_T, g8.LR_T, g8.WARMUP_T, g8.SEQ_T) == (2, 5e-5, 10, 4096)
     text = (CODE / "protocol-g4.md").read_text(encoding="utf-8")
     section = text[text.index("## 19. G4-8 training"):]
-    assert "CONCEPT, NIET GESTART" in section and "R-oud" in section and "R-nieuw" in section
+    # §19 is final since 23 Nov (Yeb chose O6): no draft line, both variants still described, exactly one O6 line
+    assert "CONCEPT, NIET GESTART" not in section and "R-oud" in section and "R-nieuw" in section
+    o6 = [line for line in section.splitlines() if line.startswith("- `O6 [besluit Yeb")]
+    assert o6 == ["- `O6 [besluit Yeb 23 nov 2026]: R-nieuw`"]
 
 
 # ---------------------------------------------------------------------------------------------------- sftset
@@ -238,7 +241,14 @@ def test_smoke8_passes_a_good_smoke_run_and_estimates_the_full_run(tmp_path, cap
     assert '"passed": true' in capsys.readouterr().out
 
 
+def test_smoke8_takes_the_peak_lr_as_logged_in_float32(tmp_path):
+    # run g4arm_G4-8_s8 (23 Nov) logged its peak as 4.999999873689376e-05, 5e-5 in float32
+    g8.smoke8(smoke_files(tmp_path, summary(8, [0, 4, 8], lr={"0": 0.0, "4": 2.857e-05, "7": 4.999999873689376e-05})))
+    assert json.loads((tmp_path / "smoke8.json").read_text())["checks"]["lr_peak"]["holds"]
+
+
 @pytest.mark.parametrize("kw, failed", [
+    ({"s": summary(8, [0, 4, 8], lr={"0": 0.0, "7": 4.9e-05})}, ["lr_peak"]),
     ({"s": summary(8, [0, 4, 8], own0=1.2)}, ["own_step0"]),
     ({"s": summary(8, [0, 4, 8], peak=29.6)}, ["peak_gib"]),
     ({"s": summary(8, [0, 4, 8], batches=(30, 30, 30, 30))}, ["batches_as_sftset"]),

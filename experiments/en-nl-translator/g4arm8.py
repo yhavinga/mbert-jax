@@ -1044,7 +1044,9 @@ def run_checks_t(summary, manifest, steps, eval_steps):
     checks["batches_as_sftset"] = {"value": {"pipeline": got, "sftset": manifest["batches_per_process"]},
                                    "holds": got == manifest["batches_per_process"]}
     lrs = list((summary.get("lr_at") or {}).values())
-    checks["lr_peak"] = {"value": max(lrs) if lrs else None, "holds": bool(lrs) and abs(max(lrs) - LR_T) <= 1e-12}
+    # the LR is logged as float32: 5e-5 reads back as 4.999999873689376e-05, so compare within float32 precision
+    checks["lr_peak"] = {"value": max(lrs) if lrs else None,
+                         "holds": bool(lrs) and abs(max(lrs) - LR_T) <= 1e-6 * LR_T}
     evals = summary.get("eval") or []
     for name in SFT_EVALS_T:
         rows = {e["step"]: e for e in evals if e["set"] == name}

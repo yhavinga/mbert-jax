@@ -2200,3 +2200,123 @@ eerdere ketens; vóór elke TPU-stap de TPU van de worker(s) vrij. Stap 1: `setu
 "gehaald": `bonpairs` (w0, CPU), `score` (4 workers), `select` per model, `texts`, `classify` (w0, C1), `bonreport`,
 `blind` (w0). Elke stap eindigt op `EXIT 0`, anders `FAILED` en stoppen; de keten schrijft niets over wat G4-bon, G4-7 of
 de sampling-proef schreef.
+
+*G4-judge.11 Aanvulling van 23 nov 2026: A en B (tijdstip: de commit van deze alinea's op `en-nl-g4judge`), vóór elke
+stap op een worker en vóór elke uitslag van A en B* [besluit van de hoofdsessie namens Yeb, op advies van Gemini 4
+Neon, 23 nov ~10:35; binnen de door Yeb goedgekeurde judge-proef; uitwerking door een subagent]. Twee metingen na stap
+2, geen training, geen G4-8, geen herselectie met B. Vooraf gelezen: de rapporten van stap 1 en 2
+(`g4-judge-validation.md`, `g4-judge-bon.md`) en de blinde uitslagen van `G4-judge-i15` en `G4-judge-G4-0` (LEARNINGS);
+niet gelezen: enige telling of keuze van A en enige uitvoer van B. Teksten, selecties en redeneringen van de judge
+worden ook nu niet gelezen; alleen id's, tellingen en scores.
+
+*G4-judge.12 A: judge of anker.* Vraag: in stap 2 heeft de judgeq-keuze maar bij 56–75% van de bronnen
+P̄(sample beter) > P̄(anker beter) (tabel 4); wat geeft het houden van het anker waar de judge geen sample duidelijk beter
+vindt?
+- **Selectie `janchor`** per bron, voor G4-0 en G4-7-i15 op het zoekdeel: k = de judgeq-keuze van G4-judge.7
+  (ongewijzigd, uit `$G/judge/<model>/select/choice.parquet`). Is judgeq niet teruggevallen (er was een kandidaat) en is
+  P̄(sample k beter dan het anker) > 0,5 (G4-judge.4: de genormaliseerde kans, gemiddeld over beide volgordes; strikt
+  groter), dan sample k; anders G4-0's greedy vertaling (het anker, ook voor G4-7-i15). Alles uit de bestaande
+  judge-scores van stap 2: geen nieuwe judge-scoring, vertaling of MetricX/COMET.
+- **Maten**: C1 in één nieuwe classify-run (`run_arms.sh classify` ongewijzigd) over 14 uitvoeren van het zoekdeel
+  (2 modellen × greedy, t10s1, qe, c2q, judge, judgeq, janchor); QE, MetricX-ref, COMET-22 (WMT24++), C2 en de
+  fail-vlaggen uit de bestaande scores van de gekozen tekst (bij het anker die van G4-0 greedy, zoals G4-bon ze heeft).
+  Rapport in de vorm van G4-judge.7 (`pairjudge.py bonreport`, zelfde bootstrap, zaadnamen
+  `en-nl-g4arm/0/G4-bon/boot/G4-judge/<model>/<vergelijking>`), met janchor als extra uitvoer: tabel 1 (C1, Δ eigen
+  greedy en Δ G4-0 greedy) en tabel 2 met janchor; tabel 3 bovendien janchor − greedy (eigen), janchor − judgeq,
+  janchor − qe, janchor − c2q en voor G4-7-i15 janchor − G4-0 greedy (ΔC1 samen, ΔCOMET-22 en ΔMetricX-ref op WMT24++,
+  95%-BI); tabel 5 per model en set: het aantal en aandeel bronnen waar het anker blijft, gesplitst in "judgeq valt
+  terug" en "P̄ ≤ 0,5", het aantal waar de tekst van janchor gelijk is aan die van G4-0 greedy (gestript), het gemiddelde
+  P̄(sample beter) van de gekozen samples en de verdeling over anker en t10s1…t10s8. Controles (gerapporteerd): die van
+  G4-judge.7; C1 van de 12 uitvoeren die ook in de classify-run van stap 2 zitten tegen die run, en C1 van janchor
+  tegen het label dat zijn tekst daar had (omgeslagen labels).
+- **Niet onafhankelijk** van janchor: de judge, QE en MetricX-ref (via judgeq's QE ≤ QE₀), de fail-vlaggen.
+  Onafhankelijk: C1, C2, COMET-22.
+- **Blind pakket** `gs://…/sft/blind/G4-judge-anchor-i15/`, opzet als `G4-judge-i15`: 50 WMT24++ + 50 FLAN van het
+  zoekdeel waar de tekst van (G4-7-i15, janchor) verschilt van G4-0's greedy vertaling (gestript vergeleken); per set
+  `random.Random("g4judge-anchor/blind/<set>").sample` van de verschillende id's in gesorteerde volgorde (minder dan
+  50: alle); `blind_id` `anchor-001…anchor-100` (WMT24++ eerst, in de volgorde van de trekking); A/B per paar met
+  `random.Random("g4judge-anchor/blind/ab/<blind_id>").random() < 0,5` → A = G4-0 greedy (`base`), anders A = de
+  doeltekst (`G4-7-i15-janchor`). `judge-input.jsonl` (blind_id, source, A, B), apart `key.jsonl` (blind_id, A, B,
+  seed, set, item) en `select-report.json` (aantallen, en hoeveel items ook in `G4-judge-i15` zitten: alleen id's
+  vergeleken). De beoordeling doet de hoofdsessie met een verse Claude-subagent (rubriek §4.2.4), niet deze keten.
+- Rapport: `$G/judge/anchor/report/report.md`/`.json`, kopie `mbert-ops/translator-sft/g4-judge-anchor.md` (`.json`).
+- Wat A niet zegt: als G4-judge.9; janchor mengt bij G4-7-i15 twee systemen (waar het anker blijft, is de uitvoer
+  G4-0 greedy); de grens 0,5 is vooraf gekozen, niet gezocht.
+
+*G4-judge.13 B: een judge die eerst redeneert (alleen validatie en tijd).* Vraag: volgt een judge die eerst kort
+redeneert de Claude-oordelen beter, vooral waar de judge van G4-judge.3 zwak is (5a, een betekenisfout aan precies één
+kant: 61,5%; richting op de niet-gelijke idioomparen: 60,0%), en wat kost hij per paar? Geen herselectie in deze ronde.
+- **Judge**: als G4-judge.2 (Gemma 4 31B-it @ `842da37`, MaxEngine op de fork @ `f4d8615`, `translate.make_engine`,
+  tensor 4 over de 4 chips van één worker van mbert-mix; het chat-template met één gebruikersbeurt en een lege
+  denkruimte).
+- **Prompt B** (letterlijk de tekst van de gebruikersbeurt; `{bron}`, `{A}` en `{B}` gestript ingevuld): de prompt van
+  G4-judge.3 met een andere laatste alinea.
+
+```
+Je beoordeelt vertalingen uit het Engels in het Nederlands. Je krijgt de Engelse bron en twee Nederlandse vertalingen, A en B. Je weet niet hoe of door wie ze zijn gemaakt; probeer dat niet te raden.
+
+Oordeel eerst op juistheid: de vertaling zonder betekenisfout, of met de minst ernstige, is beter. Een betekenisfout is:
+- een weglating: iets uit de bron ontbreekt in de vertaling;
+- een toevoeging: de vertaling zegt iets wat niet in de bron staat;
+- een verkeerde betekenis: de vertaling zegt iets anders dan de bron;
+- een misplaatste uitdrukking: een idioom of vaste uitdrukking uit de bron is letterlijk vertaald waar dat in het Nederlands niet werkt, of vertaald met een Nederlandse uitdrukking die iets anders betekent.
+Woordkeus, stijl en zinsbouw zijn geen betekenisfout zolang de betekenis klopt.
+
+Zijn ze even juist, oordeel dan op natuurlijk, oorspronkelijk klinkend Nederlands: de vertaling die het meest leest als tekst die in het Nederlands is geschreven en niet als vertaling. "gelijk" als er op beide punten geen duidelijk verschil is.
+
+Engelse bron:
+{bron}
+
+Vertaling A:
+{A}
+
+Vertaling B:
+{B}
+
+Welke vertaling is beter? Noem eerst in één of twee korte zinnen de betekenisfouten van A en van B, of dat er geen zijn; zijn ze even juist, zeg dan welke het natuurlijkst klinkt. Schrijf daarna op een laatste, aparte regel alleen: "Oordeel: A", "Oordeel: B" of "Oordeel: gelijk".
+```
+
+- **Decoderen**: greedy (MaxEngine's `decode_sampling_strategy`), hoogstens 256 nieuwe tokens, stop op de eos-ids van
+  `gemma4-31b` (1, 106, 50); `translate.decode_all` (continuous batching, `sync_every` 8) met 12 slots, prefill-lengtes
+  512, 1.024, 1.536, 2.048, 2.560 en `max_decode` 256 (12 × 2.816 = 33.792 slot-tokens, onder de 38.912 die op 13 nov op
+  een v4-chip pasten [`translate_models.yml`, d1k]). Een prompt van meer dan 2.048 tokens wordt niet gescoord en
+  geteld.
+- **Antwoord** [keuze]: completion = de gedecodeerde tokens zonder stoptoken (`skip_special_tokens`, gestript). De
+  oordeelregel is de eerste regel die, na weglaten van voorloopspaties en de tekens `*`, `#`, `_`, `>`, `-`, begint met
+  "oordeel" (hoofdletterongevoelig). Redenering = de tekst vóór die regel, rechts gestript; zonder oordeelregel de hele
+  completion (geteld). Dan één prefill van de chatbeurt + redenering + een lege regel + `Oordeel:` (zonder redenering
+  alleen `Oordeel:`), als één string getokeniseerd (de ids van de prompt moeten daarvan het begin zijn); P(A), P(B) en
+  P(gelijk) uit de logits van de volgende positie, precies als G4-judge.2 (zelfde antwoord-ids, massa, genormaliseerd);
+  P̄, oordeel, richting en het greedy oordeel per volgorde als G4-judge.4. Waarom zo: (i) kansen in dezelfde vorm als
+  stap 1, zodat D1–D3 en alle maten ongewijzigd gelden; (ii) een vaste antwoordplek, los van opmaak (vet, kopjes) in de
+  oordeelregel van het model. Daarnaast vastgelegd, beslist niets: het eigen antwoord van het model (het woord na
+  "Oordeel" op de oordeelregel, zonder opmaak en zonder een voorafgaand "Vertaling": A, B, gelijk of anders) en hoe vaak
+  het afwijkt van het greedy oordeel op de antwoordplek.
+- **Validatie**: dezelfde 500 paren, referenties en maten als G4-judge.5 (de maten van `valreport` ongewijzigd); D1–D3
+  met de grenzen van G4-judge.6, gerapporteerd (beslist niets); 5a en de richting op de niet-gelijke idioomparen
+  apart; per maat het gepaarde verschil met de judge van stap 1 op dezelfde paren (Δ richting op de paren van D1, D2, alle
+  niet-gelijke, 5a en idioom; Δ omklappen en Δ drie klassen op alle paren; bootstrap over paren, 10.000 trekkingen, zaad
+  `en-nl-g4arm/0/G4-judge/reason/boot/<maat>`). Per volgorde: gegenereerde tokens (mediaan, gemiddelde, max), niet af
+  (256 bereikt), geen oordeelregel, eigen antwoord, eigen antwoord ≠ greedy op de antwoordplek, massa.
+- **Tijd** (per worker; een worker van mbert-mix is 4 v4-chips, een v4-8): engine laden en opwarmen (prefill en insert
+  van elke prefill-lengte en generate, vóór de klok) apart; daarna de wandklok van fase 1 (`decode_all` over alle
+  prompts van de worker: prefills en decodeerstappen) en fase 2 (de prefills op de antwoordplek). Tijd per paar =
+  2 × (fase 1 + fase 2) / prompts; tokens per seconde in fase 1. Ter vergelijking de judge van stap 1 uit de logs van stap
+  2 (de shard-tijden zonder de COMPILE-regels). [gevolgtrekking, gemarkeerd] Uren voor 100.000 samples (elk tegen het
+  anker, beide volgordes) op één v4-8 en op de 4 workers, bij deze instelling; er is niet naar een snellere instelling
+  gezocht.
+- Rapport: `$G/judge/reason/val/report.md`/`.json`, kopie `mbert-ops/translator-sft/g4-judge-reason-validation.md`
+  (`.json`); alleen tabellen met tellingen en scores. De redeneringen staan in de score-shards in de bucket
+  (`$G/judge/reason/val/scores/`) en worden niet gelezen.
+- Wat B niet zegt: als G4-judge.9; een redenering volgens de rubriek kan het oordeel dichter bij Claude's brengen
+  zonder het beter te maken (Claude oordeelde met dezelfde rubriek); één prompt, greedy, geen zoektocht; de tijd geldt
+  voor deze 1.000 validatieprompts en deze instelling.
+
+*G4-judge.14 Keten* (`mbert-ops/scripts/g4judge2_run.sh`, kopie in `gs://t5-dutch-english-usc2/hammond/scratch-scripts/`;
+alleen mbert-mix; `final_eval_mix.lock` met `flock` tot het eind; mbert-corpus wordt niet aangeraakt). Code als bundel
+via de bucket naar de 4 workers; elke ssh met `timeout 900` en de ssh-opties van G4-judge.10; vóór elke TPU-stap de
+TPU van de worker(s) vrij. `setup` opnieuw (`run_g4arm.sh setup`, `ARM=G4-bon`). A: `aselect` per model (w0, CPU),
+`atexts` (w0, CPU), `aclassify` (w0, C1), `areport` (w0), `ablind` (w0). B: `rvaldata` (w0, CPU), `reason` (4 workers),
+`rreport` (w0). Markers in `$G/stages/g4-judge/` met nieuwe namen; plaatsen `$G/judge/anchor/`,
+`$G/judge/<model>/select-anchor/`, `$G/judge/reason/`; niets wat stap 1 of 2 schreef wordt overschreven. Elke stap
+eindigt op `EXIT 0`, anders `FAILED` en stoppen.

@@ -1957,3 +1957,70 @@ beslist niets, ook niet over G4-8.
   select van G4-0) overgeslagen, dan `bon-select` (MODEL=G4-4, w0, CPU), `bon-texts`, `bon-classify` (C1) en `bon-report`
   onder key `G4-0_G4-4`; geen kandidaat. Het rapport gaat naar `translator-sft/g4-bon-G4-0_G4-4.md/.json` en
   `g4-bon-G4-4.md/.json`; `g4-bon.md` blijft het rapport van de kandidaat.
+
+## 16. Meting C2F: kennen C2 en C1 fictie?
+
+**Vastgelegd 23 nov 2026 (~01:30; tijdstip: de commit van deze sectie op branch `en-nl-g4bon`)**, vóór de eerste stap op
+een worker en vóór elke uitslag van deze meting [aanleiding: advies Gemini 4 Neon; Yeb vroeg mbert-mix 's nachts bezig te
+houden; een meting binnen eerdere besluiten; uitwerking door een subagent]. Vooraf is alleen het schema van de invoer
+bekeken (kolommen, aantallen, de vorm van de id's; geen tekst, geen score). Een meting, geen arm: er wordt niets getraind,
+niets vertaald en niets beslist.
+
+*C2F.1 Vraag.* C2 (de reward van G4-7, G4-7.6: dmbert v2 met head, Nederlandse originelen tegen Gemma 4's rondgang, vijf
+registers zonder fictie) en C1 (S @ 653k met head, §4.3 en spec §3.2: originelen tegen TranslateGemma's rondgang) zagen in
+hun training geen fictie. Op romans gaf G4-0 bij C2 2–3% "origineel", en de RL van G4-7 ontspoorde daar het eerst. Scheiden
+C2 en C1 op romanpassages Nederlandse originelen van menselijke vertalingen en van G4-0's vertalingen, en menselijke
+vertalingen van G4-0's?
+
+*C2F.2 Groepen* (alleen bestaande teksten; er wordt niets met Gemma gegenereerd):
+- `nl_books`: de Nederlandse kant (`reference`) van de set `books` van G4-2.5 (`$G/data/heldout/evalsets.parquet`, set
+  `books`: 500 rijen uit 2 boeken; Nederlandse originelen).
+- `nl_books31` [aanvulling, keuze subagent: `nl_books` is 2 boeken]: Nederlandse originelen uit de andere boeken van
+  G4-1's boekenset (`$G/data/G4-1/`, `g4arm.g41_set`, soort `book`, het Nederlands zoals G4-2.5 het leest: de
+  assistent-beurt, gestript), zonder de 2 boeken van `nl_books` (`$G/data/heldout/books.json`).
+- `human`: de menselijke Nederlandse vertaling (`nl` van `$S/data/books-b1/b1-selected.parquet`, groep `en_orig`) van de
+  romanpassages van G4-7's anker (`$RL/anchor/samples/`, id `novels:<rij-id>`; pool en RL-val).
+- `g40`: G4-0's greedy vertaling (`hypothesis`, klasse `medium`, fork `f4d8615`, `natural-v1`) van dezelfde passages, uit
+  hetzelfde anker. `human` en `g40` zijn gepaard: dezelfde passages.
+- Een ankerrij komt in aanmerking als `ended` waar is, `decode_loop`, `english_left` en `empty` onwaar zijn en de
+  `hypothesis` niet leeg is. Het Engels van het anker (`source`) moet gelijk zijn aan `en` van de b1-rij (beide gestript);
+  is dat bij één rij niet zo, of ontbreekt een rij in b1 of staat hij er niet één keer in met groep `en_orig`, dan stopt
+  de meting.
+- **Heel, niet afgekapt** (als G4-7.6): elke tekst heeft ten hoogste 1.022 tokens zonder de speciale tokens, geteld met
+  de tokenizer van C1 en met die van C2 (elk via zijn `config.json`, `g4c2.tokenizer_of`). Bij `human`/`g40` moeten beide
+  kanten passen.
+- **Trekking**: van de rijen die in aanmerking komen, gesorteerd op id, `random.Random(seed).sample` van min(500, n), seed
+  `c2fiction/0/<groep>`; `human` en `g40` één trekking van passages met seed `c2fiction/0/novels`.
+
+*C2F.3 Classifiers.* C1: `$S/arms/naturalness/classifier/`; C2: `$RL/c2/model/`. Beide met `naturalness.py classify`
+(`~/mbert-dumb/.venv`, `~/mbert-dumbx` @ `ae11478`, `--max-length 1024`) op één texts-bestand, op w0 van mbert-mix, binnen
+`final_eval_mix.lock`, alleen als de TPU van w0 vrij is. mbert-corpus wordt niet aangeraakt.
+
+*C2F.4 Maten* (`c2fiction.py report`; P = P(label 1 = origineel); logit = clip(logit, −12, 12) uit P, `g4c2.logit_of`,
+zoals `c2cal7`):
+1. Per classifier en groep: n, boeken, mediaan tokens; aandeel "origineel" (P ≥ 0,5); gemiddelde P; gemiddelde en mediaan
+   logit.
+2. AUC (Mann–Whitney op P, gelijke scores ½) per classifier voor de paren `nl_books`–`human`, `nl_books`–`g40`,
+   `human`–`g40`, `nl_books31`–`human`, `nl_books31`–`g40` en `nl_books`–`nl_books31` (de eerste groep hoort hoger; het
+   laatste paar is een controle, verwacht rond 0,5), met een 95%-bootstrapinterval (2.000 trekkingen, seed
+   `c2fiction/0/boot`; binnen elke groep apart, bij `human`–`g40` per paar).
+3. Gepaard `human`–`g40` per classifier: aandeel paren met P(human) > P(g40) (gelijk ½), gemiddelde Δlogit (human − g40)
+   met 95%-bootstrapinterval.
+4. Per lengteband (≤ 128, 129–256, > 256 tokens): n en aandeel "origineel" per groep en classifier; Spearman logit~tokens
+   per groep; Spearman C1~C2 per groep en over alle teksten.
+5. Controles (gerapporteerd): C2's P op `g40` tegen de judge-score van het anker (`$RL/anchor/scores/c2/w1/`, `p_c2`;
+   grootste |ΔP|, aantal > 1e-3) en het aantal tokens tegen `c2_tokens`; het aantal teksten dat `naturalness.py` als
+   `truncated` markeert (alleen teksten van precies 1.022 tokens mogen dat; anders stopt het rapport); hoeveel referenties
+   van `nl_books` gelijk zijn aan het Nederlands van G4-1 voor hetzelfde paar. Ter vergelijking: het aandeel "origineel"
+   van C2 volgens de judge op alle romanrijen van het anker die in aanmerking komen.
+
+*C2F.5 Wat het niet zegt.* Geen maat van kwaliteit: een hoge AUC zegt dat een classifier de groepen scheidt, niet dat hij
+een goede reward op fictie is. De groepen verschillen ook in lengte (het anker heeft Engels van ten hoogste 256 Gemma
+4-tokens, `books` tot 512), in boeken, auteurs en tijd van uitgave; `nl_books` is 2 boeken. Alleen `human`–`g40` is
+gepaard; de vergelijking met de originelen is dat niet. De menselijke vertalingen komen uit het gelijnde en gefilterde
+-b1-corpus, geen steekproef van alle vertaalde fictie. Het besluit niets over G4-7, G4-bon of een volgende arm.
+
+*C2F.6 Uitvoer.* `$G/c2fiction/<TAG>/` in de bucket: `texts.parquet` (privé, blijft in de bucket en op de VM),
+`meta.parquet` (id, groep, boek, tokens; geen tekst), `predictions-c1.parquet`, `predictions-c2.parquet`,
+`report.json`/`.md`. Op co1 alleen het rapport: `mbert-ops/translator-sft/c2-fiction-check.md` (en `.json`), tabellen met
+tellingen en scores, geen teksten. Keten: `mbert-ops/scripts/c2fiction_run.sh`.

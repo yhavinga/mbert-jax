@@ -2543,8 +2543,10 @@ overschreven.
 code `g4arm8.py`, `run_g4arm8.sh`, `run_g4arm.sh` met `ARM=G4-8` op `en-nl-g4arm8`). Alleen mbert-mix (een v4-32: de
 training over alle 16 chips, de rest per worker); mbert-corpus (T3) wordt niet aangeraakt. Wacht eerst op de marker
 `$G/stages/g4-8-data/report.done` van §18 en `$G8/targets/targets.parquet`, dan op het startbestand
-`mbert-ops/g4arm8.train-go` (één regel `O6=R-oud` of `O6=R-nieuw`, gelijk aan G4-8.0), dan op `final_eval_mix.lock`
-(met `flock`, tot het eind gehouden). Volgorde: setup (`FULL=1`), `sftset` (w0), `check` (w0), smoke-run + `smoke8`
+`mbert-ops/g4arm8.train-go` (twee regels: `O6=R-oud` of `O6=R-nieuw`, gelijk aan G4-8.0, en `COMMIT=<de gepushte
+commit met de definitieve §19>`, die afstamt van dit concept en van de geteste code), dan op `final_eval_mix.lock` (met
+`flock`, tot het eind gehouden). Volgorde: setup (`FULL=1`; daarna op elke worker ≥ 12 GB vrij in `/dev/shm`, anders
+`FAILED`), `sftset` (w0), `check` (w0), smoke-run + `smoke8`
 (w0), de training, `adapter` (w0), per kandidaat `translate` en `score` (4 workers), RL-val-samples per model (4
 workers), `texts`, `classify`, `classify-c2`, `pll` (w0), `report8` (w0), het blinde pakket als (a1) en (a3) gelden;
 `DONE` met de keuze en de regels. Elke stap eindigt op `EXIT 0`, anders `FAILED` en stoppen; een gemarkeerde stap wordt

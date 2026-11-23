@@ -170,6 +170,15 @@
 #   KEY=<key> MODELS="G4-0 [G4-4] [G4-7-i<n>]" bash run_g4arm.sh bon-texts | bon-classify | bon-report   w0: C1's texts of
 #                                 every output, C1 (run_arms.sh classify, job arms_classify_<TAG>b), g4bon.py report, to
 #                                 $GB/naturalness/<key>/ and $GB/report/<key>/
+# Arm G4-8 (protocol-g4.md §19: SFT with LoRA from G4-0 on the targets of G4-8-data; the set, the training and the
+# adapters are run_g4arm8.sh's, the chain g4arm8_train_run.sh), with ARM=G4-8, its candidates G4-8-s<step> ($G/G4-8-s<step>/),
+# only setup and these stages, SET=eval:
+#   MODEL=G4-8-s<step> bash run_g4arm.sh translate|score   every worker: a candidate, its LoRA merged (rank 32 / alpha 16,
+#                                 checked; the job's own copy removed after), to $G/eval/G4-8-s<step>/
+#   CANDIDATES="G4-8-s<k1> ..." bash run_g4arm.sh texts   w0 (CPU): the candidates, G4-0 and G4-4 (reported), one classify
+#                                 run, to $G/naturalness-G4-8/; classify, classify-c2 and pll on those texts as G4-7's
+#   SELECTED=<report8's choice> bash run_g4arm.sh blind   w0 (CPU): only if (a1) and (a3) hold (G4-8.9), to $S/blind/G4-8/
+#                                 and $S/blind/G4-8-tg/
 # The code is beside this script (a copy of $G/scripts/). TAG names the jobs of one chain.
 set -euo pipefail
 STAGE=${1:?a stage: fetchbt, build, check, evaldata, setup, train, adapter, translate, score, texts, classify, blind, report, smoke-translate, smoke-score, smoke-report, fetchval, heldout, own, smoke2-report, replay, build2, heldout3, build3, smoke3-report, build4, smoke4-report, novels4, build5, split5, refqe5, resume5, report5, smoke5-report, cands6, build6, check6, cpuproof6, smoke6-report, pairtexts6, pairclassify6, pairclass6, ends6c, report6c, classify-c2, pll, report7, bon-data, bon-translate, bon-score, bon-c2texts, bon-c2, bon-select, bon-texts, bon-classify, bon-report}
@@ -178,7 +187,7 @@ S=$R/sft
 E=$R/eval
 G=$S/g4arm
 ARM=${ARM:-G4-1}
-case $ARM in G4-1|G4-2|G4-3|G4-4|G4-5|G4-6|G4-6b|G4-6c|G4-7|G4-bon) ;; *) echo "ARM is G4-1, G4-2, G4-3, G4-4, G4-5, G4-6, G4-6b, G4-6c, G4-7 or G4-bon, not $ARM"; exit 1 ;; esac
+case $ARM in G4-1|G4-2|G4-3|G4-4|G4-5|G4-6|G4-6b|G4-6c|G4-7|G4-8|G4-bon) ;; *) echo "ARM is G4-1, G4-2, G4-3, G4-4, G4-5, G4-6, G4-6b, G4-6c, G4-7, G4-8 or G4-bon, not $ARM"; exit 1 ;; esac
 SMOKE_RUN=g4arm_${ARM}_s8
 FULL_RUN=g4arm_$ARM
 # G4-6 (draft amendment G4-6.4): rows of 4,096, or of 2,048 if the smoke test at 4,096 does not fit (its own smoke run)
@@ -261,7 +270,20 @@ if [ "$ARM" = G4-7 ]; then
   esac
   [ "$SET" = eval ] || { echo "ARM=G4-7: SET=eval only"; exit 1; }
 fi
-[ "$ARM" = G4-7 ] || case $STAGE in classify-c2|pll|report7) echo "$STAGE is G4-7's"; exit 1 ;; esac
+# Arm G4-8's places (protocol-g4.md §19 G4-8.7-G4-8.11): its classify run (C1, C2 and PLL as G4-7's) and report; the
+# set, the training and the adapters $G/G4-8-s<step>/ are run_g4arm8.sh's
+cand8() {  # cand8 NAME: a candidate of G4-8, the adapter after <step> steps (G4-8.4)
+  case $1 in G4-8-s[1-9]|G4-8-s[1-9][0-9]|G4-8-s[1-9][0-9][0-9]|G4-8-s[1-9][0-9][0-9][0-9]) return 0 ;; *) return 1 ;; esac
+}
+if [ "$ARM" = G4-8 ]; then
+  NAT=$G/naturalness-G4-8; REP=$G/report-G4-8
+  case $STAGE in
+    setup|translate|score|texts|classify|classify-c2|pll|blind) ;;
+    *) echo "$STAGE is no stage of G4-8 (setup, translate, score, texts, classify, classify-c2, pll, blind)"; exit 1 ;;
+  esac
+  [ "$SET" = eval ] || { echo "ARM=G4-8: SET=eval only"; exit 1; }
+fi
+case $ARM in G4-7|G4-8) ;; *) case $STAGE in classify-c2|pll|report7) echo "$STAGE is G4-7's"; exit 1 ;; esac ;; esac
 # The measurement G4-bon (protocol-g4.md §15): its own stages and places; it trains nothing and reads G4-7's adapters
 GB=$G/bon
 if [ "$ARM" = G4-bon ]; then
@@ -852,10 +874,13 @@ adapter)
   ;;
 translate|smoke-translate)
   MODEL=${MODEL:?G4-1, G4-2, G4-3, G4-4, G4-5c<k>, G4-6, G4-6b, G4-6c, G4-6c-s<step>, G4-7-i<n> or G4-0}
-  case $MODEL in G4-1|G4-2|G4-3|G4-4|G4-6|G4-6b|G4-6c|G4-0|G4-5c[1-9]|G4-6c-s[1-9]*) ;; *) cand7 "$MODEL" || { echo "MODEL is G4-1, G4-2, G4-3, G4-4, G4-5c<k>, G4-6, G4-6b, G4-6c, G4-6c-s<step>, G4-7-i<n> (n = 1..30) or G4-0, not $MODEL"; exit 1; } ;; esac
+  case $MODEL in G4-1|G4-2|G4-3|G4-4|G4-6|G4-6b|G4-6c|G4-0|G4-5c[1-9]|G4-6c-s[1-9]*) ;; *) cand7 "$MODEL" || cand8 "$MODEL" || { echo "MODEL is G4-1, G4-2, G4-3, G4-4, G4-5c<k>, G4-6, G4-6b, G4-6c, G4-6c-s<step>, G4-7-i<n> (n = 1..30), G4-8-s<step> or G4-0, not $MODEL"; exit 1; } ;; esac
   # amendment G4-7: its candidates only with ARM=G4-7, and ARM=G4-7 translates and scores its candidates only
   if cand7 "$MODEL"; then [ "$ARM" = G4-7 ] || { echo "$MODEL is G4-7's (ARM=G4-7)"; exit 1; }; fi
   [ "$ARM" != G4-7 ] || cand7 "$MODEL" || { echo "ARM=G4-7: MODEL is a candidate G4-7-i<n> (n = 1..30), not $MODEL"; exit 1; }
+  # G4-8 (§19 G4-8.7): the same for its candidates
+  if cand8 "$MODEL"; then [ "$ARM" = G4-8 ] || { echo "$MODEL is G4-8's (ARM=G4-8)"; exit 1; }; fi
+  [ "$ARM" != G4-8 ] || cand8 "$MODEL" || { echo "ARM=G4-8: MODEL is a candidate G4-8-s<step>, not $MODEL"; exit 1; }
   [ "$SET" != dpo ] || [ "$MODEL" = "$REJ6" ] || { echo "SET=dpo with ARM=$ARM: $REJ6 only (the rejected side of its pairs)"; exit 1; }
   case $MODEL in G4-5c*) [ "$SET" = eval ] || { echo "$MODEL: SET=eval only"; exit 1; } ;; esac
   case $MODEL in G4-6c-s*) [ "$SET" = eval ] && [ "$STAGE" = translate ] || { echo "$MODEL: SET=eval only"; exit 1; } ;; esac
@@ -927,7 +952,8 @@ translate|smoke-translate)
     adapter_local "$ADAPTER_DIR" "$G_SHM/adapter-$NAME"
     EXTRA="--lora $G_SHM/adapter-$NAME"
     # amendment G4-7.4: a candidate's LoRA is rank 32 / alpha 16 from G4-0 (nothing stacked)
-    if cand7 "$MODEL" && ! python3 -c "import json, sys; a = json.load(open(sys.argv[1])); assert (a['rank'], a['alpha'], a['scale']) == (32, 16.0, 0.5), a" \
+    # G4-8.4: the same for a candidate of G4-8
+    if { cand7 "$MODEL" || cand8 "$MODEL"; } && ! python3 -c "import json, sys; a = json.load(open(sys.argv[1])); assert (a['rank'], a['alpha'], a['scale']) == (32, 16.0, 0.5), a" \
         "$G_SHM/adapter-$NAME/adapter.json"; then
       rm -rf -- "$G_SHM/adapter-$NAME"
       echo "$ADAPTER_DIR/adapter.json is not rank 32, alpha 16"
@@ -948,17 +974,20 @@ translate|smoke-translate)
       echo "translate_class $G_SHM/seg-$TAG/$SET/$SEG $cls $OUT/$cls ~/logs/${NAME}_$cls.log $EXTRA || exit 1"
     done
     # G4-6c: the job's own copy of a checkpoint's adapter (2 GB on every worker; the bucket has it); G4-7: a candidate's
-    case $MODEL in G4-6c-s*|G4-7-i*) echo "rm -rf -- $G_SHM/adapter-$NAME" ;; esac
+    case $MODEL in G4-6c-s*|G4-7-i*|G4-8-s*) echo "rm -rf -- $G_SHM/adapter-$NAME" ;; esac
     echo "echo \"TRANSLATED w$W $MODEL: $CLASSES\""
   } > ~/job_body_$NAME.sh
   detach "$NAME" bash ~/job_body_$NAME.sh
   ;;
 score|smoke-score)
   MODEL=${MODEL:?G4-1, G4-2, G4-3, G4-4, G4-5c<k>, G4-6, G4-6b, G4-6c, G4-6c-s<step>, G4-7-i<n> or G4-0}
-  case $MODEL in G4-1|G4-2|G4-3|G4-4|G4-6|G4-6b|G4-6c|G4-0|G4-5c[1-9]|G4-6c-s[1-9]*) ;; *) cand7 "$MODEL" || { echo "MODEL is G4-1, G4-2, G4-3, G4-4, G4-5c<k>, G4-6, G4-6b, G4-6c, G4-6c-s<step>, G4-7-i<n> (n = 1..30) or G4-0, not $MODEL"; exit 1; } ;; esac
+  case $MODEL in G4-1|G4-2|G4-3|G4-4|G4-6|G4-6b|G4-6c|G4-0|G4-5c[1-9]|G4-6c-s[1-9]*) ;; *) cand7 "$MODEL" || cand8 "$MODEL" || { echo "MODEL is G4-1, G4-2, G4-3, G4-4, G4-5c<k>, G4-6, G4-6b, G4-6c, G4-6c-s<step>, G4-7-i<n> (n = 1..30), G4-8-s<step> or G4-0, not $MODEL"; exit 1; } ;; esac
   # amendment G4-7: its candidates only with ARM=G4-7, and ARM=G4-7 translates and scores its candidates only
   if cand7 "$MODEL"; then [ "$ARM" = G4-7 ] || { echo "$MODEL is G4-7's (ARM=G4-7)"; exit 1; }; fi
   [ "$ARM" != G4-7 ] || cand7 "$MODEL" || { echo "ARM=G4-7: MODEL is a candidate G4-7-i<n> (n = 1..30), not $MODEL"; exit 1; }
+  # G4-8 (§19 G4-8.7): the same for its candidates
+  if cand8 "$MODEL"; then [ "$ARM" = G4-8 ] || { echo "$MODEL is G4-8's (ARM=G4-8)"; exit 1; }; fi
+  [ "$ARM" != G4-8 ] || cand8 "$MODEL" || { echo "ARM=G4-8: MODEL is a candidate G4-8-s<step>, not $MODEL"; exit 1; }
   case $MODEL in G4-6c-s*) [ "$SET" = eval ] && [ "$STAGE" = score ] || { echo "$MODEL: SET=eval only"; exit 1; } ;; esac
   [ "$MODEL" != G4-6c ] || [ "$STAGE" = smoke-score ] || { echo "MODEL=G4-6c is the smoke run's (smoke-score)"; exit 1; }
   if [ "$SET" != eval ]; then
@@ -1066,6 +1095,13 @@ texts)
     done
     MODELS="$CANDIDATES G4-0 G4-4"
   fi
+  if [ "$ARM" = G4-8 ]; then
+    # §19 G4-8.7: as G4-7, the candidates, G4-0, and G4-4 reported, in one classify run; C2 and PLL on the same texts
+    for m in ${CANDIDATES:?the candidates, G4-8-s<step> ...}; do
+      cand8 "$m" || { echo "CANDIDATES: $m is no candidate of G4-8"; exit 1; }
+    done
+    MODELS="$CANDIDATES G4-0 G4-4"
+  fi
   PAIRS=""
   for m in $MODELS; do PAIRS="$PAIRS --pairs '$m=$T/$m/pairs-w*.parquet'"; done
   {
@@ -1102,6 +1138,13 @@ blind)
     cand7 "$BARM" || { echo "SELECTED $BARM is no candidate of G4-7"; exit 1; }
     gsutil cat "$REP/report.json" | python3 -c "import json, sys; r = json.load(sys.stdin); assert r['selected'] == sys.argv[1] and r['blind_due'], (r['selected'], r['blind_due'])" "$BARM" \
       || { echo "$REP/report.json: $BARM is not report7's choice with (a1), (a3) and (b) holding"; exit 1; }
+  fi
+  # G4-8: the candidate report8 selected (§19 G4-8.9: only if (a1) and (a3) hold, under either variant of the rule)
+  if [ "$ARM" = G4-8 ]; then
+    BARM=${SELECTED:?the candidate report8 selected, G4-8-s<step>}
+    cand8 "$BARM" || { echo "SELECTED $BARM is no candidate of G4-8"; exit 1; }
+    gsutil cat "$REP/report.json" | python3 -c "import json, sys; r = json.load(sys.stdin); assert r['selected'] == sys.argv[1] and r['blind_due'], (r['selected'], r['blind_due'])" "$BARM" \
+      || { echo "$REP/report.json: $BARM is not report8's choice with (a1) and (a3) holding"; exit 1; }
   fi
   for d in "$S/blind/$ARM" "$S/blind/$ARM-tg"; do
     ! gsutil -q stat "$d/key.jsonl" || { echo "$d has a key.jsonl: the package stays as it is"; exit 1; }

@@ -16,11 +16,25 @@
 #   CHUNK=c<n> bash run_g4arm8.sh select        w0 (CPU): g4arm8.py select -> $G8/<c>/select/
 #   bash run_g4arm8.sh v3                       w0 (CPU): g4arm8.py v3 on c1's targets -> $S/blind/G4-8-V3/
 #   bash run_g4arm8.sh report                   w0 (CPU): g4arm8.py report -> $G8/report/, $G8/targets/targets.parquet
+# G4-8's training (protocol-g4.md §19; the chain g4arm8_train_run.sh; SFT=$G8/sft; translate, score, texts, classify,
+# classify-c2, pll and blind are run_g4arm.sh's with ARM=G4-8):
+#   bash run_g4arm8.sh sftset                   w0 (CPU): g4arm8.py sftset (the targets as SFT rows, 2 passes, checked
+#                                               against the plan and the evaluation; the smoke set; RL-val's segments) -> $SFT/
+#   bash run_g4arm8.sh check                    w0 (CPU): g4arm.py check --arm G4-8 (MaxText's own SFT steps) -> $SFT/check.txt
+#   RUN=g4arm_G4-8_s8|g4arm_G4-8 [PHASE=prep|launch] bash run_g4arm8.sh train   every worker at once: run_sft.sh over the
+#                                               16 chips (the smoke run: 8 steps on $SFT/smoke/, the adapter of step 4 kept;
+#                                               the full run: sftset's steps, the adapters of its save steps kept)
+#   RUN=g4arm_G4-8_s8 bash run_g4arm8.sh smoke8 w0 (CPU): g4arm8.py smoke8 -> $SFT/smoke8-<run>.json (exit 1: a check failed)
+#   RUN=g4arm_G4-8 bash run_g4arm8.sh adapter   w0 (CPU): g4arm8.py trained, then the candidates' adapters -> $G/G4-8-s<step>/
+#   JOB=div MODEL=G4-0|G4-8-s<step> bash run_g4arm8.sh generate   every worker (its TPU): 8 samples at T = 1 of its RL-val
+#                                               sources (the candidate's LoRA merged) -> $SFT/div/<MODEL>/samples/w<k>/
+#   CANDIDATES="G4-8-s<k1> ..." O6=R-oud|R-nieuw|open [SMOKE_RUN=<run>] bash run_g4arm8.sh report8   w0 (CPU):
+#                                               g4arm8.py report8 -> $G/report-G4-8/
 # A stage whose output is in the bucket already (its last file) prints that and ends in EXIT 0 (the outputs are
 # deterministic or resumed by shard); nothing is removed. The code is beside this script (a copy of
 # $G/scripts-g4a8-<commit>/). TAG names the jobs of one chain.
 set -euo pipefail
-STAGE=${1:?a stage: fresh generate plan qe pairs judge select v3 report}
+STAGE=${1:?a stage: fresh generate plan qe pairs judge select v3 report sftset check train smoke8 adapter report8}
 R=gs://t5-dutch-english-usc2/mbert/translator
 S=$R/sft
 E=$R/eval
@@ -28,6 +42,8 @@ G=$S/g4arm
 RL=$G/rl/G4-7
 G8=$G/data/G4-8
 V3_OUT=$S/blind/G4-8-V3
+SFT=$G8/sft                                                     # §19: G4-8's SFT set, its checks, RL-val's samples
+H=$G/data/heldout                                               # G4-2.5's SFT evals books, btval, own
 FNL=gs://t5-dutch-english-usc2/mbert/flan-nl
 DECODE_CKPT=$R/judge/gemma-4-31b-it-maxtext/0/items            # the conversion every Gemma 4 decode uses
 SHM=/dev/shm/translator
@@ -98,6 +114,18 @@ export XLA_FLAGS=--xla_dump_hlo_as_text=false TPU_LOG_DIR=$SHM/tpu_logs TOKENIZE
 PREFLIGHT="timeout 600 $FPY -c \"import jax; assert (jax.device_count(), jax.process_count()) == (4, 1), (jax.device_count(), jax.process_count()); print('devices', jax.devices())\" || { echo 'preflight failed: not 4 chips of one process'; exit 2; }"
 CPU="export JAX_PLATFORMS=cpu OMP_NUM_THREADS=8 TOKENIZERS_PARALLELISM=false HF_HUB_OFFLINE=1"
 
+t8() {  # t8 NAME: a constant of g4arm8.py (§19), so that the stages and the code agree
+  JAX_PLATFORMS=cpu $SFT_PY -I -c "import sys; sys.path.insert(0, '$CODE'); import g4arm8; print(g4arm8.$1)"
+}
+
+json_key() {  # json_key FILE KEY: a top-level value of a json file (a list joined by commas)
+  python3 -c "import json, sys; v = json.load(open(sys.argv[1]))[sys.argv[2]]; print(','.join(map(str, v)) if isinstance(v, list) else v)" "$1" "$2"
+}
+
+smoke_run() { [[ $1 =~ ^g4arm_G4-8_s8[a-z]?$ ]]; }              # g4arm8.SMOKE_RUN_T
+full_run() { [[ $1 =~ ^g4arm_G4-8[a-z]?$ ]]; }                  # g4arm8.RUN_T
+cand8() { [[ $1 =~ ^G4-8-s[1-9][0-9]{0,3}$ ]]; }                # g4arm8.CAND_T (run_g4arm.sh's cand8)
+
 case $STAGE in
 fresh)
   only 0
@@ -127,8 +155,10 @@ EOF
   detach "$NAME" bash "$f"
   ;;
 generate)
-  JOB=${JOB:?anchor, c1, c2 or c3}
+  JOB=${JOB:?anchor, c1, c2, c3 or div}
   ready
+  NAME=g4a8_gen_${JOB}_$TAG
+  LORA=""
   case $JOB in
     # the anchor of the fresh sources: G4-0's greedy translation (G4-7.4a), shards of 512
     anchor) SEG=$G8/fresh/segments-w$W.parquet; OUT=$G8/anchor/samples/w$W; DONE_AT=$OUT/DONE; EXTRA="--copies 1"; SS=512 ;;
@@ -136,12 +166,29 @@ generate)
     c1|c2|c3) SEG=$G8/$JOB/segments/segments-w$W.parquet; OUT="$G8/$JOB/{sample}/w$W"; DONE_AT=$G8/$JOB/samples/w$W/DONE
        SEED=$(JAX_PLATFORMS=cpu $SFT_PY -I -c "import sys; sys.path.insert(0, '$CODE'); import g4rl; print(g4rl.seed_int('en-nl-g4arm/0/G4-8/sample/$JOB/w$W'))")
        EXTRA="--copies 8 --sample samples=1.0:$SEED"; SS=256 ;;
-    *) echo "JOB is anchor, c1, c2 or c3, not $JOB"; exit 1 ;;
+    # §19 G4-8.6: RL-val's 8 samples at T = 1 of G4-0 or a candidate, the same seed per worker for every model
+    div) MODEL=${MODEL:?G4-0 or a candidate G4-8-s<step>}
+       { [ "$MODEL" = G4-0 ] || cand8 "$MODEL"; } || { echo "MODEL is G4-0 or a candidate G4-8-s<step>, not $MODEL"; exit 1; }
+       SEG=$SFT/rlval/segments-w$W.parquet; OUT="$SFT/div/$MODEL/{sample}/w$W"; DONE_AT=$SFT/div/$MODEL/samples/w$W/DONE
+       SEED=$(JAX_PLATFORMS=cpu $SFT_PY -I -c "import sys; sys.path.insert(0, '$CODE'); import g4rl; print(g4rl.seed_int('en-nl-g4arm/0/G4-8/div/w$W'))")
+       EXTRA="--copies 8 --sample samples=1.0:$SEED"; SS=256; NAME=g4a8_gen_div_${MODEL}_$TAG ;;
+    *) echo "JOB is anchor, c1, c2, c3 or div, not $JOB"; exit 1 ;;
   esac
-  NAME=g4a8_gen_${JOB}_$TAG
   gsutil -q stat "$DONE_AT" && there_before "$NAME" "GENERATED w$W $JOB (DONE there before)"
   tpu_free
   gsutil -q stat "$SEG" || { echo "no $SEG"; exit 1; }
+  if [ "$JOB" = div ] && [ "$MODEL" != G4-0 ]; then
+    # G4-8.4: the candidate's LoRA, rank 32 / alpha 16 from G4-0 (nothing stacked); the job removes its own copy
+    LORA=$W8/adapter-$NAME
+    mkdir -p "$LORA"
+    gsutil -q cp "$G/$MODEL/adapter.npz" "$G/$MODEL/adapter.json" "$LORA/"
+    if ! python3 -c "import json, sys; a = json.load(open(sys.argv[1])); assert (a['rank'], a['alpha'], a['scale']) == (32, 16.0, 0.5), a" "$LORA/adapter.json"; then
+      rm -rf -- "$LORA"
+      echo "$G/$MODEL/adapter.json is not rank 32, alpha 16"
+      exit 1
+    fi
+    EXTRA="$EXTRA --lora $LORA"
+  fi
   f=$(body "$NAME" <<EOF
 set -uo pipefail
 $ONE_HOST
@@ -149,9 +196,10 @@ export JAX_COMPILATION_CACHE_DIR=$G_SHM/jax_cache
 mkdir -p $W8/seg-$NAME $G_SHM/work
 gsutil -q cp $SEG $W8/seg-$NAME/segments.parquet || exit 1
 $PREFLIGHT
-echo "== $JOB w$W \$(date -u +%T) G4-0, no adapter"
+echo "== $JOB w$W \$(date -u +%T) ${MODEL:-G4-0}${LORA:+ with its LoRA}${LORA:- (no adapter)}"
 # no fallback on memory (as G4-7.5): the class's own slots; translate.py skips the shards already in the bucket
 $FPY -u $CODE/translate.py --segments $W8/seg-$NAME/segments.parquet --out '$OUT' --ckpt $DECODE_CKPT --tokenizer $TOK_DEC --model gemma4-31b --prompt natural-v1 --length-class medium --source-lang en --target-lang nl --work-dir $G_SHM/work --shard-size $SS $EXTRA || exit \$?
+${LORA:+rm -rf -- $LORA}
 gsutil -q stat '$DONE_AT' || { echo "no $DONE_AT"; exit 1; }
 echo "GENERATED w$W $JOB"
 EOF
@@ -315,6 +363,241 @@ nice -n 19 $SFT_PY -I -u $CODE/g4arm8.py report --plan $X/plan.parquet$ARGS --ou
 gsutil -q cp $X/out/targets.parquet $G8/targets/targets.parquet
 gsutil -m -q cp $X/out/report.json $X/out/report.md $G8/report/
 echo "REPORT8_DONE $G8/report/report.md"
+EOF
+)
+  detach "$NAME" bash "$f"
+  ;;
+sftset)
+  # §19 G4-8.2, G4-8.5, G4-8.6: the SFT set of the targets, the smoke set, RL-val's segments
+  only 0
+  ready
+  NAME=g4a8_sftset_$TAG
+  gsutil -q stat "$SFT/manifest.json" && there_before "$NAME" "SFTSET8_DONE $SFT/ (there before)"
+  gsutil -q stat "$G8/targets/targets.parquet" || { echo "no $G8/targets/targets.parquet (G4-8-data's report)"; exit 1; }
+  X=$W8/sftset-$TAG
+  f=$(body "$NAME" <<EOF
+set -euo pipefail
+$CPU
+mkdir -p $X/in $X/out
+gsutil -m -q cp $G8/targets/targets.parquet $G8/plan/plan.parquet $E/data/evalsets.parquet $S/blind/fixed-2026-11-10/blind100.jsonl $R/mainset/flan-eval/eval-rows.parquet $X/in/
+gsutil -q cp $RL/data/pool/pool.parquet $X/in/g47-pool.parquet
+gsutil -q cp $RL/data/plan/plan.parquet $X/in/g47-plan.parquet
+gsutil -m -q cp $H/eval-books.parquet $H/eval-btval.parquet $H/eval-own.parquet $X/in/
+nice -n 19 ionice -c3 $SFT_PY -I -u $CODE/g4arm8.py sftset --targets $X/in/targets.parquet --plan $X/in/plan.parquet --evalsets $X/in/evalsets.parquet --blind $X/in/blind100.jsonl --flan-eval $X/in/eval-rows.parquet --g47-pool $X/in/g47-pool.parquet --g47-plan $X/in/g47-plan.parquet --sft-eval books=$X/in/eval-books.parquet --sft-eval btval=$X/in/eval-btval.parquet --sft-eval own=$X/in/eval-own.parquet --tokenizer $TOK_SFT --out $X/out
+gsutil -m -q cp $X/out/train.parquet $X/out/train-meta.parquet $X/out/template.jinja $X/out/report.json $X/out/report.md $SFT/
+gsutil -m -q cp $X/out/smoke/train.parquet $X/out/smoke/train-meta.parquet $X/out/smoke/template.jinja $X/out/smoke/manifest.json $SFT/smoke/
+gsutil -m -q cp '$X/out/rlval/segments-w*.parquet' $SFT/rlval/
+# the manifest last: its presence says the stage is done
+gsutil -q cp $X/out/manifest.json $SFT/manifest.json
+echo "SFTSET8_DONE $SFT/"
+EOF
+)
+  detach "$NAME" bash "$f"
+  ;;
+check)
+  # §19 G4-8.2: MaxText's own SFT steps on every distinct example (g4arm.py check, as G4-3 and G4-4)
+  only 0
+  ready
+  NAME=g4a8_check_$TAG
+  gsutil -q stat "$SFT/check.txt" && there_before "$NAME" "CHECK8_DONE $SFT/check.txt (there before)"
+  gsutil -q stat "$SFT/manifest.json" || { echo "no $SFT/manifest.json (sftset)"; exit 1; }
+  X=$W8/check-$TAG
+  f=$(body "$NAME" <<EOF
+set -euo pipefail
+export OMP_NUM_THREADS=8 TOKENIZERS_PARALLELISM=true HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 JAX_PLATFORMS=cpu
+mkdir -p $X
+gsutil -m -q cp $SFT/train.parquet $SFT/train-meta.parquet $SFT/template.jinja $X/
+nice -n 19 ionice -c3 $SFT_PY -u $CODE/g4arm.py check --data $X --tokenizer $TOK_SFT --arm G4-8 --processes ${CHECK_PROCESSES:-8} | tee $X/check.txt
+grep -q '^CHECK ' $X/check.txt
+gsutil -q cp $X/check.txt $SFT/check.txt
+echo "CHECK8_DONE $SFT/check.txt"
+EOF
+)
+  detach "$NAME" bash "$f"
+  ;;
+train)
+  # §19 G4-8.3/G4-8.5: one job over the 16 chips; PHASE=prep on every worker first, then PHASE=launch on every worker
+  # (the processes meet in jax.distributed.initialize within a timeout, as G4-5's and G4-7's runs)
+  RUN=${RUN:?g4arm_G4-8_s8 (the smoke run) or g4arm_G4-8 (the full run; a new start of either takes a new letter)}
+  D=$W8/data-$RUN
+  case ${PHASE:-} in
+    launch) [ -s "$D/launch.sh" ] || { echo "w$W: no $D/launch.sh (PHASE=prep first)"; exit 1; }
+            bash "$D/launch.sh"
+            exit 0 ;;
+    prep|"") ;;
+    *) echo "PHASE is prep, launch or empty (both), not $PHASE"; exit 1 ;;
+  esac
+  ready
+  tpu_free
+  # a launch never takes the arguments of an earlier or a refused preparation
+  rm -f -- "$D/launch.sh"
+  if smoke_run "$RUN"; then
+    SETDIR=$SFT/smoke
+  elif full_run "$RUN"; then
+    SETDIR=$SFT
+  else
+    echo "RUN $RUN is no run of G4-8 (g4arm_G4-8_s8[a-z] or g4arm_G4-8[a-z])"; exit 1
+  fi
+  gsutil -q stat "$SFT/check.txt" || { echo "no $SFT/check.txt: the set is not checked (check)"; exit 1; }
+  ! gsutil -q stat "$G/runs/$RUN/summary.json" || { echo "$G/runs/$RUN has a summary.json: a new run takes a new RUN"; exit 1; }
+  for f in eval-books.parquet eval-btval.parquet eval-own.parquet; do gsutil -q stat "$H/$f" || { echo "no $H/$f"; exit 1; }; done
+  mkdir -p "$D"
+  gsutil -m -q cp "$SETDIR/train.parquet" "$SETDIR/template.jinja" "$SETDIR/manifest.json" "$H/eval-books.parquet" \
+    "$H/eval-btval.parquet" "$H/eval-own.parquet" "$D/"
+  if smoke_run "$RUN"; then
+    STEPS=$(t8 SMOKE_STEPS_T); EVERY=$(t8 SMOKE_EVERY_T); SAVE=$(t8 SMOKE_SAVE_T)
+  else
+    gsutil -q cp "$SFT/manifest.json" "$D/manifest-sft.json"
+    STEPS=$(json_key "$D/manifest-sft.json" steps); EVERY=$(json_key "$D/manifest-sft.json" eval_every)
+    SAVE=$(json_key "$D/manifest-sft.json" save_steps)
+  fi
+  ARGS="--eval books=$D/eval-books.parquet --eval btval=$D/eval-btval.parquet --eval own=$D/eval-own.parquet"
+  ARGS="$ARGS --eval-every $EVERY --save-steps $SAVE --warmup-steps $(t8 WARMUP_T) --decay-fraction 0"
+  # G4-8.3: LoRA rank 32 / alpha 16 on run_sft.sh's modules, rows of 4,096, LR 5e-5 constant after the warmup (MaxText's
+  # WSD without decay: --decay-fraction 0)
+  printf '%q ' env SFT_ARGS="$ARGS" MULTIHOST=1 NAME="$RUN" MODEL=gemma4-31b DATA="$D/train.parquet" \
+    TEMPLATE="$D/template.jinja" ROOT="$G" STEPS="$STEPS" bash "$CODE/run_sft.sh" per_device_batch_size=1 \
+    max_target_length="$(t8 SEQ_T)" lora.lora_rank=32 lora.lora_alpha=16.0 learning_rate="$(t8 LR_T)" \
+    lr_schedule_type=wsd wsd_decay_style=linear learning_rate_final_fraction=0.1 > "$D/launch.sh.new"
+  mv "$D/launch.sh.new" "$D/launch.sh"
+  if [ "${PHASE:-}" = prep ]; then
+    echo "prepared $RUN on w$W"
+    exit 0
+  fi
+  bash "$D/launch.sh"
+  ;;
+smoke8)
+  # §19 G4-8.5: the smoke run's checks; the job ends in EXIT 1 if one fails
+  only 0
+  ready
+  RUN=${RUN:?the smoke run, g4arm_G4-8_s8}
+  smoke_run "$RUN" || { echo "RUN $RUN is no smoke run of G4-8"; exit 1; }
+  NAME=g4a8_smoke8_$TAG
+  RD=$G/runs/$RUN
+  X=$W8/smoke8-$TAG
+  f=$(body "$NAME" <<EOF
+set -euo pipefail
+$CPU
+mkdir -p $X
+# run_sft.sh copies the run's files after its EXIT line: up to 10 min
+for _ in \$(seq 1 60); do
+  gsutil -q stat $RD/summary.json && gsutil -q stat $RD/adapter.json && gsutil -q stat $RD/adapter-step4.json && break
+  sleep 10
+done
+gsutil -m -q cp $RD/summary.json $RD/adapter.json $RD/adapter-step4.json $X/
+gsutil -q cp $SFT/smoke/manifest.json $X/smoke-manifest.json
+gsutil -q cp $SFT/manifest.json $X/manifest.json
+code=0
+$SFT_PY -I -u $CODE/g4arm8.py smoke8 --run $RUN --summary $X/summary.json --adapter $X/adapter.json --adapter-step $X/adapter-step4.json --smoke-manifest $X/smoke-manifest.json --manifest $X/manifest.json --out $X/smoke8.json || code=\$?
+if [ -s $X/smoke8.json ]; then gsutil -q cp $X/smoke8.json $SFT/smoke8-$RUN.json; fi
+[ \$code = 0 ] || exit \$code
+echo "SMOKE8_DONE $SFT/smoke8-$RUN.json"
+EOF
+)
+  detach "$NAME" bash "$f"
+  ;;
+adapter)
+  # §19 G4-8.4: the full run checked against sftset (g4arm8.py trained), then each candidate's adapter to $G/G4-8-s<step>/
+  only 0
+  ready
+  RUN=${RUN:?the full run, g4arm_G4-8}
+  full_run "$RUN" || { echo "RUN $RUN is no full run of G4-8"; exit 1; }
+  NAME=g4a8_adapter_$TAG
+  gsutil -q stat "$SFT/trained.json" && there_before "$NAME" "TRAINED8_DONE $SFT/trained.json (there before)"
+  gsutil -q stat "$SFT/manifest.json" || { echo "no $SFT/manifest.json (sftset)"; exit 1; }
+  X=$W8/adapter-$TAG
+  mkdir -p "$X"
+  gsutil -q cp "$SFT/manifest.json" "$X/manifest.json"
+  SAVE=$(json_key "$X/manifest.json" save_steps | tr ',' ' ')
+  LAST=$(json_key "$X/manifest.json" steps)
+  for k in $SAVE $LAST; do
+    ! gsutil -q stat "$G/G4-8-s$k/adapter.json" || { echo "$G/G4-8-s$k has an adapter.json: it stays as it is"; exit 1; }
+  done
+  RD=$G/runs/$RUN
+  ADAPTERS="--adapter G4-8-s$LAST=$X/adapter.json"
+  WANT="$RD/summary.json $RD/adapter.json"
+  for k in $SAVE; do ADAPTERS="$ADAPTERS --adapter G4-8-s$k=$X/adapter-step$k.json"; WANT="$WANT $RD/adapter-step$k.json"; done
+  f=$(body "$NAME" <<EOF
+set -euo pipefail
+$CPU
+# run_sft.sh copies the run's files after its EXIT line: up to 10 min
+for _ in \$(seq 1 60); do
+  n=0; for p in $WANT; do gsutil -q stat \$p && n=\$((n + 1)); done
+  [ \$n = $(echo $WANT | wc -w) ] && break
+  sleep 10
+done
+gsutil -m -q cp $WANT $X/
+code=0
+$SFT_PY -I -u $CODE/g4arm8.py trained --run $RUN --summary $X/summary.json --manifest $X/manifest.json $ADAPTERS --out $X/trained.json || code=\$?
+if [ \$code != 0 ]; then
+  if [ -s $X/trained.json ]; then gsutil -q cp $X/trained.json $SFT/trained-$RUN-failed.json; fi
+  exit \$code
+fi
+for k in $SAVE; do
+  gsutil -q cp $RD/adapter-step\$k.npz $G/G4-8-s\$k/adapter.npz
+  gsutil -q cp $RD/adapter-step\$k.json $G/G4-8-s\$k/adapter.json
+  gsutil -q cp $RD/summary.json $G/G4-8-s\$k/summary.json
+  echo "ADAPTER8 G4-8-s\$k: $G/G4-8-s\$k/ (adapter-step\$k of $RUN)"
+done
+gsutil -q cp $RD/adapter.npz $G/G4-8-s$LAST/adapter.npz
+gsutil -q cp $RD/adapter.json $G/G4-8-s$LAST/adapter.json
+gsutil -q cp $RD/summary.json $G/G4-8-s$LAST/summary.json
+echo "ADAPTER8 G4-8-s$LAST: $G/G4-8-s$LAST/ (the last step of $RUN)"
+gsutil -q cp $X/trained.json $SFT/trained.json
+echo "TRAINED8_DONE $SFT/trained.json"
+EOF
+)
+  detach "$NAME" bash "$f"
+  ;;
+report8)
+  # §19 G4-8.10: the choice on the search part, both variants of the rule on the decision part, G4-8.6 per candidate
+  only 0
+  ready
+  CANDS=${CANDIDATES:?the candidates, G4-8-s<step> ...}
+  O6=${O6:?R-oud, R-nieuw or open (G4-8.0)}
+  case $O6 in R-oud|R-nieuw|open) ;; *) echo "O6 is R-oud, R-nieuw or open, not $O6"; exit 1 ;; esac
+  for m in $CANDS; do cand8 "$m" || { echo "CANDIDATES: $m is no candidate of G4-8"; exit 1; }; done
+  NAT=$G/naturalness-G4-8
+  REP=$G/report-G4-8
+  G5S=$G/data/G4-5-split
+  for f in "$NAT/predictions.parquet" "$NAT/predictions-c2.parquet" "$G5S/split.json" "$G5S/refqe.parquet" \
+    "$SFT/manifest.json" "$SFT/trained.json" "$RL/data/plan/plan.parquet"; do
+    gsutil -q stat "$f" || { echo "no $f (classify; classify-c2; split5; refqe5; sftset; adapter)"; exit 1; }
+  done
+  for m in G4-0 $CANDS; do gsutil -q stat "$SFT/div/$m/samples/w0/DONE" || { echo "no $SFT/div/$m/samples/w0/DONE (generate JOB=div)"; exit 1; }; done
+  RUN=$(gsutil cat "$SFT/trained.json" | python3 -c "import json, sys; print(json.load(sys.stdin)['run'])")
+  NAME=g4a8_report8_$TAG
+  X=$W8/report8-$TAG
+  ARGS=""
+  for m in $CANDS; do ARGS="$ARGS --candidate $m=$X/$m --lora $m=$X/lora-$m.json --div $m=$X/div/$m"; done
+  ARGS="$ARGS --div G4-0=$X/div/G4-0 --reference G4-4=$X/G4-4"
+  SMOKE=""
+  if [ -n "${SMOKE_RUN:-}" ]; then
+    gsutil -q stat "$SFT/smoke8-$SMOKE_RUN.json" || { echo "no $SFT/smoke8-$SMOKE_RUN.json"; exit 1; }
+    SMOKE="--smoke $X/smoke8.json"
+  fi
+  f=$(body "$NAME" <<EOF
+set -euo pipefail
+$CPU
+mkdir -p $X/logs
+for m in $CANDS G4-0 G4-4; do mkdir -p $X/\$m; gsutil -m -q rsync -r -x 'translations/.*' $G/eval/\$m $X/\$m; done
+for m in $CANDS G4-0; do mkdir -p $X/div/\$m; gsutil -m -q rsync -r $SFT/div/\$m/samples $X/div/\$m; done
+gsutil -q cp $G/data/eval/evalsets.parquet $G5S/split.json $G5S/refqe.parquet $NAT/predictions.parquet $NAT/predictions-c2.parquet $X/
+gsutil -q cp $RL/data/plan/plan.parquet $X/g47-plan.parquet
+gsutil -q cp $G/runs/$RUN/summary.json $X/summary.json
+gsutil -q cp $SFT/manifest.json $X/manifest.json
+if [ -n "$SMOKE" ]; then gsutil -q cp $SFT/smoke8-${SMOKE_RUN:-}.json $X/smoke8.json; fi
+# G4-8.6: each candidate's update norm from translate.py's LORA line in its translate logs
+for m in $CANDS; do
+  gsutil -m -q cp "$G/logs/g4a_translate_\${m}_*" $X/logs/
+  $FPY -I -u $CODE/g4arm8.py loraline --logs "$X/logs/g4a_translate_\${m}_*" --out $X/lora-\$m.json
+done
+EXTRA=""
+if gsutil -q stat $NAT/pll.parquet; then gsutil -q cp $NAT/pll.parquet $X/; EXTRA="--pll $X/pll.parquet"; fi
+if gsutil -q stat $REP/tally.json; then gsutil -q cp $REP/tally.json $X/; EXTRA="\$EXTRA --tally $X/tally.json"; fi
+$FPY -I -u $CODE/g4arm8.py report8 --evalsets $X/evalsets.parquet --split $X/split.json --refqe $X/refqe.parquet --base $X/G4-0 --predictions $X/predictions.parquet --predictions-c2 $X/predictions-c2.parquet --summary $X/summary.json --manifest $X/manifest.json --rlval $X/g47-plan.parquet --o6 $O6$ARGS $SMOKE \$EXTRA --out $X/report.md
+gsutil -m -q cp $X/report.md $X/report.json $REP/
+echo "REPORT8_TRAIN_DONE $REP/report.md"
 EOF
 )
   detach "$NAME" bash "$f"

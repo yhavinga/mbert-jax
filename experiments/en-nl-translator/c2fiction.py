@@ -315,7 +315,7 @@ def report_md(r, info):
             y = x[c] or {}
             cells += [f(y.get("share_original")), f(y.get("mean_p")), f(y.get("mean_logit"), 2),
                       f(y.get("median_logit"), 2)]
-        L.append(f"| {g} | {x['n']} | {x['books']} | {f(x['median_tokens'])} | " + " | ".join(cells) + " |")
+        L.append(f"| {g} | {x['n']} | {x['books']} | {f(x['median_tokens'], 1)} | " + " | ".join(cells) + " |")
     L += ["", "## 2. AUC (de eerste groep hoort hoger; `nl_books`–`nl_books31` is een controle)", "",
           "| paar | C1 AUC | C1 95%-interval | C2 AUC | C2 95%-interval |", "|---|---:|---|---:|---|"]
     for k, v in r["auc"].items():
@@ -344,7 +344,7 @@ def report_md(r, info):
     a = r["anchor_novels_judge_c2"]
     L += ["", "## 6. Controles en herkomst", "",
           f"- C2 op `g40` tegen de judge-score van het anker: {ch['compared']} vergeleken, {ch['missing']} ontbreken, "
-          f"grootste |ΔP| {ch['max_abs_dp']:.2e}, {ch['over_tol']} boven {ch['tol']:g}; tokens gelijk aan `c2_tokens` "
+          f"grootste |ΔP| {f(ch['max_abs_dp'], 4)}, {ch['over_tol']} boven {f(ch['tol'], 3)}; tokens gelijk aan `c2_tokens` "
           f"bij {ch['tokens_equal']}." if ch["max_abs_dp"] is not None else "- C2 tegen de judge: niets vergeleken.",
           f"- Door `naturalness.py` als `truncated` gemarkeerd (alleen teksten van precies {MAX_TOKENS} tokens): "
           + ", ".join(f"{c} {n}" for c, n in r["checks"]["truncated_flags"].items()) + ".",

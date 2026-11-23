@@ -2024,3 +2024,8 @@ gepaard; de vergelijking met de originelen is dat niet. De menselijke vertalinge
 `meta.parquet` (id, groep, boek, tokens; geen tekst), `predictions-c1.parquet`, `predictions-c2.parquet`,
 `report.json`/`.md`. Op co1 alleen het rapport: `mbert-ops/translator-sft/c2-fiction-check.md` (en `.json`), tabellen met
 tellingen en scores, geen teksten. Keten: `mbert-ops/scripts/c2fiction_run.sh`.
+
+*C2F.7 Correctie (23 nov, na de meting).* Het tijdstip in de kop van §16 is ~01:05 (de commit `b3b560a`), niet ~01:30.
+De meting liep als run `c2f1123a` met `c2fiction.py` @ `a4128e3`; het rapport op co1 is uit `report.json` opnieuw
+opgemaakt met de getalnotatie van `c2fiction.py` @ de commit van deze correctie (mediaan tokens met één decimaal, |ΔP|
+met komma); de getallen zijn dezelfde.

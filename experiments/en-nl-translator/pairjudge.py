@@ -14,6 +14,12 @@ with C1 and the samples' existing scores, and builds a blind package.
     python pairjudge.py bonreport --evalsets E --split S --refqe R --anchor DIR --predictions P \\
         --probe-predictions PP --bon-predictions BP --model NAME=GREEDY,T10S1,BONSELECT,JSELECT ... --out report.md
     python pairjudge.py blind --model NAME --select DIR --anchor DIR --evalsets E --split S --out DIR
+    python pairjudge.py fbdata --c2f DIR --b1 P --c2-data P --bt DIR --g47-pool P --g48-plan P --tokenizer T --out DIR
+    python pairjudge.py fbreport --refs R --data-json J --scores GLOB --fiction-c1 P --fiction-c2 P --bt-c2 P --out report.md
+
+§20 (G4-judge-FB, 24 Nov 2026): the same judge on fiction (the human Dutch translation against G4-0's of C2F's
+passages) and BT (the Dutch original against Gemma 4's round trip, C2's test split), A = the human or original side in
+order ab; the report beside C1 and C2 on the same pairs as they exist.
 
 A prompt row is (uid, text): text is the user turn; score puts the model's chat turn around it. The texts stay in the
 bucket and on the VM: no command prints a text, the reports hold counts and scores only."""
@@ -1540,6 +1546,354 @@ def reasonreport_text(r):
     return "\n".join(L) + "\n"
 
 
+# ---------------------------------------------------------------------------------------------------- §20: fiction and BT
+
+FB_PROTOCOL = "protocol-g4.md §20"
+FB_TESTS = ("fiction", "bt")
+FB_SIDES = {"fiction": ("human", "g40"), "bt": ("nl", "nl_back")}   # (A in order ab: the human or original side, B)
+FB_PAIRS = 500
+FB_BT_PER_SOURCE = 100
+FB_NOVEL = "novels:"                              # C2F's ids: novels:<-b1- row id>
+FB_BANDS = (("<=128", 0, 128), ("129-256", 129, 256), (">256", 257, 10 ** 9))   # Gemma 4 tokens of the English
+FB_BOOT = 10000
+FB_BOOT_SEED = "en-nl-g4arm/0/G4-judge-fb/boot"
+FB_OVERLAP = ("c2_train_document", "pool_plan_id", "pool_plan_document", "pool_plan_english")
+
+
+def fb_fiction(texts_rows, b1_rows):
+    """FB.2: C2F's pairs (groups human and g40, the same ids) with the English of their -b1- row: (pairs, info)"""
+    side = {g: {} for g in FB_SIDES["fiction"]}
+    for r in texts_rows:
+        if r["model"] in side:
+            if r["id"] in side[r["model"]]:
+                raise SystemExit(f"C2F's texts: {r['model']}/{r['id']} twice")
+            side[r["model"]][r["id"]] = r["text"] or ""
+    human, g40 = (side[g] for g in FB_SIDES["fiction"])
+    if set(human) != set(g40) or len(human) != FB_PAIRS:
+        raise SystemExit(f"C2F's texts: {len(human)} human and {len(g40)} g40 texts, not the same {FB_PAIRS} passages")
+    b1 = collections.defaultdict(list)
+    for r in b1_rows:
+        b1[r["id"]].append(r)
+    out = []
+    for i in sorted(human):
+        if not i.startswith(FB_NOVEL):
+            raise SystemExit(f"{i}: not {FB_NOVEL}<-b1- row id>")
+        found = b1.get(i[len(FB_NOVEL):], [])
+        if len(found) != 1 or found[0]["group"] != "en_orig":
+            raise SystemExit(f"{i}: {len(found)} rows in b1-selected (or not of group en_orig)")
+        b = found[0]
+        if (b["nl"] or "").strip() != human[i].strip():
+            raise SystemExit(f"{i}: the text of human is not the -b1- row's nl")
+        en = (b["en"] or "").strip()
+        if not en or not human[i].strip() or not g40[i].strip():
+            raise SystemExit(f"{i}: an empty source or translation")
+        out.append({"test": "fiction", "id": i, "stratum": FB_NOVEL + b["id"].rsplit("-b1-", 1)[0], "en": en,
+                    "first": human[i], "second": g40[i]})
+    return out, {"pairs": len(out), "books": len({p["stratum"] for p in out})}
+
+
+def fb_bt(c2_rows, bt_rows, pool_rows, plan_rows):
+    """FB.2: C2's test split (nl against nl_back) with the Gemma 4 English of the same pid; none of it of C2's training
+    documents, G4-7's pool or G4-8's plan (a hit stops): (pairs, info)"""
+    import g4arm
+    import g4c2
+
+    test, source_of, train_docs = collections.defaultdict(dict), {}, set()
+    for r in c2_rows:
+        if r["split"] == "train":
+            train_docs.add(g4c2.doc_key(r["pid"]))
+        elif r["split"] == "test":
+            label = int(r["label"])
+            if label in test[r["pid"]] or source_of.setdefault(r["pid"], r["source"]) != r["source"]:
+                raise SystemExit(f"C2's test split: {r['pid']} has label {label} twice or two sources")
+            test[r["pid"]][label] = r["text"] or ""
+        else:
+            raise SystemExit(f"C2's data: split {r['split']!r}")
+    per_source = dict(sorted(collections.Counter(source_of.values()).items()))
+    if any(set(x) != {0, 1} for x in test.values()) or \
+            per_source != {s: FB_BT_PER_SOURCE for s in sorted(g4arm.BT_REPOS3)}:
+        raise SystemExit(f"C2's test split: {per_source} passages per source, not {FB_BT_PER_SOURCE} each with both labels")
+    bt = {r["pid"]: r for r in bt_rows}
+    blocked = {"id": {r["id"] for r in pool_rows + plan_rows}, "doc": {r["doc"] for r in pool_rows + plan_rows},
+               "en": {(r["en"] or "").strip() for r in pool_rows + plan_rows}}
+    overlap = dict.fromkeys(FB_OVERLAP, 0)
+    out = []
+    for pid in sorted(test):
+        b = bt.get(pid)
+        if b is None or b["source"] != source_of[pid]:
+            raise SystemExit(f"{pid}: no train row of {source_of[pid]} in the BT sets")
+        nl, back = test[pid][1], test[pid][0]
+        if (b["nl"] or "").strip() != nl.strip() or (b["nl_back"] or "").strip() != back.strip():
+            raise SystemExit(f"{pid}: nl or nl_back of the BT row is not the text of C2's test split")
+        en = (b["en"] or "").strip()
+        if not en or not nl.strip() or not back.strip():
+            raise SystemExit(f"{pid}: an empty source or text")
+        doc = g4c2.doc_key(pid)
+        overlap["c2_train_document"] += doc in train_docs
+        overlap["pool_plan_id"] += f"bt:{pid}" in blocked["id"]
+        overlap["pool_plan_document"] += doc in blocked["doc"]
+        overlap["pool_plan_english"] += en in blocked["en"]
+        out.append({"test": "bt", "id": pid, "stratum": source_of[pid], "en": en, "first": nl, "second": back})
+    if any(overlap.values()):
+        raise SystemExit(f"C2's test split overlaps C2's training documents, G4-7's pool or G4-8's plan: {overlap}")
+    return out, {"pairs": len(out), "per_source": per_source, "c2_train_documents": len(train_docs),
+                 "g47_pool_rows": len(pool_rows), "g48_plan_rows": len(plan_rows), "overlap": overlap}
+
+
+def fb_band(n):
+    return next(name for name, lo, hi in FB_BANDS if lo <= n <= hi)
+
+
+def fbdata(args):
+    """FB.2, FB.3: the prompts of both tests in both orders (A = the human or original side in order ab) and the
+    references without text"""
+    import g4arm
+    import pyarrow.parquet as pq
+
+    texts_rows = read_rows(Path(args.c2f) / "texts.parquet", ["model", "id", "text"])
+    want = sorted({r["id"][len(FB_NOVEL):] for r in texts_rows if r["id"].startswith(FB_NOVEL)})
+    b1_rows = pq.read_table(args.b1, columns=["id", "group", "en", "nl"], filters=[("id", "in", want)]).to_pylist()
+    fiction, finfo = fb_fiction(texts_rows, b1_rows)
+    pool_rows = read_rows(args.g47_pool, ["id", "doc", "en"])
+    plan_rows = read_rows(args.g48_plan, ["id", "doc", "en"])
+    finfo["in_g47_pool"] = len({p["id"] for p in fiction} & {r["id"] for r in pool_rows})
+    finfo["in_g48_plan"] = len({p["id"] for p in fiction} & {r["id"] for r in plan_rows})
+    c2_rows = read_rows(args.c2_data, ["pid", "source", "split", "label", "text"])
+    bt_rows = g4arm.read_bt(args.bt, g4arm.revisions3(args.bt), split="train", extra=("nl_back",))
+    bt, binfo = fb_bt(c2_rows, bt_rows, pool_rows, plan_rows)
+    pairs = fiction + bt
+    tokens = g4arm.TokenCounter(args.tokenizer).lengths([p["en"] for p in pairs])
+    prompts, refs = [], []
+    for p, n in zip(pairs, tokens):
+        for uid, text, _ in pair_prompts(f"{p['test']}/{p['id']}", p["en"], p["first"], p["second"]):
+            prompts.append({"uid": uid, "text": text})
+        refs.append({"package": p["test"], "blind_id": p["id"], "stratum": p["stratum"], "tokens_en": n,
+                     "identical": p["first"].strip() == p["second"].strip()})
+    if len({(r["package"], r["blind_id"]) for r in refs}) != len(refs):
+        raise SystemExit("a pair twice")
+    out = Path(args.out)
+    workers = write_prompts(prompts, out)
+    write_rows(refs, out / "refs.parquet")
+    info = {"protocol": FB_PROTOCOL, "prompts": len(prompts), "workers": workers, "fiction": finfo, "bt": binfo,
+            "identical": {t: sum(r["identical"] for r in refs if r["package"] == t) for t in FB_TESTS},
+            "tokens_en": {t: {"median": statistics.median(r["tokens_en"] for r in refs if r["package"] == t),
+                              "max": max(r["tokens_en"] for r in refs if r["package"] == t),
+                              "bands": {b: sum(fb_band(r["tokens_en"]) == b for r in refs if r["package"] == t)
+                                        for b, _, _ in FB_BANDS}} for t in FB_TESTS},
+            "inputs": {name: g4arm.sha256_file(path) for name, path in
+                       (("c2f_texts", Path(args.c2f) / "texts.parquet"), ("b1", args.b1), ("c2_data", args.c2_data),
+                        ("g47_pool", args.g47_pool), ("g48_plan", args.g48_plan))}}
+    (out / "fbdata.json").write_text(json.dumps(info, indent=1) + "\n")
+    print(f"FBDATA {json.dumps({k: info[k] for k in ('prompts', 'workers', 'identical')} | {'fiction': finfo, 'bt': binfo})}",
+          flush=True)
+
+
+def fb_measures(rows):
+    """FB.4 1-3 over rows of val_pairs (A = the human or original side)"""
+    if not rows:
+        return {"n": 0}
+    verdicts = collections.Counter(r["judge"] for r in rows)
+    return {"n": len(rows), "human": verdicts["A"], "machine": verdicts["B"], "gelijk": verdicts["gelijk"],
+            "direction": share(direction_credit(r["p"], "A") for r in rows),
+            "mean_p_human": statistics.fmean(r["p"]["A"] for r in rows),
+            "mean_p_machine": statistics.fmean(r["p"]["B"] for r in rows),
+            "mean_p_gelijk": statistics.fmean(r["p"]["gelijk"] for r in rows),
+            "mean_delta": statistics.fmean(r["p"]["A"] - r["p"]["B"] for r in rows),
+            "flip": share({r["greedy_ab"], r["greedy_ba"]} == {"A", "B"} for r in rows),
+            "inconsistent": share(r["greedy_ab"] != r["greedy_ba"] for r in rows)}
+
+
+def fb_boot(values, seed):
+    """95% bootstrap interval of the mean (FB_BOOT draws over the values)"""
+    import numpy as np
+
+    x = np.asarray(values, dtype=np.float64)
+    rng = np.random.default_rng(int.from_bytes(hashlib.sha256(seed.encode()).digest()[:8], "little"))
+    means = x[rng.integers(0, len(x), (FB_BOOT, len(x)))].mean(axis=1)
+    lo, hi = np.percentile(means, [2.5, 97.5])
+    return [float(lo), float(hi)]
+
+
+def fb_probs(pred_rows, refs, test):
+    """{id: (P(original) of the human or original side, of the machine side)} of a classifier's predictions: C2F's
+    (model = group, set fiction) or c2cal7's (model C2-test, set = the BT source, id <pid>#<label>)"""
+    got = {}
+    for r in pred_rows:
+        if test == "fiction" and r["set"] == "fiction" and r["model"] in FB_SIDES["fiction"]:
+            k = (r["id"], FB_SIDES["fiction"].index(r["model"]), "fiction")
+        elif test == "bt" and r["model"] == "C2-test":
+            pid, label = r["id"].rsplit("#", 1)
+            k = (pid, {"1": 0, "0": 1}[label], r["set"])
+        else:
+            continue
+        if k in got:
+            raise SystemExit(f"a prediction of {k} twice")
+        got[k] = r["p_original"]
+    out = {}
+    for r in refs:
+        if r["package"] != test:
+            continue
+        s = "fiction" if test == "fiction" else r["stratum"]
+        k = [(r["blind_id"], side, s) for side in (0, 1)]
+        if any(x not in got for x in k):
+            raise SystemExit(f"{test}/{r['blind_id']}: no prediction of both sides")
+        out[r["blind_id"]] = (got[k[0]], got[k[1]])
+    return out
+
+
+def fb_classifier(rows, probs):
+    """FB.4 5: the classifier's paired preference on the judge's pairs and its agreement with the judge's direction"""
+    import g4c2
+
+    higher, dj, dl = [], [], []
+    for r in rows:
+        first, second = probs[r["blind_id"]]
+        higher.append(1.0 if first > second else 0.5 if first == second else 0.0)
+        dj.append(r["p"]["A"] - r["p"]["B"])
+        dl.append(g4c2.logit_of(first) - g4c2.logit_of(second))
+    both = [(a > 0, b > 0) for a, b in zip(dj, dl) if a != 0 and b != 0]
+    side = {True: "human", False: "machine"}
+    table = {j: {c: sum(side[a] == j and side[b] == c for a, b in both) for c in side.values()} for j in side.values()}
+    return {"n": len(rows), "human_higher": share(higher), "mean_dlogit": statistics.fmean(dl),
+            "agree": share(a == b for a, b in both), "table": table, "spearman": g4c2.spearman(dj, dl)}
+
+
+def fb_result(refs, scores, probs, info):
+    """The measures of FB.4: (result, rows)"""
+    if len(scores) != 2 * len(refs):
+        raise SystemExit(f"{len(scores)} scores for {len(refs)} pairs (expected {2 * len(refs)})")
+    rows, skipped = val_pairs(refs, scores)
+    result = {"protocol": FB_PROTOCOL, "pairs": len(refs), "scored_pairs": len(rows), "skipped_pairs": skipped,
+              "tests": {}, "classifiers": {}, "data": info}
+    for t in FB_TESTS:
+        rs = [r for r in rows if r["package"] == t]
+        m = fb_measures(rs)
+        if rs:
+            m["delta_ci95"] = fb_boot([r["p"]["A"] - r["p"]["B"] for r in rs], f"{FB_BOOT_SEED}/{t}")
+            m["position"] = position_measures(rs)
+        m["strata"] = {s: fb_measures([r for r in rs if r["stratum"] == s])
+                       for s in sorted({r["stratum"] for r in rs})} if t == "bt" else {}
+        m["bands"] = {b: fb_measures([r for r in rs if fb_band(r["tokens_en"]) == b]) for b, _, _ in FB_BANDS}
+        m["identical"] = sum(r["identical"] for r in rs)
+        m["strata_n"] = len({r["stratum"] for r in rs})
+        result["tests"][t] = m
+        result["classifiers"][t] = {c: fb_classifier(rs, p) for c, p in probs[t].items()}
+    return result, rows
+
+
+def fbreport(args):
+    refs = read_rows(args.refs)
+    info = json.loads(Path(args.data_json).read_text())
+    probs = {"fiction": {"C1": fb_probs(read_rows(args.fiction_c1), refs, "fiction"),
+                         "C2": fb_probs(read_rows(args.fiction_c2), refs, "fiction")},
+             "bt": {"C2": fb_probs(read_rows(args.bt_c2), refs, "bt")}}
+    result, _ = fb_result(refs, scores_by_uid(read_glob(args.scores)), probs, info)
+    Path(args.out).with_suffix(".json").write_text(json.dumps(result, indent=1) + "\n")
+    Path(args.out).write_text(fbreport_text(result), encoding="utf-8")
+    print("FBREPORT " + json.dumps({t: {"n": m["n"], "direction": round(m["direction"]["share"], 4),
+                                        "verdicts": [m["human"], m["machine"], m["gelijk"]],
+                                        "flip": round(m["flip"]["share"], 4)}
+                                    for t, m in result["tests"].items() if m["n"]}), flush=True)
+
+
+FB_NAMES = {"fiction": ("fictie", "mens", "G4-0"), "bt": ("BT", "origineel", "rondgang")}
+
+
+def fb_row_cells(m):
+    if not m["n"]:
+        return [str(0)] + ["–"] * 5
+    n = m["n"]
+    return [str(n), f"{m['human']} ({pct(m['human'] / n)})", f"{m['machine']} ({pct(m['machine'] / n)})",
+            f"{m['gelijk']} ({pct(m['gelijk'] / n)})", share_text(m["direction"]), pct(m["flip"]["share"])]
+
+
+def fbreport_text(r):
+    d = r["data"]
+    L = ["# Meting G4-judge-FB: de judge op fictie en BT (rapporteren; beslist niets)", "",
+         f"Gemaakt door `pairjudge.py fbreport` ({FB_PROTOCOL}). De judge van §17 ongewijzigd: Gemma 4 31B-it, prompt "
+         "G4-judge.3, één prefill, P(A)/P(B)/P(gelijk), elk paar in beide volgordes. P̄ = het gemiddelde van de "
+         "genormaliseerde kansen over de twee volgordes; oordeel = de grootste P̄. **Mens** = de menselijke of "
+         "oorspronkelijke kant: bij fictie de menselijke Nederlandse vertaling (`-b1-`, `en_orig`), bij BT het "
+         "Nederlandse origineel (`nl`). **Machine** = G4-0 greedy (fictie) of Gemma 4's rondgang (`nl_back`, BT). "
+         "Richting = aandeel paren met P̄(mens) > P̄(machine) (gelijk telt ½). Intervallen: 95% Wilson; Δ = "
+         "P̄(mens) − P̄(machine), interval met bootstrap (10.000 trekkingen).", "",
+         f"Gescoorde paren: {r['scored_pairs']} van {r['pairs']}" +
+         (f"; niet gescoord (prompt > 4.096 tokens): {len(r['skipped_pairs'])}" if r["skipped_pairs"] else "") + ".", "",
+         "## Tabel 1: per proef", "",
+         "| proef | n | oordeel mens | oordeel machine | oordeel gelijk | richting (95%-BI) | omklappen | inconsistent | "
+         "gem. P̄(mens) | gem. P̄(machine) | gem. P̄(gelijk) | gem. Δ [95%-BI] |",
+         "|---|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|---|"]
+    for t, m in r["tests"].items():
+        name, human, machine = FB_NAMES[t]
+        if not m["n"]:
+            L.append(f"| {name} ({human} / {machine}) | 0 |" + " – |" * 10)
+            continue
+        ci = m["delta_ci95"]
+        L.append(f"| {name} ({human} / {machine}) | " + " | ".join(fb_row_cells(m)[:5]) +
+                 f" | {pct(m['flip']['share'])} | {pct(m['inconsistent']['share'])} | {num(m['mean_p_human'])} | "
+                 f"{num(m['mean_p_machine'])} | {num(m['mean_p_gelijk'])} | {num(m['mean_delta'])} "
+                 f"[{num(ci[0])}; {num(ci[1])}] |")
+    L += ["", "## Tabel 2: positie en antwoordmassa (greedy antwoord per volgorde; `ab`: A = mens)", "",
+          "| proef | volgorde | eerste positie (A) | tweede positie (B) | gelijk | gem. p_A − p_B | massa mediaan | massa < 0,5 |",
+          "|---|---|---:|---:|---:|---:|---:|---:|"]
+    for t, m in r["tests"].items():
+        for o, x in (m.get("position") or {}).items():
+            L.append(f"| {FB_NAMES[t][0]} | {o} | {pct(x['first_position'])} | {pct(x['second_position'])} | "
+                     f"{pct(x['gelijk'])} | {num(x['mean_pa_minus_pb'])} | {num(x['mass_median'])} | {x['mass_below_half']} |")
+    head = "| n | oordeel mens | oordeel machine | oordeel gelijk | richting (95%-BI) | omklappen |"
+    L += ["", "## Tabel 3: BT per bron", "", "| bron " + head, "|---|---:|---:|---:|---:|---|---:|"]
+    for s, m in r["tests"]["bt"]["strata"].items():
+        L.append(f"| {s} | " + " | ".join(fb_row_cells(m)) + " |")
+    L += ["", "## Tabel 4: per lengteband van de Engelse bron (Gemma 4-tokens)", "", "| proef | band " + head,
+          "|---|---|---:|---:|---:|---:|---|---:|"]
+    for t, m in r["tests"].items():
+        for b, x in m["bands"].items():
+            L.append(f"| {FB_NAMES[t][0]} | {b} | " + " | ".join(fb_row_cells(x)) + " |")
+    L += ["", "## Tabel 5: de classifiers op dezelfde paren (bestaande scores; P = P(origineel))", "",
+          "Fictie: C1 en C2 uit run `c2f1123a` (§16). BT: C2 uit `c2cal7` (zijn testsplit); C1 heeft geen scores op deze "
+          "BT-paren. Overeenstemming = de richting van de classifier (Δlogit) gelijk aan die van de judge (Δ P̄), op de "
+          "paren waar beide ≠ 0.", "",
+          "| proef | classifier | n | P(mens) > P(machine) (95%-BI) | gem. Δlogit (±12) | richting gelijk aan de judge "
+          "(95%-BI) | judge mens · clf mens | judge mens · clf machine | judge machine · clf mens | "
+          "judge machine · clf machine | Spearman Δ judge ~ Δlogit |",
+          "|---|---|---:|---|---:|---|---:|---:|---:|---:|---:|"]
+    for t, cs in r["classifiers"].items():
+        for c, x in cs.items():
+            tb = x["table"]
+            L.append(f"| {FB_NAMES[t][0]} | {c} | {x['n']} | {share_text(x['human_higher'])} | {num(x['mean_dlogit'], 2)} | "
+                     f"{share_text(x['agree'])} | {tb['human']['human']} | {tb['human']['machine']} | "
+                     f"{tb['machine']['human']} | {tb['machine']['machine']} | {num(x['spearman'])} |")
+    f, b = d["fiction"], d["bt"]
+    L += ["", "## Betekenisfouten aan de menselijke kant", "",
+          "Niet gemeten. De prompt van G4-judge.3 vraagt één woord (A, B of gelijk); juistheid en natuurlijkheid zitten "
+          "in dat ene antwoord en zijn er niet uit te scheiden. Een tweede prompt valt buiten deze meting (§20, FB.4 6).",
+          "", "## Herkomst en controles", "",
+          f"- Fictie: {f['pairs']} paren uit {f['books']} boeken (C2F, run `c2f1123a`); daarvan in G4-7's pool "
+          f"{f['in_g47_pool']}, in G4-8's plan {f['in_g48_plan']} (alleen id's vergeleken); tekst mens = machine "
+          f"(gestript): {d['identical']['fiction']}.",
+          f"- BT: {b['pairs']} paren, C2's testsplit, per bron " +
+          ", ".join(f"{s} {n}" for s, n in b["per_source"].items()) +
+          f"; overlap met C2's {b['c2_train_documents']} trainingsdocumenten, G4-7's pool ({b['g47_pool_rows']} rijen) "
+          f"en G4-8's plan ({b['g48_plan_rows']} rijen): " +
+          ", ".join(f"{k} {v}" for k, v in b["overlap"].items()) +
+          f" (gecontroleerd); tekst origineel = rondgang (gestript): {d['identical']['bt']}.",
+          "- Engelse bron in Gemma 4-tokens: " + "; ".join(
+              f"{FB_NAMES[t][0]} mediaan {num(float(x['median']), 1)}, max {x['max']}, per band " +
+              ", ".join(f"{k} {v}" for k, v in x["bands"].items()) for t, x in d["tokens_en"].items()) + ".",
+          "", "## Wat dit niet zegt", "",
+          "- De herkomst is bekend, de kwaliteit niet. Een menselijke romanvertaling heeft literaire vrijheid (weglaten, "
+          "toevoegen, herschikken); de rubriek telt dat als betekenisfout, dus een voorkeur voor G4-0 kan de rubriek "
+          "juist volgen. Bij BT is het Engels Gemma 4's vertaling van het origineel: waar dat Engels iets weglaat of "
+          "toevoegt, lijkt het origineel tegen de bron een fout te hebben, en de rondgang volgt het Engels.",
+          "- De machinekant is in beide proeven Gemma 4 31B-it, hetzelfde model als de judge: een voorkeur voor de eigen "
+          "stijl is niet te scheiden van de vraag.",
+          "- Fictie: passages uit het anker van G4-7 (Engels 20–256 Gemma 4-tokens), uit het gelijnde en gefilterde "
+          "-b1-corpus; BT: C2's testsplit (één passage per document, heel in C2), ook langere bronnen dan die van G4-8. "
+          "Geen steekproef van alle fictie of BT.",
+          "- Eén prompt, zero-shot, geen drempel; beslist niets over G4-8, de judge of een volgende arm.", ""]
+    return "\n".join(L) + "\n"
+
+
 # ---------------------------------------------------------------------------------------------------- CLI
 
 def main(argv=None):
@@ -1620,10 +1974,27 @@ def main(argv=None):
     a.add_argument("--evalsets", required=True)
     a.add_argument("--split", required=True)
     a.add_argument("--out", required=True)
+    a = sub.add_parser("fbdata")
+    a.add_argument("--c2f", required=True, help="C2F's run directory (texts.parquet with the groups human and g40)")
+    a.add_argument("--b1", required=True, help="$S/data/books-b1/b1-selected.parquet (the English of the novels)")
+    a.add_argument("--c2-data", required=True, help="C2's classifier.parquet (its test split: nl against nl_back)")
+    a.add_argument("--bt", required=True, help="the five BT sets at G4-3's revisions ($G/input/bt3)")
+    a.add_argument("--g47-pool", required=True, help="G4-7's pool.parquet")
+    a.add_argument("--g48-plan", required=True, help="G4-8's plan.parquet")
+    a.add_argument("--tokenizer", required=True, help="a directory with Gemma 4's tokenizer.json")
+    a.add_argument("--out", required=True)
+    a = sub.add_parser("fbreport")
+    a.add_argument("--refs", required=True)
+    a.add_argument("--data-json", required=True, help="fbdata.json")
+    a.add_argument("--scores", required=True, help="GLOB of the score shards")
+    a.add_argument("--fiction-c1", required=True, help="C2F's predictions-c1.parquet")
+    a.add_argument("--fiction-c2", required=True, help="C2F's predictions-c2.parquet")
+    a.add_argument("--bt-c2", required=True, help="c2cal7's predictions.parquet (model C2-test)")
+    a.add_argument("--out", required=True)
     args = p.parse_args(argv)
     {"valdata": valdata, "score": score, "valreport": valreport, "bonpairs": bonpairs, "select": select,
      "bonreport": bonreport, "anchorselect": anchorselect, "blind": blind, "reason": reason,
-     "reasonreport": reasonreport}[args.cmd](args)
+     "reasonreport": reasonreport, "fbdata": fbdata, "fbreport": fbreport}[args.cmd](args)
 
 
 if __name__ == "__main__":

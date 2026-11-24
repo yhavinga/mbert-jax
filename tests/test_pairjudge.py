@@ -450,7 +450,7 @@ def test_run_pairjudge_stages_render_their_jobs(tmp_path):
         assert "preflight failed" in body and "venv-fork-f4d8615f4" in body
         (home / "logs" / "pj_score_val_s1.log").unlink(missing_ok=True)
     out, _ = run("score", SET="test", TAG="s2")
-    assert out.returncode != 0 and "SET is val or bon" in out.stdout
+    assert out.returncode != 0 and "SET is val, bon or fb" in out.stdout
     out, _ = run("valreport", TAG="r1")
     assert out.returncode == 0, out.stdout + out.stderr
     body = (home / "job_body_pj_valreport_r1.sh").read_text()
@@ -893,3 +893,247 @@ def test_run_pairjudge_a_and_b_stages_render_their_jobs(tmp_path):
     key.write_text("x")
     out, _ = run("ablind", TAG="a7")
     assert out.returncode != 0 and "stays as it is" in out.stdout
+
+
+# ---------------------------------------------------------------------------------------------------- §20: fiction and BT
+
+FB_SOURCES = sorted(g4arm.BT_REPOS3)
+
+
+def fb_inputs(tmp_path):
+    """C2F's run (texts.parquet), b1, C2's classifier.parquet, the BT rows, G4-7's pool and G4-8's plan, synthetic"""
+    c2f = tmp_path / "c2f"
+    c2f.mkdir(parents=True)
+    texts, b1 = [], []
+    for n in range(pj.FB_PAIRS):
+        i = f"bk{n % 40:02d}-x-b1-{n}"
+        human = f"{MARK} human {n}"
+        texts += [{"model": "human", "set": "fiction", "id": f"novels:{i}", "text": human + "  "},
+                  {"model": "g40", "set": "fiction", "id": f"novels:{i}", "text": human if n == 7 else f"{MARK} g40 {n}"},
+                  {"model": "nl_books", "set": "fiction", "id": f"heldout:books:{n}", "text": f"{MARK} orig {n}"}]
+        b1.append({"id": i, "group": "en_orig", "en": f" {MARK} english {n} " + "w " * (n % 200), "nl": human})
+    b1 += [{"id": f"other-b1-{n}", "group": "nl_orig", "en": "e", "nl": "n"} for n in range(5)]
+    pj.write_rows(texts, c2f / "texts.parquet")
+    pj.write_rows(b1, tmp_path / "b1.parquet")
+    c2, bt = [], []
+    for s in FB_SOURCES:
+        for n in range(pj.FB_BT_PER_SOURCE + 20):
+            pid = f"{s}:doc{n}:t1:{n % 3}"
+            split = "test" if n < pj.FB_BT_PER_SOURCE else "train"
+            nl, back = f"{MARK} nl {s} {n}", f"{MARK} back {s} {n}"
+            c2 += [{"pid": pid, "id": pid, "source": s, "rank": n, "split": split, "label": 1, "text": nl},
+                   {"pid": pid, "id": pid, "source": s, "rank": n, "split": split, "label": 0, "text": back}]
+            bt.append({"pid": pid, "source": s, "nl": nl + "\n", "en": f"{MARK} en {s} {n} " + "w " * (n * 3),
+                       "nl_back": back, "hard_fails": [], "chrf": 0.5, "model": "m", "dump": None})
+        bt.append({"pid": f"{s}:other:t1:0", "source": s, "nl": "x", "en": "y", "nl_back": "z", "hard_fails": [],
+                   "chrf": 0.5, "model": "m", "dump": None})
+    pj.write_rows(c2, tmp_path / "classifier.parquet")
+    pool = [{"id": f"bt:{s}:other:t1:0", "doc": f"{s}:other", "en": "y"} for s in FB_SOURCES] + \
+           [{"id": "novels:bk00-x-b1-0", "doc": "novels:bk00-x", "en": "q"}]
+    plan = [{"id": "novels:bk00-x-b1-0", "doc": "novels:bk00-x", "en": "q"},
+            {"id": "novels:bk01-x-b1-1", "doc": "novels:bk01-x", "en": "q"}]
+    pj.write_rows(pool, tmp_path / "pool.parquet")
+    pj.write_rows(plan, tmp_path / "plan.parquet")
+    return c2f, bt
+
+
+class FakeCounter:
+    def __init__(self, tokenizer_dir):
+        pass
+
+    def lengths(self, texts):
+        return [len(t.split()) for t in texts]
+
+
+def fb_args(tmp_path, c2f, out):
+    return ["fbdata", "--c2f", str(c2f), "--b1", str(tmp_path / "b1.parquet"), "--c2-data",
+            str(tmp_path / "classifier.parquet"), "--bt", str(tmp_path / "bt3"), "--g47-pool", str(tmp_path / "pool.parquet"),
+            "--g48-plan", str(tmp_path / "plan.parquet"), "--tokenizer", str(tmp_path / "tok"), "--out", str(out)]
+
+
+def run_fbdata(tmp_path, monkeypatch, bt):
+    c2f = tmp_path / "c2f"
+    monkeypatch.setattr(g4arm, "read_bt", lambda directory, revisions, split="train", extra=(): bt)
+    monkeypatch.setattr(g4arm, "revisions3", lambda directory: {})
+    monkeypatch.setattr(g4arm, "TokenCounter", FakeCounter)
+    out = tmp_path / "fbdata"
+    pj.main(fb_args(tmp_path, c2f, out))
+    return out
+
+
+def test_fbdata_builds_both_tests_in_both_orders_without_text_beside_the_prompts(tmp_path, monkeypatch, capsys):
+    c2f, bt = fb_inputs(tmp_path)
+    out = run_fbdata(tmp_path, monkeypatch, bt)
+    assert "FBDATA" in capsys.readouterr().out
+    prompts = [r for k in range(4) for r in pj.read_rows(out / f"prompts-w{k}.parquet")]
+    assert len(prompts) == 2 * 2 * pj.FB_PAIRS and len({r["uid"] for r in prompts}) == len(prompts)
+    by = {r["uid"]: r["text"] for r in prompts}
+    # order ab: A is the human (fiction) or original (BT) side; ba swaps; the English source is the -b1-/BT row's
+    ab, ba = by["fiction/novels:bk03-x-b1-3/ab"], by["fiction/novels:bk03-x-b1-3/ba"]
+    assert f"Engelse bron:\n{MARK} english 3 w w w\n\nVertaling A:\n{MARK} human 3\n\nVertaling B:\n{MARK} g40 3\n" in ab
+    assert f"Vertaling A:\n{MARK} g40 3\n\nVertaling B:\n{MARK} human 3\n" in ba
+    ab = by["bt/raad:doc5:t1:2/ab"]
+    assert f"Vertaling A:\n{MARK} nl raad 5\n\nVertaling B:\n{MARK} back raad 5\n" in ab and f"{MARK} en raad 5" in ab
+    refs = pj.read_rows(out / "refs.parquet")
+    assert len(refs) == 2 * pj.FB_PAIRS and {r["package"] for r in refs} == set(pj.FB_TESTS)
+    assert sum(r["identical"] for r in refs) == 1
+    one = next(r for r in refs if r["blind_id"] == "novels:bk03-x-b1-3")
+    assert one["stratum"] == "novels:bk03-x" and one["tokens_en"] == 3 + 3
+    assert next(r for r in refs if r["blind_id"] == "dpc:doc5:t1:2")["stratum"] == "dpc"
+    for f in ("refs.parquet", "fbdata.json"):
+        assert MARK not in (out / f).read_bytes().decode("latin-1")
+    info = json.loads((out / "fbdata.json").read_text())
+    assert info["fiction"] == {"pairs": 500, "books": 40, "in_g47_pool": 1, "in_g48_plan": 2}
+    assert info["bt"]["per_source"] == {s: 100 for s in FB_SOURCES} and set(info["bt"]["overlap"].values()) == {0}
+    assert info["bt"]["c2_train_documents"] == 5 * 20 and info["identical"] == {"fiction": 1, "bt": 0}
+    assert info["tokens_en"]["bt"]["bands"][">256"] > 0 and info["tokens_en"]["fiction"]["max"] == 3 + 199
+
+
+@pytest.mark.parametrize("change, match", [
+    ("pool_id", "overlaps"), ("plan_english", "overlaps"), ("train_doc", "overlaps"), ("bt_nl", "is not the text"),
+    ("human", "not the -b1- row's nl"), ("b1_group", "en_orig"), ("per_source", "not 100 each")])
+def test_fbdata_stops_on_an_overlap_or_a_mismatch(tmp_path, monkeypatch, change, match):
+    c2f, bt = fb_inputs(tmp_path)
+    if change == "pool_id":
+        pj.write_rows(pj.read_rows(tmp_path / "pool.parquet") + [{"id": "bt:raad:doc5:t1:2", "doc": "d", "en": "e"}],
+                      tmp_path / "pool.parquet")
+    elif change == "plan_english":
+        en = next(r["en"] for r in bt if r["pid"] == "dpc:doc9:t1:0").strip()
+        pj.write_rows(pj.read_rows(tmp_path / "plan.parquet") + [{"id": "x", "doc": "d", "en": en}],
+                      tmp_path / "plan.parquet")
+    elif change == "train_doc":
+        c2 = pj.read_rows(tmp_path / "classifier.parquet")
+        c2.append({"pid": "fineweb:doc3:t9:0", "id": "x", "source": "fineweb", "rank": 0, "split": "train", "label": 1,
+                   "text": "t"})
+        pj.write_rows(c2, tmp_path / "classifier.parquet")
+    elif change == "bt_nl":
+        next(r for r in bt if r["pid"] == "handelingen:doc1:t1:1")["nl"] = "other"
+    elif change in ("human", "b1_group"):
+        b1 = pj.read_rows(tmp_path / "b1.parquet")
+        row = next(r for r in b1 if r["id"] == "bk02-x-b1-2")
+        row.update({"nl": "other"} if change == "human" else {"group": "nl_orig"})
+        pj.write_rows(b1, tmp_path / "b1.parquet")
+    else:
+        c2 = [r for r in pj.read_rows(tmp_path / "classifier.parquet") if r["pid"] != "rechtspraak:doc0:t1:0"]
+        pj.write_rows(c2, tmp_path / "classifier.parquet")
+    with pytest.raises(SystemExit, match=match):
+        run_fbdata(tmp_path, monkeypatch, bt)
+
+
+def fb_scores(refs, out):
+    """A judge that prefers the human side, except: fiction every 3rd pair the machine side, BT dpc gelijk; BT every
+    10th pair a strong first-position bias (the same position twice: a flip)"""
+    rows = []
+    for t in pj.FB_TESTS:
+        for n, r in enumerate(sorted((x for x in refs if x["package"] == t), key=lambda x: x["blind_id"])):
+            rows += fb_score_rows(n, r)
+    pj.write_rows(rows, out / "shard-00000.parquet")
+
+
+def fb_score_rows(n, r):
+    """The two score rows of the n-th pair of its test (see fb_scores)"""
+    key = f"{r['package']}/{r['blind_id']}"
+    content = (0.6, 0.2, 0.2)
+    if r["package"] == "fiction" and n % 3 == 0:
+        content = (0.2, 0.6, 0.2)
+    if r["package"] == "bt" and r["stratum"] == "dpc":
+        content = (0.25, 0.25, 0.5)
+    rows = []
+    for order in pj.ORDERS:
+        pa, pb, pe = content if order == "ab" else (content[1], content[0], content[2])
+        if r["package"] == "bt" and n % 10 == 0 and r["stratum"] != "dpc":
+            pa, pb, pe = 0.8, 0.1, 0.1
+        rows.append({"uid": f"{key}/{order}", "p_a": pa, "p_b": pb, "p_eq": pe, "mass": 0.9, "skipped": None,
+                     "top_ids": [236776], "prompt_tokens": 100})
+    return rows
+
+
+def test_fbreport_measures_and_the_classifiers_on_the_same_pairs(tmp_path, monkeypatch, capsys):
+    c2f, bt = fb_inputs(tmp_path)
+    data = run_fbdata(tmp_path, monkeypatch, bt)
+    refs = pj.read_rows(data / "refs.parquet")
+    (tmp_path / "scores" / "w0").mkdir(parents=True)
+    fb_scores(refs, tmp_path / "scores" / "w0")
+    c1, c2 = [], []
+    for r in refs:
+        if r["package"] == "fiction":
+            c1 += [{"model": "human", "set": "fiction", "id": r["blind_id"], "p_original": 0.8, "truncated": False},
+                   {"model": "g40", "set": "fiction", "id": r["blind_id"], "p_original": 0.2, "truncated": False}]
+            c2 += [{"model": "human", "set": "fiction", "id": r["blind_id"], "p_original": 0.3, "truncated": False},
+                   {"model": "g40", "set": "fiction", "id": r["blind_id"], "p_original": 0.4, "truncated": False}]
+    c1.append({"model": "nl_books", "set": "fiction", "id": "heldout:books:1", "p_original": 0.9, "truncated": False})
+    cal = [{"model": "C2-test", "set": r["stratum"], "id": f"{r['blind_id']}#{lab}", "p_original": p, "truncated": False}
+           for r in refs if r["package"] == "bt" for lab, p in ((1, 0.9), (0, 0.1))]
+    cal.append({"model": "G4-0", "set": "flan", "id": "flan-1", "p_original": 0.5, "truncated": False})
+    for name, rows in (("c1.parquet", c1), ("c2.parquet", c2), ("cal.parquet", cal)):
+        pj.write_rows(rows, tmp_path / name)
+    args = ["fbreport", "--refs", str(data / "refs.parquet"), "--data-json", str(data / "fbdata.json"),
+            "--scores", str(tmp_path / "scores/w*/shard-*.parquet"), "--fiction-c1", str(tmp_path / "c1.parquet"),
+            "--fiction-c2", str(tmp_path / "c2.parquet"), "--bt-c2", str(tmp_path / "cal.parquet"),
+            "--out", str(tmp_path / "report.md")]
+    pj.main(args)
+    assert "FBREPORT" in capsys.readouterr().out
+    r = json.loads((tmp_path / "report.json").read_text())
+    f, b = r["tests"]["fiction"], r["tests"]["bt"]
+    # by hand: fiction sorted by id, every 3rd (n = 0, 3, ...) for the machine; the identical pair is symmetric
+    order = sorted(x["blind_id"] for x in refs if x["package"] == "fiction")
+    machine = {i for n, i in enumerate(order) if n % 3 == 0}
+    assert f["n"] == 500 and f["machine"] == len(machine) and f["human"] == 500 - len(machine) and f["gelijk"] == 0
+    assert f["direction"]["share"] == pytest.approx((500 - len(machine)) / 500)
+    assert f["flip"]["share"] == 0.0 and f["mean_delta"] == pytest.approx(
+        (0.4 * (500 - len(machine)) - 0.4 * len(machine)) / 500)
+    assert f["delta_ci95"][0] < f["mean_delta"] < f["delta_ci95"][1]
+    # BT: dpc gelijk (direction ½), every 10th of the rest the same position twice (a flip, P̄ symmetric)
+    assert b["strata"]["dpc"]["gelijk"] == 100 and b["strata"]["dpc"]["direction"]["share"] == 0.5
+    bt_order = sorted(x["blind_id"] for x in refs if x["package"] == "bt")
+    stratum = {x["blind_id"]: x["stratum"] for x in refs}
+    flips = [i for n, i in enumerate(bt_order) if n % 10 == 0 and stratum[i] != "dpc"]
+    assert b["flip"]["share"] == pytest.approx(len(flips) / 500) and b["flip"]["share"] > 0
+    assert b["direction"]["share"] == pytest.approx((400 - len(flips) + 0.5 * (100 + len(flips))) / 500)
+    assert set(b["strata"]) == set(FB_SOURCES) and f["strata"] == {}
+    assert sum(x["n"] for x in b["bands"].values()) == 500 and f["bands"][">256"]["n"] == 0
+    # the classifiers: C1 always prefers the human side, C2 on fiction the machine side; C2 on BT the original
+    k = r["classifiers"]
+    assert k["fiction"]["C1"]["human_higher"]["share"] == 1.0 and k["fiction"]["C2"]["human_higher"]["share"] == 0.0
+    assert k["fiction"]["C1"]["agree"]["share"] == pytest.approx(f["human"] / 500)
+    assert k["fiction"]["C1"]["table"]["machine"]["human"] == f["machine"]
+    assert k["bt"]["C2"]["agree"]["n"] == 400 - len(flips) and k["bt"]["C2"]["agree"]["share"] == 1.0
+    assert set(k["bt"]) == {"C2"}
+    md = (tmp_path / "report.md").read_text()
+    assert MARK not in md and MARK not in (tmp_path / "report.json").read_text()
+    for head in ("## Tabel 1", "## Tabel 2", "## Tabel 3", "## Tabel 4", "## Tabel 5", "Niet gemeten", "## Wat dit niet zegt"):
+        assert head in md
+    assert "| BT | C2 | 500 |" in md and "| fictie | C1 | 500 |" in md and "| dpc | 100 |" in md
+    # a missing prediction or score is refused
+    pj.write_rows(cal[:-3], tmp_path / "cal.parquet")
+    with pytest.raises(SystemExit, match="no prediction"):
+        pj.main(args)
+    pj.write_rows(cal, tmp_path / "cal.parquet")
+    pj.write_rows(pj.read_rows(tmp_path / "scores/w0/shard-00000.parquet")[:-1], tmp_path / "scores/w0/shard-00000.parquet")
+    with pytest.raises(SystemExit, match="scores for"):
+        pj.main(args)
+
+
+def test_run_pairjudge_fb_stages_render_their_jobs(tmp_path):
+    run, shm, home, g = pj_world(tmp_path)
+    out, _ = run("fbdata", TAG="f1")
+    assert out.returncode == 0 and "started pj_fbdata_f1 on w0" in out.stdout, out.stdout + out.stderr
+    body = (home / "job_body_pj_fbdata_f1.sh").read_text()
+    assert "pairjudge.py fbdata" in body and "/c2fiction/c2f1123a/texts.parquet" in body
+    assert "/rl/G4-7/c2/data/classifier.parquet" in body and "/rl/G4-7/data/pool/pool.parquet" in body
+    assert "/data/G4-8/plan/plan.parquet" in body and "/input/bt3 " in body and "/books-b1/b1-selected.parquet" in body
+    assert "--tokenizer " in body and "tokenizer-gemma4" in body and "/judge/fb/data/" in body
+    out, _ = run("fbdata", host="2", TAG="f2")
+    assert out.returncode != 0 and "runs on w0 only" in out.stdout
+    for host in "0123":
+        out, _ = run("score", host=host, SET="fb", TAG="f3")
+        assert out.returncode == 0 and f"started pj_score_fb_f3 on w{host}" in out.stdout, out.stdout + out.stderr
+        body = (home / "job_body_pj_score_fb_f3.sh").read_text()
+        assert f"/judge/fb/data/prompts-w{host}.parquet" in body and f"/judge/fb/scores/w{host} " in body
+        (home / "logs" / "pj_score_fb_f3.log").unlink(missing_ok=True)
+    out, _ = run("fbreport", TAG="f4")
+    assert out.returncode == 0, out.stdout + out.stderr
+    body = (home / "job_body_pj_fbreport_f4.sh").read_text()
+    assert "pairjudge.py fbreport" in body and all(f"/judge/fb/scores/w{k}/shard-*.parquet" in body for k in range(4))
+    assert "/c2fiction/c2f1123a/predictions-c1.parquet" in body and "/rl/G4-7/c2/cal7/predictions.parquet" in body
+    assert "report.json gs://t5-dutch-english-usc2/mbert/translator/sft/g4arm/judge/fb/" in body

@@ -3110,3 +3110,151 @@ tellingen (§21's rapport; per deel, bron en reden de rijen van `$G8/c1/select-n
   maken of kiezen geen doelen. [gevolgtrekking] Paren met `rubric` = `zelfde sample` zijn ook doelen van G4-8; het
   verschil tussen N1 en de rubriek zit in de paren met `ander sample` en `anker`. G4-8-V3 kwam ook uit `c1`: een bron kan
   in beide pakketten zitten (onafhankelijk getrokken).
+
+## 23. Meting G4-maat: welk automatisch signaal kiest dezelfde kant als Yeb
+
+**Vastgelegd 24 nov 2026 (tijdstip: de commit van deze sectie op branch `en-nl-g4arm8`)**, vóór elke stap van deze
+meting op een worker en vóór elke uitslag [besluit Yeb 24 nov ~11:15: G4-8-s140 is voortaan de vertaler; geen G4-9
+voordat een maat gevonden is die samenhangt met zijn menselijke oordelen; uitwerking door een subagent]. Vooraf gelezen:
+Yebs antwoorden (`answers.txt` van beide steekproeven) en de sleutels; van de blinde pakketten de veldnamen en de
+aantallen per oordeel (de labels van de Claude-oordelen; hun uitleg niet); de kolomnamen en aantallen (geen tekst, geen
+score) van de bestanden die de keten leest, met één leesopdracht op mbert-mix w0. Geen tekst (bron, vertaling, roman) en
+geen score van deze meting. Een meting: er wordt niets getraind, gesampled, vertaald of beslist. Claude en GPT zijn geen
+judge of generator; de bestaande Claude-oordelen dienen alleen als vergelijking. `GM=$G/measure`.
+
+*G4-maat.1 Vraag.* Welk automatisch signaal (of welke van vier vooraf vastgelegde combinaties) kiest bij een paar
+vertalingen van dezelfde Engelse bron het vaakst dezelfde kant als Yeb? Ter vergelijking: hetzelfde tegen de blinde
+Claude-oordelen (rubriek protocol.md §4.2.4), en Claude tegen Yeb op de paren die beiden beoordeelden. Rapportage; geen
+drempel, geen winnaar, geen besluit.
+
+*G4-maat.2 Paren en oordelen.*
+- **Yeb, steekproef 1** (V1 van `translator-sft/g4-8-spec-judge.md`): 40 paren,
+  `$S/blind/steekproef-yeb/key-map.json` (nummer → pakket `G4-judge-i15` of `G4-judge-anchor-i15`, `blind_id`),
+  antwoorden `answers.txt` (A of B, in het kader van het pakket).
+- **Yeb, gemengde steekproef** (G4-8.15): 40 paren G4-8-s140 tegen G4-0, `$S/blind/steekproef-yeb-g4-8-mix/key.json`
+  (`n`, `set`, `item`, `A`, `B`), antwoorden `answers.txt` (A, B of `=`, eventueel `fout A` / `fout B`), in het kader
+  van de steekproef. Samen [gelezen] 74 niet-gelijke oordelen (40 + 34), 6 keer `=`.
+- **Claude** (één verse subagent per pakket, eerste ronde, vóór elke vervanging van twijfelgevallen): de 14 pakketten
+  in `$S/blind/` met hun `judge-input.jsonl` (de teksten die de beoordelaar zag) en `key.jsonl`, samen 1.398 paren,
+  824 niet-gelijk [gelezen, labels]:
+
+  | pakket | paren | A/B (sleutel) | Claude-oordelen | paren gekozen op |
+  |---|---:|---|---|---|
+  | G4-7 | 100 | G4-7-i15 / G4-0 | `review-74l/judgments.jsonl` | – (vaste 100) |
+  | G4-7-tg | 100 | G4-7-i15 / TranslateGemma 27B | `review-74l/judgments.jsonl` | – (vaste 100) |
+  | G4-bon-i15c2q | 100 | (i15, c2q) / G4-0 | `review/judgments.jsonl` | C2 + QE ≤ QE₀ |
+  | G4-judge-i15 | 100 | (i15, judgeq) / G4-0 | `review/judgments.jsonl` | rubriek + QE ≤ QE₀ |
+  | G4-judge-G4-0 | 100 | (G4-0, judgeq) / G4-0 | `review/judgments.jsonl` | rubriek + QE ≤ QE₀ |
+  | G4-judge-i15-vs-qe | 100 | (i15, judgeq) / (i15, qe) | `review/judgments.jsonl` | rubriek + QE ≤ QE₀ tegen laagste QE |
+  | G4-judge-anchor-i15 | 100 | (i15, janchor) / G4-0 | `review/judgments.jsonl` | rubriek (P̄ > 0,5) + QE ≤ QE₀ |
+  | G4-8 | 100 | G4-8-s140 / G4-0 | `review/judge-judgments.jsonl` | – (vaste 100) |
+  | G4-8-tg | 100 | G4-8-s140 / TranslateGemma 27B | `review/judgments.jsonl` | – (vaste 100) |
+  | G4-8-replica | 100 | G4-8-s140 / G4-0 | `review/judgments.jsonl` | – |
+  | G4-8-romans-bt | 98 | G4-8-s140 / G4-0 | `review/judgments.jsonl` | – |
+  | G4-8-V3 | 100 | janchor-doel / G4-0 | `review/judgments.jsonl` | rubriek (P̄ > 0,5) + QE ≤ QE₀ |
+  | G4-9-V3N1 | 100 | N1-doel / G4-0 | `review/judgments.jsonl` | N1 (P̄ > 0,5) + QE ≤ QE₀ |
+  | RB3 | 100 | RB3 / TranslateGemma 27B | `review-exploratory/judgments.jsonl` | – (vaste 100) |
+
+  Groepen: **alle** (14); **Gemma 4 tegen Gemma 4** (zonder G4-7-tg, G4-8-tg en RB3, waar één kant TranslateGemma is;
+  600 niet-gelijk); **zonder paarselectie** (G4-7, G4-8, G4-8-replica, G4-8-romans-bt: twee greedy systemen, geen
+  signaal koos de paren; 191 niet-gelijk). Daarnaast alleen voor "Claude tegen Claude": de tweede beoordelaar van G4-8
+  (`review/second-reviewer-all.jsonl`).
+- **Teksten** = wat de beoordelaar zag: bij de pakketten `judge-input.jsonl` (`source`, `A`, `B`); bij de gemengde
+  steekproef per `key.json` opnieuw opgebouwd zoals `g4mixsample.pick` (FLAN, WMT24++, FLORES, NTREX en idioom uit
+  `$G/eval/{G4-0,G4-8-s140}/pairs/`, idioom als de rij `blind-NNN`; romans en BT uit `$G/mixsample/pairs/`), en
+  gecontroleerd: `g4mixsample.sample_text` van deze 40 paren met de datum uit de kop van het bestand geeft byte voor byte
+  `steekproef-yeb-g4-8-mix.md` in de bucket (anders stopt de meting). Steekproef 1 bestaat uit paren van twee pakketten
+  en gebruikt hun teksten.
+- **Gedeelde paren Yeb–Claude**: de 40 van steekproef 1 (zelfde paar, zelfde kader) en de paren van de gemengde
+  steekproef die ook in een pakket zitten met (gestript) dezelfde bron en dezelfde twee vertalingen: de roman- en
+  BT-paren van `G4-8-romans-bt` (veld `steekproef_n`) en de idioomparen van `G4-8` (`blind_id` = de rij `blind-NNN`);
+  Claude's oordeel naar het kader van de steekproef omgezet via de systeemnamen van de twee sleutels. Een paar waarvan
+  een tekst verschilt, telt niet als gedeeld (geteld).
+
+*G4-maat.3 Signalen* (per kant A en B, vers berekend op de teksten van G4-maat.2, in één keten op mbert-mix).
+1. **QE**: MetricX-24 hybrid XXL zonder referentie (`metricx_qe.py score --pair source:hypothesis --model xxl`, bf16,
+   als §4.3; lege vertaling gescoord); lager is beter.
+2. **COMET-22** met de referentie van de testset (`comet_score.py`, CPU), alleen WMT24++, FLORES en NTREX: de rij van
+   `$G/data/eval/evalsets.parquet` met het item als id, bij de vaste 100 de rij `blind-NNN` (35 WMT24++ met referentie);
+   de bron van die rij moet (gestript) de bron van het paar zijn, anders stopt de meting. Niet bij FLAN en idioom (geen
+   referentie), romans en BT [keuze: een gepubliceerde romanvertaling neemt vrijheden (§20 FB.5); bij BT is het
+   Nederlandse origineel de bron van het Engels, geen vertaling ervan].
+3. **C1**: P("origineel") van de classifier van 10 nov (S @ 653k, `$S/arms/naturalness/classifier/`), `run_arms.sh
+   classify` ongewijzigd, op de Nederlandse tekst alleen; één classify-run over alle kanten.
+4. **C2**: P("origineel") van C2 (`$RL/c2/model/`), `naturalness.py classify --max-length 1024` zoals `classify-c2`, op
+   dezelfde teksten.
+5. **Judge, rubriek** (prompt G4-judge.3), 6. **judge, N1** (FB.8, met bron), 7. **judge, N2** (FB.8, zonder bron):
+   Gemma 4 31B-it, `pairjudge.py score` ongewijzigd (één prefill, G4-judge.2), beide volgordes, P̄ volgens G4-judge.4 in
+   het kader van het paar; uids `<paar>/<prompt>/ab|ba`, verdeeld over de 4 workers op sha256 van de uid. Een prompt van
+   meer dan 4.096 tokens wordt niet gescoord (geteld).
+8. **Lengte**: Gemma 4-tokens van de gestripte tekst (`g4arm.TokenCounter`, zonder speciale tokens).
+Daarnaast twee **referentierijen** die geen signaal zijn: **nieuw systeem** (altijd de kant waarvan de sleutel niet
+`base` is: bij steekproef 1 de judge-keuze, bij de gemengde G4-8-s140) en **positie A**.
+
+*G4-maat.4 Keuze van een signaal per paar.* QE: de kant met de lagere QE; COMET-22, C1, C2: de hogere; judge: het teken
+van P̄(A beter) − P̄(B beter); lengte: de kant met minder tokens. Gelijke waarden (QE en COMET-22 zoals geschreven, op 4
+decimalen) en een ontbrekende waarde (geen referentie, niet gescoord): **geen keuze**.
+
+*G4-maat.5 Combinaties* (vooraf vastgelegd, geen andere; [keuze] QE als juistheidsbewaker en een judge waar QE weinig
+verschil ziet, de opzet van §21–§22; K4 is de doorsnede van O9 met QE als terugval; de grens 0,2 is vooraf gekozen, het
+voorbeeld in de opdracht van de hoofdsessie, niet gezocht):
+- **K1**: de QE-winnaar; bij |ΔQE| < 0,2 de keuze van N1.
+- **K2**: de QE-winnaar; bij |ΔQE| < 0,2 de keuze van de rubriek.
+- **K3**: de meerderheid van QE, rubriek en N1 (de kant die minstens twee van de drie kiezen; anders geen keuze).
+- **K4**: kiezen rubriek en N1 dezelfde kant, dan die; anders de QE-winnaar.
+
+*G4-maat.6 Maten* (`g4measure.py report`; alleen tellingen en percentages).
+1. **Overeenstemming** met een referentie (Yeb, Claude) op de paren waar de referentie A of B kiest: n_ref; n = de paren
+   waar het signaal kiest; k = dezelfde kant; k / n met een 95%-Wilson-interval; n_ref − n (geen keuze) apart.
+2. **Hoofdtabel**: de 8 signalen, K1–K4, Claude (als signaal, alleen tegen Yeb, op de gedeelde paren; Claude "gelijk" =
+   geen keuze) en de twee referentierijen × Yeb steekproef 1 / Yeb gemengd / Yeb samen / Claude alle / Claude Gemma 4
+   tegen Gemma 4 / Claude zonder paarselectie.
+3. **Per set**: Yeb steekproef 1 per set (FLAN, WMT24++) en per pakket (judgeq, janchor); gemengd per groep (romans, BT,
+   FLAN, idioom, nieuws = WMT24++ + FLORES + NTREX); beide samen per groep (FLAN, nieuws, romans, BT, idioom); Claude per
+   pakket en per set (FLAN, WMT24++, idioom, romans, BT). Alle groepen met n; bij n < 10 geen lezing.
+4. **Claude tegen Yeb** op de gedeelde paren: de 3 × 3-tabel (Claude A / B / gelijk × Yeb A / B / =) en de
+   overeenstemming op de paren waar beiden een kant kiezen. **Claude tegen Claude**: G4-8, eerste ronde tegen de tweede
+   beoordelaar, op de paren waar beide een kant kiezen.
+5. **Per marge** (rapportage): QE bij |ΔQE| < 0,2 en ≥ 0,2; elke judge bij |ΔP̄| < 0,2 en ≥ 0,2; tegen Yeb (samen) en
+   Claude (alle).
+6. **Betekenisfouten**: op de paren waar Yeb precies één kant `fout` noemde, en apart waar Claude precies één kant een
+   betekenisfout gaf (`fout_A`/`fout_B`): hoe vaak het signaal de kant zonder fout kiest (k / n).
+7. **Controles** (gerapporteerd; een afwijking in de eerste stopt de meting vóór de TPU): (a) de rubriekprompts van
+   G4-7, G4-7-tg, G4-bon-i15c2q en RB3 zijn per paar (sha256 van de tekst) die van §17's
+   `$G/judge/val/data/prompts-w<k>.parquet`; (b) P̄ van de rubriek tegen §17's scores op die 400 paren (grootste |Δ|,
+   zelfde richting); (c) QE, COMET-22, C1 en C2 van de kanten waarvan de tekst (gestript) gelijk is aan een bestaande
+   evaluatie-uitvoer (G4-0, G4-8-s140, G4-7-i15 in `$G/eval/`; C1 en C2 van `$G/naturalness-G4-8/` en
+   `$G/naturalness-G4-7/` waar ze er zijn) tegen die bestaande scores: n, grootste |Δ|, zelfde label bij 0,5; (d) de
+   paren van de gemengde steekproef die ook in een pakket zitten: dezelfde scores; (e) niet gescoorde prompts, afgekapte
+   invoer van MetricX, C1 en C2, lege teksten, gelijke teksten.
+
+*G4-maat.7 Wat het niet zegt.*
+- n is klein: 74 niet-gelijke oordelen van Yeb, per groep 5–40; een interval van ±10–20 pp; veel vergelijkingen zonder
+  correctie. Geen harde conclusie, geen drempel, geen winnaar; de meting beslist niets over G4-9 of over een maat.
+- **Selectie**: de paren van steekproef 1 zijn gekozen met de rubriek-judge en QE ≤ QE₀ (judgeq, janchor); rubriek en QE
+  kiezen daar grotendeels de kant van "nieuw systeem" door de constructie, en hun overeenstemming met Yeb is daar vooral
+  die van de selectie (25 / 40, LEARNINGS), geen onafhankelijke toets. Zo ook in de pakketten van de tabel met een
+  selectie. Zonder paarselectie: de gemengde steekproef en de groep "zonder paarselectie" (G4-8-s140 is wel getraind op
+  keuzes van de rubriek-judge).
+- Claude oordeelde met dezelfde rubriek als de rubriek-judge (§17: 71% overeenstemming): tegen Claude heeft de rubriek
+  een voorsprong door de constructie.
+- Yeb is één beoordelaar en hier de referentie, geen grondwaarheid; zijn oordeel volgt de instructie van de
+  steekproefbestanden (eerst juistheid, dan natuurlijk Nederlands).
+- De judge is Gemma 4 31B-it, hetzelfde model als (de basis van) de meeste vertalingen.
+- COMET-22 alleen op nieuws (WMT24++, FLORES, NTREX): voor Yeb ~31 paren.
+- Lengte is geen kwaliteitsmaat; de rij toont of een beoordelaar de kortere kant voortrekt.
+
+*G4-maat.8 Uitvoer.* `$GM/data/` (`pairs.parquet` met teksten, `refs.parquet` zonder tekst, `prompts-w<k>.parquet`,
+`qe-in.parquet`, `comet-in.parquet`, `data.json`), `$GM/judge/scores/w<k>/`, `$GM/scores/` (`metricx.parquet`,
+`comet.parquet`), `$GM/naturalness/` (`texts.parquet`, `predictions.parquet`, `predictions-c2.parquet`); het rapport
+`$GM/report.md`/`.json`, kopie `mbert-ops/translator-sft/g4-measure-vs-yeb.md` (`.json`), alleen tabellen met tellingen
+en percentages. Prompts en teksten blijven in de bucket en op de VM.
+
+*G4-maat.9 Keten* (`mbert-ops/scripts/g4measure_run.sh`, kopie in `gs://t5-dutch-english-usc2/hammond/scratch-scripts/`;
+code `g4measure.py` en `run_g4measure.sh` op `en-nl-g4arm8`). Alleen mbert-mix; `final_eval_mix.lock` met `flock` tot het
+eind; mbert-corpus (T3) wordt niet aangeraakt. Code als bundel via de bucket naar de 4 workers; elke ssh met `timeout 900`
+en de ssh-opties van G4-judge.10; vóór elke TPU-stap de TPU van de worker(s) vrij. Volgorde: `setup` (`run_g4arm.sh
+setup`, `ARM=G4-bon`; w0 met `FULL=1`), `data` (w0, CPU), `judge` (4 workers), daarna tegelijk `qe` (w1), `classify`
+(C1) en `classify-c2` (w0, na elkaar) en `comet` (w2, CPU); tot slot `report` op co1 uit de bestanden zonder tekst
+(`refs.parquet`, de scores, de sleutels en antwoorden). Markers `$G/stages/g4-measure/`; niets wat eerdere secties
+schreven wordt overschreven. Elke stap eindigt op `EXIT 0`, anders `FAILED` en stoppen. [schatting] ~35–50 min.

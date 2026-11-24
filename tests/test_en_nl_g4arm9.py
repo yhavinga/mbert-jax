@@ -3,6 +3,7 @@ on the N1 choice of §21. g4arm8.py's n1targets (§21's select-n1 merged and che
 the comparison with G4-8's choice) on small synthetic inputs; run_g4arm8.sh's and run_g4arm.sh's stages of G4-9 rendered
 with a fake bucket (no model, no TPU)."""
 
+import collections
 import json
 import re
 from argparse import Namespace
@@ -168,6 +169,148 @@ def test_n1targets_takes_each_chunk_once(tmp_path):
     args = n1_args(tmp_path, {c: d for c, d in dirs.items() if c != "c3"})
     with pytest.raises(SystemExit, match="one per chunk"):
         g8.main(args)
+
+
+# ---------------------------------------------------------------------------------------------------- §22 G4-9.V3N1
+
+V3N1_TARGETS = {("bt", "dpc"): 10, ("bt", "raad"): 12, ("bt", "fineweb"): 5, ("novels", ""): 50, ("flan", ""): 11}
+
+
+def v3n1_world(tmp_path):
+    """Chunk c1 (and a source of c2) with select-n1's choice and targets, §18's choice (for each N1 target the same
+    sample, another one or the anchor in turn) and §21's report with the sha256 of plan and both choices"""
+    plan, n1, targets, rubric = [], [], [], []
+    k = 0
+    for (part, stratum), n in V3N1_TARGETS.items():
+        for m in range(n + 2):                     # two sources per group without an N1 target ('p' and 'none')
+            k += 1
+            i = f"{part}:{stratum or 'x'}-{m:03d}"
+            en = f"an english source {k}"
+            plan.append({"id": i, "part": part, "stratum": stratum, "doc": f"d{k}", "en": en, "tokens": 24,
+                         "origin": "g4-7", "chunk": "c1", "hypothesis0": f"anker {k}", "l0": 20, "qe0_g47": 2.0})
+            reason = "sample" if m < n else ("p" if m == n else "none")
+            j = m % 8 if reason == "sample" else -1
+            row = {"id": i, "part": part, "stratum": stratum, "origin": "g4-7", "chunk": "c1", "reason": reason, "j": j,
+                   "p_best": None if reason == "none" else 0.7, "qe0": 2.0, "candidates": 3, "keys": 3,
+                   "not_scored": 0, "distinct": 5, "fails": 0, **dict.fromkeys(g8.TARGET_MEASURES)}
+            if reason == "sample":
+                row.update({"p_sample": 0.75, "p_anchor": 0.2, "p_gelijk": 0.05, "qe": 1.5, "ratio": 1.0,
+                            "tokens_out": 20, "tokens_in": 50, "chrf": 70.0})
+                targets.append({**row, "en": en, "target": f"doel {k}", "doc": f"d{k}", "l0": 20})
+            n1.append(row)
+            rubric_reason, rubric_j = (("sample", j), ("sample", (j + 1) % 8), ("p", -1))[m % 3] if reason == "sample" \
+                else (reason, -1)
+            rubric.append({**row, "reason": rubric_reason, "j": rubric_j})
+    plan.append({"id": "bt:other-chunk", "part": "bt", "stratum": "dpc", "doc": "dz", "en": "another", "tokens": 24,
+                 "origin": "g4-7", "chunk": "c2", "hypothesis0": "anker z", "l0": 20, "qe0_g47": 2.0})
+    d = tmp_path / "in"
+    g8.write_parquet(plan, d / "plan.parquet", g8.PLAN_SCHEMA)
+    g8.write_parquet(n1, d / "choice.parquet")
+    g8.write_parquet(targets, d / "targets.parquet")
+    g8.write_parquet(rubric, d / "rubric-choice.parquet")
+    rep = {"protocol": g8.PROTOCOL_N1, "chunks": ["c1", "c2", "c3"],
+           "inputs": {"c1": {"n1pairs": {"plan": g4rl.file_sha256(d / "plan.parquet")},
+                             "choice.parquet": g4rl.file_sha256(d / "rubric-choice.parquet"),
+                             "choice-n1.parquet": g4rl.file_sha256(d / "choice.parquet")}}}
+    (d / "n1report.json").write_text(json.dumps(rep))
+    return d, rep, {r["id"]: r for r in plan}, {r["id"]: r for r in targets}, {r["id"]: r for r in rubric}
+
+
+def v3n1_args(d, out, extra=("--set", "n1")):
+    return ["v3", "--plan", str(d / "plan.parquet"), "--targets", str(d / "targets.parquet"), *extra,
+            "--choice", str(d / "choice.parquet"), "--rubric", str(d / "rubric-choice.parquet"),
+            "--n1report", str(d / "n1report.json"), "--out", str(out)]
+
+
+def test_v3_with_set_n1_builds_g4_9_v3n1_from_c1s_n1_targets(tmp_path, capsys):
+    import random
+
+    d, rep, plan, targets, rubric = v3n1_world(tmp_path)
+    out = tmp_path / "out"
+    g8.main(v3n1_args(d, out))
+    keys = [json.loads(x) for x in (out / "key.jsonl").read_text().splitlines()]
+    inputs = [json.loads(x) for x in (out / "judge-input.jsonl").read_text().splitlines()]
+    report = json.loads((out / "select-report.json").read_text())
+    # BT 8 per source (fewer: all), the sources by name; then novels 40, FLAN 20 (fewer: all)
+    want = []
+    for part, stratum, n in (("bt", "dpc", 8), ("bt", "fineweb", 8), ("bt", "raad", 8), ("novels", "", 40), ("flan", "", 20)):
+        ids = sorted(i for i, t in targets.items() if t["part"] == part and (part != "bt" or t["stratum"] == stratum))
+        seed = f"en-nl-g4arm/0/G4-9/v3n1/{part}/{stratum}" if part == "bt" else f"en-nl-g4arm/0/G4-9/v3n1/{part}"
+        want += random.Random(seed).sample(ids, min(n, len(ids)))
+    assert [k["item"] for k in keys] == want and len(want) == 8 + 5 + 8 + 40 + 11
+    assert [k["blind_id"] for k in keys] == [f"v3n1-{n:03d}" for n in range(1, len(want) + 1)]
+    labels = {"sample": "zelfde sample", "p": "anker"}
+    for k, x in zip(keys, inputs):
+        t, base = targets[k["item"]], plan[k["item"]]["hypothesis0"]
+        assert k["seed"] == f"en-nl-g4arm/0/G4-9/v3n1/ab/{k['blind_id']}"
+        base_first = random.Random(k["seed"]).random() < 0.5
+        assert (k["A"], k["B"]) == (("base", "G4-9-n1") if base_first else ("G4-9-n1", "base"))
+        assert (x["A"], x["B"]) == ((base, t["target"]) if base_first else (t["target"], base))
+        assert set(x) == {"blind_id", "source", "A", "B"} and x["source"] == t["en"] and x["blind_id"] == k["blind_id"]
+        r = rubric[k["item"]]
+        assert k["rubric"] == (labels[r["reason"]] if r["reason"] == "p" or r["j"] == t["j"] else "ander sample")
+        assert (k["set"], k["stratum"]) == (t["part"], t["stratum"])
+    assert {k["rubric"] for k in keys} == {"zelfde sample", "ander sample", "anker"}
+    # the report: counts, seeds and sha256 only, no text
+    assert report["protocol"] == "protocol-g4.md §22 G4-9.V3N1" and report["target"] == "G4-9-n1"
+    assert report["n"] == len(keys) and report["chunk"] == "c1" and report["a_is_base"] == sum(k["A"] == "base" for k in keys)
+    bt = report["sets"]["bt"]
+    assert bt["targets"] == 27 and bt["picked"] == 21 and bt["strata"] == {"dpc": 8, "fineweb": 5, "raad": 8}
+    assert bt["targets_strata"] == {"dpc": 10, "fineweb": 5, "raad": 12}
+    assert bt["seed"] == {s: f"en-nl-g4arm/0/G4-9/v3n1/bt/{s}" for s in ("dpc", "fineweb", "raad")}
+    assert report["sets"]["novels"]["seed"] == "en-nl-g4arm/0/G4-9/v3n1/novels" and report["sets"]["flan"]["picked"] == 11
+    for part, s in report["sets"].items():
+        assert sum(s["rubric"].values()) == s["picked"] and sum(s["rubric_targets"].values()) == s["targets"]
+        assert s["rubric"] == dict(sorted(collections.Counter(k["rubric"] for k in keys if k["set"] == part).items()))
+    assert report["inputs"] == {n: g4rl.file_sha256(d / f) for n, f in (
+        ("plan", "plan.parquet"), ("targets", "targets.parquet"), ("choice", "choice.parquet"),
+        ("rubric", "rubric-choice.parquet"), ("n1report", "n1report.json"))}
+    shown = (out / "key.jsonl").read_text() + (out / "select-report.json").read_text() + capsys.readouterr().out
+    assert "doel " not in shown and "anker " not in shown and "english" not in shown
+
+
+def test_v3_without_a_set_is_g4_8_v3_and_n1s_inputs_only_with_set_n1(tmp_path):
+    d, *_ = v3n1_world(tmp_path)
+    assert g8.V3_SETS[""]["seed"] == "en-nl-g4arm/0/G4-8/v3" and g8.V3_SETS[""]["target"] == g8.V3_TARGET
+    assert g8.V3_SETS[""]["parts"] == (("bt", 50, False), ("novels", 50, False))
+    with pytest.raises(SystemExit, match="only with v3 --set n1"):
+        g8.main(v3n1_args(d, tmp_path / "out", extra=()))
+    with pytest.raises(SystemExit, match="takes --choice, --rubric and --n1report"):
+        g8.main(["v3", "--set", "n1", "--plan", str(d / "plan.parquet"), "--targets", str(d / "targets.parquet"),
+                 "--choice", str(d / "choice.parquet"), "--out", str(tmp_path / "out")])
+    assert not (tmp_path / "out").exists()
+
+
+@pytest.mark.parametrize("what, msg", [
+    ("plan", "is not the plan that §21's n1pairs read"), ("rubric", "is not §18's choice.parquet"),
+    ("choice", "is not the choice-n1.parquet"), ("qe", "above QE0"), ("none", "where §18's rubric chose"),
+    ("protocol", "is not protocol-g4.md §21's report over c1"), ("drop", "not one per source"),
+])
+def test_v3_with_set_n1_refuses_and_writes_nothing(tmp_path, what, msg):
+    d, rep, plan, targets, rubric = v3n1_world(tmp_path)
+    first = sorted(targets)[0]
+    if what == "plan":
+        edit(d / "plan.parquet", lambda rows: rows[-1].update(en="changed"))
+    elif what == "rubric":
+        edit(d / "rubric-choice.parquet", lambda rows: rows[0].update(fails=1))
+    elif what == "choice":
+        edit(d / "choice.parquet", lambda rows: rows[0].update(fails=1))
+    elif what in ("qe", "none"):
+        # also in the choice files, their sha256 in §21's report: the checks themselves stop
+        name = "choice.parquet" if what == "qe" else "rubric-choice.parquet"
+        change = {"qe": {"qe": 2.5}, "none": {"reason": "none", "j": -1}}[what]
+        if what == "qe":
+            edit(d / "targets.parquet", lambda rows: [r.update(change) for r in rows if r["id"] == first])
+        edit(d / name, lambda rows: [r.update(change) for r in rows if r["id"] == first])
+        rep["inputs"]["c1"]["choice-n1.parquet" if what == "qe" else "choice.parquet"] = g4rl.file_sha256(d / name)
+    elif what == "protocol":
+        rep["chunks"] = ["c2", "c3"]
+    elif what == "drop":
+        edit(d / "targets.parquet", lambda rows: rows.pop())
+    (d / "n1report.json").write_text(json.dumps(rep))
+    with pytest.raises(SystemExit, match=re.escape(msg)):
+        g8.main(v3n1_args(d, tmp_path / "out"))
+    assert not (tmp_path / "out").exists()
 
 
 # ---------------------------------------------------------------------------------------------------- sftset, trained
@@ -363,6 +506,40 @@ def test_run_g4arm8_n1targets_and_sftset_of_g4_9_render_their_jobs(tmp_path):
     out, _ = run("check", ARM8="G4-9", TAG="c1")
     b = body("g4a9_check_c1")
     assert out.returncode == 0 and "--arm G4-9" in b and "/data/G4-9/sft/check.txt" in b
+
+
+def test_run_g4arm8_v3_with_set_n1_renders_the_g4_9_v3n1_job(tmp_path):
+    run, body, put, shm, home, g = t8t.t8_world(tmp_path)
+    out, calls = run("v3", SET="n1", TAG="v1")
+    assert out.returncode != 0 and "no gs://t5-dutch-english-usc2/mbert/translator/sft/g4arm/data/G4-8/c1/select-n1/targets.parquet" in out.stdout
+    put("data/G4-8/c1/select-n1/targets.parquet")
+    out, calls = run("v3", SET="n1", TAG="v2")
+    assert out.returncode != 0 and "data/G4-8/n1/report.json (§21's n1report)" in out.stdout
+    assert not any(c.startswith("SETSID") for c in calls)
+    put("data/G4-8/n1/report.json", "{}")
+    out, _ = run("v3", SET="n1", TAG="v3")
+    assert out.returncode == 0 and "started g4a8_v3n1_v3 on w0" in out.stdout, out.stdout + out.stderr
+    b = body("g4a8_v3n1_v3")
+    for x in ("g4arm8.py v3 --plan", "--set n1 --choice", "/data/G4-8/c1/select-n1/targets.parquet",
+              "/data/G4-8/c1/select-n1/choice.parquet", "/data/G4-8/c1/select/choice.parquet", "/data/G4-8/n1/report.json",
+              "/sft/blind/G4-9-V3N1/key.jsonl", "/sft/blind/G4-9-V3N1/", f"{shm}/translator/g4arm8/v3n1-v3"):
+        assert x in b, x
+    assert "G4-8-V3" not in b and "rm " not in b
+    assert b.index("judge-input.jsonl") < b.index("/sft/blind/G4-9-V3N1/key.jsonl")
+    out, _ = run("v3", host="2", SET="n1", TAG="v4")
+    assert out.returncode != 0 and "runs on w0 only" in out.stdout
+    out, _ = run("v3", SET="n2", TAG="v5")
+    assert out.returncode != 0 and "SET is empty (G4-8-V3) or n1 (G4-9-V3N1), not n2" in out.stdout
+    put("../blind/G4-9-V3N1/key.jsonl")
+    out, calls = run("v3", SET="n1", TAG="v6")
+    assert out.returncode != 0 and "G4-9-V3N1 has a key.jsonl: the package stays as it is" in out.stdout
+    assert not any(c.startswith("SETSID") for c in calls)
+    # without SET the stage is G4-8-V3's, as before
+    put("data/G4-8/c1/select/targets.parquet")
+    out, _ = run("v3", TAG="v7")
+    assert out.returncode == 0, out.stdout + out.stderr
+    b = body("g4a8_v3_v7")
+    assert "--set" not in b and "/sft/blind/G4-8-V3/key.jsonl" in b and "G4-9-V3N1" not in b and "select-n1" not in b
 
 
 def test_run_g4arm8_train_smoke8_adapter_div_and_report8_of_g4_9(tmp_path):

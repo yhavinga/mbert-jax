@@ -15,6 +15,8 @@ with the highest P̄(sample better) is the target if that P̄ > 0.5, else the so
     python g4arm8.py pairs --plan P --chunk C --samples DIR --qe GLOB --out DIR        (judge prompts, cands.parquet)
     python g4arm8.py select --plan P --chunk C --samples DIR --cands F --scores GLOB --out DIR
     python g4arm8.py v3 --plan P --targets F --out DIR                                 (the blind package G4-8-V3)
+    python g4arm8.py v3 --set n1 --plan P --targets F --choice F --rubric F --n1report F --out DIR
+        (§22 G4-9.V3N1, the blind package G4-9-V3N1: §21's N1 targets of c1, select-n1's targets and choice, §18's choice)
     python g4arm8.py report --plan P --chunk-dir C=DIR ... --out DIR                    (report.md/.json, targets.parquet)
 
 §21 (G4-8-data N1-scores, a preparation that decides nothing): the same pairs judged with FB.8's prompt N1 (pairjudge.N1_PROMPT);
@@ -74,6 +76,13 @@ QE0_MEDIAN_MAX, QE0_BIG, QE0_BIG_SHARE = 0.05, 0.5, 0.02   # G4-8-data.2: the re
 V3_PARTS = ("bt", "novels")
 V3_PER_PART = 50
 V3_TARGET = "G4-8-janchor"
+# the blind packages in V3's form (v3 --set): G4-8-V3 (G4-8-data.8) and G4-9-V3N1 (§22 G4-9.V3N1: the N1 targets of c1);
+# parts as (part, picked, per stratum)
+V3_SETS = {"": {"protocol": PROTOCOL, "target": V3_TARGET, "seed": f"{SEED8}/v3", "prefix": "v3", "chunk": "c1",
+                "parts": tuple((part, V3_PER_PART, False) for part in V3_PARTS)},
+           "n1": {"protocol": "protocol-g4.md §22 G4-9.V3N1", "target": "G4-9-n1", "seed": "en-nl-g4arm/0/G4-9/v3n1",
+                  "prefix": "v3n1", "chunk": "c1",
+                  "parts": (("bt", 8, True), ("novels", 40, False), ("flan", 20, False))}}
 SFT_SEQ, SFT_ROWS, SFT_FILL, SFT_EPOCHS = 4096, 16, 0.95, 2      # spec §4 (the estimate of the report only)
 TARGET_MEASURES = ("p_sample", "p_anchor", "p_gelijk", "qe", "ratio", "tokens_out", "tokens_in", "chrf")
 READ_COLUMNS = ("uid", "id", "j", "source", "hypothesis", "ended", "decode_loop", "english_left", "empty", "tokens_in",
@@ -603,39 +612,94 @@ def select(args):
 
 # ---------------------------------------------------------------------------------------------------- V3
 
-def v3_package(targets, anchors):
-    """(inputs, keys, report) of the blind package G4-8-V3 (G4-8-data.8): per part of V3_PARTS a seeded sample of
-    V3_PER_PART of the sorted ids with a target; A/B per item seeded"""
-    inputs, keys, report = [], [], {"protocol": PROTOCOL, "target": V3_TARGET, "sets": {}}
+def rubric_label(t, rubric):
+    """§22 G4-9.V3N1: what §18's rubric chose for a source with an N1 target (G4-8-N1.7.2): zelfde sample, ander
+    sample or anker"""
+    label = n1_label(("sample", t["j"]), rubric[t["id"]])
+    if label not in ("sample/zelfde sample", "sample/ander sample", "sample/anker"):
+        raise SystemExit(f"{t['id']}: an N1 target where §18's rubric chose {rubric[t['id']]}")
+    return label.split("/", 1)[1]
+
+
+def v3_package(targets, anchors, spec=None, rubric=None):
+    """(inputs, keys, report) of a blind package in V3's form: G4-8-V3 (G4-8-data.8, V3_SETS[""]) or G4-9-V3N1
+    (§22 G4-9.V3N1, V3_SETS["n1"], with rubric = {id: (reason, j)} of §18's choice): per part a seeded sample of the
+    sorted ids with a target (per stratum if the spec says so, the strata by name); A/B per item seeded"""
+    spec = spec or V3_SETS[""]
+    name, seed0 = spec["target"], spec["seed"]
+    inputs, keys, report = [], [], {"protocol": spec["protocol"], "target": name, "sets": {}}
     by = {r["id"]: r for r in targets}
     n = 0
-    for part in V3_PARTS:
+    for part, per, per_stratum in spec["parts"]:
         ids = sorted(i for i, r in by.items() if r["part"] == part)
-        seed = f"{SEED8}/v3/{part}"
-        picked = random.Random(seed).sample(ids, min(V3_PER_PART, len(ids)))
-        report["sets"][part] = {"targets": len(ids), "picked": len(picked), "seed": seed,
-                                "strata": dict(sorted(collections.Counter(by[i]["stratum"] for i in picked).items()))}
+        if per_stratum:
+            groups_ = {s: [i for i in ids if by[i]["stratum"] == s] for s in sorted({by[i]["stratum"] for i in ids})}
+            seed = {s: f"{seed0}/{part}/{s}" for s in groups_}
+            picked = [i for s, g in groups_.items() for i in random.Random(seed[s]).sample(g, min(per, len(g)))]
+        else:
+            seed = f"{seed0}/{part}"
+            picked = random.Random(seed).sample(ids, min(per, len(ids)))
+        rep = report["sets"][part] = {
+            "targets": len(ids), "picked": len(picked), "seed": seed,
+            "strata": dict(sorted(collections.Counter(by[i]["stratum"] for i in picked).items()))}
+        if per_stratum:
+            rep["targets_strata"] = {s: len(g) for s, g in groups_.items()}
+        if rubric is not None:
+            label = {i: rubric_label(by[i], rubric) for i in ids}
+            rep["rubric"] = dict(sorted(collections.Counter(label[i] for i in picked).items()))
+            rep["rubric_targets"] = dict(sorted(collections.Counter(label.values()).items()))
         for i in picked:
             n += 1
-            b = f"v3-{n:03d}"
-            ab_seed = f"{SEED8}/v3/ab/{b}"
+            b = f"{spec['prefix']}-{n:03d}"
+            ab_seed = f"{seed0}/ab/{b}"
             base_first = random.Random(ab_seed).random() < 0.5
             base, own = anchors[i], by[i]["target"]
             if norm(base) == norm(own):
                 raise SystemExit(f"{i}: the target is the anchor's text")
             a, bb = (base, own) if base_first else (own, base)
             inputs.append({"blind_id": b, "source": by[i]["en"], "A": a, "B": bb})
-            keys.append({"blind_id": b, "A": "base" if base_first else V3_TARGET, "B": V3_TARGET if base_first else "base",
-                         "seed": ab_seed, "set": part, "item": i, "stratum": by[i]["stratum"]})
+            keys.append({"blind_id": b, "A": "base" if base_first else name, "B": name if base_first else "base",
+                         "seed": ab_seed, "set": part, "item": i, "stratum": by[i]["stratum"],
+                         **({} if rubric is None else {"rubric": label[i]})})
     report["n"] = len(keys)
     report["a_is_base"] = sum(k["A"] == "base" for k in keys)
     return inputs, keys, report
 
 
+def v3n1_inputs(args, c):
+    """§22 G4-9.V3N1: the N1 targets of chunk c with G4-9.2's checks (n1_chunk), and §18's choice of c; the plan and
+    §18's choice must be the ones §21's n1report read. (targets, {id: (reason, j)} of §18, sha256 of the inputs)"""
+    rep = json.loads(Path(args.n1report).read_text())
+    if rep.get("protocol") != PROTOCOL_N1 or c not in rep.get("chunks", []):
+        raise SystemExit(f"{args.n1report} is not {PROTOCOL_N1}'s report over {c}")
+    if g4rl.file_sha256(args.plan) != rep["inputs"][c]["n1pairs"]["plan"]:
+        raise SystemExit(f"{args.plan} is not the plan that §21's n1pairs read ({c})")
+    if g4rl.file_sha256(args.rubric) != rep["inputs"][c]["choice.parquet"]:
+        raise SystemExit(f"{args.rubric} is not §18's choice.parquet that §21's n1report checked ({c})")
+    plan = {r["id"]: r for r in read_rows(args.plan, ["id", "part", "chunk", "en", "hypothesis0"])}
+    targets, _ = n1_chunk(c, Path(args.choice), Path(args.targets), plan, rep)
+    rubric = {r["id"]: (r["reason"], r["j"]) for r in read_rows(args.rubric, ["id", "reason", "j"])}
+    if set(rubric) != {i for i, r in plan.items() if r["chunk"] == c}:
+        raise SystemExit(f"{args.rubric}: not the sources of chunk {c} in the plan")
+    inputs = {k: g4rl.file_sha256(getattr(args, k)) for k in ("plan", "targets", "choice", "rubric", "n1report")}
+    return targets, rubric, inputs
+
+
 def v3(args):
+    spec = V3_SETS[args.set]
+    extra = [k for k in ("choice", "rubric", "n1report") if getattr(args, k) is not None]
+    if args.set == "n1" and len(extra) < 3:
+        raise SystemExit("v3 --set n1 takes --choice, --rubric and --n1report")
+    if args.set != "n1" and extra:
+        raise SystemExit(f"--{', --'.join(extra)}: only with v3 --set n1")
     sources = {r["id"]: r for r in read_rows(args.plan, columns=["id", "hypothesis0"])}
-    targets = read_rows(args.targets)
-    inputs, keys, report = v3_package(targets, {i: r["hypothesis0"] for i, r in sources.items()})
+    if args.set == "n1":
+        targets, rubric, used = v3n1_inputs(args, spec["chunk"])
+    else:
+        targets, rubric, used = read_rows(args.targets), None, None
+    inputs, keys, report = v3_package(targets, {i: r["hypothesis0"] for i, r in sources.items()}, spec, rubric)
+    if used is not None:
+        report.update({"chunk": spec["chunk"], "inputs": used})
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     with open(out / "judge-input.jsonl", "w", encoding="utf-8") as f:
@@ -1081,33 +1145,7 @@ def n1targets(args):
     targets, inputs = [], {"plan": g4rl.file_sha256(args.plan), "n1report": g4rl.file_sha256(args.n1report)}
     for c in chunks:
         d = Path(dirs[c])
-        sha = g4rl.file_sha256(d / "choice.parquet")
-        if sha != rep["inputs"][c]["choice-n1.parquet"]:
-            raise SystemExit(f"{d / 'choice.parquet'} is not the choice-n1.parquet that §21's n1report checked ({c})")
-        choice = {r["id"]: r for r in read_rows(d / "choice.parquet")}
-        if set(choice) != {i for i, r in plan.items() if r["chunk"] == c}:
-            raise SystemExit(f"{d / 'choice.parquet'}: not the sources of chunk {c} in the plan")
-        rows = read_rows(d / "targets.parquet")
-        ids = [t["id"] for t in rows]
-        kept = {i for i, r in choice.items() if r["reason"] == "sample"}
-        if len(ids) != len(set(ids)) or set(ids) != kept:
-            raise SystemExit(f"{d / 'targets.parquet'}: {len(ids)} rows, not one per source of choice.parquet with a "
-                             f"sample ({len(kept)})")
-        for t in rows:
-            i, ch, src = t["id"], choice[t["id"]], plan[t["id"]]
-            if (t["part"], t["chunk"], t["reason"]) != (src["part"], c, "sample"):
-                raise SystemExit(f"{c} {i}: part, chunk or reason {(t['part'], t['chunk'], t['reason'])} is not the "
-                                 f"plan's {(src['part'], c)} with a sample")
-            if (t["j"], t["p_sample"], t["qe"], t["qe0"]) != (ch["j"], ch["p_sample"], ch["qe"], ch["qe0"]):
-                raise SystemExit(f"{c} {i}: the target's sample, P or QE is not choice.parquet's")
-            if t["p_sample"] is None or not t["p_sample"] > ANCHOR_P:
-                raise SystemExit(f"{c} {i}: P {t['p_sample']!r}, not above {ANCHOR_P}")
-            if t["qe"] is None or t["qe0"] is None or t["qe"] > t["qe0"] + QE_TOL:
-                raise SystemExit(f"{c} {i}: QE {t['qe']!r} above QE0 {t['qe0']!r} (the guard of G4-9.2)")
-            if (t["en"] or "").strip() != (src["en"] or "").strip():
-                raise SystemExit(f"{c} {i}: the English is not the plan's")
-            if not (t["target"] or "").strip() or norm(t["target"]) == norm(src["hypothesis0"] or ""):
-                raise SystemExit(f"{c} {i}: the target is empty or the anchor's text")
+        rows, sha = n1_chunk(c, d / "choice.parquet", d / "targets.parquet", plan, rep)
         targets += rows
         inputs[c] = {"choice": sha, "targets": g4rl.file_sha256(d / "targets.parquet")}
     counts = {p: sum(t["part"] == p for t in targets) for p in PARTS8}
@@ -1122,6 +1160,39 @@ def n1targets(args):
             "targets_sha256": g4rl.file_sha256(out / "targets.parquet")}
     (out / "targets.json").write_text(json.dumps(info, indent=1) + "\n")
     print(f"N1TARGETS {json.dumps({'targets': len(targets), 'parts': counts})}", flush=True)
+
+
+def n1_chunk(c, choice_path, targets_path, plan, rep):
+    """G4-9.2's checks of one chunk's N1 choice (select-n1's choice.parquet and targets.parquet) against the plan and
+    §21's report: (its target rows, the sha256 of its choice.parquet); a failed check stops"""
+    sha = g4rl.file_sha256(choice_path)
+    if sha != rep["inputs"][c]["choice-n1.parquet"]:
+        raise SystemExit(f"{choice_path} is not the choice-n1.parquet that §21's n1report checked ({c})")
+    choice = {r["id"]: r for r in read_rows(choice_path)}
+    if set(choice) != {i for i, r in plan.items() if r["chunk"] == c}:
+        raise SystemExit(f"{choice_path}: not the sources of chunk {c} in the plan")
+    rows = read_rows(targets_path)
+    ids = [t["id"] for t in rows]
+    kept = {i for i, r in choice.items() if r["reason"] == "sample"}
+    if len(ids) != len(set(ids)) or set(ids) != kept:
+        raise SystemExit(f"{targets_path}: {len(ids)} rows, not one per source of choice.parquet with a "
+                         f"sample ({len(kept)})")
+    for t in rows:
+        i, ch, src = t["id"], choice[t["id"]], plan[t["id"]]
+        if (t["part"], t["chunk"], t["reason"]) != (src["part"], c, "sample"):
+            raise SystemExit(f"{c} {i}: part, chunk or reason {(t['part'], t['chunk'], t['reason'])} is not the "
+                             f"plan's {(src['part'], c)} with a sample")
+        if (t["j"], t["p_sample"], t["qe"], t["qe0"]) != (ch["j"], ch["p_sample"], ch["qe"], ch["qe0"]):
+            raise SystemExit(f"{c} {i}: the target's sample, P or QE is not choice.parquet's")
+        if t["p_sample"] is None or not t["p_sample"] > ANCHOR_P:
+            raise SystemExit(f"{c} {i}: P {t['p_sample']!r}, not above {ANCHOR_P}")
+        if t["qe"] is None or t["qe0"] is None or t["qe"] > t["qe0"] + QE_TOL:
+            raise SystemExit(f"{c} {i}: QE {t['qe']!r} above QE0 {t['qe0']!r} (the guard of G4-9.2)")
+        if (t["en"] or "").strip() != (src["en"] or "").strip():
+            raise SystemExit(f"{c} {i}: the English is not the plan's")
+        if not (t["target"] or "").strip() or norm(t["target"]) == norm(src["hypothesis0"] or ""):
+            raise SystemExit(f"{c} {i}: the target is empty or the anchor's text")
+    return rows, sha
 
 
 def checked_targets(targets, plan):
@@ -1809,6 +1880,10 @@ def main(argv=None):
     a = sub.add_parser("v3")
     for name in ("plan", "targets", "out"):
         a.add_argument(f"--{name}", required=True)
+    a.add_argument("--set", default="", choices=tuple(V3_SETS), help="n1: G4-9-V3N1 (§22 G4-9.V3N1); default G4-8-V3")
+    a.add_argument("--choice", default=None, help="--set n1: select-n1's choice.parquet of the chunk")
+    a.add_argument("--rubric", default=None, help="--set n1: §18's select/choice.parquet of the chunk")
+    a.add_argument("--n1report", default=None, help="--set n1: §21's report.json")
     a = sub.add_parser("report")
     a.add_argument("--plan", required=True)
     a.add_argument("--chunk-dir", action="append", required=True,

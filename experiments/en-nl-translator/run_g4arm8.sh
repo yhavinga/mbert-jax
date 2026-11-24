@@ -21,6 +21,8 @@
 #   CHUNK=c<n> SET=n1 bash run_g4arm8.sh judge  every worker (its TPU): pairjudge.py score -> $G8/<c>/judge-n1/scores/w<k>/
 #   CHUNK=c<n> SET=n1 bash run_g4arm8.sh select w0 (CPU): g4arm8.py select on N1's scores -> $G8/<c>/select-n1/
 #   bash run_g4arm8.sh n1report                 w0 (CPU): g4arm8.py n1report -> $G8/n1/
+#   SET=n1 bash run_g4arm8.sh v3                w0 (CPU): §22 G4-9.V3N1, g4arm8.py v3 --set n1 on c1's N1 targets (checked
+#                                               against §21's report) -> $S/blind/G4-9-V3N1/
 # G4-8's training (protocol-g4.md §19; the chain g4arm8_train_run.sh; SFT=$G8/sft; translate, score, texts, classify,
 # classify-c2, pll and blind are run_g4arm.sh's with ARM=G4-8):
 #   bash run_g4arm8.sh sftset                   w0 (CPU): g4arm8.py sftset (the targets as SFT rows, 2 passes, checked
@@ -54,6 +56,7 @@ RL=$G/rl/G4-7
 G8=$G/data/G4-8
 COMPARE9=G4-8-s140                                              # g4arm8.ARMS_T["G4-9"]["compare"] (§22 G4-9.11)
 V3_OUT=$S/blind/G4-8-V3
+V3N1_OUT=$S/blind/G4-9-V3N1                                     # §22 G4-9.V3N1
 ARM8=${ARM8:-G4-8}
 case $ARM8 in
   G4-8) TG=$G8; J=g4a8; REFS="G4-4" ;;                         # §19: G4-8-data's targets
@@ -361,22 +364,33 @@ EOF
   detach "$NAME" bash "$f"
   ;;
 v3)
+  # G4-8-data.8 (SET empty): the rubric's targets of c1; §22 G4-9.V3N1 (SET=n1): §21's N1 targets of c1, checked by
+  # g4arm8.py against §21's report, with §18's choice for the key
   only 0
   ready
-  NAME=g4a8_v3_$TAG
-  gsutil -q stat "$V3_OUT/key.jsonl" && { echo "$V3_OUT has a key.jsonl: the package stays as it is"; exit 1; }
-  gsutil -q stat "$G8/c1/select/targets.parquet" || { echo "no $G8/c1/select/targets.parquet"; exit 1; }
-  X=$W8/v3-$TAG
+  case ${SET:-} in
+    "") OUT=$V3_OUT; NAME=g4a8_v3_$TAG; X=$W8/v3-$TAG; SRC=$G8/c1/select; EXTRA=""; N1IN="" ;;
+    n1) OUT=$V3N1_OUT; NAME=g4a8_v3n1_$TAG; X=$W8/v3n1-$TAG; SRC=$G8/c1/select-n1
+        EXTRA=" --set n1 --choice $X/choice.parquet --rubric $X/rubric-choice.parquet --n1report $X/n1report.json"
+        N1IN="gsutil -q cp $SRC/choice.parquet $X/choice.parquet
+gsutil -q cp $G8/c1/select/choice.parquet $X/rubric-choice.parquet
+gsutil -q cp $G8/n1/report.json $X/n1report.json" ;;
+    *) echo "SET is empty (G4-8-V3) or n1 (G4-9-V3N1), not $SET"; exit 1 ;;
+  esac
+  gsutil -q stat "$OUT/key.jsonl" && { echo "$OUT has a key.jsonl: the package stays as it is"; exit 1; }
+  gsutil -q stat "$SRC/targets.parquet" || { echo "no $SRC/targets.parquet"; exit 1; }
+  [ -z "${SET:-}" ] || gsutil -q stat "$G8/n1/report.json" || { echo "no $G8/n1/report.json (§21's n1report)"; exit 1; }
   f=$(body "$NAME" <<EOF
 set -euo pipefail
 $CPU
 mkdir -p $X/out
 gsutil -q cp $G8/plan/plan.parquet $X/plan.parquet
-gsutil -q cp $G8/c1/select/targets.parquet $X/targets.parquet
-nice -n 19 $SFT_PY -I -u $CODE/g4arm8.py v3 --plan $X/plan.parquet --targets $X/targets.parquet --out $X/out
-gsutil -m -q cp $X/out/judge-input.jsonl $X/out/select-report.json $V3_OUT/
-gsutil -q cp $X/out/key.jsonl $V3_OUT/key.jsonl
-echo "V3_DONE $V3_OUT/"
+gsutil -q cp $SRC/targets.parquet $X/targets.parquet
+$N1IN
+nice -n 19 $SFT_PY -I -u $CODE/g4arm8.py v3 --plan $X/plan.parquet --targets $X/targets.parquet$EXTRA --out $X/out
+gsutil -m -q cp $X/out/judge-input.jsonl $X/out/select-report.json $OUT/
+gsutil -q cp $X/out/key.jsonl $OUT/key.jsonl
+echo "V3_DONE $OUT/"
 EOF
 )
   detach "$NAME" bash "$f"

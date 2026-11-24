@@ -3171,7 +3171,8 @@ drempel, geen winnaar, geen besluit.
   Claude's oordeel naar het kader van de steekproef omgezet via de systeemnamen van de twee sleutels. Een paar waarvan
   een tekst verschilt, telt niet als gedeeld (geteld).
 
-*G4-maat.3 Signalen* (per kant A en B, vers berekend op de teksten van G4-maat.2, in één keten op mbert-mix).
+*G4-maat.3 Signalen* (per kant A en B, vers berekend op de teksten van G4-maat.2, gestript zoals de judge ze krijgt,
+in één keten op mbert-mix).
 1. **QE**: MetricX-24 hybrid XXL zonder referentie (`metricx_qe.py score --pair source:hypothesis --model xxl`, bf16,
    als §4.3; lege vertaling gescoord); lager is beter.
 2. **COMET-22** met de referentie van de testset (`comet_score.py`, CPU), alleen WMT24++, FLORES en NTREX: de rij van

@@ -3037,3 +3037,32 @@ stappen in 62 min), `adapter` ~2 min, per kandidaat vertalen + scoren ~16 min (3
   sample en anker, §21) en hun aantal (16.349 tegen 15.194), en ook uit andere zaden (schudding, smoke-set, RL-val).
 - Geen tweede ronde, geen judge op evaluatie-uitvoer, geen beoordeling van het blinde pakket (die is aan de hoofdsessie
   en Yeb).
+
+*G4-9.V3N1 Aanvulling 24 nov 2026 ~09:55: blinde blik op de N1-doelen, rapportage* (opdracht van de hoofdsessie 24 nov
+~09:45, vóór Yebs besluit over G4-9; uitwerking door een subagent; tijdstip: de commit van deze alinea op `en-nl-g4arm8`,
+vóór elke stap op een worker). Beslist niets en verandert G4-9.0–G4-9.15 niet; er wordt niets getraind, gesampled,
+vertaald of gescoord: het pakket bevat alleen bestaande teksten (doelen van §21, ankers van §18). Vooraf gelezen: alleen
+tellingen (§21's rapport; per deel, bron en reden de rijen van `$G8/c1/select-n1/choice.parquet` en
+`$G8/c1/select/choice.parquet`); geen tekst.
+- **Pakket** `$S/blind/G4-9-V3N1/` in de vorm van G4-8-data.8 (`g4arm8.py v3 --set n1`, `run_g4arm8.sh v3` met `SET=n1`,
+  w0, CPU): 100 paren doel tegen anker uit deel `c1`; doel = de N1-keuze (G4-8-N1.6, `$G8/c1/select-n1/targets.parquet`),
+  anker = G4-0 greedy (`hypothesis0` van het plan). BT 40: per bron (dpc, fineweb, handelingen, raad, rechtspraak) 8 met
+  `random.Random("en-nl-g4arm/0/G4-9/v3n1/bt/<bron>").sample` van de gesorteerde id's met een doel; romans 40
+  (`…/G4-9/v3n1/novels`); FLAN 20 (`…/G4-9/v3n1/flan`); minder doelen: alle. `blind_id` `v3n1-001…v3n1-100` (BT per bron
+  op naam, dan romans, dan FLAN; binnen een groep in de volgorde van de trekking); A/B met
+  `random.Random("en-nl-g4arm/0/G4-9/v3n1/ab/<blind_id>").random() < 0,5` → A = het anker (`base`), anders A = het doel
+  (`G4-9-n1`). [gemeten in de c1-keuzes] BT 200–253 doelen per bron, romans 1.312, FLAN 236.
+- **Controles** (een afwijking stopt vóór er iets geschreven wordt): die van G4-9.2 op `c1` (`choice.parquet` is (sha256)
+  de `choice-n1.parquet` die §21's `n1report` las; de doelen zijn precies de bronnen met reden `sample`, met dezelfde `j`,
+  P̄ en QE; P̄_N1 > 0,5; QE ≤ QE₀ (+ 1e-9); deel en Engels als in het plan; niet leeg en niet de tekst van het anker);
+  daarbij zijn het plan en §18's `$G8/c1/select/choice.parquet` (sha256) die welke §21 las.
+- **Uitvoer**: `judge-input.jsonl` (blind_id, source, A, B); apart `key.jsonl` (blind_id, A, B, seed, set, item, stratum
+  en `rubric`: wat §18's rubriek voor die bron koos, `zelfde sample` / `ander sample` / `anker`, met de regel van
+  G4-8-N1.7.2); `select-report.json` (aantallen per set en bron, de verdeling van `rubric` over de getrokken paren en over
+  alle doelen van de set in `c1`, sha256 van de invoer; geen tekst). Een bestaande `key.jsonl` wordt niet overschreven.
+  Eén job op mbert-mix w0 met `final_eval_mix.lock`; mbert-corpus (T3) wordt niet aangeraakt.
+- **Beoordeling** als G4-8-data.8 (verse Claude-subagent, rubriek protocol.md §4.2.4, alleen `judge-input.jsonl`, de
+  sleutel pas daarna) door de hoofdsessie; rapportage voor Yebs besluit over G4-9, zonder drempel of regel. Claude en GPT
+  maken of kiezen geen doelen. [gevolgtrekking] Paren met `rubric` = `zelfde sample` zijn ook doelen van G4-8; het
+  verschil tussen N1 en de rubriek zit in de paren met `ander sample` en `anker`. G4-8-V3 kwam ook uit `c1`: een bron kan
+  in beide pakketten zitten (onafhankelijk getrokken).

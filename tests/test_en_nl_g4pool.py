@@ -352,9 +352,10 @@ def test_the_reviewers_rubric_is_protocol_md_4_2_4_literally():
     assert "```" not in rubric and lines[0] == lines[0].lstrip() and lines[-1] == lines[-1].lstrip()
     # the block in protocol.md is the rubric indented by five spaces
     assert "\n".join("     " + x if x else "" for x in lines) in (CODE / "protocol.md").read_text(encoding="utf-8")
-    md = gp.reviewer_text("G4-8-vs-mens", 60, rubric)
+    md = gp.reviewer_text(60, rubric)
     assert rubric in md and "`judge-input.jsonl`: 60 regels" in md and "`judgments.jsonl` in deze map" in md
-    assert "mens" not in md.replace("G4-8-vs-mens", "")
+    # nothing names the other side: no package name, no system
+    assert not any(w in md for w in ("mens", "bo8", "G4-", "base", "menselijk", "origineel"))
 
 
 def test_round_robin_spreads_over_the_groups_and_the_sides_are_blocked():

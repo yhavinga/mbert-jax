@@ -794,10 +794,11 @@ def rubric_text(protocol_md):
     return textwrap.dedent("\n".join(lines[fences[0] + 1:fences[1]])).strip("\n")
 
 
-def reviewer_text(package, n, rubric):
-    """REVIEWER.md (Blind25.5): the rubric literally, besides it only the input, the output and the number of pairs"""
+def reviewer_text(n, rubric):
+    """REVIEWER.md (Blind25.5): the rubric literally, besides it only the input, the output and the number of pairs; no
+    package name, since that names the other side"""
     return "\n".join([
-        f"# Blinde beoordeling {package}", "",
+        "# Blinde beoordeling", "",
         f"In deze map staat `judge-input.jsonl`: {n} regels, per regel één JSON-object met `blind_id`, `source` (de "
         "Engelse bron), `A` en `B` (twee Nederlandse vertalingen).", "",
         "Beoordeel elk paar volgens de instructie hieronder. Schrijf je oordelen naar `judgments.jsonl` in deze map: "
@@ -907,7 +908,7 @@ def blind(args):
         with open(pkg / "key.jsonl", "w", encoding="utf-8") as f:
             f.writelines(json.dumps(x, ensure_ascii=False) + "\n" for x in keys)
         (pkg / "select-report.json").write_text(json.dumps(report, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
-        (pkg / "review" / "REVIEWER.md").write_text(reviewer_text(package, len(keys), rubric), encoding="utf-8")
+        (pkg / "review" / "REVIEWER.md").write_text(reviewer_text(len(keys), rubric), encoding="utf-8")
         summary[package] = {k: report[k] for k in ("n", "per_set", "arm_is_a", "a_is_base", "eligible", "excluded")}
     print(f"BLIND25 {json.dumps(summary, ensure_ascii=False)}", flush=True)
     return summary

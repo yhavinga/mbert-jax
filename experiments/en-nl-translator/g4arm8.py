@@ -1090,7 +1090,7 @@ def trained(args):
     checks = run_checks_t(s, m, steps, [0, *m["save_steps"], steps])
     lr = s.get("lr_at") or {}
     checks["lr_constant"] = {"value": {k: lr.get(str(k)) for k in (WARMUP_T, steps - 1)},
-                             "holds": all(lr.get(str(k)) is not None and abs(lr[str(k)] - LR_T) <= 1e-12
+                             "holds": all(lr.get(str(k)) is not None and abs(lr[str(k)] - LR_T) <= 1e-6 * LR_T  # float32, as lr_peak
                                           for k in (WARMUP_T, steps - 1))}
     metas = dict(x.split("=", 1) for x in args.adapter)
     if sorted(metas) != sorted(candidates_t(m)):

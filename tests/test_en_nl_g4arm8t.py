@@ -289,6 +289,10 @@ def test_trained_checks_the_run_against_sftset_and_each_candidates_adapter(tmp_p
     with pytest.raises(SystemExit, match="TRAINED8 failed"):
         g8.trained(trained_files(tmp_path / "c", summary(190, evals, lr={**lr, "189": 5e-6})))
     assert json.loads((tmp_path / "c" / "trained.json").read_text())["failed"] == ["lr_constant"]
+    # run g4arm_G4-8 (24 Nov) logged its constant LR as 4.999999873689376e-05 (5e-5 in float32)
+    f32 = 4.999999873689376e-05
+    g8.trained(trained_files(tmp_path / "f", summary(190, evals, lr={"0": 0.0, "10": f32, "95": f32, "189": f32})))
+    assert json.loads((tmp_path / "f" / "trained.json").read_text())["passed"]
     metas = {"G4-8-s64": adapter_meta(64), "G4-8-s128": adapter_meta(190), "G4-8-s190": adapter_meta(190)}
     with pytest.raises(SystemExit, match="TRAINED8 failed"):
         g8.trained(trained_files(tmp_path / "d", summary(190, evals, lr=lr), metas))

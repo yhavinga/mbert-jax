@@ -2570,3 +2570,6 @@ beoordelaar in plaats van Yeb: wijkt hij bij meer dan 3 af, dan beoordeelt hij a
 een echte afwijking (bv. 4,9e-5 of 1e-4) faalt nog steeds (tests). De overige controles van de smoke-run slaagden
 (piek 29,13 GiB ≤ 29,5). De smoke-training is gemarkeerd en draait niet opnieuw; de herstart (nieuwe TAG) draait alleen
 `smoke8` opnieuw. De test van §19 controleert nu de definitieve versie (één O6-regel, R-nieuw) in plaats van het concept.
+Hetzelfde voor `lr_constant` in `trained` (24 nov ~01:35): de volle run `g4arm_G4-8` (205 stappen, piek 29,13 GiB,
+verlies 0,114 → 0,074) faalde alleen daarop, met de LR na de warmup overal 4,999999873689376e-05; nu ≤ 1e-6 × 5e-5. De
+training is af en draait niet opnieuw; de herstart draait `adapter` en wat volgt.

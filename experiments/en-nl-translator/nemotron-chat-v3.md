@@ -254,3 +254,24 @@ neemt pas dan `flock` op `final_eval_mix.lock`, controleert de TPU vóór elke T
 fwildchat → fprepare → fgen → fcollect → fqe → ffinal → fsummary. Elke stap per shard hervatbaar: een shard met zijn
 marker wordt overgeslagen, een vertaling gaat verder na de laatste golf in de bucket; de keten zelf slaat stappen met een
 marker in `stages/` over. Een herstart = dezelfde opdracht met een nieuwe TAG. mbert-corpus (T3) wordt niet aangeraakt.
+
+### Amendement 1a (24 nov ~15:25): de herkomsten zoals ze in het bestand staan
+
+Een test van `prepare` op echte shards (0, 63, 126; uitvoer alleen onder `…/nemotron/fulltest/`, met een lege
+WildChat-tabel) liet zien dat `metadata.seed_dataset` meer waarden heeft dan de 505 rijen van §1. Op de 9.106 rijen van
+de proefbereiken [gemeten, `trial/data/sample.json`]:
+
+| `seed_dataset` | rijen | aandeel | volle run |
+|---|---:|---:|---|
+| `allenai/WildChat-1M` | 3.872 | 42,5% | ja (vraag teruggezet) |
+| `lmarena-ai/arena-human-preference-55k` | 1.930 | 21,2% | ja |
+| `lmarena-ai/arena-human-preference-100k` | 1.166 | 12,8% | ja |
+| `lmarena-ai/arena-human-preference-140k` | 692 | 7,6% | **ja** (CC-BY-4.0, §2) |
+| `lmsys/lmsys-chat-1m` | 895 | 9,8% | nooit |
+| `nvidia/HelpSteer2` | 403 | 4,4% | nee [keuze: licentie niet nagekeken] |
+| `lmarena-ai/repochat-arena-preference-4k` | 148 | 1,6% | nee [keuze: gesprekken over code-repo's, licentie niet nagekeken] |
+
+De proef trekt alleen uit 100k en 55k (`LMARENA`); 140k valt daar onder `seed_not_lmarena`. Het bestand is niet
+gemengd: shard 0 is 89% WildChat, shard 63 94% lmarena-140k, shard 126 100% WildChat. Van de lmarena-rijen (100k + 55k)
+haalde 63% de filters; over 637K rijen geeft dat voor lmarena (41,6%) ~167K gesprekken, voor WildChat (42,5%, ~271K
+rijen) een onbekend deel (meer niet-Engels en code). De echte aantallen geeft `fprepare`.

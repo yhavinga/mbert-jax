@@ -453,6 +453,9 @@ def test_wildchat_rows_get_their_prompt_back_and_lmsys_never_goes():
     assert nc.conversation(restored) == (None, "seed_not_lmarena")
     assert nc.conversation(row(seed=nc.LMSYS), nc.FULL_SEEDS) == (None, "seed_lmsys")
     assert nc.conversation(row(seed="other/set"), nc.FULL_SEEDS) == (None, "seed_other")
+    assert nc.conversation(row(seed=nc.LMARENA_140K), nc.FULL_SEEDS)[1] is None
+    assert nc.conversation(row(seed=nc.LMARENA_140K)) == (None, "seed_not_lmarena")  # the trial's draw: 100k and 55k
+    assert nc.conversation(row(seed="nvidia/HelpSteer2"), nc.FULL_SEEDS) == (None, "seed_other")
     lm = row()
     assert nc.restore_row(lm, {}) is lm
 

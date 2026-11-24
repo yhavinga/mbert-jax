@@ -46,7 +46,10 @@ WILDCHAT = "allenai/WildChat-1M"
 WILDCHAT_REVISION = "7d6490e462285cf85d91eabea0f9a954fbddcd1f"
 WILDCHAT_FILES = 14
 LMSYS = "lmsys/lmsys-chat-1m"
-FULL_SEEDS = LMARENA + (WILDCHAT,)    # the full run (Yeb 24 Nov ~14:55: the whole chat split; lmsys never)
+LMARENA_140K = "lmarena-ai/arena-human-preference-140k"  # prompts CC-BY-4.0; 7.6% of the trial's rows, not in its draw
+# The full run (Yeb 24 Nov ~14:55: the whole chat split): lmarena's three sets and WildChat. lmsys never (its licence);
+# lmarena-ai/repochat-arena-preference-4k (1.6%, repository chats) and nvidia/HelpSteer2 (4.4%) not: licences unchecked.
+FULL_SEEDS = LMARENA + (LMARENA_140K, WILDCHAT)
 SHARD_BYTES = 128 * 2 ** 20           # a shard of the full run: the lines that start in 128 MiB of chat.jsonl
 SHARDS = -(-FILE_BYTES // SHARD_BYTES)
 FETCH_MARGIN = 8 * 2 ** 20

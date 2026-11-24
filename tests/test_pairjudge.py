@@ -450,7 +450,7 @@ def test_run_pairjudge_stages_render_their_jobs(tmp_path):
         assert "preflight failed" in body and "venv-fork-f4d8615f4" in body
         (home / "logs" / "pj_score_val_s1.log").unlink(missing_ok=True)
     out, _ = run("score", SET="test", TAG="s2")
-    assert out.returncode != 0 and "SET is val, bon or fb" in out.stdout
+    assert out.returncode != 0 and "SET is val, bon, fb, fbn1 or fbn2" in out.stdout
     out, _ = run("valreport", TAG="r1")
     assert out.returncode == 0, out.stdout + out.stderr
     body = (home / "job_body_pj_valreport_r1.sh").read_text()
@@ -1137,3 +1137,202 @@ def test_run_pairjudge_fb_stages_render_their_jobs(tmp_path):
     assert "pairjudge.py fbreport" in body and all(f"/judge/fb/scores/w{k}/shard-*.parquet" in body for k in range(4))
     assert "/c2fiction/c2f1123a/predictions-c1.parquet" in body and "/rl/G4-7/c2/cal7/predictions.parquet" in body
     assert "report.json gs://t5-dutch-english-usc2/mbert/translator/sft/g4arm/judge/fb/" in body
+
+
+# ---------------------------------------------------------------------------------------------------- §20 FB.8: N1, N2
+
+def test_n_prompts_are_the_protocols_text_letter_for_letter():
+    text = (CODE / "protocol-g4.md").read_text(encoding="utf-8")
+    section = text[text.index("*FB.8 Aanvulling"):]
+    for name, prompt in (("N1", pj.N1_PROMPT), ("N2", pj.N2_PROMPT)):
+        block = re.search(rf"\*\*{name}\*\* \(.*?```\n(.*?)\n```", section, re.S).group(1)
+        assert block == prompt
+    one = pj.user_text(" src ", " a ", " b ", pj.N1_PROMPT)
+    assert "Engelse bron:\nsrc\n\nTekst A:\na\n\nTekst B:\nb\n\nWelke tekst" in one
+    two = pj.user_text("the English", "a", "b", pj.N2_PROMPT)
+    assert "English" not in two and "Engelse" not in two and "Tekst A:\na\n\nTekst B:\nb\n\n" in two
+    for t in (one, two):
+        assert t.endswith("Antwoord met één woord: A, B of gelijk.") and "{" not in t
+    assert pj.FB_PROMPTS == {"rubric": pj.PROMPT, "n1": pj.N1_PROMPT, "n2": pj.N2_PROMPT}
+
+
+def run_fbndata(tmp_path, monkeypatch, bt, prompt, same_as, out_name):
+    monkeypatch.setattr(g4arm, "read_bt", lambda directory, revisions, split="train", extra=(): bt)
+    monkeypatch.setattr(g4arm, "revisions3", lambda directory: {})
+    monkeypatch.setattr(g4arm, "TokenCounter", FakeCounter)
+    out = tmp_path / out_name
+    pj.main(["fbdata", "--prompt", prompt, "--same-as", str(same_as)] + fb_args(tmp_path, tmp_path / "c2f", out)[1:])
+    return out
+
+
+def test_fbdata_n_prompts_take_the_pairs_of_20_and_nothing_else(tmp_path, monkeypatch, capsys):
+    c2f, bt = fb_inputs(tmp_path)
+    fb = run_fbdata(tmp_path, monkeypatch, bt)
+    capsys.readouterr()
+    outs = {p: run_fbndata(tmp_path, monkeypatch, bt, p, fb, f"fb{p}") for p in ("n1", "n2")}
+    assert capsys.readouterr().out.count('"same_as"') == 2
+    old = {r["uid"]: (k, r["text"]) for k in range(4) for r in pj.read_rows(fb / f"prompts-w{k}.parquet")}
+    for p, out in outs.items():
+        new = {r["uid"]: (k, r["text"]) for k in range(4) for r in pj.read_rows(out / f"prompts-w{k}.parquet")}
+        # the same uids on the same workers; the refs are §20's; the texts are the prompt's
+        assert {u: k for u, (k, _) in new.items()} == {u: k for u, (k, _) in old.items()}
+        assert pj.read_rows(out / "refs.parquet") == pj.read_rows(fb / "refs.parquet")
+        info = json.loads((out / "fbdata.json").read_text())
+        assert info["protocol"] == pj.FBN_PROTOCOL and info["prompt"] == p
+        assert info["same_as"] == {"inputs": 5, "refs": 1000, "rubric_prompts": 2000}
+        assert info["workers"] == json.loads((fb / "fbdata.json").read_text())["workers"]
+        assert MARK not in (out / "fbdata.json").read_text()
+        ab = new["fiction/novels:bk03-x-b1-3/ab"][1]
+        assert f"Tekst A:\n{MARK} human 3\n\nTekst B:\n{MARK} g40 3\n" in ab
+        assert f"Tekst A:\n{MARK} nl raad 5\n\nTekst B:\n{MARK} back raad 5\n" in new["bt/raad:doc5:t1:2/ab"][1]
+        assert (f"{MARK} english 3" in ab) == (p == "n1")
+        assert new["bt/raad:doc5:t1:2/ba"][1].index(f"{MARK} back raad 5") < new["bt/raad:doc5:t1:2/ba"][1].index(f"{MARK} nl raad 5")
+    assert json.loads((fb / "fbdata.json").read_text())["prompt"] == "rubric"
+    with pytest.raises(SystemExit, match="takes --same-as"):
+        pj.main(["fbdata", "--prompt", "n1"] + fb_args(tmp_path, c2f, tmp_path / "x")[1:])
+
+
+@pytest.mark.parametrize("change, match", [
+    ("input", "inputs are not §20's"), ("refs", "refs.parquet is not §20's"), ("prompt", "1 of 2000 differ"),
+    ("protocol", "is not of")])
+def test_fbdata_n_prompts_stop_on_other_pairs(tmp_path, monkeypatch, change, match):
+    c2f, bt = fb_inputs(tmp_path)
+    fb = run_fbdata(tmp_path, monkeypatch, bt)
+    if change == "input":
+        pj.write_rows(pj.read_rows(tmp_path / "pool.parquet") + [{"id": "z", "doc": "z", "en": "z"}], tmp_path / "pool.parquet")
+    elif change == "refs":
+        refs = pj.read_rows(fb / "refs.parquet")
+        refs[3]["tokens_en"] += 1
+        pj.write_rows(refs, fb / "refs.parquet")
+    elif change == "prompt":
+        k = pj.worker_of("bt/dpc:doc4:t1:1/ba")
+        rows = pj.read_rows(fb / f"prompts-w{k}.parquet")
+        next(r for r in rows if r["uid"] == "bt/dpc:doc4:t1:1/ba")["text"] += " "
+        pj.write_rows(rows, fb / f"prompts-w{k}.parquet")
+    else:
+        info = json.loads((fb / "fbdata.json").read_text())
+        (fb / "fbdata.json").write_text(json.dumps(info | {"protocol": "other"}))
+    with pytest.raises(SystemExit, match=match):
+        run_fbndata(tmp_path, monkeypatch, bt, "n2", fb, "fbn2")
+    assert not (tmp_path / "fbn2" / "refs.parquet").exists()
+
+
+def fbn_scores(refs, out, side):
+    """A judge that always prefers one side (human or machine), in both orders"""
+    rows = []
+    for r in refs:
+        for order in pj.ORDERS:
+            first = (side == "human") == (order == "ab")
+            pa, pb = (0.7, 0.2) if first else (0.2, 0.7)
+            rows.append({"uid": f"{r['package']}/{r['blind_id']}/{order}", "p_a": pa, "p_b": pb, "p_eq": 0.1,
+                         "mass": 0.4 if side == "machine" else 0.95, "skipped": None, "top_ids": [236776],
+                         "prompt_tokens": 100})
+    out.mkdir(parents=True)
+    pj.write_rows(rows, out / "shard-00000.parquet")
+
+
+def test_fbnreport_sets_n1_and_n2_beside_the_rubric_of_20(tmp_path, monkeypatch, capsys):
+    c2f, bt = fb_inputs(tmp_path)
+    fb = run_fbdata(tmp_path, monkeypatch, bt)
+    nd = {p: run_fbndata(tmp_path, monkeypatch, bt, p, fb, f"fb{p}") for p in ("n1", "n2")}
+    refs = pj.read_rows(fb / "refs.parquet")
+    (tmp_path / "s-rubric" / "w0").mkdir(parents=True)
+    fb_scores(refs, tmp_path / "s-rubric" / "w0")
+    fbn_scores(refs, tmp_path / "s-n1" / "w0", "human")
+    fbn_scores(refs, tmp_path / "s-n2" / "w0", "machine")
+    c1 = [{"model": m, "set": "fiction", "id": r["blind_id"], "p_original": p, "truncated": False}
+          for r in refs if r["package"] == "fiction" for m, p in (("human", 0.8), ("g40", 0.2))]
+    cal = [{"model": "C2-test", "set": r["stratum"], "id": f"{r['blind_id']}#{lab}", "p_original": p, "truncated": False}
+           for r in refs if r["package"] == "bt" for lab, p in ((1, 0.9), (0, 0.1))]
+    pj.write_rows(c1, tmp_path / "c1.parquet")
+    pj.write_rows(cal, tmp_path / "cal.parquet")
+    clf = ["--fiction-c1", str(tmp_path / "c1.parquet"), "--fiction-c2", str(tmp_path / "c1.parquet"),
+           "--bt-c2", str(tmp_path / "cal.parquet")]
+    pj.main(["fbreport", "--refs", str(fb / "refs.parquet"), "--data-json", str(fb / "fbdata.json"),
+             "--scores", str(tmp_path / "s-rubric/w*/shard-*.parquet"), "--out", str(tmp_path / "fb-report.md")] + clf)
+    args = ["fbnreport", "--refs", str(fb / "refs.parquet"), "--data-json", str(fb / "fbdata.json"),
+            "--fb-report", str(tmp_path / "fb-report.json"), "--n-data", f"n1={nd['n1'] / 'fbdata.json'}",
+            "--n-data", f"n2={nd['n2'] / 'fbdata.json'}"] + \
+           [x for n in pj.FBN_ORDER for x in ("--scores", f"{n}={tmp_path / f's-{n}'}/w*/shard-*.parquet")] + clf + \
+           ["--out", str(tmp_path / "report.md")]
+    capsys.readouterr()
+    pj.main(args)
+    assert "FBNREPORT" in capsys.readouterr().out
+    r = json.loads((tmp_path / "report.json").read_text())
+    old = json.loads((tmp_path / "fb-report.json").read_text())
+    assert r["prompts"]["rubric"]["tests"] == old["tests"] and r["prompts"]["rubric"]["classifiers"] == old["classifiers"]
+    for t in pj.FB_TESTS:
+        one, two = r["prompts"]["n1"]["tests"][t], r["prompts"]["n2"]["tests"][t]
+        assert (one["human"], one["machine"], one["direction"]["share"], one["flip"]["share"]) == (500, 0, 1.0, 0.0)
+        assert (two["human"], two["machine"], two["direction"]["share"]) == (0, 500, 0.0)
+        assert one["mean_delta"] == pytest.approx(0.5) and two["mean_delta"] == pytest.approx(-0.5)
+        assert two["position"]["ab"]["mass_below_half"] == 500
+        j = r["judges"][t]
+        assert j["n1~n2"]["n"] == 500 and j["n1~n2"]["agree"]["share"] == 0.0
+        assert j["n1~n2"]["table"] == {"human": {"human": 0, "machine": 500}, "machine": {"human": 0, "machine": 0}}
+        # N1 always the human side, N2 always the machine side: against the rubric they split its directed pairs
+        assert j["n1~rubric"]["agree"]["n"] == j["n2~rubric"]["agree"]["n"]
+        assert j["n1~rubric"]["agree"]["share"] == pytest.approx(1 - j["n2~rubric"]["agree"]["share"])
+    rub, jf = old["tests"]["fiction"], r["judges"]["fiction"]["n1~rubric"]
+    assert jf["table"] == {"human": {"human": rub["human"], "machine": rub["machine"]}, "machine": {"human": 0, "machine": 0}}
+    assert jf["agree"]["share"] == pytest.approx(rub["human"] / 500) and jf["spearman"] is None
+    # BT: the rubric judge's dpc pairs are gelijk (Δ = 0) and the flips symmetric: no direction, not in the agreement
+    assert r["judges"]["bt"]["n1~rubric"]["agree"]["n"] == 500 - 100 - sum(
+        1 for n, x in enumerate(sorted((x for x in refs if x["package"] == "bt"), key=lambda x: x["blind_id"]))
+        if n % 10 == 0 and x["stratum"] != "dpc")
+    assert r["n_data"]["n1"]["rubric_prompts"] == 2000 and set(r["n_data"]["n2"]["workers"]) == {"w0", "w1", "w2", "w3"}
+    k = r["prompts"]["n2"]["classifiers"]["bt"]["C2"]
+    assert k["human_higher"]["share"] == 1.0 and k["agree"]["share"] == 0.0
+    md = (tmp_path / "report.md").read_text()
+    assert MARK not in md and MARK not in (tmp_path / "report.json").read_text()
+    for head in ("## Tabel 1", "## Tabel 2", "## Tabel 3", "## Tabel 4", "## Tabel 5", "## Tabel 6", "## Wat dit niet zegt"):
+        assert head in md
+    assert "| fictie (mens / G4-0) | N1 | 500 | 500 (100,0%) |" in md and "| BT | N2 ~ rubriek (§20) |" in md
+    assert "| dpc | rubriek (§20) | 100 |" in md and "| BT | C2 | N2 | 500 |" in md
+    # §20's report.json other than the rubric's scores, another prompt's data, or a missing name: refused
+    (tmp_path / "fb-report.json").write_text(json.dumps(old | {"tests": old["tests"] | {
+        "bt": old["tests"]["bt"] | {"human": old["tests"]["bt"]["human"] + 1}}}))
+    with pytest.raises(SystemExit, match="not §20's report.json"):
+        pj.main(args)
+    (tmp_path / "fb-report.json").write_text(json.dumps(old))
+    with pytest.raises(SystemExit, match="not FB.8's data of prompt n2"):
+        pj.main([a.replace(f"n2={nd['n2']}", f"n2={nd['n1']}") for a in args])
+    i = args.index(f"n2={tmp_path / 's-n2'}/w*/shard-*.parquet")
+    with pytest.raises(SystemExit, match=r"--scores: names \['n1', 'rubric'\]"):
+        pj.main(args[:i - 1] + args[i + 1:])
+
+
+def test_run_pairjudge_fbn_stages_render_their_jobs(tmp_path):
+    run, shm, home, g = pj_world(tmp_path)
+    out, _ = run("fbndata", PROMPT="n1", TAG="n0")
+    assert out.returncode != 0 and "§20's inputs" in out.stdout, out.stdout + out.stderr
+    fin = shm / "translator/g4arm/judge-fbdata-g4jfb1124a/in"
+    for f in ("c2f/texts.parquet", "b1-selected.parquet", "classifier.parquet", "pool.parquet", "plan.parquet",
+              "bt3/revisions.json"):
+        (fin / f).parent.mkdir(parents=True, exist_ok=True)
+        (fin / f).write_text("x")
+    out, _ = run("fbndata", PROMPT="n1", TAG="n1")
+    assert out.returncode == 0 and "started pj_fbndata_n1_n1 on w0" in out.stdout, out.stdout + out.stderr
+    body = (home / "job_body_pj_fbndata_n1_n1.sh").read_text()
+    assert "pairjudge.py fbdata --prompt n1 --same-as " in body and f"--c2f {fin}/c2f " in body
+    assert "/judge/fb/data/prompts-w*.parquet" in body and "/judge/fb/data/refs.parquet" in body
+    assert "/judge/fbn1/data/" in body and "tokenizer-gemma4" in body
+    out, _ = run("fbndata", PROMPT="n3", TAG="n2")
+    assert out.returncode != 0 and "PROMPT is n1 or n2" in out.stdout
+    out, _ = run("fbndata", host="1", PROMPT="n2", TAG="n3")
+    assert out.returncode != 0 and "runs on w0 only" in out.stdout
+    for host in "0123":
+        out, _ = run("score", host=host, SET="fbn2", TAG="n4")
+        assert out.returncode == 0 and f"started pj_score_fbn2_n4 on w{host}" in out.stdout, out.stdout + out.stderr
+        body = (home / "job_body_pj_score_fbn2_n4.sh").read_text()
+        assert f"/judge/fbn2/data/prompts-w{host}.parquet" in body and f"/judge/fbn2/scores/w{host} " in body
+        (home / "logs" / "pj_score_fbn2_n4.log").unlink(missing_ok=True)
+    out, _ = run("fbnreport", TAG="n5")
+    assert out.returncode == 0, out.stdout + out.stderr
+    body = (home / "job_body_pj_fbnreport_n5.sh").read_text()
+    assert "pairjudge.py fbnreport" in body and "--fb-report " in body and "/judge/fb/report.json" in body
+    for s in ("fb", "fbn1", "fbn2"):
+        assert all(f"/judge/{s}/scores/w{k}/shard-*.parquet" in body for k in range(4))
+    assert "--n-data n1=" in body and "--n-data n2=" in body and "--scores 'rubric=" in body
+    assert "/c2fiction/c2f1123a/predictions-c1.parquet" in body and "/rl/G4-7/c2/cal7/predictions.parquet" in body
+    assert "report.json gs://t5-dutch-english-usc2/mbert/translator/sft/g4arm/judge/fbn/" in body

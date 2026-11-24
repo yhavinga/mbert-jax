@@ -37,9 +37,15 @@
 #   SET=fb bash run_pairjudge.sh score every worker (its TPU): as above, to $GJ/fb/scores/w<k>/
 #   bash run_pairjudge.sh fbreport     w0 (CPU): pairjudge.py fbreport (with C1/C2 of C2F and C2 of c2cal7), to
 #                                      $GJ/fb/report.md/.json
+# G4-judge-FB.N (protocol-g4.md §20 FB.8), the same pairs with the prompts N1 and N2:
+#   PROMPT=n1|n2 bash run_pairjudge.sh fbndata   w0 (CPU): pairjudge.py fbdata --prompt, from §20's inputs on w0
+#                                      ($FB_IN), checked against §20's data ($GJ/fb/data/), to $GJ/fb<PROMPT>/data/
+#   SET=fbn1|fbn2 bash run_pairjudge.sh score   every worker (its TPU): as above, to $GJ/<SET>/scores/w<k>/
+#   bash run_pairjudge.sh fbnreport    w0 (CPU): pairjudge.py fbnreport (rubric of §20, N1, N2; C1/C2 as fbreport), to
+#                                      $GJ/fbn/report.md/.json
 # The code is beside this script (a copy of $G/scripts-g4j-<commit>/). TAG names the jobs of one chain.
 set -euo pipefail
-STAGE=${1:?a stage: valdata, score, valreport, bonpairs, select, texts, classify, bonreport, blind, aselect, atexts, aclassify, areport, ablind, rvaldata, reason, rreport, fbdata, fbreport}
+STAGE=${1:?a stage: valdata, score, valreport, bonpairs, select, texts, classify, bonreport, blind, aselect, atexts, aclassify, areport, ablind, rvaldata, reason, rreport, fbdata, fbreport, fbndata, fbnreport}
 R=gs://t5-dutch-english-usc2/mbert/translator
 S=$R/sft
 G=$S/g4arm
@@ -62,6 +68,7 @@ GR=$GJ/reason/val
 GF=$GJ/fb                                                       # §20
 RL=$G/rl/G4-7
 C2F=$G/c2fiction/c2f1123a                                       # §16's run: the pairs human/g40 and C1/C2 on them
+FB_IN=$G_SHM/judge-fbdata-g4jfb1124a/in                         # §20's inputs on w0 (run g4jfb1124a), reused by FB.8
 PACKAGES="G4-7 G4-7-tg G4-bon-i15c2q RB3 RB2"
 MODELS="G4-0 G4-7-i15"
 CODE=$(cd "$(dirname "$0")" && pwd)
@@ -120,8 +127,8 @@ valdata)
   detach "pj_valdata_$TAG" bash ~/job_body_pj_valdata_$TAG.sh
   ;;
 score)
-  SET=${SET:?SET=val, SET=bon or SET=fb}
-  case $SET in val|bon|fb) ;; *) echo "SET is val, bon or fb, not $SET"; exit 1 ;; esac
+  SET=${SET:?SET=val, bon, fb, fbn1 or fbn2}
+  case $SET in val|bon|fb|fbn1|fbn2) ;; *) echo "SET is val, bon, fb, fbn1 or fbn2, not $SET"; exit 1 ;; esac
   tpu_free
   fork_ready
   X=$G_SHM/judge-score-$SET-$TAG
@@ -370,6 +377,45 @@ fbreport)
     echo "echo \"FBREPORT_DONE $GF/report.md\""
   } > ~/job_body_pj_fbreport_$TAG.sh
   detach "pj_fbreport_$TAG" bash ~/job_body_pj_fbreport_$TAG.sh
+  ;;
+fbndata)
+  only 0
+  fork_ready
+  PROMPT=${PROMPT:?PROMPT=n1 or PROMPT=n2}
+  case $PROMPT in n1|n2) ;; *) echo "PROMPT is n1 or n2, not $PROMPT"; exit 1 ;; esac
+  for f in c2f/texts.parquet b1-selected.parquet classifier.parquet pool.parquet plan.parquet bt3/revisions.json; do
+    [ -s "$FB_IN/$f" ] || { echo "w$W: no $FB_IN/$f (§20's inputs)"; exit 1; }
+  done
+  X=$G_SHM/judge-fbndata-$PROMPT-$TAG
+  {
+    echo "set -euo pipefail"
+    echo "mkdir -p $X/fb"
+    echo "gsutil -m -q cp '$GF/data/prompts-w*.parquet' $GF/data/refs.parquet $GF/data/fbdata.json $X/fb/"
+    echo "HF_HUB_OFFLINE=1 JAX_PLATFORMS=cpu nice -n 19 $FPY -I -u $CODE/pairjudge.py fbdata --prompt $PROMPT --same-as $X/fb --c2f $FB_IN/c2f --b1 $FB_IN/b1-selected.parquet --c2-data $FB_IN/classifier.parquet --bt $FB_IN/bt3 --g47-pool $FB_IN/pool.parquet --g48-plan $FB_IN/plan.parquet --tokenizer $TOK_DEC --out $X/out"
+    echo "gsutil -m -q cp $X/out/* $GJ/fb$PROMPT/data/"
+    echo "echo \"FBNDATA_DONE $GJ/fb$PROMPT/data/\""
+  } > ~/job_body_pj_fbndata_${PROMPT}_$TAG.sh
+  detach "pj_fbndata_${PROMPT}_$TAG" bash ~/job_body_pj_fbndata_${PROMPT}_$TAG.sh
+  ;;
+fbnreport)
+  only 0
+  fork_ready
+  X=$G_SHM/judge-fbnreport-$TAG
+  {
+    echo "set -euo pipefail"
+    echo "mkdir -p $X/fb $X/c2f $X/fbn1 $X/fbn2"
+    echo "gsutil -m -q cp $GF/data/refs.parquet $GF/data/fbdata.json $GF/report.json $X/fb/"
+    for s in fbn1 fbn2; do echo "gsutil -q cp $GJ/$s/data/fbdata.json $X/$s/"; done
+    for s in fb fbn1 fbn2; do
+      for k in 0 1 2 3; do echo "mkdir -p $X/scores-$s/w$k && gsutil -m -q cp '$GJ/$s/scores/w$k/shard-*.parquet' $X/scores-$s/w$k/"; done
+    done
+    echo "gsutil -m -q cp $C2F/predictions-c1.parquet $C2F/predictions-c2.parquet $X/c2f/"
+    echo "gsutil -q cp $RL/c2/cal7/predictions.parquet $X/c2cal7-predictions.parquet"
+    echo "JAX_PLATFORMS=cpu $FPY -I -u $CODE/pairjudge.py fbnreport --refs $X/fb/refs.parquet --data-json $X/fb/fbdata.json --fb-report $X/fb/report.json --n-data n1=$X/fbn1/fbdata.json --n-data n2=$X/fbn2/fbdata.json --scores 'rubric=$X/scores-fb/w*/shard-*.parquet' --scores 'n1=$X/scores-fbn1/w*/shard-*.parquet' --scores 'n2=$X/scores-fbn2/w*/shard-*.parquet' --fiction-c1 $X/c2f/predictions-c1.parquet --fiction-c2 $X/c2f/predictions-c2.parquet --bt-c2 $X/c2cal7-predictions.parquet --out $X/report.md"
+    echo "gsutil -m -q cp $X/report.md $X/report.json $GJ/fbn/"
+    echo "echo \"FBNREPORT_DONE $GJ/fbn/report.md\""
+  } > ~/job_body_pj_fbnreport_$TAG.sh
+  detach "pj_fbnreport_$TAG" bash ~/job_body_pj_fbnreport_$TAG.sh
   ;;
 classify)
   only 0

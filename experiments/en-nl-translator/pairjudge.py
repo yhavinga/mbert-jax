@@ -16,10 +16,15 @@ with C1 and the samples' existing scores, and builds a blind package.
     python pairjudge.py blind --model NAME --select DIR --anchor DIR --evalsets E --split S --out DIR
     python pairjudge.py fbdata --c2f DIR --b1 P --c2-data P --bt DIR --g47-pool P --g48-plan P --tokenizer T --out DIR
     python pairjudge.py fbreport --refs R --data-json J --scores GLOB --fiction-c1 P --fiction-c2 P --bt-c2 P --out report.md
+    python pairjudge.py fbdata --prompt n1|n2 --same-as DIR ... (as above)
+    python pairjudge.py fbnreport --refs R --data-json J --fb-report J --n-data n1=J --n-data n2=J \
+        --scores rubric=GLOB --scores n1=GLOB --scores n2=GLOB --fiction-c1 P --fiction-c2 P --bt-c2 P --out report.md
 
 §20 (G4-judge-FB, 24 Nov 2026): the same judge on fiction (the human Dutch translation against G4-0's of C2F's
 passages) and BT (the Dutch original against Gemma 4's round trip, C2's test split), A = the human or original side in
-order ab; the report beside C1 and C2 on the same pairs as they exist.
+order ab; the report beside C1 and C2 on the same pairs as they exist. §20 FB.8 (G4-judge-FB.N): the same pairs, checked
+against §20's, with two other prompts, N1 (the English source, naturalness only) and N2 (no source: which text is
+originally Dutch), reported beside §20's rubric.
 
 A prompt row is (uid, text): text is the user turn; score puts the model's chat turn around it. The texts stay in the
 bucket and on the VM: no command prints a text, the reports hold counts and scores only."""
@@ -1558,6 +1563,42 @@ FB_BANDS = (("<=128", 0, 128), ("129-256", 129, 256), (">256", 257, 10 ** 9))   
 FB_BOOT = 10000
 FB_BOOT_SEED = "en-nl-g4arm/0/G4-judge-fb/boot"
 FB_OVERLAP = ("c2_train_document", "pool_plan_id", "pool_plan_document", "pool_plan_english")
+FBN_PROTOCOL = "protocol-g4.md §20 FB.8"
+# FB.8 N1, letterlijk: the English source, naturalness only
+N1_PROMPT = (
+    "Je krijgt een Engelse bron en twee Nederlandse teksten, A en B, met ongeveer dezelfde inhoud.\n"
+    "\n"
+    "Oordeel alleen op natuurlijk, oorspronkelijk klinkend Nederlands: welke tekst leest het meest als tekst die "
+    "oorspronkelijk in het Nederlands is geschreven, en het minst als een vertaling? Laat juistheid uitdrukkelijk buiten "
+    "beschouwing: weglatingen, toevoegingen en afwijkingen van de Engelse bron tellen niet mee. \"gelijk\" als er geen "
+    "duidelijk verschil is.\n"
+    "\n"
+    "Engelse bron:\n"
+    "{bron}\n"
+    "\n"
+    "Tekst A:\n"
+    "{A}\n"
+    "\n"
+    "Tekst B:\n"
+    "{B}\n"
+    "\n"
+    "Welke tekst leest het meest als oorspronkelijk Nederlands? Antwoord met één woord: A, B of gelijk.")
+# FB.8 N2, letterlijk: no source, which text is originally Dutch
+N2_PROMPT = (
+    "Je krijgt twee Nederlandse teksten, A en B, met ongeveer dezelfde inhoud. De ene is oorspronkelijk in het "
+    "Nederlands geschreven, de andere is een vertaling.\n"
+    "\n"
+    "Welke van de twee is oorspronkelijk in het Nederlands geschreven, en welke is de vertaling? \"gelijk\" als je het "
+    "verschil niet kunt zien.\n"
+    "\n"
+    "Tekst A:\n"
+    "{A}\n"
+    "\n"
+    "Tekst B:\n"
+    "{B}\n"
+    "\n"
+    "Welke tekst is oorspronkelijk in het Nederlands geschreven? Antwoord met één woord: A, B of gelijk.")
+FB_PROMPTS = {"rubric": PROMPT, "n1": N1_PROMPT, "n2": N2_PROMPT}
 
 
 def fb_fiction(texts_rows, b1_rows):
@@ -1650,6 +1691,8 @@ def fbdata(args):
     import g4arm
     import pyarrow.parquet as pq
 
+    if args.prompt != "rubric" and not args.same_as:
+        raise SystemExit(f"--prompt {args.prompt} takes --same-as: FB.8 scores §20's pairs only")
     texts_rows = read_rows(Path(args.c2f) / "texts.parquet", ["model", "id", "text"])
     want = sorted({r["id"][len(FB_NOVEL):] for r in texts_rows if r["id"].startswith(FB_NOVEL)})
     b1_rows = pq.read_table(args.b1, columns=["id", "group", "en", "nl"], filters=[("id", "in", want)]).to_pylist()
@@ -1663,18 +1706,20 @@ def fbdata(args):
     bt, binfo = fb_bt(c2_rows, bt_rows, pool_rows, plan_rows)
     pairs = fiction + bt
     tokens = g4arm.TokenCounter(args.tokenizer).lengths([p["en"] for p in pairs])
-    prompts, refs = [], []
+    prompts, refs, rubric = [], [], []
     for p, n in zip(pairs, tokens):
-        for uid, text, _ in pair_prompts(f"{p['test']}/{p['id']}", p["en"], p["first"], p["second"]):
+        key = f"{p['test']}/{p['id']}"
+        for uid, text, _ in pair_prompts(key, p["en"], p["first"], p["second"], FB_PROMPTS[args.prompt]):
             prompts.append({"uid": uid, "text": text})
+        if args.same_as:
+            rubric += [{"uid": uid, "text": text} for uid, text, _ in pair_prompts(key, p["en"], p["first"], p["second"])]
         refs.append({"package": p["test"], "blind_id": p["id"], "stratum": p["stratum"], "tokens_en": n,
                      "identical": p["first"].strip() == p["second"].strip()})
     if len({(r["package"], r["blind_id"]) for r in refs}) != len(refs):
         raise SystemExit("a pair twice")
     out = Path(args.out)
-    workers = write_prompts(prompts, out)
-    write_rows(refs, out / "refs.parquet")
-    info = {"protocol": FB_PROTOCOL, "prompts": len(prompts), "workers": workers, "fiction": finfo, "bt": binfo,
+    info = {"protocol": FB_PROTOCOL if args.prompt == "rubric" else FBN_PROTOCOL, "prompt": args.prompt,
+            "prompts": len(prompts), "fiction": finfo, "bt": binfo,
             "identical": {t: sum(r["identical"] for r in refs if r["package"] == t) for t in FB_TESTS},
             "tokens_en": {t: {"median": statistics.median(r["tokens_en"] for r in refs if r["package"] == t),
                               "max": max(r["tokens_en"] for r in refs if r["package"] == t),
@@ -1683,9 +1728,39 @@ def fbdata(args):
             "inputs": {name: g4arm.sha256_file(path) for name, path in
                        (("c2f_texts", Path(args.c2f) / "texts.parquet"), ("b1", args.b1), ("c2_data", args.c2_data),
                         ("g47_pool", args.g47_pool), ("g48_plan", args.g48_plan))}}
+    if args.same_as:
+        info["same_as"] = fb_same_as(args.same_as, info["inputs"], refs, rubric)
+    info["workers"] = write_prompts(prompts, out)
+    write_rows(refs, out / "refs.parquet")
     (out / "fbdata.json").write_text(json.dumps(info, indent=1) + "\n")
-    print(f"FBDATA {json.dumps({k: info[k] for k in ('prompts', 'workers', 'identical')} | {'fiction': finfo, 'bt': binfo})}",
+    print(f"FBDATA {json.dumps({k: info[k] for k in ('prompt', 'prompts', 'workers', 'identical')} | {'fiction': finfo, 'bt': binfo} | ({'same_as': info['same_as']} if args.same_as else {}))}",
           flush=True)
+
+
+def fb_same_as(directory, inputs, refs, rubric):
+    """FB.8: the pairs are §20's: the sha256 of the inputs, refs.parquet, and G4-judge.3's prompts of these pairs per uid
+    (sha256 of the text) as in §20's data directory; a difference stops"""
+    d = Path(directory)
+    old = json.loads((d / "fbdata.json").read_text())
+    if old.get("protocol") != FB_PROTOCOL:
+        raise SystemExit(f"{d / 'fbdata.json'} is not of {FB_PROTOCOL}")
+    if old["inputs"] != inputs:
+        raise SystemExit(f"the inputs are not §20's: {sorted(k for k in inputs if old['inputs'].get(k) != inputs[k])}")
+
+    def key(r):
+        return r["package"], r["blind_id"]
+
+    if sorted(read_rows(d / "refs.parquet"), key=key) != sorted(refs, key=key):
+        raise SystemExit("refs.parquet is not §20's")
+
+    def digests(rows):
+        return {r["uid"]: hashlib.sha256(r["text"].encode("utf-8")).hexdigest() for r in rows}
+
+    was, now = digests(read_glob(str(d / "prompts-w*.parquet"))), digests(rubric)
+    if was != now:
+        raise SystemExit(f"G4-judge.3's prompts of these pairs are not §20's: {sum(was.get(u) != h for u, h in now.items())} "
+                         f"of {len(now)} differ, {len(set(was) - set(now))} of §20's missing")
+    return {"inputs": len(inputs), "refs": len(refs), "rubric_prompts": len(now)}
 
 
 def fb_measures(rows):
@@ -1894,6 +1969,193 @@ def fbreport_text(r):
     return "\n".join(L) + "\n"
 
 
+# ---------------------------------------------------------------------------------------------------- §20 FB.8: N1, N2
+
+FBN_ORDER = ("rubric", "n1", "n2")
+FBN_LABELS = {"rubric": "rubriek (§20)", "n1": "N1", "n2": "N2"}
+FBN_PAIRS = (("n1", "rubric"), ("n2", "rubric"), ("n1", "n2"))
+FBN_CHECK = ("human", "machine", "gelijk", "mean_delta")
+
+
+def fb_judges(rows_x, rows_y):
+    """FB.8: two prompts on the same pairs: the direction alike where both Δ ≠ 0 (with the 2 x 2 table) and Spearman
+    between their Δ = P̄(mens) − P̄(machine)"""
+    import g4c2
+
+    y = {(r["package"], r["blind_id"]): r["p"]["A"] - r["p"]["B"] for r in rows_y}
+    dx, dy = [], []
+    for r in rows_x:
+        k = (r["package"], r["blind_id"])
+        if k in y:
+            dx.append(r["p"]["A"] - r["p"]["B"])
+            dy.append(y[k])
+    both = [(a > 0, b > 0) for a, b in zip(dx, dy) if a != 0 and b != 0]
+    side = {True: "human", False: "machine"}
+    table = {i: {j: sum(side[a] == i and side[b] == j for a, b in both) for j in side.values()} for i in side.values()}
+    return {"n": len(dx), "agree": share(a == b for a, b in both), "table": table, "spearman": g4c2.spearman(dx, dy)}
+
+
+def fb_check_rubric(result, report):
+    """The rubric's measures recomputed from §20's scores are §20's report.json"""
+    for t in FB_TESTS:
+        new, old = result["tests"][t], report["tests"][t]
+        got = [new[k] for k in FBN_CHECK] + [new["direction"]["share"], new["flip"]["share"]] + new["delta_ci95"]
+        want = [old[k] for k in FBN_CHECK] + [old["direction"]["share"], old["flip"]["share"]] + old["delta_ci95"]
+        if len(got) != len(want) or any(not math.isclose(a, b, rel_tol=0, abs_tol=1e-12) for a, b in zip(got, want)):
+            raise SystemExit(f"{t}: the rubric's measures from §20's scores are not §20's report.json")
+
+
+def named(values, what, names):
+    """{name: value} of NAME=VALUE arguments, exactly the names"""
+    out = {}
+    for v in values:
+        name, sep, rest = v.partition("=")
+        if not sep or not rest or name in out:
+            raise SystemExit(f"{what}: {v!r} is not NAME=VALUE, or its name twice")
+        out[name] = rest
+    if set(out) != set(names):
+        raise SystemExit(f"{what}: names {sorted(out)}, not {sorted(names)}")
+    return out
+
+
+def fbnreport(args):
+    refs = read_rows(args.refs)
+    info = json.loads(Path(args.data_json).read_text())
+    ndata = {}
+    for name, path in named(args.n_data, "--n-data", FBN_ORDER[1:]).items():
+        d = json.loads(Path(path).read_text())
+        if d.get("protocol") != FBN_PROTOCOL or d.get("prompt") != name or "same_as" not in d:
+            raise SystemExit(f"{path}: not FB.8's data of prompt {name} checked against §20's")
+        ndata[name] = d["same_as"] | {"workers": d["workers"]}
+    scores = named(args.scores, "--scores", FBN_ORDER)
+    probs = {"fiction": {"C1": fb_probs(read_rows(args.fiction_c1), refs, "fiction"),
+                         "C2": fb_probs(read_rows(args.fiction_c2), refs, "fiction")},
+             "bt": {"C2": fb_probs(read_rows(args.bt_c2), refs, "bt")}}
+    results, rows = {}, {}
+    for name in FBN_ORDER:
+        results[name], rows[name] = fb_result(refs, scores_by_uid(read_glob(scores[name])), probs, info)
+    fb_check_rubric(results["rubric"], json.loads(Path(args.fb_report).read_text()))
+    judges = {t: {f"{x}~{y}": fb_judges([r for r in rows[x] if r["package"] == t], rows[y]) for x, y in FBN_PAIRS}
+              for t in FB_TESTS}
+    result = {"protocol": FBN_PROTOCOL, "pairs": len(refs),
+              "prompts": {n: {k: results[n][k] for k in ("scored_pairs", "skipped_pairs", "tests", "classifiers")}
+                          for n in FBN_ORDER},
+              "judges": judges, "n_data": ndata, "data": info}
+    Path(args.out).with_suffix(".json").write_text(json.dumps(result, indent=1) + "\n")
+    Path(args.out).write_text(fbnreport_text(result), encoding="utf-8")
+    print("FBNREPORT " + json.dumps({n: {t: {"n": m["n"], "direction": round(m["direction"]["share"], 4),
+                                             "verdicts": [m["human"], m["machine"], m["gelijk"]],
+                                             "flip": round(m["flip"]["share"], 4)}
+                                         for t, m in r["tests"].items() if m["n"]}
+                                     for n, r in result["prompts"].items()}), flush=True)
+
+
+def fbnreport_text(r):
+    P = r["prompts"]
+    L = ["# Meting G4-judge-FB.N: de judge alleen naar natuurlijkheid of herkomst gevraagd (rapporteren; beslist niets)", "",
+         f"Gemaakt door `pairjudge.py fbnreport` ({FBN_PROTOCOL}; de prompts N1 en N2 staan daar letterlijk). Dezelfde "
+         "judge (Gemma 4 31B-it, één prefill, P(A)/P(B)/P(gelijk), elk paar in beide volgordes) op dezelfde 1.000 paren "
+         "als §20 (run `g4jfb1124a`), met drie prompts: **rubriek (§20)** = G4-judge.3 (eerst juistheid, dan "
+         "natuurlijkheid; de uitslag van §20, herberekend uit zijn scores en gelijk aan zijn report.json); **N1** = "
+         "Engelse bron + A + B, alleen natuurlijkheid (welke tekst leest het meest als oorspronkelijk Nederlands; "
+         "juistheid buiten beschouwing); **N2** = alleen A + B, geen Engels (welke tekst is oorspronkelijk in het "
+         "Nederlands geschreven). **Mens** = de menselijke vertaling (fictie) of het Nederlandse origineel (BT); "
+         "**machine** = G4-0 greedy (fictie) of Gemma 4's rondgang (BT). P̄ = het gemiddelde van de genormaliseerde "
+         "kansen over de twee volgordes; oordeel = de grootste P̄. Richting = aandeel paren met P̄(mens) > P̄(machine) "
+         "(gelijk telt ½). Intervallen: 95% Wilson; Δ = P̄(mens) − P̄(machine), interval met bootstrap (10.000 "
+         "trekkingen, het zaad van §20).", "",
+         "Gescoorde paren: " + "; ".join(
+             f"{FBN_LABELS[n]} {x['scored_pairs']} van {r['pairs']}" +
+             (f" (niet gescoord, prompt > 4.096 tokens: {len(x['skipped_pairs'])})" if x["skipped_pairs"] else "")
+             for n, x in P.items()) + ".", "",
+         "## Tabel 1: per proef en prompt", "",
+         "| proef | prompt | n | oordeel mens | oordeel machine | oordeel gelijk | richting (95%-BI) | omklappen | "
+         "inconsistent | gem. P̄(mens) | gem. P̄(machine) | gem. P̄(gelijk) | gem. Δ [95%-BI] |",
+         "|---|---|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|---|"]
+    for t in FB_TESTS:
+        name, human, machine = FB_NAMES[t]
+        for n, x in P.items():
+            m = x["tests"][t]
+            if not m["n"]:
+                L.append(f"| {name} ({human} / {machine}) | {FBN_LABELS[n]} | 0 |" + " – |" * 10)
+                continue
+            ci = m["delta_ci95"]
+            L.append(f"| {name} ({human} / {machine}) | {FBN_LABELS[n]} | " + " | ".join(fb_row_cells(m)[:5]) +
+                     f" | {pct(m['flip']['share'])} | {pct(m['inconsistent']['share'])} | {num(m['mean_p_human'])} | "
+                     f"{num(m['mean_p_machine'])} | {num(m['mean_p_gelijk'])} | {num(m['mean_delta'])} "
+                     f"[{num(ci[0])}; {num(ci[1])}] |")
+    L += ["", "## Tabel 2: positie en antwoordmassa (greedy antwoord per volgorde; `ab`: A = mens)", "",
+          "| proef | prompt | volgorde | eerste positie (A) | tweede positie (B) | gelijk | gem. p_A − p_B | "
+          "massa mediaan | massa < 0,5 |",
+          "|---|---|---|---:|---:|---:|---:|---:|---:|"]
+    for t in FB_TESTS:
+        for n, x in P.items():
+            for o, v in (x["tests"][t].get("position") or {}).items():
+                L.append(f"| {FB_NAMES[t][0]} | {FBN_LABELS[n]} | {o} | {pct(v['first_position'])} | "
+                         f"{pct(v['second_position'])} | {pct(v['gelijk'])} | {num(v['mean_pa_minus_pb'])} | "
+                         f"{num(v['mass_median'])} | {v['mass_below_half']} |")
+    head = "| n | oordeel mens | oordeel machine | oordeel gelijk | richting (95%-BI) | omklappen |"
+    L += ["", "## Tabel 3: BT per bron", "", "| bron | prompt " + head, "|---|---|---:|---:|---:|---:|---|---:|"]
+    for s in P["rubric"]["tests"]["bt"]["strata"]:
+        for n, x in P.items():
+            L.append(f"| {s} | {FBN_LABELS[n]} | " + " | ".join(fb_row_cells(x["tests"]["bt"]["strata"][s])) + " |")
+    L += ["", "## Tabel 4: per lengteband van de Engelse bron (Gemma 4-tokens)", "",
+          "| proef | band | prompt " + head, "|---|---|---|---:|---:|---:|---:|---|---:|"]
+    for t in FB_TESTS:
+        for b, _, _ in FB_BANDS:
+            for n, x in P.items():
+                L.append(f"| {FB_NAMES[t][0]} | {b} | {FBN_LABELS[n]} | " + " | ".join(fb_row_cells(x["tests"][t]["bands"][b])) + " |")
+    L += ["", "## Tabel 5: de classifiers op dezelfde paren (bestaande scores; P = P(origineel))", "",
+          "Fictie: C1 en C2 uit run `c2f1123a` (§16). BT: C2 uit `c2cal7` (zijn testsplit); C1 heeft geen scores op deze "
+          "BT-paren. De voorkeur van de classifier is per prompt dezelfde; overeenstemming = de richting van de "
+          "classifier (Δlogit) gelijk aan die van de judge (Δ P̄), op de paren waar beide ≠ 0.", "",
+          "| proef | classifier | prompt | n | P(mens) > P(machine) (95%-BI) | gem. Δlogit (±12) | richting gelijk aan "
+          "de judge (95%-BI) | judge mens · clf mens | judge mens · clf machine | judge machine · clf mens | "
+          "judge machine · clf machine | Spearman Δ judge ~ Δlogit |",
+          "|---|---|---|---:|---|---:|---|---:|---:|---:|---:|---:|"]
+    for t in FB_TESTS:
+        for c in P["rubric"]["classifiers"][t]:
+            for n, x in P.items():
+                k = x["classifiers"][t][c]
+                tb = k["table"]
+                L.append(f"| {FB_NAMES[t][0]} | {c} | {FBN_LABELS[n]} | {k['n']} | {share_text(k['human_higher'])} | "
+                         f"{num(k['mean_dlogit'], 2)} | {share_text(k['agree'])} | {tb['human']['human']} | "
+                         f"{tb['human']['machine']} | {tb['machine']['human']} | {tb['machine']['machine']} | "
+                         f"{num(k['spearman'])} |")
+    L += ["", "## Tabel 6: de prompts onderling op dezelfde paren", "",
+          "Richting gelijk = beide prompts kiezen dezelfde kant (Δ P̄ met hetzelfde teken), op de paren waar beide Δ ≠ 0. "
+          "X en Y: de eerste en de tweede prompt van de rij.", "",
+          "| proef | X ~ Y | n | richting gelijk (95%-BI) | X mens · Y mens | X mens · Y machine | X machine · Y mens | "
+          "X machine · Y machine | Spearman ΔX ~ ΔY |",
+          "|---|---|---:|---|---:|---:|---:|---:|---:|"]
+    for t in FB_TESTS:
+        for x, y in FBN_PAIRS:
+            j = r["judges"][t][f"{x}~{y}"]
+            tb = j["table"]
+            L.append(f"| {FB_NAMES[t][0]} | {FBN_LABELS[x]} ~ {FBN_LABELS[y]} | {j['n']} | {share_text(j['agree'])} | "
+                     f"{tb['human']['human']} | {tb['human']['machine']} | {tb['machine']['human']} | "
+                     f"{tb['machine']['machine']} | {num(j['spearman'])} |")
+    nd = r["n_data"]
+    L += ["", "## Herkomst en controles", "",
+          "- De paren van N1 en N2 zijn die van §20: " + "; ".join(
+              f"{FBN_LABELS[n]}: sha256 van {x['inputs']} invoerbestanden gelijk, refs ({x['refs']} paren) gelijk, "
+              f"{x['rubric_prompts']} prompts van G4-judge.3 per uid gelijk, prompts per worker " +
+              ", ".join(f"{w} {c}" for w, c in x["workers"].items()) for n, x in nd.items()) + ".",
+          "- De rubriek-uitslag is herberekend uit §20's scores en gelijk aan §20's report.json (oordelen, richting, "
+          "omklappen, Δ en zijn interval).",
+          "- Paren, invoer en lengtebanden: als §20 (`g4-judge-fiction-bt.md`, Herkomst en controles).",
+          "", "## Wat dit niet zegt", "",
+          "- Fictie: beide kanten zijn vertalingen uit het Engels. De premisse van N2 (één tekst is oorspronkelijk "
+          "Nederlands) klopt daar niet; de menselijke kant geldt, als in §20, als de verwachte.",
+          "- BT: N1 ziet het Engels, dat Gemma 4's vertaling van het origineel is en waar de rondgang van komt; N2 ziet "
+          "geen Engels.",
+          "- De machinekant is in beide proeven Gemma 4 31B-it, hetzelfde model als de judge: een voorkeur voor de eigen "
+          "stijl is niet te scheiden van de vraag.",
+          "- Eén formulering per prompt, zero-shot, geen drempel; beslist niets over G4-8, de judge of een volgende arm.",
+          ""]
+    return "\n".join(L) + "\n"
+
+
 # ---------------------------------------------------------------------------------------------------- CLI
 
 def main(argv=None):
@@ -1975,6 +2237,10 @@ def main(argv=None):
     a.add_argument("--split", required=True)
     a.add_argument("--out", required=True)
     a = sub.add_parser("fbdata")
+    a.add_argument("--prompt", choices=sorted(FB_PROMPTS), default="rubric",
+                   help="rubric (G4-judge.3, §20), n1 or n2 (FB.8; these take --same-as)")
+    a.add_argument("--same-as", help="§20's data directory (fbdata.json, refs.parquet, prompts-w<k>.parquet): the pairs "
+                                     "must be its pairs (FB.8)")
     a.add_argument("--c2f", required=True, help="C2F's run directory (texts.parquet with the groups human and g40)")
     a.add_argument("--b1", required=True, help="$S/data/books-b1/b1-selected.parquet (the English of the novels)")
     a.add_argument("--c2-data", required=True, help="C2's classifier.parquet (its test split: nl against nl_back)")
@@ -1991,10 +2257,20 @@ def main(argv=None):
     a.add_argument("--fiction-c2", required=True, help="C2F's predictions-c2.parquet")
     a.add_argument("--bt-c2", required=True, help="c2cal7's predictions.parquet (model C2-test)")
     a.add_argument("--out", required=True)
+    a = sub.add_parser("fbnreport")
+    a.add_argument("--refs", required=True, help="§20's refs.parquet")
+    a.add_argument("--data-json", required=True, help="§20's fbdata.json")
+    a.add_argument("--fb-report", required=True, help="§20's report.json (the rubric's measures are checked against it)")
+    a.add_argument("--n-data", action="append", required=True, help="n1=FBDATA_JSON, n2=FBDATA_JSON (FB.8's data)")
+    a.add_argument("--scores", action="append", required=True, help="rubric=GLOB, n1=GLOB, n2=GLOB of the score shards")
+    a.add_argument("--fiction-c1", required=True, help="C2F's predictions-c1.parquet")
+    a.add_argument("--fiction-c2", required=True, help="C2F's predictions-c2.parquet")
+    a.add_argument("--bt-c2", required=True, help="c2cal7's predictions.parquet (model C2-test)")
+    a.add_argument("--out", required=True)
     args = p.parse_args(argv)
     {"valdata": valdata, "score": score, "valreport": valreport, "bonpairs": bonpairs, "select": select,
      "bonreport": bonreport, "anchorselect": anchorselect, "blind": blind, "reason": reason,
-     "reasonreport": reasonreport, "fbdata": fbdata, "fbreport": fbreport}[args.cmd](args)
+     "reasonreport": reasonreport, "fbdata": fbdata, "fbreport": fbreport, "fbnreport": fbnreport}[args.cmd](args)
 
 
 if __name__ == "__main__":

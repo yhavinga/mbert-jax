@@ -35,7 +35,8 @@ def test_the_schedule_takes_an_eval_every_sixth_and_the_candidates_after_2e_4e_a
         g8.cand_step_t("G4-7-i5")
     assert (g8.EPOCHS_T, g8.LR_T, g8.WARMUP_T, g8.SEQ_T) == (2, 5e-5, 10, 4096)
     text = (CODE / "protocol-g4.md").read_text(encoding="utf-8")
-    section = text[text.index("## 19. G4-8 training"):]
+    # §19 alone: §22 (G4-9) is a draft with lines of the same form
+    section = text[text.index("## 19. G4-8 training"):text.index("## 20. ")]
     # §19 is final since 23 Nov (Yeb chose O6): no draft line, both variants still described, exactly one O6 line
     assert "CONCEPT, NIET GESTART" not in section and "R-oud" in section and "R-nieuw" in section
     o6 = [line for line in section.splitlines() if line.startswith("- `O6 [besluit Yeb")]

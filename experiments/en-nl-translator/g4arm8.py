@@ -23,7 +23,9 @@ select unchanged on N1's scores; the report beside the rubric's choice of §18:
     python g4arm8.py n1report --plan P --chunk-dir C=DIR ... --out DIR   (DIR: n1pairs.json, cands.parquet, choice.parquet,
         choice-n1.parquet, scores/w<k>/shard-*.parquet, scores-n1/w<k>/shard-*.parquet)
 
-G4-8's training (protocol-g4.md §19, a draft until Yeb's sample and O6):
+G4-8's training (protocol-g4.md §19), and G4-9's (§22, a draft until Yeb decides: §19's training on the N1 choice of
+§21) with --arm G4-9 (its seed, names and places; default --arm G4-8):
+    python g4arm8.py n1targets --plan P --n1report F --chunk-dir C=DIR ... --out DIR   (G4-9's targets: §21's select-n1)
     python g4arm8.py sftset --targets T --plan P --evalsets E --blind B --flan-eval F --g47-pool P --g47-plan P \
         --sft-eval books=F --sft-eval btval=F --sft-eval own=F --tokenizer T --out DIR   (set, smoke set, RL-val)
     python g4arm8.py smoke8 --run R --summary S --adapter A --adapter-step A --smoke-manifest M --manifest M --out F
@@ -31,7 +33,7 @@ G4-8's training (protocol-g4.md §19, a draft until Yeb's sample and O6):
     python g4arm8.py loraline --logs 'DIR/g4a_translate_<candidate>_*' --out F       (translate.py's LORA line)
     python g4arm8.py report8 --evalsets E --split S --refqe Q --base DIR --candidate N=DIR ... [--reference N=DIR]
         --predictions P --predictions-c2 P [--pll P] --summary S --manifest M [--smoke F] --lora N=JSON ...
-        --div N=DIR ... --rlval G47PLAN --o6 R-oud|R-nieuw|open [--tally F] --out report.md
+        --div N=DIR ... --rlval G47PLAN --o6 R-oud|R-nieuw|open [--tally F] [--compare N] --out report.md
 
 All CPU. The texts stay in the bucket and on the VM: no command prints a text; the reports hold counts and scores."""
 
@@ -1010,10 +1012,19 @@ SMOKE_STEPS_T, SMOKE_SAVE_T, SMOKE_EVERY_T = 8, 4, 4
 SMOKE_EVAL_STEPS_T = [0, 4, 8]
 SMOKE_LONGEST_T, SMOKE_RANDOM_T = 256, 512  # as G4-3.5: the longest of pass 1 first, then others
 OWN_MAX_LOSS_T = 1.0                       # G4-2.4: the base model's loss on its own greedy output at step 0
-CAND_T = re.compile(r"^G4-8-s([1-9][0-9]*)$")
+CAND_T = re.compile(r"^(G4-[89])-s([1-9][0-9]*)$")
 RULES_T = ("R-oud", "R-nieuw")
 DIV_FLAG_T = 4                             # G4-8.6: a median below 4 distinct samples of 8 is a flag
-BOOT_NAME_T = "G4-8/b"                     # g4bon.paired_ci's seed: en-nl-g4arm/0/G4-bon/boot/G4-8/b
+BOOT_NAME_T = "{arm}/b"                    # g4bon.paired_ci's seed: en-nl-g4arm/0/G4-bon/boot/<arm>/b
+# §22 (G4-9, a draft): §19's training on other targets; the arm names its seed (en-nl-g4arm/0/<arm>), runs, candidates
+# and places. compare: the earlier arm's choice beside it in the same classify run (G4-9.8) and against it on the
+# decision part (G4-9.11, reported)
+PROTOCOL_9 = "protocol-g4.md §22"
+ARMS_T = {"G4-8": {"protocol": PROTOCOL_T, "targets": "G4-8-data", "report": "G4-8-data (judge-of-anker)",
+                   "compare": None},
+          "G4-9": {"protocol": PROTOCOL_9, "targets": "de N1-keuze van G4-8-data (§21)",
+                   "report": "de N1-keuze van G4-8-data (natuurlijkheidsprompt N1, QE ≤ QE₀ als bewaker)",
+                   "compare": "G4-8-s140"}}
 META_FIELDS_T = (("id", "string"), ("kind", "string"), ("source", "string"), ("prompt", "string"), ("en", "string"),
                  ("tokens_prompt", "int64"), ("tokens_target", "int64"), ("word_ratio", "float64"),
                  ("char_ratio", "float64"), ("chrf", "float64"), ("dump", "string"), ("long", "bool_"),
@@ -1031,16 +1042,86 @@ def schedule_t(steps):
     return e, save
 
 
-def candidates_t(manifest):
-    """The candidates of G4-8.4 in the order of their steps"""
-    return [f"G4-8-s{k}" for k in [*manifest["save_steps"], manifest["steps"]]]
+def seed_t(arm):
+    return f"en-nl-g4arm/0/{arm}"
 
 
-def cand_step_t(name):
+def arm_of(args):
+    """The arm of a training command (--arm; G4-8 unless given)"""
+    arm = getattr(args, "arm", None) or ARM8
+    if arm not in ARMS_T:
+        raise SystemExit(f"--arm {arm}: one of {list(ARMS_T)}")
+    return arm
+
+
+def candidates_t(manifest, arm=ARM8):
+    """The candidates of G4-8.4 (G4-9.5) in the order of their steps"""
+    return [f"{arm}-s{k}" for k in [*manifest["save_steps"], manifest["steps"]]]
+
+
+def cand_step_t(name, arm=ARM8):
     m = CAND_T.match(name)
-    if not m:
-        raise SystemExit(f"{name} is no candidate of G4-8 (G4-8-s<step>)")
-    return int(m.group(1))
+    if not m or m.group(1) != arm:
+        raise SystemExit(f"{name} is no candidate of {arm} ({arm}-s<step>)")
+    return int(m.group(2))
+
+
+def n1targets(args):
+    """§22 G4-9.2: the N1 choice of §21 (select-n1 per chunk) as one targets file in §18's form (G4-8-data.9), checked
+    against the plan, against §21's report (each chunk's choice by sha256, the counts per part) and QE <= QE0 again;
+    nothing is written if a check fails"""
+    plan = {r["id"]: r for r in read_rows(args.plan, ["id", "part", "chunk", "en", "hypothesis0"])}
+    rep = json.loads(Path(args.n1report).read_text())
+    chunks = [c for c, _ in CHUNKS8]
+    if rep.get("protocol") != PROTOCOL_N1 or rep.get("chunks") != chunks:
+        raise SystemExit(f"{args.n1report} is not {PROTOCOL_N1}'s report over {chunks}")
+    dirs = dict(spec.split("=", 1) for spec in args.chunk_dir)
+    if sorted(dirs) != chunks:
+        raise SystemExit(f"--chunk-dir {sorted(dirs)}: one per chunk {chunks}")
+    targets, inputs = [], {"plan": g4rl.file_sha256(args.plan), "n1report": g4rl.file_sha256(args.n1report)}
+    for c in chunks:
+        d = Path(dirs[c])
+        sha = g4rl.file_sha256(d / "choice.parquet")
+        if sha != rep["inputs"][c]["choice-n1.parquet"]:
+            raise SystemExit(f"{d / 'choice.parquet'} is not the choice-n1.parquet that §21's n1report checked ({c})")
+        choice = {r["id"]: r for r in read_rows(d / "choice.parquet")}
+        if set(choice) != {i for i, r in plan.items() if r["chunk"] == c}:
+            raise SystemExit(f"{d / 'choice.parquet'}: not the sources of chunk {c} in the plan")
+        rows = read_rows(d / "targets.parquet")
+        ids = [t["id"] for t in rows]
+        kept = {i for i, r in choice.items() if r["reason"] == "sample"}
+        if len(ids) != len(set(ids)) or set(ids) != kept:
+            raise SystemExit(f"{d / 'targets.parquet'}: {len(ids)} rows, not one per source of choice.parquet with a "
+                             f"sample ({len(kept)})")
+        for t in rows:
+            i, ch, src = t["id"], choice[t["id"]], plan[t["id"]]
+            if (t["part"], t["chunk"], t["reason"]) != (src["part"], c, "sample"):
+                raise SystemExit(f"{c} {i}: part, chunk or reason {(t['part'], t['chunk'], t['reason'])} is not the "
+                                 f"plan's {(src['part'], c)} with a sample")
+            if (t["j"], t["p_sample"], t["qe"], t["qe0"]) != (ch["j"], ch["p_sample"], ch["qe"], ch["qe0"]):
+                raise SystemExit(f"{c} {i}: the target's sample, P or QE is not choice.parquet's")
+            if t["p_sample"] is None or not t["p_sample"] > ANCHOR_P:
+                raise SystemExit(f"{c} {i}: P {t['p_sample']!r}, not above {ANCHOR_P}")
+            if t["qe"] is None or t["qe0"] is None or t["qe"] > t["qe0"] + QE_TOL:
+                raise SystemExit(f"{c} {i}: QE {t['qe']!r} above QE0 {t['qe0']!r} (the guard of G4-9.2)")
+            if (t["en"] or "").strip() != (src["en"] or "").strip():
+                raise SystemExit(f"{c} {i}: the English is not the plan's")
+            if not (t["target"] or "").strip() or norm(t["target"]) == norm(src["hypothesis0"] or ""):
+                raise SystemExit(f"{c} {i}: the target is empty or the anchor's text")
+        targets += rows
+        inputs[c] = {"choice": sha, "targets": g4rl.file_sha256(d / "targets.parquet")}
+    counts = {p: sum(t["part"] == p for t in targets) for p in PARTS8}
+    want = {p: rep["parts"][p]["n1_kept"] for p in PARTS8}
+    if counts != want or len(targets) != rep["parts"]["samen"]["n1_kept"]:
+        raise SystemExit(f"targets per part {counts}, §21's report {want} (together {rep['parts']['samen']['n1_kept']})")
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    write_parquet(sorted(targets, key=lambda r: r["id"]), out / "targets.parquet")
+    info = {"protocol": PROTOCOL_9, "arm": "G4-9", "source": f"{PROTOCOL_N1}: select-n1 of {chunks}",
+            "targets": len(targets), "parts": counts, "inputs": inputs,
+            "targets_sha256": g4rl.file_sha256(out / "targets.parquet")}
+    (out / "targets.json").write_text(json.dumps(info, indent=1) + "\n")
+    print(f"N1TARGETS {json.dumps({'targets': len(targets), 'parts': counts})}", flush=True)
 
 
 def checked_targets(targets, plan):
@@ -1156,6 +1237,8 @@ def sftset(args, counter=None):
     import g4arm
     import sft_build
 
+    arm = arm_of(args)
+    seed, protocol = seed_t(arm), ARMS_T[arm]["protocol"]
     counter = counter or g4arm.TokenCounter(args.tokenizer)
     out = Path(args.out)
     plan = read_rows(args.plan, columns=["id", "part", "en", "hypothesis0"])
@@ -1186,7 +1269,7 @@ def sftset(args, counter=None):
     passes = []
     for e in range(1, EPOCHS_T + 1):
         one = [sft_example(t, a, b, e) for t, a, b in zip(targets, prompts, tgts)]
-        random.Random(f"{SEED8}/train/shuffle/{e}").shuffle(one)
+        random.Random(f"{seed}/train/shuffle/{e}").shuffle(one)
         passes.append(one)
     rows = [p for one in passes for p in one]
     batches = pack_t([m["tokens_prompt"] + m["tokens_target"] for _, m in rows])
@@ -1199,11 +1282,11 @@ def sftset(args, counter=None):
     kinds = {p: {"examples": n, "tokens": sum(a + b for t, a, b in zip(targets, prompts, tgts) if t["part"] == p)}
              for p, n in per_part.items()}
     manifest = write_set(rows, out, {
-        "set": ARM8, "protocol": PROTOCOL_T, "seed": SEED8, "epochs": EPOCHS_T, "distinct": len(targets),
+        "set": arm, "protocol": protocol, "seed": seed, "epochs": EPOCHS_T, "distinct": len(targets),
         "examples_per_epoch": [len(one) for one in passes], "parts": kinds, "eval_every": every, "save_steps": save,
         "lr": LR_T, "warmup_steps": WARMUP_T, "sft_evals": list(SFT_EVALS_T),
         "leak_check": {k: len(v) for k, v in hits.items()}, "inputs": inputs})
-    manifest["candidates"] = candidates_t(manifest)
+    manifest["candidates"] = candidates_t(manifest, arm)
     (out / "manifest.json").write_text(json.dumps(manifest, indent=1) + "\n")
     # G4-8.5: pass 1's longest first, then the others in a seeded order, as few as give the smoke run its 8 steps
     first = passes[0]
@@ -1211,12 +1294,12 @@ def sftset(args, counter=None):
     longest = longest[:SMOKE_LONGEST_T]
     taken = {m["id"] for _, m in longest}
     others = sorted((p for p in first if p[1]["id"] not in taken), key=lambda p: p[1]["id"])
-    random.Random(f"{SEED8}/smoke").shuffle(others)
+    random.Random(f"{seed}/smoke").shuffle(others)
     smoke_all = longest + others
     n = max(prefix_for_steps([m["tokens_prompt"] + m["tokens_target"] for _, m in smoke_all], SMOKE_STEPS_T),
             min(len(smoke_all), SMOKE_LONGEST_T + SMOKE_RANDOM_T))
-    smoke = write_set(smoke_all[:n], out / "smoke", {"set": f"{ARM8}-smoke", "protocol": PROTOCOL_T,
-                                                     "longest": len(longest), "seed": f"{SEED8}/smoke"})
+    smoke = write_set(smoke_all[:n], out / "smoke", {"set": f"{arm}-smoke", "protocol": protocol,
+                                                     "longest": len(longest), "seed": f"{seed}/smoke"})
     # G4-8.6: RL-val of G4-7 (iteration -1 of its plan) per worker, for the samples of every model
     rl = [r for r in read_rows(args.g47_plan, columns=["id", "en", "tokens", "iteration"]) if r["iteration"] == -1]
     if not rl or len({r["id"] for r in rl}) != len(rl):
@@ -1224,7 +1307,7 @@ def sftset(args, counter=None):
     for k, part in g4rl.assign_workers7(rl, WORKERS).items():
         write_parquet([{"id": r["id"], "text": r["en"], "tokens": r["tokens"]} for r in part],
                       out / "rlval" / f"segments-w{k}.parquet", SEGMENT_FIELDS)
-    report = {"protocol": PROTOCOL_T, "manifest": manifest, "smoke": smoke, "rlval": len(rl),
+    report = {"protocol": protocol, "manifest": manifest, "smoke": smoke, "rlval": len(rl),
               "targets": {p: {"examples": n_, "p_mean": mean(t["p_sample"] for t in targets if t["part"] == p),
                               "dqe_median": median(t["qe"] - t["qe0"] for t in targets if t["part"] == p),
                               "chrf_median": median(t["chrf"] for t in targets if t["part"] == p),
@@ -1242,8 +1325,9 @@ def n0(x):
 
 def sftset_text(r):
     m, s = r["manifest"], r["smoke"]
-    lines = [f"# G4-8: de trainingsset ({r['protocol']})", "",
-             "Gemaakt door `g4arm8.py sftset`; alleen tellingen. Elk doel van G4-8-data één voorbeeld (prompt "
+    lines = [f"# {m['set']}: de trainingsset ({r['protocol']})", "",
+             f"Gemaakt door `g4arm8.py sftset`; alleen tellingen. Elk doel van {ARMS_T[m['set']]['targets']} één "
+             "voorbeeld (prompt "
              f"`{m['prompt']}`), {m['epochs']} doorgangen, elk apart geschud.", "",
              "| deel | doelen | tokens (prompt + doel, één doorgang) | P̄ (gem.) | ΔQE (med.) | chrF doel–anker (med.) | "
              "ℓ/ℓ₀ (med.) |", "|---|---:|---:|---:|---:|---:|---:|"]
@@ -1311,7 +1395,7 @@ def smoke8(args):
     own0 = next((e["loss"] for e in s.get("eval") or [] if e["set"] == "own" and e["step"] == 0), None)
     checks["own_step0"] = {"value": own0, "holds": own0 is not None and own0 <= OWN_MAX_LOSS_T}
     out = verdict_t(checks, f"the smoke run {args.run}")
-    out.update({"protocol": PROTOCOL_T, "run": args.run,
+    out.update({"protocol": ARMS_T[arm_of(args)]["protocol"], "run": args.run,
                 "estimate": g4arm.training_time(s, full["steps"], full["tokens"], sm["tokens"], every=full["eval_every"])})
     Path(args.out).write_text(json.dumps(out, indent=1) + "\n")
     print(f"SMOKE8 {json.dumps({k: out[k] for k in ('run', 'passed', 'failed', 'estimate')})}", flush=True)
@@ -1322,6 +1406,7 @@ def smoke8(args):
 def trained(args):
     """G4-8.3/G4-8.4: the full run against sftset's manifest (its steps, the batches, finite losses, the LR, the SFT
     evals at 0, at each kept step and at the last), each candidate's adapter of its step; exit 1 if a check fails"""
+    arm = arm_of(args)
     s = json.loads(Path(args.summary).read_text())
     m = json.loads(Path(args.manifest).read_text())
     steps = m["steps"]
@@ -1331,12 +1416,12 @@ def trained(args):
                              "holds": all(lr.get(str(k)) is not None and abs(lr[str(k)] - LR_T) <= 1e-6 * LR_T  # float32, as lr_peak
                                           for k in (WARMUP_T, steps - 1))}
     metas = dict(x.split("=", 1) for x in args.adapter)
-    if sorted(metas) != sorted(candidates_t(m)):
-        raise SystemExit(f"--adapter {sorted(metas)}: the candidates are {candidates_t(m)}")
-    for name in candidates_t(m):
-        checks[f"adapter_{name}"] = adapter_check(json.loads(Path(metas[name]).read_text()), cand_step_t(name))
+    if sorted(metas) != sorted(candidates_t(m, arm)):
+        raise SystemExit(f"--adapter {sorted(metas)}: the candidates are {candidates_t(m, arm)}")
+    for name in candidates_t(m, arm):
+        checks[f"adapter_{name}"] = adapter_check(json.loads(Path(metas[name]).read_text()), cand_step_t(name, arm))
     out = verdict_t(checks, f"the run {args.run}")
-    out.update({"protocol": PROTOCOL_T, "run": args.run, "candidates": candidates_t(m)})
+    out.update({"protocol": ARMS_T[arm]["protocol"], "run": args.run, "candidates": candidates_t(m, arm)})
     Path(args.out).write_text(json.dumps(out, indent=1) + "\n")
     print(f"TRAINED8 {json.dumps({k: out[k] for k in ('run', 'passed', 'failed', 'candidates')})}", flush=True)
     if not out["passed"]:
@@ -1399,14 +1484,48 @@ def rule_variants(r):
     return out
 
 
+def compare_t(scored, part, ids, c1, c2_part, chosen, ref, arm):
+    """§22 G4-9.11 (reported, decides nothing): the chosen candidate against an earlier arm's choice on one part: per
+    (a1) set the mean QE of both and the paired difference on the segments both scored with its 95% interval, (a1) of
+    both; COMET-22 per set and (a3) against it; C1 "original" on WMT24++ (good) + FLAN pooled of both with the
+    difference and its interval; C2 of both"""
+    import g4arm
+    import g4bon
+
+    m, o = part["models"][chosen], part["models"][ref]
+    boot = f"{arm}/vs-{ref.rsplit('-s', 1)[0]}"
+    qe = {}
+    for s in g4arm.HUMAN_QE:
+        diffs = [scored[chosen][i]["metricx_qe"] - scored[ref][i]["metricx_qe"] for i in ids[s]
+                 if scored[chosen][i]["metricx_qe"] is not None and scored[ref][i]["metricx_qe"] is not None]
+        if not diffs:
+            raise SystemExit(f"{s}: no segment of the part with a QE of both {chosen} and {ref}")
+        qe[s] = {"model": m["qe"][s], "ref": o["qe"][s], "ci": g4bon.paired_ci({s: diffs}, f"{boot}/qe/{s}")}
+    c1_ci = g4bon.paired_ci({s: [(c1[(chosen, s, i)] >= 0.5) - (c1[(ref, s, i)] >= 0.5) for i in ids[s]]
+                             for s in g4arm.B_SETS7}, f"{boot}/c1")
+    if abs(c1_ci["delta"] - (m["share"] - o["share"])) > 1e-9:
+        raise SystemExit(f"the comparison with {ref}: the bootstrap's point {c1_ci['delta']} is not the shares' "
+                         f"{m['share'] - o['share']}")
+    return {"ref": ref, "qe": qe, "a1": {"model": m["a1"], "ref": o["a1"]},
+            "a3": g4arm.rule_a3(scored, ids, chosen, ref),
+            "c1": {"model": m["share"], "ref": o["share"], "ci": c1_ci},
+            "c2": {"model": c2_part[chosen]["c2"]["pooled"], "ref": c2_part[ref]["c2"]["pooled"],
+                   "delta": c2_part[chosen]["c2"]["pooled"] - c2_part[ref]["c2"]["pooled"]}}
+
+
 def report8(args):
     """§19 G4-8.7-G4-8.10: the candidate chosen on the search part (select5), (a1), (a3), (b) with its interval and the
     C1 guard against G4-0 on the decision part, both variants of the rule (O6), C2, PLL and the other measures per
-    candidate on both parts, per candidate the update norm, the SFT losses at its step and the samples on RL-val"""
+    candidate on both parts, per candidate the update norm, the SFT losses at its step and the samples on RL-val; with
+    --arm G4-9 (§22) the same, and the comparison with G4-8's choice (G4-9.11, --compare)"""
     import g4arm
     import g4bon
     import g4mix
 
+    arm = arm_of(args)
+    compare = getattr(args, "compare", None)
+    if compare != ARMS_T[arm]["compare"]:
+        raise SystemExit(f"--compare {compare}: {arm} compares with {ARMS_T[arm]['compare']}")
     evalsets = {r["id"]: r for r in g4arm.read_rows(args.evalsets)}
     split = json.loads(Path(args.split).read_text())
     assign = split["assign"]
@@ -1415,9 +1534,11 @@ def report8(args):
     manifest = json.loads(Path(args.manifest).read_text())
     cands = [c.split("=", 1) for c in args.candidate]
     names = [n for n, _ in cands]
-    if names != candidates_t(manifest):
-        raise SystemExit(f"the candidates {names}: G4-8.4 takes {candidates_t(manifest)} in this order")
+    if names != candidates_t(manifest, arm):
+        raise SystemExit(f"the candidates {names}: G4-8.4 takes {candidates_t(manifest, arm)} in this order")
     refs = [c.split("=", 1) for c in args.reference or []]
+    if compare is not None and compare not in [n for n, _ in refs]:
+        raise SystemExit(f"--compare {compare}: not among the references {[n for n, _ in refs]}")
     base = g4arm.BASE
     scored = {name: g4arm.scored_dir(d) for name, d in cands + [(base, args.base)] + refs}
     for name, rows in scored.items():
@@ -1447,7 +1568,7 @@ def report8(args):
     c2 = {k: r["p_original"] for k, r in zip(keys_c2, predictions_c2)}
     dec = part_ids["decision"]
     b_ci = g4bon.paired_ci({s: [(c1[(chosen, s, i)] >= 0.5) - (c1[(base, s, i)] >= 0.5) for i in dec[s]]
-                            for s in g4arm.B_SETS7}, BOOT_NAME_T)
+                            for s in g4arm.B_SETS7}, BOOT_NAME_T.format(arm=arm))
     if abs(b_ci["delta"] - d["b_delta"]) > 1e-9:
         raise SystemExit(f"(b): the bootstrap's point {b_ci['delta']} is not part_measures5's {d['b_delta']}")
     summary = json.loads(Path(args.summary).read_text())
@@ -1465,7 +1586,7 @@ def report8(args):
     step0 = g4arm.eval_at(summary, 0)
     training = {}
     for name in names:
-        k = cand_step_t(name)
+        k = cand_step_t(name, arm)
         at = g4arm.eval_at(summary, k)
         if sorted(at) != sorted(SFT_EVALS_T):
             raise SystemExit(f"the run's summary has no SFT eval of every set at step {k}: {sorted(at)}")
@@ -1474,7 +1595,7 @@ def report8(args):
                           "sft": at, "sft_delta": {s: at[s] - step0[s] for s in SFT_EVALS_T}, "div": div[name]}
     truncated = {label: {name: sum(bool(r.get("truncated")) for r in rows if r["model"] == name) for name in scored}
                  for label, rows in (("c1", predictions), ("c2", predictions_c2))}
-    result = {"protocol": PROTOCOL_T, "arm": ARM8, "base": base, "o6": args.o6, "candidates": names,
+    result = {"protocol": ARMS_T[arm]["protocol"], "arm": arm, "base": base, "o6": args.o6, "candidates": names,
               "references": [n for n, _ in refs], "selected": chosen, "selection": why, "refqe_check": check,
               "parts": parts, "a1": {"holds": d["a1"], "sets": d["a1_sets"]}, "a3": a3["decision"][chosen],
               "a3_all": a3, "b": {"holds": d["b"], "delta": d["b_delta"], "ci": b_ci},
@@ -1489,6 +1610,8 @@ def report8(args):
                       "parts": manifest["parts"], "step_s_median": (summary.get("throughput") or {}).get("step_s_median"),
                       "peak_gib_max": summary.get("peak_gib_max")},
               "smoke": json.loads(Path(args.smoke).read_text()) if args.smoke else None}
+    result["compare"] = (compare_t(scored, parts["decision"], dec, c1, result["c2"]["decision"], chosen, compare, arm)
+                         if compare else None)
     result["blind_due"] = result["a1"]["holds"] and result["a3"]["holds"]
     result["blind"] = None
     if args.tally:
@@ -1529,8 +1652,8 @@ def report8_text(r):
     m, b0 = dec["models"][sel], dec["models"][base]
     ci = r["b"]["ci"]
     decisive = r["o6"] if r["o6"] in RULES_T else None
-    L = [f"# Arm G4-8: uitslag volgens {r['protocol']}", "",
-         "Gemaakt door `g4arm8.py report8`. SFT met LoRA vanaf G4-0 op de doelen van G4-8-data (judge-of-anker); de "
+    L = [f"# Arm {r['arm']}: uitslag volgens {r['protocol']}", "",
+         f"Gemaakt door `g4arm8.py report8`. SFT met LoRA vanaf G4-0 op de doelen van {ARMS_T[r['arm']]['report']}; de "
          "kandidaten vertaald en gescoord als G4-7.7, de keuze op het zoekdeel (`select5`), het besluit tegen G4-0 op "
          "het beslisdeel (G4-8.9). C2, PLL en alles onder \"rapporteren\" beslissen niets.", "",
          f"**Uitslag ({'beslissend: ' + decisive if decisive else 'O6 nog open'}): {r['verdict']}.** Gekozen kandidaat: "
@@ -1560,9 +1683,11 @@ def report8_text(r):
               f"(twijfel {t['doubt']}); fouten {t['errors_arm']} tegen {t['errors_base']} → (a2) "
               f"{'ja' if t['a2'] else 'nee'}, (c) {'ja' if t['c'] else 'nee'}.", ""]
     elif r["blind_due"]:
-        L += ["(a2) en (c): (a1) en (a3) gelden; het blinde pakket (`$S/blind/G4-8/`) is nog niet geteld.", ""]
+        L += [f"(a2) en (c): (a1) en (a3) gelden; het blinde pakket (`$S/blind/{r['arm']}/`) is nog niet geteld.", ""]
     else:
         L += ["(a2) en (c): niet beoordeeld; zonder (a1) en (a3) geen blinde beoordeling.", ""]
+    if r.get("compare"):
+        L += compare_text(r)
     for part, title in (("search", "Zoekdeel (de keuze)"), ("decision", "Beslisdeel, alle modellen (rapporteren)")):
         p = r["parts"][part]
         L += [f"## {title}", "", "| model | " + " | ".join(f"QE {s}" for s in sets) +
@@ -1634,6 +1759,32 @@ def report8_text(r):
     return "\n".join(L) + "\n"
 
 
+def compare_text(r):
+    """§22 G4-9.11: the comparison with the earlier arm's choice on the decision part"""
+    import g4arm
+
+    x, sel, dec = r["compare"], r["selected"], r["parts"]["decision"]
+    ref = x["ref"]
+    L = [f"## Vergelijking met {ref} op het beslisdeel (G4-9.11, rapporteren, beslist niets)", "",
+         f"{sel} tegen {ref} (de keuze van de vorige arm, in dezelfde classify-run). QE: lager is beter; het interval is "
+         "dat van het gepaarde verschil (bootstrap per set, 10.000 trekkingen).", "",
+         f"| set | n | {sel} QE | {ref} QE | verschil (95%-BI) |", "|---|---:|---:|---:|---|"]
+    for s in g4arm.HUMAN_QE:
+        q = x["qe"][s]
+        L.append(f"| {s} | {dec['n'][s]} | {f3(q['model'])} | {f3(q['ref'])} | {f3(q['ci']['delta'], True)} "
+                 f"({f3(q['ci']['lo'], True)}; {f3(q['ci']['hi'], True)}) |")
+    L += ["", f"(a1): {sel} {'ja' if x['a1']['model'] else 'nee'}, {ref} {'ja' if x['a1']['ref'] else 'nee'}.", "",
+          f"| set | n | {sel} COMET-22 | {ref} | verschil | ≥ {ref} − 0,005 |", "|---|---:|---:|---:|---:|---|"]
+    for s, v in x["a3"]["sets"].items():
+        L.append(f"| {s} | {v['n']} | {f4(v['model'])} | {f4(v['base'])} | {f4(v['delta'], True)} | "
+                 f"{'ja' if v['holds'] else 'nee'} |")
+    ci = x["c1"]["ci"]
+    L += ["", f"C1 \"origineel\" op WMT24++ (goed) + FLAN: {pc(x['c1']['model'])} tegen {pc(x['c1']['ref'])}, verschil "
+          f"{f3(ci['delta'], True)} (95%-BI {f3(ci['lo'], True)}; {f3(ci['hi'], True)}, n = {ci['n']}). C2: "
+          f"{pc(x['c2']['model'])} tegen {pc(x['c2']['ref'])}, verschil {f3(x['c2']['delta'], True)}.", ""]
+    return L
+
+
 # ---------------------------------------------------------------------------------------------------- main
 
 def main(argv=None):
@@ -1671,17 +1822,24 @@ def main(argv=None):
     a.add_argument("--chunk-dir", action="append", required=True,
                    help="CHUNK=DIR with n1pairs.json, cands.parquet, choice.parquet, choice-n1.parquet, scores/, scores-n1/")
     a.add_argument("--out", required=True)
+    a = sub.add_parser("n1targets")
+    for name in ("plan", "n1report", "out"):
+        a.add_argument(f"--{name}", required=True)
+    a.add_argument("--chunk-dir", action="append", required=True, help="CHUNK=DIR with select-n1's choice.parquet, targets.parquet")
     a = sub.add_parser("sftset")
     for name in ("targets", "plan", "evalsets", "blind", "flan-eval", "g47-pool", "g47-plan", "tokenizer", "out"):
         a.add_argument(f"--{name}", required=True)
     a.add_argument("--sft-eval", action="append", required=True, help="NAME=FILE: books, btval, own (G4-2.5)")
+    a.add_argument("--arm", default=ARM8, choices=tuple(ARMS_T))
     a = sub.add_parser("smoke8")
     for name in ("run", "summary", "adapter", "adapter-step", "smoke-manifest", "manifest", "out"):
         a.add_argument(f"--{name}", required=True)
+    a.add_argument("--arm", default=ARM8, choices=tuple(ARMS_T))
     a = sub.add_parser("trained")
     for name in ("run", "summary", "manifest", "out"):
         a.add_argument(f"--{name}", required=True)
-    a.add_argument("--adapter", action="append", required=True, help="G4-8-s<step>=adapter json of that step")
+    a.add_argument("--adapter", action="append", required=True, help="<arm>-s<step>=adapter json of that step")
+    a.add_argument("--arm", default=ARM8, choices=tuple(ARMS_T))
     a = sub.add_parser("loraline")
     for name in ("logs", "out"):
         a.add_argument(f"--{name}", required=True)
@@ -1697,12 +1855,14 @@ def main(argv=None):
     a.add_argument("--pll", default=None)
     a.add_argument("--smoke", default=None)
     a.add_argument("--tally", default=None)
+    a.add_argument("--arm", default=ARM8, choices=tuple(ARMS_T))
+    a.add_argument("--compare", default=None, help="G4-9: G4-8's choice, one of the references (G4-9.11)")
     args = p.parse_args(argv)
     if getattr(args, "chunk", None) is not None and args.chunk not in dict(CHUNKS8):
         raise SystemExit(f"--chunk {args.chunk}: one of {[c for c, _ in CHUNKS8]}")
     {"fresh": fresh, "plan": plan, "qepairs": qepairs, "pairs": pairs, "select": select, "v3": v3,
-     "report": report, "n1pairs": n1pairs, "n1report": n1report, "sftset": sftset, "smoke8": smoke8, "trained": trained, "loraline": loraline,
-     "report8": report8}[args.cmd](args)
+     "report": report, "n1pairs": n1pairs, "n1report": n1report, "n1targets": n1targets, "sftset": sftset,
+     "smoke8": smoke8, "trained": trained, "loraline": loraline, "report8": report8}[args.cmd](args)
 
 
 if __name__ == "__main__":

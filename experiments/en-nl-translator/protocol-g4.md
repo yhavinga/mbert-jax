@@ -2953,7 +2953,7 @@ kan na `DONE` als rapportage (`armeval.py blind` met G4-8-s140 als basis) als Ye
 *G4-9.14 Keten* (`mbert-ops/scripts/g4arm9_train_run.sh`, dat `g4arm8_train_run.sh` met `ARM8=G4-9` draait; kopieën in
 `gs://t5-dutch-english-usc2/hammond/scratch-scripts/`; code `g4arm8.py`, `run_g4arm8.sh` met `ARM8=G4-9` en `run_g4arm.sh`
 met `ARM=G4-9` op `en-nl-g4arm8`). Alleen mbert-mix (een v4-32: de training over alle 16 chips, de rest per worker);
-mbert-corpus (T3) wordt niet aangeraakt. Wacht eerst op de marker `$G/stages/g4-8-n1/n1report.done` van §21 en
+mbert-corpus (T3) wordt niet aangeraakt. Wacht eerst op de marker `$G/stages/g4-8-n1/report.done` van §21 en
 `$G8/n1/report.json` (beide er al), dan op het startbestand `mbert-ops/g4arm9.train-go` (twee regels: `O6=R-oud` of
 `O6=R-nieuw`, gelijk aan G4-9.0, en `COMMIT=<de gepushte commit met de definitieve §22>`, die afstamt van dit concept en
 van de geteste code; de definitieve §22 heeft precies één O6-regel en precies één O1-regel, `G4-0`), dan op

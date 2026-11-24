@@ -592,8 +592,8 @@ def report_md(r):
 
 
 def check(args):
-    # G4-8 (protocol-g4.md §19): its set of two passes is checked as G4-3's and G4-4's
-    if getattr(args, "arm", None) in (ARM3, ARM4, "G4-8"):
+    # G4-8 (protocol-g4.md §19) and G4-9 (§22): their sets of two passes are checked as G4-3's and G4-4's
+    if getattr(args, "arm", None) in (ARM3, ARM4, "G4-8", "G4-9"):
         return check3(args)
     d = Path(args.data)
     msgs = [x["messages"] for x in read_rows(d / "train.parquet")]
@@ -5596,8 +5596,8 @@ def main(argv=None):
     p = sub.add_parser("check")
     p.add_argument("--data", required=True)
     p.add_argument("--tokenizer", required=True)
-    p.add_argument("--arm", default=None, choices=(ARM, ARM2, ARM3, ARM4, "G4-8"))
-    p.add_argument("--processes", type=int, default=8, help="G4-3, G4-4, G4-8: processes of the check")
+    p.add_argument("--arm", default=None, choices=(ARM, ARM2, ARM3, ARM4, "G4-8", "G4-9"))
+    p.add_argument("--processes", type=int, default=8, help="G4-3, G4-4, G4-8, G4-9: processes of the check")
     p.add_argument("--chunk", type=int, default=5000, help="G4-3: distinct examples per task")
     p = sub.add_parser("evaldata")
     p.add_argument("--four", required=True, help="$E/data/evalsets.parquet")

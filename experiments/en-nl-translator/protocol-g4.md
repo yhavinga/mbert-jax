@@ -2916,7 +2916,7 @@ herstart overgeslagen. [schatting] ~2–2,5 u: §18's rubriek-scoring van dezelf
 
 ## 22. G4-9 training: SFT met LoRA op de N1-keuze van G4-8-data
 
-**CONCEPT, NIET GESTART; wacht op Yebs besluit (G4-9 ja of nee, O1, O6).** Opgesteld 24 nov 2026 (~08:00) door een
+**CONCEPT, NIET GESTART; wacht op Yebs besluit (G4-9 ja of nee, O1, O6, O9).** Opgesteld 24 nov 2026 (~08:00) door een
 subagent op verzoek van de hoofdsessie [opdracht: de training van een mogelijke arm G4-9 klaarzetten zoals G4-8, maar met
 de N1-keuze van §21 als doelen; bouwen, testen en droog draaien, niets trainen; Yeb sliep]. Vooraf gelezen: alleen
 tellingen (de rapporten `g4-8-data-n1.json` van §21 en `g4-8-report.json` van §19, de logregels met tijden van de keten
@@ -2939,6 +2939,17 @@ met G4-8 in het rapport (G4-9.11); waar hieronder "als G4-8.x" staat, geldt §19
   deze regel.**
 - Twijfelgevallen onder R-nieuw [besluit Yeb …]: Yebs oordeel (G4-8.9) of, als Yeb dat weer wil, de tweede blinde ronde
   van G4-8.13 (dan ook voor de controle van 10 zekere oordelen). Raakt de keten niet (de beoordeling is na `DONE`).
+- `O9 [besluit Yeb …]: n1` of `O9 [besluit Yeb …]: n1∩rubriek` (de doelen, G4-9.2; toegevoegd 24 nov 2026 ~10:40 door
+  een subagent op verzoek van de hoofdsessie, na G4-9.V3N1; geen tekst gelezen). `n1`: alle doelen van de N1-keuze van
+  §21, **16.349**. `n1∩rubriek` (de doorsnede): alleen de bronnen waar de N1-keuze van §21 en de rubriekkeuze van §18
+  **hetzelfde sample** kozen, **9.126** (FLAN 793, romans 4.507, BT 3.826) [gemeten: §21's rapport
+  `g4-8-data-n1.md`, overlap "N1 kiest een sample, de rubriek hetzelfde"]. Reden: de blinde blik op de N1-doelen
+  (G4-9.V3N1; 100 paren doel tegen anker uit `c1`, beoordeeld door een verse Claude-subagent; `mbert/LEARNINGS.md` van
+  hammond, 24 nov ~10:15), uitgesplitst naar wat de rubriek voor die bron koos, als doel beter / anker beter / gelijk
+  en betekenisfouten in doel / anker: **zelfde sample 29 / 3 / 27 (fouten 5 / 6)**, **ander sample 6 / 11 / 5 (fouten
+  8 / 2)**, rubriek koos het anker 3 / 4 / 12 (fouten 2 / 1). **Advies van de hoofdsessie: de doorsnede
+  (`n1∩rubriek`).** **De keten leest deze regel** en vergelijkt hem met de regel `TARGETS=` van het startbestand
+  (`n1` hoort bij `TARGETS=n1`, `n1∩rubriek` bij `TARGETS=intersect`; G4-9.14).
 
 *G4-9.1 Startmodel en LoRA* als G4-8.1: G4-0 zonder adapter, LoRA rank 32 / alpha 16 (schaal 0,5) op de 410 modules van
 `run_sft.sh`, AdamW als G4-1…G4-5, `num_vocab_tiling=8`, MaxText 0.2.5.
@@ -2955,14 +2966,33 @@ deel, sha256 van invoer en uitvoer). Gecontroleerd (een afwijking is `FAILED`; e
   de bronnen met reden `sample`, met dezelfde `j`, P̄ en QE als in `choice.parquet`; elk id één keer;
 - elk doel: deel, chunk en Engels als in het plan, P̄_N1 > 0,5, **QE ≤ QE₀ (+ 1e-9)** (de juistheidsbewaker,
   opnieuw nagegaan), een niet-lege tekst die (na normalisering van witruimte) niet die van het anker is;
-- de aantallen per deel zijn die van het rapport van §21: **16.349** (FLAN 1.391, romans 7.900, BT 7.058) [gemeten, §21].
+- met O9 `n1`: de aantallen per deel zijn die van het rapport van §21: **16.349** (FLAN 1.391, romans 7.900, BT 7.058)
+  [gemeten, §21].
+Met O9 `n1∩rubriek` (`n1targets --mode intersect`; de keten geeft `TARGETS` van het startbestand door, `n1` is
+`--mode n1`) blijven van die N1-doelen alleen de bronnen waar §18's rubriekkeuze `$G8/<c>/select/choice.parquet` reden
+`sample` met **dezelfde `j`** heeft (de regel "zelfde sample" van G4-8-N1.7.2). Daarbij gecontroleerd:
+- elke `select/choice.parquet` is (sha256) de `choice.parquet` die §21's `n1report` las en tegen de rubriekscores
+  controleerde, en dekt precies de bronnen van dat deel in het plan;
+- §18's `$G8/<c>/select/targets.parquet` heeft precies de bronnen met reden `sample` van die keuze, met dezelfde `j`;
+  voor elk doel van de doorsnede zijn `j`, QE en tekst die van §18 (het doel is dus ook een doel van G4-8);
+- de aantallen per deel zijn de overlap "zelfde sample" van §21's rapport: **9.126** (FLAN 793, romans 4.507, BT
+  3.826) [gemeten, §21].
+`targets.json` noemt de variant (`mode`: `n1` of `intersect`), bij `intersect` ook de aantallen van alle N1-doelen en de
+sha256 van §18's bestanden. Staat er al een `$G9/targets/targets.json` van de andere variant, dan weigeren de stap en de
+keten (`FAILED`; het bestand blijft staan).
 FLAN blijft gemaximeerd (besluit Yeb 23 nov ~16:40): de bronnen zijn die van §18 (10 / 45 / 45), van de doelen is FLAN
-8,5% (1.391 / 16.349). Geen ankerrijen (O3 van §18).
+8,5% (1.391 / 16.349; bij de doorsnede 8,7%, 793 / 9.126). Geen ankerrijen (O3 van §18).
 
 *G4-9.3 Trainingsdata* als G4-8.2 (`g4arm8.py sftset --arm G4-9` op `$G9/targets/targets.parquet`; alle controles van
 G4-8.2 ongewijzigd, ook de lekcontrole), de doorgangen geschud met zaad `en-nl-g4arm/0/G4-9/train/shuffle/<doorgang>`;
 uitvoer `$G9/sft/`. `g4arm.py check --arm G4-9` als G4-8. [schatting] Bij §19 gaven 15.194 doelen 6,78 M tokens per
-doorgang en 205 stappen; 16.349 doelen ≈ 7,3 M tokens per doorgang ≈ 220 stappen.
+doorgang en 205 stappen; 16.349 doelen ≈ 7,3 M tokens per doorgang ≈ 220 stappen; de doorsnede (9.126 doelen, met de
+tokens per doel per deel van §19: FLAN 266, romans 534, BT 375) ≈ 4,05 M tokens per doorgang ≈ 123 stappen (E = 21,
+kandidaten na 42, 84 en de laatste stap). De lekcontrole van G4-8.2 is per doel en geldt ongewijzigd voor beide
+varianten; de doelen van de doorsnede zijn ook doelen van G4-8 (G4-9.2), waarvan de set die controle doorstond (alles 0,
+`translator-sft/g4-8-sftset.md`) [gemeten]. `sftset` krijgt bij G4-9 ook `targets.json` (`--targets-info`): de sha256 van
+`targets.parquet`, de arm en de aantallen per deel moeten kloppen; de variant komt in het manifest (`targets_mode`), in
+`g4-9-sftset.md` en in het rapport (G4-9.12). Een manifest van de andere variant laat de keten weigeren.
 
 *G4-9.4 Training* als G4-8.3: LR 5e-5 constant na 10 stappen lineaire warmup, rijen van 4.096, 16 per stap, één
 multi-host-job over de 16 chips van mbert-mix; evaluatie op `books`, `btval`, `own` op stap 0, elke E = ⌈stappen / 6⌉
@@ -3001,7 +3031,8 @@ G4-8" (≥ G4-8 − 0,005); C1 "origineel" op WMT24++ (goed) + FLAN van beide me
 kan na `DONE` als rapportage (`armeval.py blind` met G4-8-s140 als basis) als Yeb dat wil.
 
 *G4-9.12 Rapport* (`g4arm8.py report8 --arm G4-9 --compare G4-8-s140` → `$G/report-G4-9/report.md`/`.json`, kopie
-`mbert-ops/translator-sft/g4-9-report.md`): als G4-8.10, plus G4-9.11.
+`mbert-ops/translator-sft/g4-9-report.md`): als G4-8.10, plus G4-9.11; het rapport noemt de variant van de doelen (O9,
+`targets_mode` uit het manifest van `sftset`).
 
 *G4-9.13 Uitvoer.* `$G9/targets/` (G4-9.2), `$G9/sft/` (set, smoke-set, `check.txt`, RL-val-segmenten, `div/<model>/`),
 `$G9/logs/`, `$G/runs/g4arm_G4-9_s8/`, `$G/runs/g4arm_G4-9/`, `$G/G4-9-s<stap>/`, `$G/eval/G4-9-s<stap>/`,
@@ -3012,29 +3043,42 @@ kan na `DONE` als rapportage (`armeval.py blind` met G4-8-s140 als basis) als Ye
 `gs://t5-dutch-english-usc2/hammond/scratch-scripts/`; code `g4arm8.py`, `run_g4arm8.sh` met `ARM8=G4-9` en `run_g4arm.sh`
 met `ARM=G4-9` op `en-nl-g4arm8`). Alleen mbert-mix (een v4-32: de training over alle 16 chips, de rest per worker);
 mbert-corpus (T3) wordt niet aangeraakt. Wacht eerst op de marker `$G/stages/g4-8-n1/report.done` van §21 en
-`$G8/n1/report.json` (beide er al), dan op het startbestand `mbert-ops/g4arm9.train-go` (twee regels: `O6=R-oud` of
-`O6=R-nieuw`, gelijk aan G4-9.0, en `COMMIT=<de gepushte commit met de definitieve §22>`, die afstamt van dit concept en
-van de geteste code; de definitieve §22 heeft precies één O6-regel en precies één O1-regel, `G4-0`), dan op
-`final_eval_mix.lock` (met `flock`, tot het eind gehouden). Volgorde: setup (`FULL=1`; daarna op elke worker ≥ 12 GB vrij
-in `/dev/shm`, anders `FAILED`), `n1targets` (w0), `sftset` (w0), `check` (w0), smoke-run + `smoke8` (w0), de training,
+`$G8/n1/report.json` (beide er al), dan op het startbestand `mbert-ops/g4arm9.train-go` (drie regels: `O6=R-oud` of
+`O6=R-nieuw`, gelijk aan G4-9.0; `TARGETS=n1` of `TARGETS=intersect`, gelijk aan O9 van G4-9.0; en
+`COMMIT=<de gepushte commit met de definitieve §22>`, die afstamt van dit concept en van de geteste code; de definitieve
+§22 heeft precies één O6-regel, precies één O9-regel en precies één O1-regel, `G4-0`); bij `intersect` ook §18's
+`$G8/<c>/select/choice.parquet` en `targets.parquet`; een `$G9/targets/targets.json` of `$G9/sft/manifest.json` van de
+andere variant is `FAILED` vóór er iets op een worker gebeurt. Dan op `final_eval_mix.lock` (met `flock`, tot het eind
+gehouden). Volgorde: setup (`FULL=1`; daarna op elke worker ≥ 12 GB vrij in `/dev/shm`, anders `FAILED`), `n1targets`
+(w0, met `TARGETS`; daarna controleert de keten in `targets.json` de variant en de aantallen, 16.349 of 9.126 met de
+aantallen per deel van G4-9.2), `sftset` (w0; daarna in het manifest de variant en de sha256 van de doelen), `check`
+(w0), smoke-run + `smoke8` (w0), de training,
 `adapter` (w0), per kandidaat `translate` en `score` (4 workers), RL-val-samples per model (4 workers), `texts`,
 `classify`, `classify-c2`, `pll` (w0), `report8` (w0), het blinde pakket als (a1) en (a3) gelden; `DONE` met de keuze en de
 regels. Elke stap eindigt op `EXIT 0`, anders `FAILED` en stoppen; een gemarkeerde stap wordt bij een herstart
-overgeslagen. [schatting, naar de gemeten tijden van G4-8 in de ketens `g4t8a`…`g4t8c`] ~3,5 u na de start (3–4 u):
-setup ~3 min, `n1targets` ~3 min, `sftset` + `check` ~5 min, smoke ~22 min, training ~65–70 min (~220 stappen; G4-8: 205
-stappen in 62 min), `adapter` ~2 min, per kandidaat vertalen + scoren ~16 min (3×), RL-val-samples ~26 min, C1/C2/PLL
-~25 min, rapport en blind pakket ~5 min.
+overgeslagen. [schatting, naar de gemeten tijden van G4-8 in de ketens `g4t8a`…`g4t8c`] Met `n1` ~3,5 u na de start
+(3–4 u): setup ~3 min, `n1targets` ~3 min, `sftset` + `check` ~5 min, smoke ~22 min, training ~65–70 min (~220 stappen;
+G4-8: 205 stappen in 62 min), `adapter` ~2 min, per kandidaat vertalen + scoren ~16 min (3×), RL-val-samples ~26 min,
+C1/C2/PLL ~25 min, rapport en blind pakket ~5 min. Met `intersect` ~3 u (2,5–3,5 u): `sftset` + `check` ~4 min, training
+~40–50 min (~123 stappen: de 7 evaluatierondes, het laden en compileren blijven, ~10,6 s per stap zoals bij G4-8), de
+rest als bij `n1`.
 
 *G4-9.15 Wat het niet zegt.*
 - N1 sluit juistheid uit; de enige juistheidsbewaking van de doelen is die van §18 (de fail-filters en QE ≤ QE₀,
   MetricX-24-QE zonder referentie). Een doel kan een betekenisfout hebben die QE niet ziet (G4-8-N1.8). De N1-doelen zijn
-  niet blind en niet door Yeb bekeken (geen V1 of V3 zoals bij G4-8).
+  niet door Yeb bekeken; G4-9.V3N1 is één blinde Claude-beoordeling van 100 paren uit `c1`.
+- O9: de reden voor de doorsnede is G4-9.V3N1, een steekproef van 100 paren (zelfde sample 59, ander sample 22, rubriek
+  koos het anker 19) [gevolgtrekking: de uitsplitsing per groep rust op 19–59 paren]. Met de doorsnede zijn de doelen een
+  deelverzameling van die van G4-8 (9.126 van 15.194, 60%): een verschil met G4-8 komt dan uit de 6.068 bronnen van G4-8
+  die wegvallen (N1 koos daar een ander sample, 4.856, of het anker, 1.212 [gemeten, §21]), het kleinere aantal stappen
+  en andere zaden; over de N1-doelen die de rubriek niet koos zegt zo'n G4-9 niets.
 - De evaluatie en de blinde rubriek (protocol.md §4.2.4: eerst juistheid, dan natuurlijkheid) zijn die van G4-8; C1 is
   de maat voor "origineel"; (b) blijft onder R-nieuw rapportage.
 - De judge is hetzelfde model als de generator van de samples (Gemma 4 31B-it): een voorkeur voor de eigen stijl is niet
   te scheiden.
-- Een verschil tussen G4-9 en G4-8 komt uit de doelen (in ~1/3 van de bronnen een ander sample of een andere keuze tussen
-  sample en anker, §21) en hun aantal (16.349 tegen 15.194), en ook uit andere zaden (schudding, smoke-set, RL-val).
+- Met O9 `n1`: een verschil tussen G4-9 en G4-8 komt uit de doelen (in ~1/3 van de bronnen een ander sample of een
+  andere keuze tussen sample en anker, §21) en hun aantal (16.349 tegen 15.194), en ook uit andere zaden (schudding,
+  smoke-set, RL-val).
 - Geen tweede ronde, geen judge op evaluatie-uitvoer, geen beoordeling van het blinde pakket (die is aan de hoofdsessie
   en Yeb).
 

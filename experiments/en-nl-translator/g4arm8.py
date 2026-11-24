@@ -27,9 +27,12 @@ select unchanged on N1's scores; the report beside the rubric's choice of §18:
 
 G4-8's training (protocol-g4.md §19), and G4-9's (§22, a draft until Yeb decides: §19's training on the N1 choice of
 §21) with --arm G4-9 (its seed, names and places; default --arm G4-8):
-    python g4arm8.py n1targets --plan P --n1report F --chunk-dir C=DIR ... --out DIR   (G4-9's targets: §21's select-n1)
+    python g4arm8.py n1targets --mode n1|intersect --plan P --n1report F --chunk-dir C=DIR ... [--rubric-dir C=DIR ...]
+        --out DIR   (G4-9's targets, O9 of §22: §21's select-n1, or with intersect only where §18's select took the
+        same sample; --rubric-dir: §18's select/ of each chunk)
     python g4arm8.py sftset --targets T --plan P --evalsets E --blind B --flan-eval F --g47-pool P --g47-plan P \
-        --sft-eval books=F --sft-eval btval=F --sft-eval own=F --tokenizer T --out DIR   (set, smoke set, RL-val)
+        --sft-eval books=F --sft-eval btval=F --sft-eval own=F --tokenizer T [--targets-info F] --out DIR
+        (set, smoke set, RL-val; --targets-info: G4-9's targets.json of n1targets, its mode into the manifest)
     python g4arm8.py smoke8 --run R --summary S --adapter A --adapter-step A --smoke-manifest M --manifest M --out F
     python g4arm8.py trained --run R --summary S --manifest M --adapter G4-8-s<k>=JSON ... --out F
     python g4arm8.py loraline --logs 'DIR/g4a_translate_<candidate>_*' --out F       (translate.py's LORA line)
@@ -1089,6 +1092,15 @@ ARMS_T = {"G4-8": {"protocol": PROTOCOL_T, "targets": "G4-8-data", "report": "G4
           "G4-9": {"protocol": PROTOCOL_9, "targets": "de N1-keuze van G4-8-data (§21)",
                    "report": "de N1-keuze van G4-8-data (natuurlijkheidsprompt N1, QE ≤ QE₀ als bewaker)",
                    "compare": "G4-8-s140"}}
+# §22 G4-9.0 O9: G4-9's targets (n1targets --mode): n1, all of §21's N1 choice; intersect, only the sources where §18's
+# rubric choice took the same sample (G4-8-N1.7.2's "zelfde sample"). A G4-9 set without a mode is one of the code
+# before O9, which made n1's targets only.
+TARGET_MODES_9 = {"n1": {"o9": "n1", "targets": ARMS_T["G4-9"]["targets"], "report": ARMS_T["G4-9"]["report"]},
+                  "intersect": {"o9": "n1∩rubriek",
+                                "targets": "de doorsnede van de N1-keuze (§21) en de rubriekkeuze (§18) van G4-8-data",
+                                "report": "de doorsnede van de N1-keuze en de rubriekkeuze van G4-8-data (de bronnen "
+                                          "waar N1 en de rubriek hetzelfde sample kozen; QE ≤ QE₀ als bewaker)"}}
+SAME_SAMPLE_N1 = "sample/zelfde sample"    # the intersection's label in §21's report (n1_label)
 META_FIELDS_T = (("id", "string"), ("kind", "string"), ("source", "string"), ("prompt", "string"), ("en", "string"),
                  ("tokens_prompt", "int64"), ("tokens_target", "int64"), ("word_ratio", "float64"),
                  ("char_ratio", "float64"), ("chrf", "float64"), ("dump", "string"), ("long", "bool_"),
@@ -1133,7 +1145,11 @@ def cand_step_t(name, arm=ARM8):
 def n1targets(args):
     """§22 G4-9.2: the N1 choice of §21 (select-n1 per chunk) as one targets file in §18's form (G4-8-data.9), checked
     against the plan, against §21's report (each chunk's choice by sha256, the counts per part) and QE <= QE0 again;
-    nothing is written if a check fails"""
+    with --mode intersect (O9 n1∩rubriek) only the sources where §18's rubric choice took the same sample (same_sample,
+    the counts of §21's overlap); nothing is written if a check fails"""
+    mode = args.mode
+    if mode not in TARGET_MODES_9:
+        raise SystemExit(f"--mode {mode}: one of {list(TARGET_MODES_9)} (§22 G4-9.0, O9)")
     plan = {r["id"]: r for r in read_rows(args.plan, ["id", "part", "chunk", "en", "hypothesis0"])}
     rep = json.loads(Path(args.n1report).read_text())
     chunks = [c for c, _ in CHUNKS8]
@@ -1142,24 +1158,79 @@ def n1targets(args):
     dirs = dict(spec.split("=", 1) for spec in args.chunk_dir)
     if sorted(dirs) != chunks:
         raise SystemExit(f"--chunk-dir {sorted(dirs)}: one per chunk {chunks}")
-    targets, inputs = [], {"plan": g4rl.file_sha256(args.plan), "n1report": g4rl.file_sha256(args.n1report)}
+    rubric_dirs = dict(spec.split("=", 1) for spec in args.rubric_dir or [])
+    if mode == "intersect" and sorted(rubric_dirs) != chunks:
+        raise SystemExit(f"--mode intersect: --rubric-dir {sorted(rubric_dirs)}, one per chunk {chunks} (§18's select/)")
+    if mode != "intersect" and rubric_dirs:
+        raise SystemExit("--rubric-dir: only with --mode intersect")
+    targets, n1_counts = [], collections.Counter()
+    inputs = {"plan": g4rl.file_sha256(args.plan), "n1report": g4rl.file_sha256(args.n1report)}
     for c in chunks:
         d = Path(dirs[c])
         rows, sha = n1_chunk(c, d / "choice.parquet", d / "targets.parquet", plan, rep)
-        targets += rows
         inputs[c] = {"choice": sha, "targets": g4rl.file_sha256(d / "targets.parquet")}
+        n1_counts.update(t["part"] for t in rows)
+        if mode == "intersect":
+            r = Path(rubric_dirs[c])
+            rows = same_sample(c, rows, r / "choice.parquet", r / "targets.parquet", plan, rep)
+            inputs[c].update({"rubric_choice": g4rl.file_sha256(r / "choice.parquet"),
+                              "rubric_targets": g4rl.file_sha256(r / "targets.parquet")})
+        targets += rows
     counts = {p: sum(t["part"] == p for t in targets) for p in PARTS8}
-    want = {p: rep["parts"][p]["n1_kept"] for p in PARTS8}
-    if counts != want or len(targets) != rep["parts"]["samen"]["n1_kept"]:
-        raise SystemExit(f"targets per part {counts}, §21's report {want} (together {rep['parts']['samen']['n1_kept']})")
+    if mode == "n1":
+        want = {p: rep["parts"][p]["n1_kept"] for p in PARTS8}
+        total = rep["parts"]["samen"]["n1_kept"]
+    else:
+        # n1report's overlap counts a label only where it occurs: no entry is none of that part
+        want = {p: rep["parts"][p]["overlap"].get(SAME_SAMPLE_N1, 0) for p in PARTS8}
+        total = rep["parts"]["samen"]["overlap"].get(SAME_SAMPLE_N1, 0)
+    if counts != want or len(targets) != total:
+        raise SystemExit(f"targets per part {counts}, §21's report {want} (together {total}; --mode {mode})")
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     write_parquet(sorted(targets, key=lambda r: r["id"]), out / "targets.parquet")
-    info = {"protocol": PROTOCOL_9, "arm": "G4-9", "source": f"{PROTOCOL_N1}: select-n1 of {chunks}",
+    source = f"{PROTOCOL_N1}: select-n1 of {chunks}"
+    if mode == "intersect":
+        source += f", where {PROTOCOL}'s select of the chunk took the same sample"
+    info = {"protocol": PROTOCOL_9, "arm": "G4-9", "mode": mode, "o9": TARGET_MODES_9[mode]["o9"], "source": source,
             "targets": len(targets), "parts": counts, "inputs": inputs,
             "targets_sha256": g4rl.file_sha256(out / "targets.parquet")}
+    if mode == "intersect":
+        info["n1_targets"] = {p: n1_counts[p] for p in PARTS8}
     (out / "targets.json").write_text(json.dumps(info, indent=1) + "\n")
-    print(f"N1TARGETS {json.dumps({'targets': len(targets), 'parts': counts})}", flush=True)
+    print(f"N1TARGETS {json.dumps({'mode': mode, 'targets': len(targets), 'parts': counts})}", flush=True)
+
+
+def same_sample(c, targets, choice_path, targets_path, plan, rep):
+    """§22 G4-9.2, O9 n1∩rubriek: chunk c's N1 targets whose source §18's rubric gave the same sample (reason 'sample',
+    the same j: G4-8-N1.7.2's "zelfde sample"). Checked: §18's choice.parquet is (sha256) the one §21's n1report read
+    and covers the chunk's sources of the plan; §18's targets.parquet holds exactly its sources with a sample, with
+    their j; each kept target has §18's QE and text (it is a target of G4-8 too)"""
+    if g4rl.file_sha256(choice_path) != rep["inputs"][c]["choice.parquet"]:
+        raise SystemExit(f"{choice_path} is not §18's choice.parquet that §21's n1report checked ({c})")
+    rubric = {r["id"]: (r["reason"], r["j"]) for r in read_rows(choice_path, ["id", "reason", "j"])}
+    if set(rubric) != {i for i, r in plan.items() if r["chunk"] == c}:
+        raise SystemExit(f"{choice_path}: not the sources of chunk {c} in the plan")
+    rows18 = read_rows(targets_path, ["id", "j", "qe", "target"])
+    by = {t["id"]: t for t in rows18}
+    kept = {i for i, (reason, _) in rubric.items() if reason == "sample"}
+    if len(by) != len(rows18) or set(by) != kept or any(by[i]["j"] != rubric[i][1] for i in kept):
+        raise SystemExit(f"{targets_path}: {len(rows18)} rows, not one per source of §18's choice with a sample "
+                         f"({len(kept)}) with its j")
+    out = [t for t in targets if rubric[t["id"]] == ("sample", t["j"])]
+    for t in out:
+        if (by[t["id"]]["qe"], by[t["id"]]["target"]) != (t["qe"], t["target"]):
+            raise SystemExit(f"{c} {t['id']}: the same sample, but its QE or text is not §18's target")
+    return out
+
+
+def targets_text(arm, mode, key):
+    """The words for an arm's targets (ARMS_T's 'targets' or 'report'); G4-9's per O9 mode (none: the code before O9)"""
+    if mode is None:
+        return ARMS_T[arm][key]
+    if arm != "G4-9" or mode not in TARGET_MODES_9:
+        raise SystemExit(f"targets mode {mode!r}: G4-9's {list(TARGET_MODES_9)} (§22 O9) only, not {arm}'s")
+    return f"{TARGET_MODES_9[mode][key]} (O9 `{TARGET_MODES_9[mode]['o9']}`)"
 
 
 def n1_chunk(c, choice_path, targets_path, plan, rep):
@@ -1315,6 +1386,21 @@ def sftset(args, counter=None):
     plan = read_rows(args.plan, columns=["id", "part", "en", "hypothesis0"])
     targets = sorted(read_rows(args.targets), key=lambda r: r["id"])
     per_part = checked_targets(targets, plan)
+    info_path = getattr(args, "targets_info", None)
+    mode = None
+    if info_path:
+        # §22 G4-9.3: n1targets' targets.json names the variant (O9); it must be the json of these very targets
+        if arm != "G4-9":
+            raise SystemExit(f"--targets-info: G4-9's targets.json of n1targets, not with --arm {arm}")
+        info = json.loads(Path(info_path).read_text())
+        if (info.get("protocol"), info.get("arm")) != (PROTOCOL_9, "G4-9") or info.get("mode") not in TARGET_MODES_9:
+            raise SystemExit(f"{info_path}: not n1targets' targets.json of G4-9 with a mode of {list(TARGET_MODES_9)}")
+        if info.get("targets_sha256") != g4rl.file_sha256(args.targets):
+            raise SystemExit(f"{args.targets} is not the targets.parquet of {info_path} (sha256)")
+        if info.get("parts") != per_part or info.get("targets") != len(targets):
+            raise SystemExit(f"{info_path}: {info.get('targets')} targets {info.get('parts')}, {args.targets} has "
+                             f"{len(targets)} {per_part}")
+        mode = info["mode"]
     evalsets = read_rows(args.evalsets)
     blind = g4arm.read_jsonl(args.blind)
     blocked = g4arm.checked_blocked(args.evalsets, args.blind)
@@ -1350,13 +1436,16 @@ def sftset(args, counter=None):
               "evalsets": g4rl.file_sha256(args.evalsets), "blind": g4rl.file_sha256(args.blind),
               "flan_eval": g4rl.file_sha256(args.flan_eval), "g47_pool": g4rl.file_sha256(args.g47_pool),
               "g47_plan": g4rl.file_sha256(args.g47_plan), "sft_eval": sft_files}
+    if mode is not None:
+        inputs["targets_info"] = g4rl.file_sha256(info_path)
     kinds = {p: {"examples": n, "tokens": sum(a + b for t, a, b in zip(targets, prompts, tgts) if t["part"] == p)}
              for p, n in per_part.items()}
     manifest = write_set(rows, out, {
         "set": arm, "protocol": protocol, "seed": seed, "epochs": EPOCHS_T, "distinct": len(targets),
         "examples_per_epoch": [len(one) for one in passes], "parts": kinds, "eval_every": every, "save_steps": save,
         "lr": LR_T, "warmup_steps": WARMUP_T, "sft_evals": list(SFT_EVALS_T),
-        "leak_check": {k: len(v) for k, v in hits.items()}, "inputs": inputs})
+        "leak_check": {k: len(v) for k, v in hits.items()}, "inputs": inputs,
+        **({} if mode is None else {"targets_mode": mode})})
     manifest["candidates"] = candidates_t(manifest, arm)
     (out / "manifest.json").write_text(json.dumps(manifest, indent=1) + "\n")
     # G4-8.5: pass 1's longest first, then the others in a seeded order, as few as give the smoke run its 8 steps
@@ -1397,7 +1486,8 @@ def n0(x):
 def sftset_text(r):
     m, s = r["manifest"], r["smoke"]
     lines = [f"# {m['set']}: de trainingsset ({r['protocol']})", "",
-             f"Gemaakt door `g4arm8.py sftset`; alleen tellingen. Elk doel van {ARMS_T[m['set']]['targets']} één "
+             f"Gemaakt door `g4arm8.py sftset`; alleen tellingen. Elk doel van "
+             f"{targets_text(m['set'], m.get('targets_mode'), 'targets')} één "
              "voorbeeld (prompt "
              f"`{m['prompt']}`), {m['epochs']} doorgangen, elk apart geschud.", "",
              "| deel | doelen | tokens (prompt + doel, één doorgang) | P̄ (gem.) | ΔQE (med.) | chrF doel–anker (med.) | "
@@ -1603,6 +1693,8 @@ def report8(args):
     if g4mix.digest(assign) != split["digest"] or split["digest"] != g4arm.SPLIT_DIGEST6C:
         raise SystemExit(f"{args.split}: not the split of G4-5.4 (digest {split['digest']})")
     manifest = json.loads(Path(args.manifest).read_text())
+    mode = manifest.get("targets_mode")
+    targets_text(arm, mode, "report")          # §22 O9: a mode is G4-9's, one of TARGET_MODES_9
     cands = [c.split("=", 1) for c in args.candidate]
     names = [n for n, _ in cands]
     if names != candidates_t(manifest, arm):
@@ -1666,7 +1758,8 @@ def report8(args):
                           "sft": at, "sft_delta": {s: at[s] - step0[s] for s in SFT_EVALS_T}, "div": div[name]}
     truncated = {label: {name: sum(bool(r.get("truncated")) for r in rows if r["model"] == name) for name in scored}
                  for label, rows in (("c1", predictions), ("c2", predictions_c2))}
-    result = {"protocol": ARMS_T[arm]["protocol"], "arm": arm, "base": base, "o6": args.o6, "candidates": names,
+    result = {"protocol": ARMS_T[arm]["protocol"], "arm": arm, "targets_mode": mode, "base": base, "o6": args.o6,
+              "candidates": names,
               "references": [n for n, _ in refs], "selected": chosen, "selection": why, "refqe_check": check,
               "parts": parts, "a1": {"holds": d["a1"], "sets": d["a1_sets"]}, "a3": a3["decision"][chosen],
               "a3_all": a3, "b": {"holds": d["b"], "delta": d["b_delta"], "ci": b_ci},
@@ -1724,7 +1817,8 @@ def report8_text(r):
     ci = r["b"]["ci"]
     decisive = r["o6"] if r["o6"] in RULES_T else None
     L = [f"# Arm {r['arm']}: uitslag volgens {r['protocol']}", "",
-         f"Gemaakt door `g4arm8.py report8`. SFT met LoRA vanaf G4-0 op de doelen van {ARMS_T[r['arm']]['report']}; de "
+         "Gemaakt door `g4arm8.py report8`. SFT met LoRA vanaf G4-0 op de doelen van "
+         f"{targets_text(r['arm'], r.get('targets_mode'), 'report')}; de "
          "kandidaten vertaald en gescoord als G4-7.7, de keuze op het zoekdeel (`select5`), het besluit tegen G4-0 op "
          "het beslisdeel (G4-8.9). C2, PLL en alles onder \"rapporteren\" beslissen niets.", "",
          f"**Uitslag ({'beslissend: ' + decisive if decisive else 'O6 nog open'}): {r['verdict']}.** Gekozen kandidaat: "
@@ -1901,11 +1995,16 @@ def main(argv=None):
     for name in ("plan", "n1report", "out"):
         a.add_argument(f"--{name}", required=True)
     a.add_argument("--chunk-dir", action="append", required=True, help="CHUNK=DIR with select-n1's choice.parquet, targets.parquet")
+    a.add_argument("--mode", default="n1", choices=tuple(TARGET_MODES_9),
+                   help="§22 O9: n1 (all of §21's N1 choice) or intersect (where §18's rubric took the same sample)")
+    a.add_argument("--rubric-dir", action="append", default=[],
+                   help="--mode intersect: CHUNK=DIR with §18's select/choice.parquet, targets.parquet")
     a = sub.add_parser("sftset")
     for name in ("targets", "plan", "evalsets", "blind", "flan-eval", "g47-pool", "g47-plan", "tokenizer", "out"):
         a.add_argument(f"--{name}", required=True)
     a.add_argument("--sft-eval", action="append", required=True, help="NAME=FILE: books, btval, own (G4-2.5)")
     a.add_argument("--arm", default=ARM8, choices=tuple(ARMS_T))
+    a.add_argument("--targets-info", default=None, help="G4-9: n1targets' targets.json of --targets (its O9 mode)")
     a = sub.add_parser("smoke8")
     for name in ("run", "summary", "adapter", "adapter-step", "smoke-manifest", "manifest", "out"):
         a.add_argument(f"--{name}", required=True)

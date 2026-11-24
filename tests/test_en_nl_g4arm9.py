@@ -1,5 +1,6 @@
 """G4-9's training (protocol-g4.md §22, a draft until Yeb decides): §19's training with --arm G4-9 / ARM8=G4-9 / ARM=G4-9
-on the N1 choice of §21. g4arm8.py's n1targets (§21's select-n1 merged and checked), sftset, trained and report8 (with
+on the N1 choice of §21 (O9 n1), or on its intersection with §18's rubric choice (O9 n1∩rubriek, --mode intersect,
+TARGETS=intersect). g4arm8.py's n1targets (§21's select-n1 merged and checked), sftset, trained and report8 (with
 the comparison with G4-8's choice) on small synthetic inputs; run_g4arm8.sh's and run_g4arm.sh's stages of G4-9 rendered
 with a fake bucket (no model, no TPU)."""
 
@@ -473,10 +474,10 @@ def test_run_g4arm8_with_arm8_g4_9_has_the_training_stages_only(tmp_path):
 
 def test_run_g4arm8_n1targets_and_sftset_of_g4_9_render_their_jobs(tmp_path):
     run, body, put, shm, home, g = t8t.t8_world(tmp_path)
-    out, _ = run("n1targets", ARM8="G4-9", TAG="n1")
+    out, _ = run("n1targets", ARM8="G4-9", TARGETS="n1", TAG="n1")
     assert out.returncode != 0 and "no gs://t5-dutch-english-usc2/mbert/translator/sft/g4arm/data/G4-8/n1/report.json" in out.stdout
     put("data/G4-8/n1/report.json", "{}")
-    out, _ = run("n1targets", ARM8="G4-9", TAG="n2")
+    out, _ = run("n1targets", ARM8="G4-9", TARGETS="n1", TAG="n2")
     assert out.returncode == 0 and "started g4a9_n1targets_n2 on w0" in out.stdout, out.stdout + out.stderr
     b = body("g4a9_n1targets_n2")
     for x in ("g4arm8.py n1targets --plan", "/data/G4-8/plan/plan.parquet", "/data/G4-8/n1/report.json",
@@ -486,10 +487,10 @@ def test_run_g4arm8_n1targets_and_sftset_of_g4_9_render_their_jobs(tmp_path):
         assert x in b, x
     assert b.index("/data/G4-9/targets/targets.parquet") < b.index("/data/G4-9/targets/targets.json") and "rm " not in b
     assert f"{shm}/translator/g4arm9/n1targets-n2" in b
-    out, _ = run("n1targets", host="1", ARM8="G4-9", TAG="n3")
+    out, _ = run("n1targets", host="1", ARM8="G4-9", TARGETS="n1", TAG="n3")
     assert out.returncode != 0 and "runs on w0 only" in out.stdout
-    put("data/G4-9/targets/targets.json", "{}")
-    out, _ = run("n1targets", ARM8="G4-9", TAG="n4")
+    put("data/G4-9/targets/targets.json", json.dumps({"mode": "n1"}))
+    out, _ = run("n1targets", ARM8="G4-9", TARGETS="n1", TAG="n4")
     assert "there before" in body("g4a9_n1targets_n4")
     # sftset reads G4-9's targets (G4-8-data's plan), writes $G9/sft/
     out, _ = run("sftset", ARM8="G4-9", TAG="s1")
@@ -665,3 +666,251 @@ def test_g49_stages_of_run_g4arm(tmp_path):
     for selected, msg in (("G4-9-s148", "not report8's choice"), ("G4-8-s140", "no candidate of G4-9")):
         out, _ = run("blind", ARM="G4-9", SELECTED=selected, TAG="t10")
         assert out.returncode != 0 and msg in out.stdout, (selected, out.stdout)
+
+
+# ---------------------------------------------------------------------------------------------------- §22 O9
+
+def section_22():
+    text = (CODE / "protocol-g4.md").read_text(encoding="utf-8")
+    start = text.index("## 22. G4-9 training")
+    end = text.find("\n## 23.", start)
+    return text[start:] if end < 0 else text[start:end]
+
+
+def test_section_22_has_the_choice_o9_and_the_code_names_its_modes():
+    section = section_22()
+    o9 = re.findall(r"`O9 \[besluit Yeb[^]`]*\]: ([^`]*)`", section)
+    if "CONCEPT, NIET GESTART" in section:
+        # the draft names both variants; the chain refuses it
+        assert sorted(set(o9)) == ["n1", "n1∩rubriek"]
+    else:
+        # the final version as g4arm9_train_run.sh reads it: one decision on O9
+        assert len(set(o9)) == 1 and o9[0] in ("n1", "n1∩rubriek")
+    assert {m: x["o9"] for m, x in g8.TARGET_MODES_9.items()} == {"n1": "n1", "intersect": "n1∩rubriek"}
+    for x in ("9.126", "16.349", "`TARGETS=n1`", "`TARGETS=intersect`", "`n1targets --mode intersect`",
+              "`--targets-info`", "`targets_mode`", "dezelfde `j`"):
+        assert x in section, x
+    assert g8.TARGET_MODES_9["n1"]["targets"] == g8.ARMS_T["G4-9"]["targets"]
+
+
+def rubric_chunks(tmp_path, dirs, rep):
+    """§18's select/ per chunk beside n1_chunks: for the N1 targets in turn the same sample, another sample (another
+    text) or the anchor, the other sources as N1's; the choice's sha256 and §21's overlap 'zelfde sample' per part in
+    the report"""
+    rdirs, same = {}, collections.Counter()
+    for c, d in dirs.items():
+        n1_targets = {t["id"]: t for t in g8.read_rows(d / "targets.parquet")}
+        choice, targets, k = [], [], 0
+        for row in g8.read_rows(d / "choice.parquet"):
+            row = dict(row)
+            if row["reason"] == "sample":
+                kind, k = k % 3, k + 1
+                t = dict(n1_targets[row["id"]])
+                if kind == 0:
+                    same[row["part"]] += 1
+                    targets.append(t)
+                elif kind == 1:
+                    row["j"] = t["j"] = (row["j"] + 1) % 8
+                    targets.append({**t, "target": f"ander sample {row['id']}", "qe": 1.0})
+                else:
+                    row.update({"reason": "p", "j": -1, **dict.fromkeys(g8.TARGET_MEASURES)})
+            choice.append(row)
+        r = tmp_path / "rubric" / c
+        g8.write_parquet(choice, r / "choice.parquet")
+        g8.write_parquet(targets, r / "targets.parquet")
+        rep["inputs"][c]["choice.parquet"] = g4rl.file_sha256(r / "choice.parquet")
+        rdirs[c] = r
+    rep["parts"]["samen"]["overlap"] = {g8.SAME_SAMPLE_N1: sum(same.values()), "sample/ander sample": 3}
+    for p in g8.PARTS8:
+        rep["parts"][p]["overlap"] = {g8.SAME_SAMPLE_N1: same[p], "sample/anker": 1}
+    (tmp_path / "n1report.json").write_text(json.dumps(rep))
+    return rdirs, same
+
+
+def rubric_args(rdirs):
+    return ["--mode", "intersect", *[x for c, d in rdirs.items() for x in ("--rubric-dir", f"{c}={d}")]]
+
+
+def test_n1targets_intersect_keeps_the_sources_where_the_rubric_took_the_same_sample(tmp_path, capsys):
+    dirs, rep = n1_chunks(tmp_path)
+    rdirs, same = rubric_chunks(tmp_path, dirs, rep)
+    g8.main(n1_args(tmp_path, dirs) + rubric_args(rdirs))
+    rows = pq.read_table(tmp_path / "out" / "targets.parquet").to_pylist()
+    rubric = {r["id"]: (r["reason"], r["j"]) for c in rdirs for r in g8.read_rows(rdirs[c] / "choice.parquet")}
+    assert len(rows) == sum(same.values()) == 6 and [r["id"] for r in rows] == sorted(r["id"] for r in rows)
+    assert all(rubric[r["id"]] == ("sample", r["j"]) for r in rows)
+    # every N1 target whose source the rubric gave the same sample, none other
+    n1 = [t for c in dirs for t in g8.read_rows(dirs[c] / "targets.parquet")]
+    assert {r["id"] for r in rows} == {t["id"] for t in n1 if rubric[t["id"]] == ("sample", t["j"])}
+    assert pq.read_table(tmp_path / "out" / "targets.parquet").schema.names == \
+        pq.read_table(dirs["c1"] / "targets.parquet").schema.names
+    info = json.loads((tmp_path / "out" / "targets.json").read_text())
+    assert (info["mode"], info["o9"], info["targets"]) == ("intersect", "n1∩rubriek", 6)
+    assert info["parts"] == dict(same) and info["n1_targets"] == {p: 4 for p in g8.PARTS8}
+    assert info["inputs"]["c2"]["rubric_choice"] == g4rl.file_sha256(rdirs["c2"] / "choice.parquet")
+    assert info["inputs"]["c2"]["rubric_targets"] == g4rl.file_sha256(rdirs["c2"] / "targets.parquet")
+    assert info["targets_sha256"] == g4rl.file_sha256(tmp_path / "out" / "targets.parquet")
+    assert '"mode": "intersect"' in capsys.readouterr().out
+    # sftset takes them as G4-8's (§19's checks of a janchor target)
+    assert g8.checked_targets(rows, g8.read_rows(tmp_path / "plan.parquet")) == info["parts"]
+    # --mode n1, and no --mode: all N1 targets, mode n1
+    for out, extra in (("out-n1", ["--mode", "n1"]), ("out-default", [])):
+        g8.main(n1_args(tmp_path, dirs, out=out) + extra)
+        info = json.loads((tmp_path / out / "targets.json").read_text())
+        assert (info["mode"], info["o9"], info["targets"]) == ("n1", "n1", 12) and "n1_targets" not in info
+
+
+@pytest.mark.parametrize("what, msg", [
+    ("rubric_sha", "is not §18's choice.parquet that §21's n1report checked"),
+    ("rubric_cover", "not the sources of chunk c2 in the plan"),
+    ("rubric_j", "not one per source of §18's choice with a sample"),
+    ("rubric_drop", "not one per source of §18's choice with a sample"),
+    ("rubric_text", "its QE or text is not §18's target"), ("rubric_qe", "its QE or text is not §18's target"),
+    ("count", "§21's report"), ("no_rubric", "--mode intersect: --rubric-dir"),
+    ("rubric_with_n1", "--rubric-dir: only with --mode intersect"),
+])
+def test_n1targets_intersect_refuses_and_writes_nothing(tmp_path, what, msg):
+    dirs, rep = n1_chunks(tmp_path)
+    rdirs, same = rubric_chunks(tmp_path, dirs, rep)
+    r2 = rdirs["c2"]
+    kept = sorted(t["id"] for c in dirs for t in g8.read_rows(dirs[c] / "targets.parquet"))
+    rubric = {r["id"]: (r["reason"], r["j"]) for r in g8.read_rows(r2 / "choice.parquet")}
+    same2 = [i for i in kept if i in rubric and rubric[i][0] == "sample"
+             and rubric[i][1] == next(t["j"] for t in g8.read_rows(dirs["c2"] / "targets.parquet") if t["id"] == i)]
+    args = n1_args(tmp_path, dirs) + rubric_args(rdirs)
+    if what == "rubric_sha":
+        edit(r2 / "choice.parquet", lambda rows: rows[5].update(fails=1))
+    elif what == "rubric_cover":
+        edit(r2 / "choice.parquet", lambda rows: rows.pop())
+        rep["inputs"]["c2"]["choice.parquet"] = g4rl.file_sha256(r2 / "choice.parquet")
+    elif what == "rubric_j":
+        edit(r2 / "targets.parquet", lambda rows: rows[0].update(j=(rows[0]["j"] + 3) % 8))
+    elif what == "rubric_drop":
+        edit(r2 / "targets.parquet", lambda rows: rows.pop())
+    elif what in ("rubric_text", "rubric_qe"):
+        change = {"target": "een andere tekst"} if what == "rubric_text" else {"qe": 0.5}
+        edit(r2 / "targets.parquet", lambda rows: [x.update(change) for x in rows if x["id"] == same2[0]])
+    elif what == "count":
+        rep["parts"]["novels"]["overlap"][g8.SAME_SAMPLE_N1] += 1
+    elif what == "no_rubric":
+        args = n1_args(tmp_path, dirs) + ["--mode", "intersect"]
+    elif what == "rubric_with_n1":
+        args = n1_args(tmp_path, dirs) + rubric_args(rdirs)[2:] + ["--mode", "n1"]
+    (tmp_path / "n1report.json").write_text(json.dumps(rep))
+    with pytest.raises(SystemExit, match=re.escape(msg)):
+        g8.main(args)
+    assert not (tmp_path / "out").exists()
+
+
+def targets_info(d, rows, change=None):
+    """n1targets' targets.json of the targets.parquet in d, mode intersect (and the change)"""
+    per = {p: sum(t["part"] == p for t in rows) for p in g8.PARTS8}
+    info = {"protocol": "protocol-g4.md §22", "arm": "G4-9", "mode": "intersect", "o9": "n1∩rubriek",
+            "targets": len(rows), "parts": per, "targets_sha256": g4rl.file_sha256(d / "targets.parquet"),
+            **(change or {})}
+    (d / "targets.json").write_text(json.dumps(info))
+    return str(d / "targets.json")
+
+
+def test_sftset_of_g4_9_takes_the_mode_of_n1targets_json(tmp_path, monkeypatch):
+    monkeypatch.setattr(g8, "SEQ_T", 32)
+    monkeypatch.setattr(g8, "SMOKE_LONGEST_T", 10)
+    monkeypatch.setattr(g8, "SMOKE_RANDOM_T", 20)
+    blind = tmp_path / "in" / "blind100.jsonl"
+    monkeypatch.setattr(g4arm, "blind_sha256", lambda: g4rl.file_sha256(blind))
+    d, plan, targets = t8t.sft_world(tmp_path)
+    args = t8t.sft_args(d, tmp_path / "out")
+    args.arm, args.targets_info = "G4-9", targets_info(d, targets)
+    g8.sftset(args, counter=t8t.Counter())
+    m = json.loads((tmp_path / "out" / "manifest.json").read_text())
+    assert m["targets_mode"] == "intersect" and m["inputs"]["targets_info"] == g4rl.file_sha256(d / "targets.json")
+    assert m["inputs"]["targets"] == g4rl.file_sha256(d / "targets.parquet")
+    md = (tmp_path / "out" / "report.md").read_text()
+    assert "Elk doel van de doorsnede van de N1-keuze (§21) en de rubriekkeuze (§18) van G4-8-data (O9 `n1∩rubriek`)" in md
+    # refused before anything is written
+    for k, (arm, change, msg) in enumerate((
+            ("G4-8", {}, "--targets-info: G4-9's targets.json of n1targets, not with --arm G4-8"),
+            ("G4-9", {"targets_sha256": "0" * 64}, "is not the targets.parquet of"),
+            ("G4-9", {"targets": len(targets) + 1}, f"{len(targets) + 1} targets"),
+            ("G4-9", {"parts": {"flan": 1, "novels": 2, "bt": 3}}, "targets {'flan': 1"),
+            ("G4-9", {"mode": "all"}, "with a mode of ['n1', 'intersect']"),
+            ("G4-9", {"arm": "G4-8"}, "not n1targets' targets.json of G4-9"))):
+        args = t8t.sft_args(d, tmp_path / f"bad{k}")
+        args.arm, args.targets_info = arm, targets_info(d, targets, change)
+        with pytest.raises(SystemExit, match=re.escape(msg)):
+            g8.sftset(args, counter=t8t.Counter())
+        assert not (tmp_path / f"bad{k}").exists()
+
+
+def test_report8_of_g4_9_names_the_mode_of_its_targets(tmp_path, monkeypatch, capsys):
+    args = world9(tmp_path, monkeypatch)
+    m = json.loads((tmp_path / "manifest.json").read_text())
+    (tmp_path / "manifest.json").write_text(json.dumps({**m, "targets_mode": "intersect"}))
+    r, md, _ = t8t.run8(args, capsys)
+    assert r["targets_mode"] == "intersect" and r["selected"] == "G4-9-s4"
+    assert ("SFT met LoRA vanaf G4-0 op de doelen van de doorsnede van de N1-keuze en de rubriekkeuze van G4-8-data (de "
+            "bronnen waar N1 en de rubriek hetzelfde sample kozen; QE ≤ QE₀ als bewaker) (O9 `n1∩rubriek`)") in md
+    # a mode is G4-9's, one of O9's
+    (tmp_path / "manifest.json").write_text(json.dumps({**m, "targets_mode": "all"}))
+    with pytest.raises(SystemExit, match=re.escape("targets mode 'all': G4-9's ['n1', 'intersect']")):
+        t8t.run8(args)
+    args8 = t8t.world8(tmp_path / "d", monkeypatch)
+    m8 = json.loads(open(args8.manifest).read())
+    with open(args8.manifest, "w") as f:
+        json.dump({**m8, "targets_mode": "n1"}, f)
+    with pytest.raises(SystemExit, match=re.escape("not G4-8's")):
+        t8t.run8(args8)
+
+
+def test_run_g4arm8_n1targets_takes_targets_and_sftset_the_json_of_g4_9(tmp_path):
+    run, body, put, shm, home, g = t8t.t8_world(tmp_path)
+    put("data/G4-8/n1/report.json", "{}")
+    for env in ({}, {"TARGETS": "all"}, {"TARGETS": "n1∩rubriek"}):
+        out, calls = run("n1targets", ARM8="G4-9", TAG="m0", **env)
+        assert out.returncode != 0 and "TARGETS is n1 or intersect (§22 G4-9.0, O9)" in out.stdout, env
+        assert not any(c.startswith(("SETSID", "gsutil")) for c in calls), env
+    # intersect: §18's select/ of each chunk beside select-n1
+    out, calls = run("n1targets", ARM8="G4-9", TARGETS="intersect", TAG="m1")
+    assert out.returncode != 0 and "data/G4-8/c1/select/choice.parquet (§18's select)" in out.stdout
+    assert not any(c.startswith("SETSID") for c in calls)
+    for c in ("c1", "c2", "c3"):
+        for f in ("choice", "targets"):
+            put(f"data/G4-8/{c}/select/{f}.parquet")
+    out, _ = run("n1targets", ARM8="G4-9", TARGETS="intersect", TAG="m2")
+    assert out.returncode == 0 and "started g4a9_n1targets_m2 on w0" in out.stdout, out.stdout + out.stderr
+    b = body("g4a9_n1targets_m2")
+    x2 = f"{shm}/translator/g4arm9/n1targets-m2"
+    for x in ("n1targets --plan", " --mode intersect --chunk-dir c1=", f"--rubric-dir c1={x2}/rubric/c1",
+              f"--rubric-dir c3={x2}/rubric/c3", "/data/G4-8/$c/select/choice.parquet",
+              "/data/G4-8/$c/select/targets.parquet", f"{x2}/rubric/$c/", "/data/G4-8/$c/select-n1/targets.parquet",
+              "N1TARGETS_DONE", "(TARGETS intersect)"):
+        assert x in b, x
+    assert b.index("/select/targets.parquet") < b.index("g4arm8.py n1targets") and "rm " not in b
+    out, _ = run("n1targets", ARM8="G4-9", TARGETS="n1", TAG="m3")
+    b = body("g4a9_n1targets_m3")
+    assert out.returncode == 0 and " --mode n1 --chunk-dir c1=" in b and "--rubric-dir" not in b and "/select/" not in b
+    # a targets.json of the other mode stays as it is: refused, nothing started; of the same mode: there before
+    put("data/G4-9/targets/targets.json", json.dumps({"mode": "n1"}, indent=1))
+    out, calls = run("n1targets", ARM8="G4-9", TARGETS="intersect", TAG="m4")
+    assert out.returncode != 0 and "targets.json is not of TARGETS intersect: it stays as it is" in out.stdout
+    assert not any(c.startswith("SETSID") for c in calls)
+    out, _ = run("n1targets", ARM8="G4-9", TARGETS="n1", TAG="m5")
+    assert out.returncode == 0 and "there before, TARGETS n1" in body("g4a9_n1targets_m5")
+    # sftset of G4-9 hands n1targets' json to g4arm8.py (its mode into the manifest); G4-8's has none
+    put("data/G4-9/targets/targets.parquet")
+    out, _ = run("sftset", ARM8="G4-9", TAG="s1")
+    b = body("g4a9_sftset_s1")
+    x1 = f"{shm}/translator/g4arm9/sftset-s1"
+    assert out.returncode == 0 and f"/data/G4-9/targets/targets.json {x1}/in/targets.json" in b
+    assert f"--arm=G4-9 --targets-info {x1}/in/targets.json --out" in b
+    assert b.index(f"{x1}/in/targets.json") < b.index("g4arm8.py sftset")
+    put("data/G4-8/targets/targets.parquet")
+    out, _ = run("sftset", TAG="s2")
+    b = body("g4a8_sftset_s2")
+    assert out.returncode == 0 and "--targets-info" not in b and "targets.json" not in b
+    # without n1targets' json G4-9's sftset does not start
+    run2, body2, put2, *_ = t8t.t8_world(tmp_path / "b")
+    put2("data/G4-9/targets/targets.parquet")
+    out, calls = run2("sftset", ARM8="G4-9", TAG="s3")
+    assert out.returncode != 0 and "data/G4-9/targets/targets.json (n1targets)" in out.stdout
+    assert not any(c.startswith("SETSID") for c in calls)

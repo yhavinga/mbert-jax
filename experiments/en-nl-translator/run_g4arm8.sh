@@ -41,8 +41,9 @@
 # ARM8=G4-9 with the stages of §19 above (sftset ... report8; generate JOB=div only), its names (runs g4arm_G4-9_s8 and
 # g4arm_G4-9, candidates G4-9-s<step>, jobs g4a9_*) and places (G9=$G/data/G4-9, SFT=$G9/sft, $G/G4-9-s<step>/,
 # $G/naturalness-G4-9/, $G/report-G4-9/), its seed en-nl-g4arm/0/G4-9; report8 with G4-8-s140 beside (G4-9.11), and
-#   ARM8=G4-9 bash run_g4arm8.sh n1targets      w0 (CPU): g4arm8.py n1targets (§21's select-n1 per chunk, checked) ->
-#                                               $G9/targets/targets.parquet, targets.json
+#   ARM8=G4-9 TARGETS=n1|intersect bash run_g4arm8.sh n1targets   w0 (CPU): g4arm8.py n1targets --mode $TARGETS (§22 O9:
+#                                               §21's select-n1 per chunk, checked; intersect: only where §18's select took
+#                                               the same sample) -> $G9/targets/targets.parquet, targets.json (its mode)
 # A stage whose output is in the bucket already (its last file) prints that and ends in EXIT 0 (the outputs are
 # deterministic or resumed by shard); nothing is removed. The code is beside this script (a copy of
 # $G/scripts-g4a8-<commit>/). TAG names the jobs of one chain.
@@ -477,15 +478,34 @@ EOF
   ;;
 n1targets)
   # §22 G4-9.2: the N1 choice of §21 (select-n1 per chunk) as one targets file in §18's form, checked against §21's
-  # report; the json last: its presence says the stage is done
+  # report; TARGETS is O9 of G4-9.0: n1 (all of them) or intersect (only where §18's rubric took the same sample,
+  # select/ of each chunk beside); the json last: its presence says the stage is done, a json of the other mode stays
   only 0
   ready
+  case ${TARGETS:-} in
+    n1|intersect) ;;
+    *) echo "TARGETS is n1 or intersect (§22 G4-9.0, O9), not '${TARGETS:-}'"; exit 1 ;;
+  esac
   NAME=${J}_n1targets_$TAG
-  gsutil -q stat "$TG/targets/targets.json" && there_before "$NAME" "N1TARGETS_DONE $TG/targets/ (there before)"
+  if gsutil -q stat "$TG/targets/targets.json"; then
+    gsutil cat "$TG/targets/targets.json" | $SFT_PY -I -c "import json, sys; sys.exit(json.load(sys.stdin).get('mode') != '$TARGETS')" \
+      || { echo "$TG/targets/targets.json is not of TARGETS $TARGETS: it stays as it is"; exit 1; }
+    there_before "$NAME" "N1TARGETS_DONE $TG/targets/ (there before, TARGETS $TARGETS)"
+  fi
   gsutil -q stat "$G8/n1/report.json" || { echo "no $G8/n1/report.json (§21's n1report)"; exit 1; }
   X=$W8/n1targets-$TAG
-  ARGS=""
+  ARGS=" --mode $TARGETS"
   for c in $CHUNKS; do ARGS="$ARGS --chunk-dir $c=$X/$c"; done
+  RUBRIC=""
+  if [ "$TARGETS" = intersect ]; then
+    for c in $CHUNKS; do
+      for x in choice targets; do
+        gsutil -q stat "$G8/$c/select/$x.parquet" || { echo "no $G8/$c/select/$x.parquet (§18's select)"; exit 1; }
+      done
+      ARGS="$ARGS --rubric-dir $c=$X/rubric/$c"
+    done
+    RUBRIC="for c in $CHUNKS; do mkdir -p $X/rubric/\$c && gsutil -m -q cp $G8/\$c/select/choice.parquet $G8/\$c/select/targets.parquet $X/rubric/\$c/; done"
+  fi
   f=$(body "$NAME" <<EOF
 set -euo pipefail
 $CPU
@@ -493,10 +513,11 @@ mkdir -p $X/out
 gsutil -q cp $G8/plan/plan.parquet $X/plan.parquet
 gsutil -q cp $G8/n1/report.json $X/n1report.json
 for c in $CHUNKS; do mkdir -p $X/\$c && gsutil -m -q cp $G8/\$c/select-n1/choice.parquet $G8/\$c/select-n1/targets.parquet $X/\$c/; done
+$RUBRIC
 nice -n 19 $SFT_PY -I -u $CODE/g4arm8.py n1targets --plan $X/plan.parquet --n1report $X/n1report.json$ARGS --out $X/out
 gsutil -q cp $X/out/targets.parquet $TG/targets/targets.parquet
 gsutil -q cp $X/out/targets.json $TG/targets/targets.json
-echo "N1TARGETS_DONE $TG/targets/"
+echo "N1TARGETS_DONE $TG/targets/ (TARGETS $TARGETS)"
 EOF
 )
   detach "$NAME" bash "$f"
@@ -509,6 +530,13 @@ sftset)
   gsutil -q stat "$SFT/manifest.json" && there_before "$NAME" "SFTSET8_DONE $SFT/ (there before)"
   gsutil -q stat "$TG/targets/targets.parquet" || { echo "no $TG/targets/targets.parquet (G4-8-data's report; G4-9: n1targets)"; exit 1; }
   X=$W8/sftset-$TAG
+  # §22 G4-9.3: G4-9's set names its targets' mode (O9) from n1targets' json; G4-8's targets have none
+  INFO=""; INFO_CP=""
+  if [ "$ARM8" = G4-9 ]; then
+    gsutil -q stat "$TG/targets/targets.json" || { echo "no $TG/targets/targets.json (n1targets)"; exit 1; }
+    INFO=" --targets-info $X/in/targets.json"
+    INFO_CP="gsutil -q cp $TG/targets/targets.json $X/in/targets.json"
+  fi
   f=$(body "$NAME" <<EOF
 set -euo pipefail
 $CPU
@@ -517,7 +545,8 @@ gsutil -m -q cp $TG/targets/targets.parquet $G8/plan/plan.parquet $E/data/evalse
 gsutil -q cp $RL/data/pool/pool.parquet $X/in/g47-pool.parquet
 gsutil -q cp $RL/data/plan/plan.parquet $X/in/g47-plan.parquet
 gsutil -m -q cp $H/eval-books.parquet $H/eval-btval.parquet $H/eval-own.parquet $X/in/
-nice -n 19 ionice -c3 $SFT_PY -I -u $CODE/g4arm8.py sftset --targets $X/in/targets.parquet --plan $X/in/plan.parquet --evalsets $X/in/evalsets.parquet --blind $X/in/blind100.jsonl --flan-eval $X/in/eval-rows.parquet --g47-pool $X/in/g47-pool.parquet --g47-plan $X/in/g47-plan.parquet --sft-eval books=$X/in/eval-books.parquet --sft-eval btval=$X/in/eval-btval.parquet --sft-eval own=$X/in/eval-own.parquet --tokenizer $TOK_SFT --arm=$ARM8 --out $X/out
+$INFO_CP
+nice -n 19 ionice -c3 $SFT_PY -I -u $CODE/g4arm8.py sftset --targets $X/in/targets.parquet --plan $X/in/plan.parquet --evalsets $X/in/evalsets.parquet --blind $X/in/blind100.jsonl --flan-eval $X/in/eval-rows.parquet --g47-pool $X/in/g47-pool.parquet --g47-plan $X/in/g47-plan.parquet --sft-eval books=$X/in/eval-books.parquet --sft-eval btval=$X/in/eval-btval.parquet --sft-eval own=$X/in/eval-own.parquet --tokenizer $TOK_SFT --arm=$ARM8$INFO --out $X/out
 gsutil -m -q cp $X/out/train.parquet $X/out/train-meta.parquet $X/out/template.jinja $X/out/report.json $X/out/report.md $SFT/
 gsutil -m -q cp $X/out/smoke/train.parquet $X/out/smoke/train-meta.parquet $X/out/smoke/template.jinja $X/out/smoke/manifest.json $SFT/smoke/
 gsutil -m -q cp '$X/out/rlval/segments-w*.parquet' $SFT/rlval/

@@ -94,7 +94,6 @@ gguf)
   # llama.cpp pins transformers 4.57.6; should its AutoConfig not know gemma4, once more with the release that does
   if ! $GV/bin/python -u $LL/convert_hf_to_gguf.py $D/merged --outtype bf16 --outfile $D/gguf/gemma-4-31b-it-en-nl-BF16.gguf; then
     echo "GGUF_RETRY with transformers 5.23.0"
-    rm -f $D/gguf/gemma-4-31b-it-en-nl-BF16.gguf
     VIRTUAL_ENV=$GV uv pip install -q transformers==5.23.0
     $GV/bin/python -u $LL/convert_hf_to_gguf.py $D/merged --outtype bf16 --outfile $D/gguf/gemma-4-31b-it-en-nl-BF16.gguf
   fi

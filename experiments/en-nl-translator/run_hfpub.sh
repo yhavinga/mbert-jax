@@ -42,7 +42,7 @@ llama)
   [ -x $GV/bin/python ] || uv venv -q --python 3.12 $GV
   VIRTUAL_ENV=$GV uv pip install -q -r $LL/requirements/requirements-convert_hf_to_gguf.txt --index-strategy unsafe-best-match
   VIRTUAL_ENV=$GV uv pip install -q cmake
-  (cd $LL && $GV/bin/cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=ON -DLLAMA_CURL=OFF > $HOMEP/cmake.log 2>&1 \
+  (cd $LL && $GV/bin/cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=ON -DLLAMA_CURL=OFF -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF > $HOMEP/cmake.log 2>&1 \
     || { tail -30 $HOMEP/cmake.log; exit 1; })
   $GV/bin/cmake --build $LL/build --config Release -j 64 --target llama-quantize llama-server llama-cli > $HOMEP/build.log 2>&1 \
     || { tail -40 $HOMEP/build.log; exit 1; }

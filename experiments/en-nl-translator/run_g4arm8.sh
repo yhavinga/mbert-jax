@@ -16,6 +16,11 @@
 #   CHUNK=c<n> bash run_g4arm8.sh select        w0 (CPU): g4arm8.py select -> $G8/<c>/select/
 #   bash run_g4arm8.sh v3                       w0 (CPU): g4arm8.py v3 on c1's targets -> $S/blind/G4-8-V3/
 #   bash run_g4arm8.sh report                   w0 (CPU): g4arm8.py report -> $G8/report/, $G8/targets/targets.parquet
+# §21 (G4-8-data N1-scores, a preparation that decides nothing; the chain g4arm8_n1_run.sh): the same pairs with FB.8's N1
+#   CHUNK=c<n> bash run_g4arm8.sh n1pairs       w0 (CPU): g4arm8.py n1pairs (checked against §18's prompts) -> $G8/<c>/judge-n1/data/
+#   CHUNK=c<n> SET=n1 bash run_g4arm8.sh judge  every worker (its TPU): pairjudge.py score -> $G8/<c>/judge-n1/scores/w<k>/
+#   CHUNK=c<n> SET=n1 bash run_g4arm8.sh select w0 (CPU): g4arm8.py select on N1's scores -> $G8/<c>/select-n1/
+#   bash run_g4arm8.sh n1report                 w0 (CPU): g4arm8.py n1report -> $G8/n1/
 # G4-8's training (protocol-g4.md §19; the chain g4arm8_train_run.sh; SFT=$G8/sft; translate, score, texts, classify,
 # classify-c2, pll and blind are run_g4arm.sh's with ARM=G4-8):
 #   bash run_g4arm8.sh sftset                   w0 (CPU): g4arm8.py sftset (the targets as SFT rows, 2 passes, checked
@@ -34,7 +39,7 @@
 # deterministic or resumed by shard); nothing is removed. The code is beside this script (a copy of
 # $G/scripts-g4a8-<commit>/). TAG names the jobs of one chain.
 set -euo pipefail
-STAGE=${1:?a stage: fresh generate plan qe pairs judge select v3 report sftset check train smoke8 adapter report8}
+STAGE=${1:?a stage: fresh generate plan qe pairs judge select v3 report n1pairs n1report sftset check train smoke8 adapter report8}
 R=gs://t5-dutch-english-usc2/mbert/translator
 S=$R/sft
 E=$R/eval
@@ -100,6 +105,14 @@ only() {  # only WORKER: the stage runs on that worker alone
 ready() {
   [ -x "$FPY" ] && [ -x "$SFT_PY" ] && [ -s "$TOK_DEC/tokenizer.json" ] && [ -s "$TOK_SFT/tokenizer.json" ] \
     || { echo "w$W: no fork venv, SFT venv or tokenizer (run_g4arm.sh setup)"; exit 1; }
+}
+
+judge_set() {  # the judge's directories of a chunk: §18's rubric (SET empty) or §21's N1 (SET=n1)
+  case ${SET:-} in
+    "") JD=$G8/$1/judge; SD=$G8/$1/select; SN="" ;;
+    n1) JD=$G8/$1/judge-n1; SD=$G8/$1/select-n1; SN=n1 ;;
+    *) echo "SET is empty (§18) or n1 (§21), not $SET"; exit 1 ;;
+  esac
 }
 
 chunk_of() {
@@ -282,30 +295,34 @@ EOF
   ;;
 judge)
   C=$(chunk_of)
+  judge_set "$C"
   ready
-  NAME=g4a8_judge_${C}_$TAG
+  NAME=g4a8_judge${SN}_${C}_$TAG
   tpu_free
-  gsutil -q stat "$G8/$C/judge/data/prompts-w$W.parquet" || { echo "no $G8/$C/judge/data/prompts-w$W.parquet"; exit 1; }
-  X=$W8/judge-$C-$TAG
+  [ -z "$SN" ] || gsutil -q stat "$JD/data/n1pairs.json" || { echo "no $JD/data/n1pairs.json"; exit 1; }
+  gsutil -q stat "$JD/data/prompts-w$W.parquet" || { echo "no $JD/data/prompts-w$W.parquet"; exit 1; }
+  X=$W8/judge$SN-$C-$TAG
   # pairjudge.py score unchanged (G4-judge.2-4); it skips the shards already in the bucket
   f=$(body "$NAME" <<EOF
 set -euo pipefail
 $ONE_HOST
 mkdir -p $X $WORK
-gsutil -q cp $G8/$C/judge/data/prompts-w$W.parquet $X/prompts.parquet
+gsutil -q cp $JD/data/prompts-w$W.parquet $X/prompts.parquet
 $PREFLIGHT
-$FPY -u $CODE/pairjudge.py score --prompts $X/prompts.parquet --out $G8/$C/judge/scores/w$W --ckpt $DECODE_CKPT --tokenizer $TOK_DEC --work-dir $WORK
+$FPY -u $CODE/pairjudge.py score --prompts $X/prompts.parquet --out $JD/scores/w$W --ckpt $DECODE_CKPT --tokenizer $TOK_DEC --work-dir $WORK
 EOF
 )
   detach "$NAME" bash "$f"
   ;;
 select)
   C=$(chunk_of)
+  judge_set "$C"
   only 0
   ready
-  NAME=g4a8_select_${C}_$TAG
-  gsutil -q stat "$G8/$C/select/select.json" && there_before "$NAME" "SELECT8_DONE $C (there before)"
-  X=$W8/select-$C-$TAG
+  NAME=g4a8_select${SN}_${C}_$TAG
+  gsutil -q stat "$SD/select.json" && there_before "$NAME" "SELECT8_DONE $C${SN:+ $SN} (there before)"
+  X=$W8/select$SN-$C-$TAG
+  # the candidates are always §18's (judge/data/cands.parquet); SET only changes whose scores choose
   f=$(body "$NAME" <<EOF
 set -euo pipefail
 $CPU
@@ -313,11 +330,11 @@ mkdir -p $X/samples $X/out
 gsutil -q cp $G8/plan/plan.parquet $X/plan.parquet
 gsutil -m -q rsync -r $G8/$C/samples $X/samples
 gsutil -q cp $G8/$C/judge/data/cands.parquet $X/cands.parquet
-for k in 0 1 2 3; do mkdir -p $X/scores/w\$k && gsutil -m -q cp "$G8/$C/judge/scores/w\$k/shard-*.parquet" $X/scores/w\$k/; done
+for k in 0 1 2 3; do mkdir -p $X/scores/w\$k && gsutil -m -q cp "$JD/scores/w\$k/shard-*.parquet" $X/scores/w\$k/; done
 nice -n 19 $SFT_PY -I -u $CODE/g4arm8.py select --plan $X/plan.parquet --chunk $C --samples $X/samples --cands $X/cands.parquet --scores '$X/scores/w*/shard-*.parquet' --out $X/out
-gsutil -m -q cp $X/out/choice.parquet $X/out/targets.parquet $G8/$C/select/
-gsutil -q cp $X/out/select.json $G8/$C/select/select.json
-echo "SELECT8_DONE $C"
+gsutil -m -q cp $X/out/choice.parquet $X/out/targets.parquet $SD/
+gsutil -q cp $X/out/select.json $SD/select.json
+echo "SELECT8_DONE $C${SN:+ $SN}"
 EOF
 )
   detach "$NAME" bash "$f"
@@ -363,6 +380,62 @@ nice -n 19 $SFT_PY -I -u $CODE/g4arm8.py report --plan $X/plan.parquet$ARGS --ou
 gsutil -q cp $X/out/targets.parquet $G8/targets/targets.parquet
 gsutil -m -q cp $X/out/report.json $X/out/report.md $G8/report/
 echo "REPORT8_DONE $G8/report/report.md"
+EOF
+)
+  detach "$NAME" bash "$f"
+  ;;
+n1pairs)
+  # §21 G4-8-N1.2-3: N1's prompts of §18's judged keys; n1pairs stops unless its rubric prompts are §18's per uid
+  C=$(chunk_of)
+  only 0
+  ready
+  NAME=g4a8_n1pairs_${C}_$TAG
+  gsutil -q stat "$G8/$C/judge-n1/data/n1pairs.json" && there_before "$NAME" "N1PAIRS_DONE $C (there before)"
+  gsutil -q stat "$G8/$C/judge/data/pairs.json" || { echo "no $G8/$C/judge/data/pairs.json (§18's pairs)"; exit 1; }
+  X=$W8/n1pairs-$C-$TAG
+  f=$(body "$NAME" <<EOF
+set -euo pipefail
+$CPU
+mkdir -p $X/samples $X/rubric $X/out
+gsutil -q cp $G8/plan/plan.parquet $X/plan.parquet
+gsutil -m -q rsync -r $G8/$C/samples $X/samples
+gsutil -m -q cp $G8/$C/judge/data/cands.parquet '$G8/$C/judge/data/prompts-w*.parquet' $X/rubric/
+nice -n 19 $SFT_PY -I -u $CODE/g4arm8.py n1pairs --plan $X/plan.parquet --chunk $C --samples $X/samples --cands $X/rubric/cands.parquet --rubric $X/rubric --out $X/out
+gsutil -m -q cp '$X/out/prompts-w*.parquet' $G8/$C/judge-n1/data/
+gsutil -q cp $X/out/n1pairs.json $G8/$C/judge-n1/data/n1pairs.json
+echo "N1PAIRS_DONE $C"
+EOF
+)
+  detach "$NAME" bash "$f"
+  ;;
+n1report)
+  # §21 G4-8-N1.7: N1's choice beside §18's rubric choice, both recomputed from their scores and checked
+  only 0
+  ready
+  NAME=g4a8_n1report_$TAG
+  gsutil -q stat "$G8/n1/report.json" && there_before "$NAME" "N1REPORT_DONE $G8/n1/report.md (there before)"
+  X=$W8/n1report-$TAG
+  ARGS=""
+  for c in $CHUNKS; do ARGS="$ARGS --chunk-dir $c=$X/$c"; done
+  f=$(body "$NAME" <<EOF
+set -euo pipefail
+$CPU
+mkdir -p $X/out
+gsutil -q cp $G8/plan/plan.parquet $X/plan.parquet
+for c in $CHUNKS; do
+  mkdir -p $X/\$c
+  gsutil -m -q cp $G8/\$c/judge/data/cands.parquet $G8/\$c/judge-n1/data/n1pairs.json $G8/\$c/select/choice.parquet $X/\$c/
+  gsutil -q cp $G8/\$c/select-n1/choice.parquet $X/\$c/choice-n1.parquet
+  for k in 0 1 2 3; do
+    mkdir -p $X/\$c/scores/w\$k $X/\$c/scores-n1/w\$k
+    gsutil -m -q cp "$G8/\$c/judge/scores/w\$k/shard-*.parquet" $X/\$c/scores/w\$k/
+    gsutil -m -q cp "$G8/\$c/judge-n1/scores/w\$k/shard-*.parquet" $X/\$c/scores-n1/w\$k/
+  done
+done
+nice -n 19 $SFT_PY -I -u $CODE/g4arm8.py n1report --plan $X/plan.parquet$ARGS --out $X/out
+gsutil -q cp $X/out/report.md $G8/n1/report.md
+gsutil -q cp $X/out/report.json $G8/n1/report.json
+echo "N1REPORT_DONE $G8/n1/report.md"
 EOF
 )
   detach "$NAME" bash "$f"

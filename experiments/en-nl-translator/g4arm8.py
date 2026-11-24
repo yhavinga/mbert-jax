@@ -17,6 +17,12 @@ with the highest P̄(sample better) is the target if that P̄ > 0.5, else the so
     python g4arm8.py v3 --plan P --targets F --out DIR                                 (the blind package G4-8-V3)
     python g4arm8.py report --plan P --chunk-dir C=DIR ... --out DIR                    (report.md/.json, targets.parquet)
 
+§21 (G4-8-data N1-scores, a preparation that decides nothing): the same pairs judged with FB.8's prompt N1 (pairjudge.N1_PROMPT);
+select unchanged on N1's scores; the report beside the rubric's choice of §18:
+    python g4arm8.py n1pairs --plan P --chunk C --samples DIR --cands F --rubric DIR --out DIR   (§18's prompts in DIR)
+    python g4arm8.py n1report --plan P --chunk-dir C=DIR ... --out DIR   (DIR: n1pairs.json, cands.parquet, choice.parquet,
+        choice-n1.parquet, scores/w<k>/shard-*.parquet, scores-n1/w<k>/shard-*.parquet)
+
 G4-8's training (protocol-g4.md §19, a draft until Yeb's sample and O6):
     python g4arm8.py sftset --targets T --plan P --evalsets E --blind B --flan-eval F --g47-pool P --g47-plan P \
         --sft-eval books=F --sft-eval btval=F --sft-eval own=F --tokenizer T --out DIR   (set, smoke set, RL-val)
@@ -31,6 +37,7 @@ All CPU. The texts stay in the bucket and on the VM: no command prints a text; t
 
 import argparse
 import collections
+import hashlib
 import json
 import math
 import random
@@ -701,6 +708,237 @@ def report(args):
     (out / "report.md").write_text(report_text(rep), encoding="utf-8")
     print(f"REPORT8 {json.dumps({'targets': len(targets), 'kept_share': {k: v['kept_share'] for k, v in rep['parts'].items()}})}",
           flush=True)
+
+
+# ---------------------------------------------------------------------------------------------------- §21: N1
+
+PROTOCOL_N1 = "protocol-g4.md §21"
+N1_BINS = 10                               # G4-8-N1.7: P̄ in tenths
+
+
+def shards_sha256(paths):
+    """One sha256 over the (name, sha256) of each file, in the given order"""
+    h = hashlib.sha256()
+    for path in paths:
+        h.update(f"{Path(path).parent.name}/{Path(path).name} {g4rl.file_sha256(path)}\n".encode())
+    return h.hexdigest()
+
+
+def text_digests(rows):
+    return {r["uid"]: hashlib.sha256(r["text"].encode("utf-8")).hexdigest() for r in rows}
+
+
+def judged_keys(cands_rows, sources):
+    """{key: (source id, j)} of the candidates; the key must be <id>/j<j> of the first candidate with its text"""
+    first = {}
+    for r in cands_rows:
+        if r["id"] not in sources:
+            raise SystemExit(f"cands: {r['id']} is not a source of this chunk")
+        if r["candidate"]:
+            i, j = first.get(r["key"], (r["id"], r["j"]))
+            if i != r["id"]:
+                raise SystemExit(f"cands: the key {r['key']} in sources {i} and {r['id']}")
+            first[r["key"]] = (i, min(j, r["j"]))
+    for key, (i, j) in first.items():
+        if key != f"{i}/j{j}":
+            raise SystemExit(f"cands: {key} is not the first sample of its text ({i}/j{j})")
+    return first
+
+
+def n1pairs(args):
+    """G4-8-N1.2-3: N1's prompts of §18's judged keys of one chunk, written only after the rubric prompts of the same
+    inputs are §18's per uid (sha256 of the text) and per worker"""
+    sources = chunk_sources(args.plan, args.chunk)
+    grouped = groups(read_samples8(args.samples), sources)
+    first = judged_keys(read_rows(args.cands, ["id", "j", "candidate", "key"]), sources)
+    rubric, n1 = [], []
+    for key in sorted(first):
+        i, j = first[key]
+        src, hyp = sources[i], grouped[i][j]["hypothesis"]
+        for template, rows in ((pairjudge.PROMPT, rubric), (pairjudge.N1_PROMPT, n1)):
+            rows += [{"uid": u, "text": t} for u, t, _ in
+                     pairjudge.pair_prompts(key, src["en"], hyp, src["hypothesis0"], template)]
+    was = {}
+    for k in range(WORKERS):
+        rows = read_rows(Path(args.rubric) / f"prompts-w{k}.parquet")
+        if any(pairjudge.worker_of(r["uid"]) != k for r in rows):
+            raise SystemExit(f"§18's prompts-w{k}.parquet holds a uid of another worker")
+        for uid, h in text_digests(rows).items():
+            if uid in was:
+                raise SystemExit(f"§18's prompts hold {uid} twice")
+            was[uid] = h
+    now = text_digests(rubric)
+    if was != now:
+        raise SystemExit(f"the rubric prompts of these inputs are not §18's: {sum(was.get(u) != h for u, h in now.items())} "
+                         f"of {len(now)} differ or are new, {len(set(was) - set(now))} of §18's missing")
+    inputs = {"plan": g4rl.file_sha256(args.plan), "cands": g4rl.file_sha256(args.cands),
+              **{f"rubric_prompts_w{k}": g4rl.file_sha256(Path(args.rubric) / f"prompts-w{k}.parquet")
+                 for k in range(WORKERS)},
+              **{f"samples_{d.name}_DONE": g4rl.file_sha256(d / "DONE")
+                 for d in sorted(p for p in Path(args.samples).glob("w*") if p.is_dir())}}
+    out = Path(args.out)
+    workers = pairjudge.write_prompts(n1, out)
+    summary = {"protocol": PROTOCOL_N1, "chunk": args.chunk, "prompt": "n1", "keys": len(first), "prompts": len(n1),
+               "workers": workers, "same_as_18": {"rubric_prompts": len(now)}, "inputs": inputs}
+    (out / "n1pairs.json").write_text(json.dumps(summary, indent=1) + "\n")
+    print(f"N1PAIRS {json.dumps({k: summary[k] for k in ('chunk', 'keys', 'prompts', 'workers', 'same_as_18')})}",
+          flush=True)
+
+
+def p_of_keys(pattern, keys):
+    """{key: P̄ or None (not scored)} from score shards that hold exactly the keys in both orders"""
+    scores = pairjudge.scores_by_uid(pairjudge.read_glob(pattern))
+    want = {f"{k}/{o}" for k in keys for o in pairjudge.ORDERS}
+    if set(scores) != want:
+        raise SystemExit(f"{pattern}: {len(want - set(scores))} prompts missing, {len(set(scores) - want)} extra")
+    return {k: pairjudge.combine(scores[f"{k}/ab"], scores[f"{k}/ba"]) for k in keys}
+
+
+def p_dist(ps):
+    """G4-8-N1.7.3: mean, quartiles, share > 0.5 and the histogram in tenths of P̄ values (None left out)"""
+    ps = sorted(p for p in ps if p is not None)
+    if not ps:
+        return {"n": 0}
+    q = statistics.quantiles(ps, n=4, method="inclusive") if len(ps) > 1 else [ps[0]] * 3
+    hist = collections.Counter(min(int(p * N1_BINS), N1_BINS - 1) for p in ps)
+    return {"n": len(ps), "mean": statistics.fmean(ps), "q1": q[0], "median": q[1], "q3": q[2],
+            "over_half": share(sum(p > ANCHOR_P for p in ps), len(ps)), "hist": [hist.get(b, 0) for b in range(N1_BINS)]}
+
+
+def n1_label(n1, rubric):
+    """G4-8-N1.7.2: N1's choice against the rubric's, from (reason, j) of both"""
+    names = {"sample": "sample", "p": "anker", "none": "geen"}
+    if n1[0] == rubric[0] == "sample":
+        return "sample/" + ("zelfde sample" if n1[1] == rubric[1] else "ander sample")
+    return f"{names[n1[0]]}/{names[rubric[0]]}"
+
+
+def n1report(args):
+    import g4c2
+
+    plan_rows_ = {r["id"]: r for r in read_rows(args.plan, ["id", "part", "chunk"])}
+    rows, keys_rows, inputs, prompts = [], [], {}, {}
+    for spec in args.chunk_dir:
+        c, d = spec.split("=", 1)
+        d = Path(d)
+        info = json.loads((d / "n1pairs.json").read_text())
+        if (info.get("protocol"), info.get("chunk")) != (PROTOCOL_N1, c):
+            raise SystemExit(f"{d / 'n1pairs.json'} is not {PROTOCOL_N1}'s of chunk {c}")
+        if g4rl.file_sha256(d / "cands.parquet") != info["inputs"]["cands"]:
+            raise SystemExit(f"{d / 'cands.parquet'} is not the one n1pairs read")
+        sources = {i: r for i, r in plan_rows_.items() if r["chunk"] == c}
+        cands = collections.defaultdict(list)
+        for r in read_rows(d / "cands.parquet"):
+            cands[r["id"]].append(r)
+        keys = set(judged_keys([r for rs in cands.values() for r in rs], sources))
+        p_r = p_of_keys(str(d / "scores" / "w*" / "shard-*.parquet"), keys)
+        p_n = p_of_keys(str(d / "scores-n1" / "w*" / "shard-*.parquet"), keys)
+        made = {}
+        for name in ("choice.parquet", "choice-n1.parquet"):
+            made[name] = {r["id"]: (r["reason"], r["j"]) for r in read_rows(d / name, ["id", "reason", "j"])}
+            if set(made[name]) != set(sources):
+                raise SystemExit(f"{d / name}: not the {len(sources)} sources of chunk {c}")
+        for i in sorted(sources):
+            rs = sorted(cands[i], key=lambda r: r["j"])
+            got = {}
+            for name, p_of in (("choice.parquet", p_r), ("choice-n1.parquet", p_n)):
+                k, reason = choose8(rs, p_of)
+                got[name] = (reason, -1 if k is None else k["j"])
+                if got[name] != made[name][i]:
+                    raise SystemExit(f"{c} {i}: {name} says {made[name][i]}, the rule on its scores {got[name]}")
+            best = {n: max((p[r["key"]]["A"] for r in rs if r["candidate"] and p[r["key"]] is not None), default=None)
+                    for n, p in (("rubric", p_r), ("n1", p_n))}
+            rows.append({"id": i, "part": sources[i]["part"], "n1": got["choice-n1.parquet"],
+                         "rubric": got["choice.parquet"], "best_n1": best["n1"], "best_rubric": best["rubric"]})
+        part_of = {k: sources[k.rsplit("/j", 1)[0]]["part"] for k in keys}
+        keys_rows += [{"part": part_of[k], "n1": None if p_n[k] is None else p_n[k]["A"],
+                       "rubric": None if p_r[k] is None else p_r[k]["A"]} for k in sorted(keys)]
+        prompts[c] = info["prompts"]
+        inputs[c] = {"n1pairs": info["inputs"],
+                     **{name: g4rl.file_sha256(d / name) for name in ("choice.parquet", "choice-n1.parquet")},
+                     **{f"{s}_shards": shards_sha256(sorted(d.glob(f"{s}/w*/shard-*.parquet")))
+                        for s in ("scores", "scores-n1")}}
+    if sorted(r["id"] for r in rows) != sorted(plan_rows_):
+        raise SystemExit(f"the chunks cover {len(rows)} sources, the plan has {len(plan_rows_)}")
+    rep = {"protocol": PROTOCOL_N1, "chunks": sorted(prompts), "prompts": prompts, "inputs": inputs, "parts": {}}
+    for name in ("samen", *PARTS8):
+        rs = [r for r in rows if name == "samen" or r["part"] == name]
+        ks = [r for r in keys_rows if name == "samen" or r["part"] == name]
+        both = [(r["n1"], r["rubric"]) for r in ks if r["n1"] is not None and r["rubric"] is not None]
+        judged = [r for r in rs if r["n1"][0] != "none" or r["rubric"][0] != "none"]
+        rep["parts"][name] = {
+            "sources": len(rs), "judged": len(judged),
+            "n1_kept": sum(r["n1"][0] == "sample" for r in rs),
+            "n1_kept_share": share(sum(r["n1"][0] == "sample" for r in rs), len(rs)),
+            "n1_kept_share_judged": share(sum(r["n1"][0] == "sample" for r in rs), len(judged)),
+            "rubric_kept": sum(r["rubric"][0] == "sample" for r in rs),
+            "rubric_kept_share": share(sum(r["rubric"][0] == "sample" for r in rs), len(rs)),
+            "not_scored": {"n1": sum(r["n1"] is None for r in ks), "rubric": sum(r["rubric"] is None for r in ks)},
+            "overlap": dict(sorted(collections.Counter(n1_label(r["n1"], r["rubric"]) for r in judged).items())),
+            "p_keys": {"n1": p_dist(r["n1"] for r in ks), "rubric": p_dist(r["rubric"] for r in ks)},
+            "p_best": {"n1": p_dist(r["best_n1"] for r in rs), "rubric": p_dist(r["best_rubric"] for r in rs)},
+            "spearman_keys": g4c2.spearman([a for a, _ in both], [b for _, b in both]), "keys_both": len(both)}
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "report.json").write_text(json.dumps(rep, indent=1) + "\n")
+    (out / "report.md").write_text(n1report_text(rep), encoding="utf-8")
+    print(f"N1REPORT {json.dumps({k: {m: v[m] for m in ('sources', 'n1_kept', 'rubric_kept', 'overlap')} for k, v in rep['parts'].items()})}",
+          flush=True)
+
+
+N1_OVERLAP = (("sample/zelfde sample", "N1 kiest een sample, de rubriek hetzelfde"),
+              ("sample/ander sample", "N1 kiest een sample, de rubriek een ander"),
+              ("sample/anker", "N1 kiest een sample, de rubriek het anker"),
+              ("anker/sample", "N1 kiest het anker, de rubriek een sample"),
+              ("anker/anker", "beide het anker"))
+N1_PART_NAMES = {"samen": "samen", "flan": "FLAN", "novels": "romans", "bt": "BT"}
+
+
+def n1report_text(r):
+    names = list(r["parts"])
+    head = ["| maat | " + " | ".join(N1_PART_NAMES[n] for n in names) + " |", "|---|" + "---|" * len(names)]
+
+    def row(label, f):
+        return f"| {label} | " + " | ".join(f(r["parts"][n]) for n in names) + " |"
+
+    def count(x):
+        return f"{x:,}".replace(",", ".")
+
+    lines = [f"# G4-8-data N1-scores: voorbereiding, beslist niets ({r['protocol']})", "",
+             "Alleen tellingen en scores; geen tekst gelezen. Dezelfde paren als de rubriek-scoring van §18 (kandidaat = "
+             "geen fail, QE ≤ QE₀, anders dan het anker; A = sample, B = anker, beide volgordes), beoordeeld met de "
+             "natuurlijkheidsprompt N1 van §20 FB.8. Keuze per bron: de kandidaat met de hoogste P̄ als P̄ > 0,5, anders "
+             "het anker (de regel van G4-8-data.6, voor N1 en voor de rubriek).", "", "## Keuzes", ""] + head
+    lines += [row("bronnen", lambda p: count(p["sources"])),
+              row("bronnen met een beoordeelde kandidaat", lambda p: count(p["judged"])),
+              row("**N1 zet een sample boven het anker (P̄ > 0,5, QE ≤ QE₀)**",
+                  lambda p: f"{count(p['n1_kept'])} ({pc(p['n1_kept_share'])})"),
+              row("idem, van de bronnen met een kandidaat", lambda p: pc(p["n1_kept_share_judged"])),
+              row("rubriek (§18) zet een sample boven het anker", lambda p: f"{count(p['rubric_kept'])} ({pc(p['rubric_kept_share'])})"),
+              row("niet gescoorde teksten (N1 / rubriek)", lambda p: f"{p['not_scored']['n1']} / {p['not_scored']['rubric']}")]
+    lines += ["", "## Overlap met de rubriekkeuze van §18 (bronnen met een beoordeelde kandidaat)", ""] + head
+    for key, label in N1_OVERLAP:
+        lines.append(row(label, lambda p, key=key: f"{count(p['overlap'].get(key, 0))} ({pc(share(p['overlap'].get(key, 0), p['judged']))})"))
+    rest = sorted({k for p in r["parts"].values() for k in p["overlap"]} - {k for k, _ in N1_OVERLAP})
+    for key in rest:
+        lines.append(row(f"overig: {key}", lambda p, key=key: count(p["overlap"].get(key, 0))))
+    lines += ["", "## Verdeling van P̄(sample beter dan het anker)", "",
+              "Per beoordeelde tekst (sleutel) en de hoogste per bron; kwartielen inclusief; histogram in tienden "
+              "[0,0–0,1) … [0,9–1,0].", "", "| deel | wat | prompt | n | gemiddeld | Q1 | mediaan | Q3 | > 0,5 | histogram |",
+              "|---|---|---|---|---|---|---|---|---|---|"]
+    for n in names:
+        for what, label in (("p_keys", "per tekst"), ("p_best", "hoogste per bron")):
+            for prompt in ("n1", "rubric"):
+                x = r["parts"][n][what][prompt]
+                lines.append(f"| {N1_PART_NAMES[n]} | {label} | {'N1' if prompt == 'n1' else 'rubriek'} | {count(x['n'])} | "
+                             f"{nl(x.get('mean'))} | {nl(x.get('q1'))} | {nl(x.get('median'))} | {nl(x.get('q3'))} | "
+                             f"{pc(x.get('over_half'))} | {' '.join(map(str, x.get('hist', [])))} |")
+    lines += ["", "Spearman tussen P̄_N1 en P̄_rubriek per tekst: " + "; ".join(
+        f"{N1_PART_NAMES[n]} {nl(r['parts'][n]['spearman_keys'])} (n {count(r['parts'][n]['keys_both'])})" for n in names) + ".",
+              "", "N1-prompts per deel: " + ", ".join(f"{c} {count(k)}" for c, k in r["prompts"].items()) + ".", "",
+              "Wat het niet zegt (§21 G4-8-N1.8): N1 sluit juistheid uit; de enige juistheidsbewaking is fail + QE ≤ QE₀. "
+              "De tellingen zeggen hoe vaak N1 en de rubriek hetzelfde kiezen, niet welke keuze beter is. Beslist niets.", ""]
+    return "\n".join(lines)
 
 
 def nl(x, digits=3):
@@ -1425,6 +1663,14 @@ def main(argv=None):
     a.add_argument("--chunk-dir", action="append", required=True,
                    help="CHUNK=DIR with choice.parquet, targets.parquet, cands.parquet, pairs.json")
     a.add_argument("--out", required=True)
+    a = sub.add_parser("n1pairs")
+    for name in ("plan", "chunk", "samples", "cands", "rubric", "out"):
+        a.add_argument(f"--{name}", required=True)
+    a = sub.add_parser("n1report")
+    a.add_argument("--plan", required=True)
+    a.add_argument("--chunk-dir", action="append", required=True,
+                   help="CHUNK=DIR with n1pairs.json, cands.parquet, choice.parquet, choice-n1.parquet, scores/, scores-n1/")
+    a.add_argument("--out", required=True)
     a = sub.add_parser("sftset")
     for name in ("targets", "plan", "evalsets", "blind", "flan-eval", "g47-pool", "g47-plan", "tokenizer", "out"):
         a.add_argument(f"--{name}", required=True)
@@ -1455,7 +1701,7 @@ def main(argv=None):
     if getattr(args, "chunk", None) is not None and args.chunk not in dict(CHUNKS8):
         raise SystemExit(f"--chunk {args.chunk}: one of {[c for c, _ in CHUNKS8]}")
     {"fresh": fresh, "plan": plan, "qepairs": qepairs, "pairs": pairs, "select": select, "v3": v3,
-     "report": report, "sftset": sftset, "smoke8": smoke8, "trained": trained, "loraline": loraline,
+     "report": report, "n1pairs": n1pairs, "n1report": n1report, "sftset": sftset, "smoke8": smoke8, "trained": trained, "loraline": loraline,
      "report8": report8}[args.cmd](args)
 
 

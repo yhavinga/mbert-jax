@@ -492,3 +492,187 @@ def test_run_g4arm8_stages_render_their_jobs(tmp_path):
     job = (home / "job_g4a8_report_x1.sh").read_text()
     assert job.startswith("bash ")
     assert re.search(r"/data/G4-8/fresh/", (home / "job_body_g4a8_fresh_f1.sh").read_text())
+
+
+# ---------------------------------------------------------------------------------------------------- §21: N1
+
+def test_section_21s_prompt_is_fb8s_n1_letter_for_letter():
+    import pairjudge as pj
+
+    text = (CODE / "protocol-g4.md").read_text(encoding="utf-8")
+    section = text[text.index("## 21. G4-8-data N1-scores"):]
+    block = re.search(r"\*G4-8-N1\.4 Prompt N1\*.*?```\n(.*?)\n```", section, re.S).group(1)
+    assert block == pj.N1_PROMPT and g8.PROTOCOL_N1 == "protocol-g4.md §21"
+
+
+def n1_world(tmp_path):
+    """chunk_world through §18's pairs and select (rubric scores as in the test above), the plan of c1 alone"""
+    plan, qe = chunk_world(tmp_path)
+    for w, ids in (("w0", "AB"), ("w1", "CDE")):
+        pq.write_table(pa.Table.from_pylist([{"id": u, "qe_source_hypothesis": v} for u, v in qe.items() if u[0] in ids]),
+                       tmp_path / f"qe-{w}.parquet")
+    pairs = tmp_path / "pairs"
+    g8.main(["pairs", "--plan", str(plan), "--chunk", "c1", "--samples", str(tmp_path / "samples"),
+             "--qe", str(tmp_path / "qe-w*.parquet"), "--out", str(pairs)])
+    prompts = [r for k in range(4) for r in pq.read_table(pairs / f"prompts-w{k}.parquet").to_pylist()]
+    rubric = {"A/j0": 0.6, "A/j1": 0.8, "A/j7": 0.7, "B/j0": 0.45, "B/j1": 0.40, "D/j0": 0.9, "D/j5": 0.9, "E/j2": 0.6}
+    (tmp_path / "scores/w0").mkdir(parents=True)
+    pq.write_table(pa.Table.from_pylist(judge_scores(prompts, rubric, skipped=("E/j0",))),
+                   tmp_path / "scores/w0/shard-00000.parquet")
+    g8.main(["select", "--plan", str(plan), "--chunk", "c1", "--samples", str(tmp_path / "samples"), "--cands",
+             str(pairs / "cands.parquet"), "--scores", str(tmp_path / "scores/w*/shard-*.parquet"), "--out",
+             str(tmp_path / "select")])
+    small_plan = tmp_path / "plan-c1.parquet"
+    g8.write_parquet([r for r in pq.read_table(plan).to_pylist() if r["chunk"] == "c1"], small_plan, g8.PLAN_SCHEMA)
+    return plan, small_plan, pairs
+
+
+def test_n1pairs_takes_18s_pairs_and_stops_on_any_difference_with_its_prompts(tmp_path):
+    import pairjudge as pj
+
+    plan, _, pairs = n1_world(tmp_path)
+
+    def n1pairs(rubric, out):
+        g8.main(["n1pairs", "--plan", str(plan), "--chunk", "c1", "--samples", str(tmp_path / "samples"), "--cands",
+                 str(pairs / "cands.parquet"), "--rubric", str(rubric), "--out", str(tmp_path / out)])
+
+    n1pairs(pairs, "n1")
+    rubric = {r["uid"]: (k, r["text"]) for k in range(4) for r in pq.read_table(pairs / f"prompts-w{k}.parquet").to_pylist()}
+    n1 = {r["uid"]: (k, r["text"]) for k in range(4)
+          for r in pq.read_table(tmp_path / "n1" / f"prompts-w{k}.parquet").to_pylist()}
+    # the same uids on the same workers, N1's text with the same source, sample (A in ab) and anchor
+    assert set(n1) == set(rubric) and all(n1[u][0] == rubric[u][0] for u in n1)
+    assert n1["A/j0/ab"][1] == pj.user_text("source A in English", "a0", "anker A", pj.N1_PROMPT)
+    assert n1["A/j0/ba"][1] == pj.user_text("source A in English", "anker A", "a0", pj.N1_PROMPT)
+    assert "Vertaling A" not in n1["D/j5/ab"][1] and "Tekst A:\nd5\n\nTekst B:\nanker D" in n1["D/j5/ab"][1]
+    info = json.loads((tmp_path / "n1/n1pairs.json").read_text())
+    assert info["protocol"] == "protocol-g4.md §21" and info["keys"] == 9 and info["prompts"] == 18
+    assert info["same_as_18"] == {"rubric_prompts": 18}
+    assert info["inputs"]["cands"] == g4rl.file_sha256(pairs / "cands.parquet")
+    assert set(info["inputs"]) == {"plan", "cands", "samples_w0_DONE", "samples_w1_DONE",
+                                   *(f"rubric_prompts_w{k}" for k in range(4))}
+
+    def tampered(name, change):
+        d = tmp_path / name
+        d.mkdir()
+        for k in range(4):
+            rows = pq.read_table(pairs / f"prompts-w{k}.parquet").to_pylist()
+            pq.write_table(pa.Table.from_pylist(change(k, rows), schema=pa.schema([("uid", pa.string()), ("text", pa.string())])),
+                           d / f"prompts-w{k}.parquet")
+        return d
+
+    one = sorted(rubric)[0]
+    k1 = rubric[one][0]
+    cases = (
+        ("text", lambda k, rows: [{**r, "text": r["text"] + " "} if r["uid"] == one else r for r in rows], "1 of 18 differ"),
+        ("missing", lambda k, rows: [r for r in rows if r["uid"] != one], "1 of 18 differ or are new"),
+        ("extra", lambda k, rows: rows + ([{"uid": "X/j0/ab", "text": "x"}] if k == pj.worker_of("X/j0/ab") else []),
+         "1 of §18's missing"),
+        ("worker", lambda k, rows: rows + ([{"uid": one, "text": rubric[one][1]}] if k == (k1 + 1) % 4 else []),
+         "a uid of another worker"))
+    for name, change, message in cases:
+        with pytest.raises(SystemExit, match=message):
+            n1pairs(tampered(name, change), f"out-{name}")
+        assert not (tmp_path / f"out-{name}").exists()
+
+
+def test_n1report_counts_n1s_choice_beside_the_rubrics_and_checks_both(tmp_path):
+    plan, small_plan, pairs = n1_world(tmp_path)
+    g8.main(["n1pairs", "--plan", str(plan), "--chunk", "c1", "--samples", str(tmp_path / "samples"), "--cands",
+             str(pairs / "cands.parquet"), "--rubric", str(pairs), "--out", str(tmp_path / "n1")])
+    n1_prompts = [r for k in range(4) for r in pq.read_table(tmp_path / "n1" / f"prompts-w{k}.parquet").to_pylist()]
+    # N1: A another sample than the rubric's j1, B a sample where the rubric kept the anchor, D the same j5, E the anchor
+    n1 = {"A/j0": 0.9, "A/j1": 0.3, "A/j7": 0.2, "B/j0": 0.7, "B/j1": 0.2, "D/j0": 0.6, "D/j5": 0.7, "E/j0": 0.4,
+          "E/j2": 0.45}
+    (tmp_path / "scores-n1/w0").mkdir(parents=True)
+    pq.write_table(pa.Table.from_pylist(judge_scores(n1_prompts, n1)), tmp_path / "scores-n1/w0/shard-00000.parquet")
+    g8.main(["select", "--plan", str(plan), "--chunk", "c1", "--samples", str(tmp_path / "samples"), "--cands",
+             str(pairs / "cands.parquet"), "--scores", str(tmp_path / "scores-n1/w*/shard-*.parquet"), "--out",
+             str(tmp_path / "select-n1")])
+    choice_n1 = {r["id"]: (r["reason"], r["j"]) for r in pq.read_table(tmp_path / "select-n1/choice.parquet").to_pylist()}
+    assert choice_n1 == {"A": ("sample", 0), "B": ("sample", 0), "C": ("none", -1), "D": ("sample", 5), "E": ("p", -1)}
+    d = tmp_path / "c1"
+    for sub in ("scores/w0", "scores-n1/w0"):
+        (d / sub).mkdir(parents=True)
+        (d / sub / "shard-00000.parquet").write_bytes((tmp_path / sub / "shard-00000.parquet").read_bytes())
+    for src, name in ((pairs / "cands.parquet", "cands.parquet"), (tmp_path / "n1/n1pairs.json", "n1pairs.json"),
+                      (tmp_path / "select/choice.parquet", "choice.parquet"),
+                      (tmp_path / "select-n1/choice.parquet", "choice-n1.parquet")):
+        (d / name).write_bytes(src.read_bytes())
+
+    def report(out, plan_=small_plan):
+        g8.main(["n1report", "--plan", str(plan_), "--chunk-dir", f"c1={d}", "--out", str(tmp_path / out)])
+        return json.loads((tmp_path / out / "report.json").read_text())
+
+    r = report("report")
+    s = r["parts"]["samen"]
+    assert (s["sources"], s["judged"], s["n1_kept"], s["rubric_kept"]) == (5, 4, 3, 3)
+    assert s["n1_kept_share"] == pytest.approx(0.6) and s["n1_kept_share_judged"] == pytest.approx(0.75)
+    assert s["overlap"] == {"sample/ander sample": 1, "sample/anker": 1, "sample/zelfde sample": 1, "anker/sample": 1}
+    assert s["not_scored"] == {"n1": 0, "rubric": 1}
+    assert s["p_keys"]["n1"]["n"] == 9 and s["p_keys"]["n1"]["hist"] == [0, 0, 2, 1, 2, 0, 1, 2, 0, 1]
+    assert s["p_keys"]["n1"]["over_half"] == pytest.approx(4 / 9) and s["p_keys"]["rubric"]["n"] == 8
+    assert s["p_best"]["n1"]["n"] == 4 and s["p_best"]["n1"]["mean"] == pytest.approx((0.9 + 0.7 + 0.7 + 0.45) / 4)
+    assert s["keys_both"] == 8 and s["spearman_keys"] is not None
+    assert r["parts"]["bt"]["overlap"] == {"sample/anker": 1, "sample/zelfde sample": 1}
+    assert r["parts"]["novels"]["n1_kept"] == 1 and r["parts"]["flan"]["judged"] == 0
+    assert r["prompts"] == {"c1": 18} and set(r["inputs"]["c1"]) == {"n1pairs", "choice.parquet", "choice-n1.parquet",
+                                                                      "scores_shards", "scores-n1_shards"}
+    md = (tmp_path / "report/report.md").read_text()
+    assert "N1 zet een sample boven het anker" in md and "| 3 (60,0%) |" in md
+    assert not any(t in md for t in ("anker A", "source A", "a0", "d5 ", "e2"))
+    # §18's choice that is not the rule on its scores, the other chunk of the plan, another cands.parquet: refused
+    rows = pq.read_table(d / "choice.parquet").to_pylist()
+    pq.write_table(pa.Table.from_pylist([{**x, "j": 7} if x["id"] == "A" else x for x in rows]), d / "choice.parquet")
+    with pytest.raises(SystemExit, match="c1 A: choice.parquet says"):
+        report("bad1")
+    (d / "choice.parquet").write_bytes((tmp_path / "select/choice.parquet").read_bytes())
+    with pytest.raises(SystemExit, match="the plan has 6"):
+        report("bad2", plan)
+    pq.write_table(pq.read_table(d / "cands.parquet").slice(0, 39), d / "cands.parquet")
+    with pytest.raises(SystemExit, match="not the one n1pairs read"):
+        report("bad3")
+
+
+def test_run_g4arm8_n1_stages_render_their_jobs(tmp_path):
+    run, body, put, home, g8dir = g8_world(tmp_path)
+    out = run("n1pairs", CHUNK="c2", TAG="n1")
+    assert out.returncode != 0 and "/c2/judge/data/pairs.json" in out.stdout
+    put("sft/g4arm/data/G4-8/c2/judge/data/pairs.json")
+    out = run("n1pairs", CHUNK="c2", TAG="n2")
+    assert out.returncode == 0 and "started g4a8_n1pairs_c2_n2 on w0" in out.stdout, out.stdout + out.stderr
+    b = body("g4a8_n1pairs_c2_n2")
+    assert "g4arm8.py n1pairs --plan" in b and "--chunk c2" in b and "/c2/judge/data/prompts-w*.parquet'" in b
+    assert "/c2/judge-n1/data/n1pairs.json" in b and "rm " not in b
+    assert b.index("prompts-w*.parquet' /") < b.index("judge-n1/data/n1pairs.json")
+    assert run("n1pairs", host="1", CHUNK="c2", TAG="n3").stdout.strip().endswith("runs on w0 only")
+    # the judge with SET=n1: N1's prompts and scores; without n1pairs.json it refuses; another SET is refused
+    put("sft/g4arm/data/G4-8/c2/judge-n1/data/prompts-w1.parquet")
+    out = run("judge", host="1", CHUNK="c2", SET="n1", TAG="j1")
+    assert out.returncode != 0 and "/c2/judge-n1/data/n1pairs.json" in out.stdout
+    put("sft/g4arm/data/G4-8/c2/judge-n1/data/n1pairs.json")
+    out = run("judge", host="1", CHUNK="c2", SET="n1", TAG="j2")
+    assert out.returncode == 0 and "started g4a8_judgen1_c2_j2 on w1" in out.stdout, out.stdout + out.stderr
+    b = body("g4a8_judgen1_c2_j2")
+    assert "/c2/judge-n1/data/prompts-w1.parquet " in b and "--out gs://" in b and "/c2/judge-n1/scores/w1 " in b
+    assert "pairjudge.py score --prompts" in b and "/c2/judge/" not in b
+    out = run("judge", host="1", CHUNK="c2", SET="n2", TAG="j3")
+    assert out.returncode != 0 and "not n2" in out.stdout
+    # select with SET=n1: §18's candidates, N1's scores, its own output
+    out = run("select", CHUNK="c2", SET="n1", TAG="s1")
+    assert out.returncode == 0 and "started g4a8_selectn1_c2_s1 on w0" in out.stdout, out.stdout + out.stderr
+    b = body("g4a8_selectn1_c2_s1")
+    assert "/c2/judge/data/cands.parquet " in b and '/c2/judge-n1/scores/w$k/shard-*.parquet' in b
+    assert "/c2/select-n1/select.json" in b and "/c2/select/" not in b and "/c2/judge/scores" not in b
+    put("sft/g4arm/data/G4-8/c2/select-n1/select.json")
+    out = run("select", CHUNK="c2", SET="n1", TAG="s2")
+    assert "there before" in body("g4a8_selectn1_c2_s2")
+    # §18's select still writes its own place
+    out = run("select", CHUNK="c3", TAG="s3")
+    b = body("g4a8_select_c3_s3")
+    assert "/c3/select/select.json" in b and '/c3/judge/scores/w$k/shard-*.parquet' in b and "-n1" not in b
+    out = run("n1report", TAG="r1")
+    assert out.returncode == 0 and "started g4a8_n1report_r1 on w0" in out.stdout, out.stdout + out.stderr
+    b = body("g4a8_n1report_r1")
+    assert b.count("--chunk-dir ") == 3 and "g4arm8.py n1report" in b and "/G4-8/n1/report.json" in b
+    assert "/select-n1/choice.parquet" in b and "choice-n1.parquet" in b and "/judge-n1/scores/w" in b

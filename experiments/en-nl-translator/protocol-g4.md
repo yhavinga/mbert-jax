@@ -2746,3 +2746,112 @@ Welke tekst is oorspronkelijk in het Nederlands geschreven? Antwoord met één w
   TPU van de worker(s) vrij. Volgorde: `setup` (`ARM=G4-bon`), `fbndata` N1 en N2 (w0, CPU), `score` `SET=fbn1` en
   `SET=fbn2` (4 workers), `fbnreport` (w0, CPU). Markers `$G/stages/g4-judge/fbn-*.done`; niets wat §16–§20 schreven
   wordt overschreven. Elke stap eindigt op `EXIT 0`, anders `FAILED` en stoppen. [schatting] ~25–35 min.
+
+## 21. G4-8-data N1-scores: voorbereiding, beslist niets
+
+**Vastgelegd 24 nov 2026 (tijdstip: de commit van deze sectie op branch `en-nl-g4arm8`)**, vóór elke stap op een worker
+en vóór elke uitslag van deze scoring [besluit van de hoofdsessie 24 nov ~05:20, Yeb sliep: mbert-mix bezig houden met
+veilig voorbereidend werk; uitwerking door een subagent]. Vooraf gelezen: alleen tellingen (de logregels `PAIRS8`,
+`SELECT8` en `PROMPTS`/`SCORED` van run `g4d8a1123a`, het rapport `g4-8-data.md` van §18 en het rapport
+`g4-judge-naturalness-prompts.md` van FB.8); geen tekst (sample, anker, bron) en geen score van deze scoring. Een
+scoring, geen arm: er wordt niets getraind, niets gesampled, niets vertaald en niets beslist. Claude en GPT zijn geen
+judge of generator. FLAN blijft gemaximeerd zoals in §18 (besluit Yeb); deze scoring verandert geen verdeling.
+`G8=$G/data/G4-8`.
+
+*G4-8-N1.1 Doel.* Als Yeb voor een volgende arm kiest met "QE als juistheidsbewaker + natuurlijkheidsjudge als
+selectie", liggen de oordelen van de natuurlijkheidsprompt N1 (§20 FB.8) op de bestaande G4-8-paren er al. Deze sectie
+legt alleen vast hoe die oordelen gemaakt en geteld worden.
+
+*G4-8-N1.2 Paren* (dezelfde als de rubriek-scoring van §18; er wordt niets getrokken, gesampled of met QE gescoord).
+Per deel `c1`, `c2`, `c3` de kandidaten van §18 (G4-8-data.4) zoals ze in `$G8/<c>/judge/data/cands.parquet` staan:
+geen fail, QE ≤ QE₀ (+ 1e-9), tekstueel anders dan het anker; gelijke genormaliseerde teksten binnen een bron één keer,
+met de sleutel `<id>/j<j>` van het eerste sample. Per sleutel beide volgordes met de uids van §18, `<id>/j<j>/ab` en
+`<id>/j<j>/ba`; kader `ab`: A = het sample, B = het anker (G4-0 greedy, `hypothesis0` van `$G8/plan/plan.parquet`);
+`{bron}` = het Engels (`en`) van de bron. De teksten komen uit `$G8/plan/plan.parquet` en de samples
+`$G8/<c>/samples/`. [gemeten, log `g4d8a1123a`] 158.506 prompts: `c1` 26.484, `c2` 65.978, `c3` 66.044.
+
+*G4-8-N1.3 Controles* (`g4arm8.py n1pairs`; een afwijking stopt vóór er iets geschreven wordt).
+1. **Zelfde paren als §18**: n1pairs bouwt uit dezelfde invoer ook de prompts van G4-judge.3 (de rubriek) en vergelijkt
+   ze per uid (sha256 van de tekst) met §18's `$G8/<c>/judge/data/prompts-w<k>.parquet`: dezelfde verzameling uids,
+   geen ontbrekende of extra, elke tekst gelijk, elke uid op dezelfde worker (`pairjudge.worker_of`). Daarmee zijn per
+   uid bron, sample, anker en volgorde die van §18, en staat elke N1-prompt op de worker van zijn rubriekprompt.
+2. Elke sleutel in `cands.parquet` is het eerste sample met zijn genormaliseerde tekst (als `pairs` van §18), en de
+   sleutels horen bij bronnen van dat deel.
+3. **sha256 van de invoer**: `plan.parquet`, `cands.parquet`, §18's `prompts-w<k>.parquet` en de sampleshards (per
+   bestand) in `$G8/<c>/judge-n1/data/n1pairs.json`. `n1report` stopt als de `cands.parquet` die het leest een andere
+   sha256 heeft dan in n1pairs.json, en legt de sha256 van zijn eigen invoer (§18's `choice.parquet`, de scoreshards
+   van rubriek en N1, de N1-`choice.parquet`) vast in `report.json`.
+4. **De rubriekkeuze van §18 opnieuw**: `n1report` berekent uit §18's scores (`$G8/<c>/judge/scores/`) met de regel van
+   G4-8-data.6 de keuze opnieuw en vergelijkt per bron (reden en sample) met §18's `select/choice.parquet`; een
+   verschil stopt.
+5. De N1-scores dekken precies de sleutels × 2 volgordes (als `select` van §18: ontbrekend of extra stopt).
+
+*G4-8-N1.4 Prompt N1*, letterlijk FB.8 (`pairjudge.N1_PROMPT`, commit `49bcc96`; de tekst van de gebruikersbeurt;
+`{bron}`, `{A}` en `{B}` gestript ingevuld; verder als G4-judge.2: hetzelfde chat-template met één gebruikersbeurt en
+een lege denkruimte):
+
+```
+Je krijgt een Engelse bron en twee Nederlandse teksten, A en B, met ongeveer dezelfde inhoud.
+
+Oordeel alleen op natuurlijk, oorspronkelijk klinkend Nederlands: welke tekst leest het meest als tekst die oorspronkelijk in het Nederlands is geschreven, en het minst als een vertaling? Laat juistheid uitdrukkelijk buiten beschouwing: weglatingen, toevoegingen en afwijkingen van de Engelse bron tellen niet mee. "gelijk" als er geen duidelijk verschil is.
+
+Engelse bron:
+{bron}
+
+Tekst A:
+{A}
+
+Tekst B:
+{B}
+
+Welke tekst leest het meest als oorspronkelijk Nederlands? Antwoord met één woord: A, B of gelijk.
+```
+
+*G4-8-N1.5 Scoren.* Als G4-8-data.5: `pairjudge.py score` ongewijzigd (Gemma 4 31B-it @ `842da37`, de
+MaxText-omzetting, één prefill, P(A)/P(B)/P(gelijk) uit de logits van de eerste antwoordpositie met de ids van
+G4-judge.2, beide volgordes, P̄ gemiddeld volgens G4-judge.4 met `pairjudge.combine`), prompts over de 4 workers van
+mbert-mix op sha256 van de uid. P̄_N1(sample) = P̄(A) in kader `ab`: "het sample leest meer als oorspronkelijk
+Nederlands dan het anker". Een prompt van meer dan 4.096 tokens wordt niet gescoord (geteld; die kandidaat valt af,
+als §18).
+
+*G4-8-N1.6 Keuze met N1 (ter voorbereiding).* `g4arm8.py select` ongewijzigd met de N1-scores: per bron k = de
+kandidaat met de hoogste P̄_N1 (gelijk: de lagere QE, dan het eerdere sample); k is de N1-keuze als P̄_N1(k) > 0,5,
+anders kiest N1 het anker; zonder kandidaat geen keuze. Uitvoer `$G8/<c>/select-n1/` (`choice.parquet`,
+`targets.parquet`, `select.json`). Dit is geen trainingsset: of en hoe een volgende arm deze keuze gebruikt, beslist Yeb.
+
+*G4-8-N1.7 Rapport* (`g4arm8.py n1report`; per deel FLAN / romans / BT en samen; alleen tellingen en scores, geen tekst).
+1. Bronnen; bronnen met minstens één beoordeelde kandidaat; **bronnen met een sample dat N1 boven het anker zet
+   (P̄_N1 > 0,5) met QE ≤ QE₀** (aantal en aandeel), met ernaast hetzelfde voor de rubriek (§18); niet gescoorde
+   kandidaten.
+2. **Overlap met de rubriekkeuze van §18** (per bron met een kandidaat): N1 kiest een sample en de rubriek koos
+   hetzelfde sample / een ander sample / het anker; N1 kiest het anker en de rubriek koos een sample / ook het anker.
+3. **Verdeling van P̄_N1(sample)**: per beoordeelde tekst (sleutel) en de hoogste per bron: gemiddelde, kwartielen,
+   aandeel > 0,5 en een histogram in tienden; de rubriek-P̄ van dezelfde sleutels ernaast; de samenhang per sleutel
+   (Spearman tussen P̄_N1 en P̄_rubriek).
+Naar `$G8/n1/report.md`/`.json`, kopie `mbert-ops/translator-sft/g4-8-data-n1.md` (`.json`).
+
+*G4-8-N1.8 Wat het niet zegt.*
+- N1 vraagt alleen naar natuurlijkheid en sluit juistheid uitdrukkelijk uit. De enige juistheidsbewaking is die van §18:
+  de fail-filters en QE ≤ QE₀ (MetricX-24-QE, een automatische maat zonder referentie). Een N1-keuze kan dus een
+  betekenisfout hebben die QE niet ziet.
+- N1 is alleen op FB.8's 1.000 paren bekeken (fictie mens/G4-0 en BT origineel/rondgang): daar zette hij de menselijke
+  of oorspronkelijke kant vaker boven de machinekant. Dat is een andere vraag dan kiezen tussen samples van hetzelfde
+  model; of N1 tussen G4-0's samples de natuurlijkere kiest, is niet gemeten.
+- De judge is hetzelfde model als de generator (Gemma 4 31B-it): een voorkeur voor de eigen stijl is niet te scheiden.
+- Geen menselijke of blinde beoordeling van de N1-keuzes, geen training, geen evaluatie. De tellingen zeggen hoe vaak N1
+  en de rubriek hetzelfde kiezen, niet welke keuze beter is. Eén formulering, zero-shot; geen drempel buiten P̄ > 0,5
+  van G4-8-data.6. Beslist niets over een volgende arm.
+
+*G4-8-N1.9 Uitvoer.* Per deel `$G8/<c>/judge-n1/data/` (`prompts-w<k>.parquet`, `n1pairs.json`),
+`$G8/<c>/judge-n1/scores/w<k>/`, `$G8/<c>/select-n1/`; `$G8/n1/report.md`/`.json`; markers `$G/stages/g4-8-n1/`. Niets
+wat §18–§20 schreven wordt overschreven. Prompts en teksten blijven in de bucket en op de VM.
+
+*G4-8-N1.10 Keten* (`mbert-ops/scripts/g4arm8_n1_run.sh`, kopie in `gs://t5-dutch-english-usc2/hammond/scratch-scripts/`;
+code `g4arm8.py n1pairs|select|n1report` en `run_g4arm8.sh n1pairs|judge SET=n1|select SET=n1|n1report` op
+`en-nl-g4arm8`). Alleen mbert-mix; `final_eval_mix.lock` met `flock` tot het eind; mbert-corpus (T3) wordt niet
+aangeraakt. Code als bundel via de bucket naar de 4 workers; elke ssh met `timeout 900` en de ssh-opties van
+G4-judge.10; vóór elke TPU-stap de TPU van de worker(s) vrij. Volgorde: `setup` (`run_g4arm.sh setup`, `ARM=G4-bon`);
+per deel `c1`, `c2`, `c3`: `n1pairs` (w0, CPU), `judge` met `SET=n1` (4 workers), `select` met `SET=n1` (w0, CPU); tot
+slot `n1report` (w0, CPU). Elke stap eindigt op `EXIT 0`, anders `FAILED` en stoppen; een gemarkeerde stap wordt bij een
+herstart overgeslagen. [schatting] ~2–2,5 u: §18's rubriek-scoring van dezelfde prompts duurde 20 / 45 / 45 min
+(`c1` / `c2` / `c3`, gemeten in de log van `g4d8a1123a`); N1 is korter dan de rubriekprompt.

@@ -320,3 +320,168 @@ def test_texts_cands_choose_and_report(tmp_path, monkeypatch, capsys):
     gp.write(rows, t / "scores" / "qe-w0.parquet")
     with pytest.raises(SystemExit, match="QE reproduction deviates"):
         gp.report(args)
+
+
+# ---------------------------------------------------------------------------------------------------- §25 blind packages
+
+def test_the_blind_packages_are_fixed_as_section_25_has_it():
+    text = (CODE / "protocol-g4.md").read_text(encoding="utf-8")
+    section = text[text.index("## 25. Twee blinde pakketten"):]
+    assert "`S25=en-nl-g4arm/0/G4-blind25`" in section and gp.BLIND_SEED == "en-nl-g4arm/0/G4-blind25"
+    assert "**P2 `G4-8-vs-bo8ri`, 60 paren**" in section and "**P1 `G4-8-vs-mens`, 60 paren**" in section
+    assert "**20 romans, 20 BT en 20 WMT24++**" in section and gp.BLIND_PER_PART == 20
+    assert gp.BLIND_PARTS == ("novels", "bt", "wmt24pp")
+    assert list(gp.BLIND_PACKAGES) == ["G4-8-vs-bo8ri", "G4-8-vs-mens"] and "Volgorde: eerst P2, dan P1." in section
+    assert {k: (v["type"], v["prefix"], v["base"]) for k, v in gp.BLIND_PACKAGES.items()} == {
+        "G4-8-vs-bo8ri": ("bo8", "vb", "bo8-rubriek∩N1"), "G4-8-vs-mens": ("mens", "vm", "mens")}
+    assert "`vb-001`…`vb-060` (P2) en `vm-001`…`vm-060` (P1)" in section
+    for seed in ('random.Random(f"{S25}/{pakket}/{stratum}/groups").shuffle',
+                 'random.Random(f"{S25}/{pakket}/{stratum}/{groep}").shuffle',
+                 'random.Random(f"{S25}/{pakket}/{stratum}/ab").shuffle', 'random.Random(f"{S25}/{pakket}/order").shuffle',
+                 '`["A"] * 10 + ["B"] * 10`'):
+        assert seed in section
+    assert "dit beslist niets" in section
+
+
+def test_the_reviewers_rubric_is_protocol_md_4_2_4_literally():
+    rubric = gp.rubric_text(CODE / "protocol.md")
+    lines = rubric.split("\n")
+    assert lines[0].startswith("Je beoordeelt vertalingen uit het Engels in het Nederlands. Per passage krijg je")
+    assert lines[-1] == ('{"blind_id": "...", "fout_A": "ja|nee", "fout_B": "ja|nee", "oordeel": "A beter|B beter|gelijk", '
+                         '"zekerheid": "zeker|twijfel", "uitleg": "..."}')
+    assert "```" not in rubric and lines[0] == lines[0].lstrip() and lines[-1] == lines[-1].lstrip()
+    # the block in protocol.md is the rubric indented by five spaces
+    assert "\n".join("     " + x if x else "" for x in lines) in (CODE / "protocol.md").read_text(encoding="utf-8")
+    md = gp.reviewer_text("G4-8-vs-mens", 60, rubric)
+    assert rubric in md and "`judge-input.jsonl`: 60 regels" in md and "`judgments.jsonl` in deze map" in md
+    assert "mens" not in md.replace("G4-8-vs-mens", "")
+
+
+def test_round_robin_spreads_over_the_groups_and_the_sides_are_blocked():
+    groups = {"b1": [f"b1-{k}" for k in range(7)], "b2": ["b2-0"], "b3": [f"b3-{k}" for k in range(3)]}
+    got = gp.round_robin(groups, 6, "s")
+    assert got == gp.round_robin({g: list(reversed(v)) for g, v in groups.items()}, 6, "s")
+    assert sum(x.startswith("b2") for x in got) == 1 and sum(x.startswith("b3") for x in got) == 2
+    order = mx.shuffled(groups, "s/groups")
+    assert got[:3] == [mx.shuffled(groups[g], f"s/{g}")[0] for g in order]
+    assert len(gp.round_robin(groups, 11, "s")) == 11
+    with pytest.raises(SystemExit, match="11 eligible sources, 12 wanted"):
+        gp.round_robin(groups, 12, "s")
+    sides = gp.blocked_sides(20, "x/ab")
+    assert sides.count("A") == 10 and sides.count("B") == 10 and sides == gp.blocked_sides(20, "x/ab")
+    assert sides != gp.blocked_sides(20, "y/ab")
+    with pytest.raises(SystemExit, match="50/50"):
+        gp.blocked_sides(19, "x/ab")
+
+
+def blind_world(tmp, rng, n_sample=None):
+    """A pool's choose/ of novels (10 books x 10), BT (5 sources x 20), WMT24++ 100 and FLORES 40: per source G4-0,
+    G4-8-s140, the rubric ∩ N1 choice (a sample for n_sample[part] sources, else the anchor) and the human text"""
+    n_sample = n_sample or {"novels": 37, "bt": 41, "wmt24pp": 38, "flores": 12}
+    groups = {"novels": [str(90000 + 1111 * b) for b in range(10)], "bt": list(SOURCES), "wmt24pp": ["wmt24pp"],
+              "flores": ["flores"]}
+    per = {"novels": 10, "bt": 20, "wmt24pp": 100, "flores": 40}
+    C = "bo8-rubriek∩N1"
+    choice, outputs, meta, pairs = [], [], [], []
+    for part, gs in groups.items():
+        ids = [(f"{part}:{g}-{k:02d}", g) for g in gs for k in range(per[part])]
+        sampled = set(rng.sample([i for i, _ in ids], n_sample[part]))
+        for n, (i, g) in enumerate(ids):
+            src = "  " + sentence(rng) + "\n"
+            text = {"G4-0": sentence(rng), "G4-8-s140": sentence(rng) + " \n", "mens": "\n" + sentence(rng)}
+            j = rng.randrange(8) if i in sampled else -1
+            tid = {"G4-0": f"{i}|G4-0", "G4-8-s140": f"{i}|G4-8-s140", "mens": f"{i}|mens",
+                   C: f"{i}|s{j}" if j >= 0 else f"{i}|G4-0"}
+            if j >= 0:
+                text[C] = sentence(rng) if n % 9 else " ".join(text["G4-8-s140"].split())  # some equal G4-8's text
+            else:
+                text[C] = text["G4-0"]
+            choice.append({"id": i, "part": part, "stratum": g, f"{C}|j": j, f"{C}|reason": "sample" if j >= 0 else "differ"})
+            for system in ("G4-0", "G4-8-s140", C, "mens"):
+                outputs.append({"id": i, "part": part, "system": system, "tid": tid[system], "text": text[system]})
+            for ptype, b in (("mens", "mens"), ("bo8", C)):
+                same = gp.norm(text["G4-8-s140"]) == gp.norm(text[b])
+                pid = f"{ptype}/{i}"
+                meta.append({"pair": pid, "type": ptype, "id": i, "part": part, "a_system": "G4-8-s140", "b_system": b,
+                             "a_tid": tid["G4-8-s140"], "b_tid": tid[b], "identical": same})
+                if not same:
+                    pairs.append({"pair": pid, "source": src, "A": text["G4-8-s140"], "B": text[b]})
+    d = tmp / "choose"
+    for name, rows in (("choice", choice), ("outputs", outputs), ("pairs-meta", meta), ("pairs", pairs)):
+        gp.write(rows, d / f"{name}.parquet")
+    return d, {r["tid"]: r["text"] for r in outputs}, {r["id"]: r for r in choice}
+
+
+def test_blind_draws_p2_then_p1_blocked_and_blind(tmp_path, capsys):
+    rng = random.Random(25)
+    d, texts_, choice = blind_world(tmp_path, rng)
+    args = Namespace(choose=str(d), out=str(tmp_path / "out"), protocol=str(CODE / "protocol.md"))
+    summary = gp.blind(args)
+    printed = capsys.readouterr().out
+    assert "BLIND25" in printed and not any(t.strip() in printed for t in texts_.values() if len(t.strip()) > 8)
+    drawn = {}
+    for package, spec in gp.BLIND_PACKAGES.items():
+        pkg = tmp_path / "out" / package
+        assert sorted(x.name for x in pkg.iterdir()) == ["judge-input.jsonl", "key.jsonl", "review", "select-report.json"]
+        inputs = g4arm.read_jsonl(pkg / "judge-input.jsonl")
+        keys = g4arm.read_jsonl(pkg / "key.jsonl")
+        assert [x["blind_id"] for x in inputs] == [k["blind_id"] for k in keys] == [f"{spec['prefix']}-{n:03d}"
+                                                                                    for n in range(1, 61)]
+        assert all(set(x) == {"blind_id", "source", "A", "B"} for x in inputs)
+        s = summary[package]
+        assert s["n"] == 60 and s["per_set"] == {"novels": 20, "bt": 20, "wmt24pp": 20}
+        assert s["arm_is_a"] == {"novels": 10, "bt": 10, "wmt24pp": 10} and s["a_is_base"] == 30
+        for x, k in zip(inputs, keys):
+            assert k["base_system"] == spec["base"] and k["set"] in gp.BLIND_PARTS and {k["A"], k["B"]} == {"G4-8-s140", "base"}
+            arm_side = "A" if k["A"] == "G4-8-s140" else "B"
+            other = "B" if arm_side == "A" else "A"
+            assert x[arm_side] == texts_[k["a_tid"]].strip() and x[other] == texts_[k["b_tid"]].strip()
+            assert all(v == v.strip() for v in x.values()) and k["stratum"] == choice[k["item"]]["stratum"]
+            if spec["type"] == "bo8":
+                c = choice[k["item"]]
+                assert c["bo8-rubriek∩N1|reason"] == "sample" and k["b_tid"] == f"{k['item']}|s{k['bo8_j']}"
+                assert gp.norm(x[other]) != gp.norm(x[arm_side])
+            else:
+                assert k["b_tid"] == f"{k['item']}|mens"
+        # the 20 novels spread over the books, BT over its five sources
+        per_stratum = json.loads((pkg / "select-report.json").read_text())["per_stratum"]
+        assert len(per_stratum["bt"]) == 5 and max(per_stratum["bt"].values()) <= 4 + (spec["type"] == "bo8") * 4
+        if spec["type"] == "mens":
+            assert set(per_stratum["novels"].values()) == {2} and set(per_stratum["bt"].values()) == {4}
+        assert gp.rubric_text(CODE / "protocol.md") in (pkg / "review" / "REVIEWER.md").read_text(encoding="utf-8")
+        drawn[package] = {k["item"] for k in keys}
+        # the key works with the official tally (A/B name the arm or 'base')
+        judg = [{"blind_id": k["blind_id"], "fout_A": "nee", "fout_B": "ja" if k["B"] == "base" else "nee",
+                 "oordeel": "A beter" if k["A"] == "G4-8-s140" else "B beter", "zekerheid": "zeker"} for k in keys]
+        t = g4arm.tally_rows(judg, keys, "G4-8-s140")
+        assert (t["arm_better"], t["base_better"], t["equal"], t["errors_base"], t["errors_arm"]) == (60, 0, 0, 30, 0)
+    assert not drawn["G4-8-vs-bo8ri"] & drawn["G4-8-vs-mens"]
+    rep2 = json.loads((tmp_path / "out" / "G4-8-vs-bo8ri" / "select-report.json").read_text())
+    rep1 = json.loads((tmp_path / "out" / "G4-8-vs-mens" / "select-report.json").read_text())
+    assert rep1["drawn_before"] == ["G4-8-vs-bo8ri"] and rep2["drawn_before"] == []
+    assert sum(rep1["excluded"][p].get("drawn_before", 0) for p in gp.BLIND_PARTS) == 60
+    assert all(rep2["excluded"][p]["anchor"] > 0 for p in gp.BLIND_PARTS)
+    # the same inputs draw the same packages; an existing package is not drawn again
+    again = Namespace(choose=str(d), out=str(tmp_path / "again"), protocol=str(CODE / "protocol.md"))
+    gp.blind(again)
+    for package in gp.BLIND_PACKAGES:
+        for name in ("judge-input.jsonl", "key.jsonl"):
+            assert (tmp_path / "again" / package / name).read_bytes() == (tmp_path / "out" / package / name).read_bytes()
+    with pytest.raises(SystemExit, match="a package is drawn once"):
+        gp.blind(args)
+
+
+def test_blind_stops_on_too_few_samples_and_on_a_choice_with_the_anchors_text(tmp_path):
+    d, _, _ = blind_world(tmp_path, random.Random(3), {"novels": 37, "bt": 19, "wmt24pp": 38, "flores": 0})
+    with pytest.raises(SystemExit, match="G4-8-vs-bo8ri/bt: 1[0-9] eligible sources, 20 wanted"):
+        gp.blind(Namespace(choose=str(d), out=str(tmp_path / "a"), protocol=str(CODE / "protocol.md")))
+    d, texts_, choice = blind_world(tmp_path / "w2", random.Random(4))
+    rows = pq.read_table(d / "outputs.parquet").to_pylist()
+    i = next(c["id"] for c in choice.values() if c["bo8-rubriek∩N1|reason"] == "sample")
+    j = choice[i]["bo8-rubriek∩N1|j"]
+    for r in rows:
+        if r["tid"] == f"{i}|s{j}":
+            r["text"] = texts_[f"{i}|G4-0"]
+    gp.write(rows, d / "outputs.parquet")
+    with pytest.raises(SystemExit, match="has G4-0 greedy's text"):
+        gp.blind(Namespace(choose=str(d), out=str(tmp_path / "b"), protocol=str(CODE / "protocol.md")))

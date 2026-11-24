@@ -13,6 +13,7 @@ anyone.
     python g4pool.py choose --data DIR --texts F --cands F --scores GLOB --out DIR --prompts-out DIR
     python g4pool.py report --data DIR --texts-meta F --texts-json J --cands-json J --choose DIR --qe GLOB --comet F \\
         --c1 F --c2 F --judge1 GLOB --judge2 GLOB --m23-metricx F --m23-judge GLOB --out report.md
+    python g4pool.py blind --choose DIR --out DIR [--protocol protocol.md]   (§25: the blind packages, co1, CPU)
 
 All CPU. The texts stay in the bucket and on the VM: no command prints a text; the json files and the report hold ids,
 counts and scores."""
@@ -745,6 +746,173 @@ def report_text(r):
     return "\n".join(L)
 
 
+# ---------------------------------------------------------------------------------------------------- §25 blind packages
+
+BLIND = "protocol-g4.md §25 (Blind25)"
+BLIND_SEED = "en-nl-g4arm/0/G4-blind25"
+BLIND_PARTS = ("novels", "bt", "wmt24pp")
+BLIND_PER_PART = 20
+BLIND_ARM = "G4-8-s140"
+BLIND_BASE = "base"
+# dict order is the draw order: P2 first, P1 only from the sources P2 left (Blind25.3)
+BLIND_PACKAGES = {"G4-8-vs-bo8ri": {"type": "bo8", "prefix": "vb", "base": "bo8-rubriek∩N1"},
+                  "G4-8-vs-mens": {"type": "mens", "prefix": "vm", "base": "mens"}}
+RUBRIC_HEAD = "**Rubriek** (letterlijk zo aan de beoordelaar gegeven"
+
+
+def round_robin(groups, n, seed):
+    """n ids of {group: [id]} (Blind25.3): the groups in a seeded order, per group its ids in a seeded order, then one
+    per group in turn, an exhausted group skipped; fewer than n stops"""
+    order = mx.shuffled(groups, f"{seed}/groups")
+    queues = [mx.shuffled(groups[g], f"{seed}/{g}") for g in order]
+    out = []
+    for r in range(max((len(q) for q in queues), default=0)):
+        out += [q[r] for q in queues if r < len(q)]
+    if len(out) < n:
+        raise SystemExit(f"{seed}: {len(out)} eligible sources, {n} wanted")
+    return out[:n]
+
+
+def blocked_sides(n, seed):
+    """G4-8-s140's side for each of n drawn pairs: exactly half A, half B, in a seeded order (Blind25.3)"""
+    if n % 2:
+        raise SystemExit(f"{n} pairs cannot be split 50/50 between A and B")
+    sides = ["A"] * (n // 2) + ["B"] * (n // 2)
+    random.Random(seed).shuffle(sides)
+    return sides
+
+
+def rubric_text(protocol_md):
+    """protocol.md §4.2.4's rubric as the reviewer gets it: the code block after its heading, dedented"""
+    import textwrap
+
+    text = Path(protocol_md).read_text(encoding="utf-8")
+    lines = text[text.index(RUBRIC_HEAD):].split("\n")
+    fences = [k for k, line in enumerate(lines) if line.strip() == "```"]
+    if len(fences) < 2:
+        raise SystemExit(f"{protocol_md}: no code block after the rubric's heading")
+    return textwrap.dedent("\n".join(lines[fences[0] + 1:fences[1]])).strip("\n")
+
+
+def reviewer_text(package, n, rubric):
+    """REVIEWER.md (Blind25.5): the rubric literally, besides it only the input, the output and the number of pairs"""
+    return "\n".join([
+        f"# Blinde beoordeling {package}", "",
+        f"In deze map staat `judge-input.jsonl`: {n} regels, per regel één JSON-object met `blind_id`, `source` (de "
+        "Engelse bron), `A` en `B` (twee Nederlandse vertalingen).", "",
+        "Beoordeel elk paar volgens de instructie hieronder. Schrijf je oordelen naar `judgments.jsonl` in deze map: "
+        f"één JSON-regel per `blind_id`, voor alle {n} paren, in de volgorde van de invoer, en verder niets.", "",
+        "## Instructie", "", "```", rubric, "```", ""])
+
+
+def blind_eligible(spec, choice, meta, pairs, outputs, used):
+    """({part: {group: [id]}}, {id: pairs-meta row}, {part: excluded counts}) of one package (Blind25.2), with its checks"""
+    ptype, base = spec["type"], spec["base"]
+    eligible = {p: collections.defaultdict(list) for p in BLIND_PARTS}
+    rows, excluded = {}, {p: collections.Counter() for p in BLIND_PARTS}
+    for r in meta:
+        if r["type"] != ptype or r["part"] not in BLIND_PARTS:
+            continue
+        i, part = r["id"], r["part"]
+        if (r["a_system"], r["b_system"], r["a_tid"]) != (BLIND_ARM, base, f"{i}|{BLIND_ARM}") or i in rows:
+            raise SystemExit(f"{r['pair']}: {r['a_system']} ({r['a_tid']}) / {r['b_system']}, not {BLIND_ARM} / {base}, "
+                             "or its source twice")
+        c = choice.get(i)
+        if c is None or c["part"] != part:
+            raise SystemExit(f"{r['pair']}: no row of part {part} in choice.parquet")
+        if ptype == "bo8":
+            if c[f"{base}|reason"] != "sample":
+                excluded[part]["anchor"] += 1
+                continue
+            if r["b_tid"] != f"{i}|s{c[f'{base}|j']}":
+                raise SystemExit(f"{r['pair']}: {r['b_tid']} is not the sample {c[f'{base}|j']} of the choice")
+            if norm(outputs[r["b_tid"]]) == norm(outputs[f"{i}|G4-0"]):
+                raise SystemExit(f"{r['pair']}: the choice {r['b_tid']} has G4-0 greedy's text")
+        elif r["b_tid"] != f"{i}|mens":
+            raise SystemExit(f"{r['pair']}: {r['b_tid']} is not the human text")
+        if r["identical"]:
+            excluded[part]["identical"] += 1
+            continue
+        if i in used:
+            excluded[part]["drawn_before"] += 1
+            continue
+        p = pairs.get(r["pair"])
+        if p is None or p["A"] != outputs[r["a_tid"]] or p["B"] != outputs[r["b_tid"]]:
+            raise SystemExit(f"{r['pair']}: pairs.parquet does not hold the texts of {r['a_tid']} and {r['b_tid']}")
+        eligible[part][c["stratum"]].append(i)
+        rows[i] = r
+    return eligible, rows, excluded
+
+
+def blind(args):
+    """§25: the blind packages P2 G4-8-vs-bo8ri and P1 G4-8-vs-mens from the pool's pairs (Blind25.2-25.4). Prints ids
+    and counts only; the texts go to judge-input.jsonl"""
+    d, out = Path(args.choose), Path(args.out)
+    for package in BLIND_PACKAGES:
+        if (out / package).exists():
+            raise SystemExit(f"{out / package} exists; a package is drawn once")
+    choice = {r["id"]: r for r in read_rows(d / "choice.parquet")}
+    meta = read_rows(d / "pairs-meta.parquet")
+    pairs = {}
+    for r in read_rows(d / "pairs.parquet"):
+        if pairs.setdefault(r["pair"], r) is not r:
+            raise SystemExit(f"{r['pair']} twice in pairs.parquet")
+    outputs = {}
+    for r in read_rows(d / "outputs.parquet", ["tid", "text"]):
+        if outputs.setdefault(r["tid"], r["text"]) != r["text"]:
+            raise SystemExit(f"{r['tid']}: two texts in outputs.parquet")
+    rubric = rubric_text(args.protocol)
+    inputs = {name: g4arm.sha256_file(d / name)
+              for name in ("choice.parquet", "pairs-meta.parquet", "pairs.parquet", "outputs.parquet")}
+    used, summary = set(), {}
+    for package, spec in BLIND_PACKAGES.items():
+        eligible, rows, excluded = blind_eligible(spec, choice, meta, pairs, outputs, used)
+        side_of = {}
+        for part in BLIND_PARTS:
+            seed = f"{BLIND_SEED}/{package}/{part}"
+            ids = round_robin(eligible[part], BLIND_PER_PART, seed)
+            side_of |= {(part, i): s for i, s in zip(ids, blocked_sides(len(ids), f"{seed}/ab"))}
+        drawn_before = sorted(summary)
+        used |= {i for _, i in side_of}
+        inputs_, keys = [], []
+        for n, (part, i) in enumerate(mx.shuffled(side_of, f"{BLIND_SEED}/{package}/order"), 1):
+            r, p = rows[i], pairs[rows[i]["pair"]]
+            texts_ = {"source": (p["source"] or "").strip(), BLIND_ARM: (p["A"] or "").strip(),
+                      BLIND_BASE: (p["B"] or "").strip()}
+            if not all(texts_.values()):
+                raise SystemExit(f"{r['pair']}: an empty text")
+            a, b = (BLIND_ARM, BLIND_BASE) if side_of[(part, i)] == "A" else (BLIND_BASE, BLIND_ARM)
+            bid = f"{spec['prefix']}-{n:03d}"
+            inputs_.append({"blind_id": bid, "source": texts_["source"], "A": texts_[a], "B": texts_[b]})
+            k = {"blind_id": bid, "A": a, "B": b, "base_system": spec["base"], "seed": f"{BLIND_SEED}/{package}/{part}/ab",
+                 "set": part, "item": i, "stratum": choice[i]["stratum"], "pair": r["pair"], "a_tid": r["a_tid"],
+                 "b_tid": r["b_tid"]}
+            if spec["type"] == "bo8":
+                k["bo8_j"] = int(choice[i][f"{spec['base']}|j"])
+            keys.append(k)
+        report = {"protocol": BLIND, "package": package, "pair_type": spec["type"], "target": BLIND_ARM,
+                  "base": spec["base"], "n": len(keys), "seed": f"{BLIND_SEED}/{package}", "drawn_before": drawn_before,
+                  "per_set": {p: sum(k["set"] == p for k in keys) for p in BLIND_PARTS},
+                  "per_stratum": {p: dict(sorted(collections.Counter(k["stratum"] for k in keys if k["set"] == p).items()))
+                                  for p in BLIND_PARTS},
+                  "arm_is_a": {p: sum(k["set"] == p and k["A"] == BLIND_ARM for k in keys) for p in BLIND_PARTS},
+                  "a_is_base": sum(k["A"] == BLIND_BASE for k in keys),
+                  "eligible": {p: sum(len(v) for v in eligible[p].values()) for p in BLIND_PARTS},
+                  "eligible_per_group": {p: {g: len(v) for g, v in sorted(eligible[p].items())} for p in BLIND_PARTS},
+                  "excluded": {p: dict(excluded[p]) for p in BLIND_PARTS}, "inputs": inputs}
+        pkg = out / package
+        (pkg / "review").mkdir(parents=True)
+        with open(pkg / "judge-input.jsonl", "w", encoding="utf-8") as f:
+            f.writelines(json.dumps(x, ensure_ascii=False) + "\n" for x in inputs_)
+        with open(pkg / "key.jsonl", "w", encoding="utf-8") as f:
+            f.writelines(json.dumps(x, ensure_ascii=False) + "\n" for x in keys)
+        (pkg / "select-report.json").write_text(json.dumps(report, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
+        (pkg / "review" / "REVIEWER.md").write_text(reviewer_text(package, len(keys), rubric), encoding="utf-8")
+        summary[package] = {k: report[k] for k in ("n", "per_set", "arm_is_a", "a_is_base", "eligible", "excluded")}
+    print(f"BLIND25 {json.dumps(summary, ensure_ascii=False)}", flush=True)
+    return summary
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -768,8 +936,12 @@ def main(argv=None):
     for f in ("data", "texts-meta", "texts-json", "cands-json", "choose", "qe", "comet", "c1", "c2", "judge1", "judge2",
               "m23-metricx", "m23-judge", "out"):
         a.add_argument(f"--{f}", required=True)
+    a = sub.add_parser("blind")
+    a.add_argument("--choose", required=True, help="the pool's choose/ (choice, pairs-meta, pairs, outputs)")
+    a.add_argument("--out", required=True, help="per package <out>/<package>/ (judge-input, key, select-report, review/)")
+    a.add_argument("--protocol", default=str(HERE / "protocol.md"), help="protocol.md with §4.2.4's rubric")
     args = p.parse_args(argv)
-    {"data": data, "texts": texts, "cands": cands, "choose": choose, "report": report}[args.cmd](args)
+    {"data": data, "texts": texts, "cands": cands, "choose": choose, "report": report, "blind": blind}[args.cmd](args)
 
 
 if __name__ == "__main__":

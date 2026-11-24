@@ -2573,3 +2573,93 @@ een echte afwijking (bv. 4,9e-5 of 1e-4) faalt nog steeds (tests). De overige co
 Hetzelfde voor `lr_constant` in `trained` (24 nov ~01:35): de volle run `g4arm_G4-8` (205 stappen, piek 29,13 GiB,
 verlies 0,114 → 0,074) faalde alleen daarop, met de LR na de warmup overal 4,999999873689376e-05; nu ≤ 1e-6 × 5e-5. De
 training is af en draait niet opnieuw; de herstart draait `adapter` en wat volgt.
+
+## 20. Meting G4-judge-FB: de judge op fictie en BT
+
+**Vastgelegd 24 nov 2026 (tijdstip: de commit van deze sectie op branch `en-nl-g4arm8`)**, vóór elke stap op een worker
+en vóór elke uitslag van deze meting [besluit van de hoofdsessie 24 nov ~05:10 op advies van Gemini 4 Neon, Yeb sliep;
+binnen de judge-proef van §17; uitwerking door een subagent]. Vooraf gelezen: de rapporten van §16 en §17, de
+kolomnamen en aantallen van de invoer (C2's `classifier.parquet`: 500 + 500 rijen met `split` = `test`;
+`$RL/c2/cal7/predictions.parquet`: model `C2-test`, 200 rijen per BT-set, id `<pid>#<label>`) en de cijfers van
+`c2cal7` (nauwkeurigheid op de testsplit 0,886); geen tekst en geen score van deze meting. Een meting, geen arm: er wordt
+niets getraind, niets vertaald en niets beslist. Claude en GPT zijn geen judge. `GJ=$G/judge`, `RL=$G/rl/G4-7`.
+
+*FB.1 Vraag.* De judge van §17 koos de doelen van G4-8 (§18), voor 90% romans en BT, maar is alleen gevalideerd op FLAN,
+WMT24++ en idioom (G4-judge.5; G4-8-data.11). Herkent hij, bij een Engelse bron en twee Nederlandse teksten waarvan de
+herkomst bekend is, de menselijke of oorspronkelijke kant als de betere? Twee proeven:
+1. **fictie**: een Engelse romanpassage met (i) de menselijke Nederlandse vertaling en (ii) G4-0's vertaling;
+2. **BT**: het Gemma 4-Engels van een Nederlands origineel met (i) het origineel en (ii) Gemma 4's rondgangvertaling.
+
+*FB.2 Paren* (er wordt niets getrokken of gegenereerd; alleen bestaande teksten).
+- **Fictie** (500 paren): de groepen `human` en `g40` van C2F (§16, run `c2f1123a`, `$G/c2fiction/c2f1123a/texts.parquet`;
+  dezelfde 500 id's `novels:<rij-id van -b1->`), ongewijzigd. Engelse bron: `en` van die rij in
+  `$S/data/books-b1/b1-selected.parquet` (gestript). Controles (een afwijking stopt de meting): elke id staat één keer
+  in b1 met groep `en_orig`; de tekst van `human` is (gestript) `nl` van die rij; geen lege tekst; `human` en `g40`
+  hebben dezelfde id's.
+- **BT** (500 paren): **C2's testsplit** (`$RL/c2/data/classifier.parquet`, `split` = `test`: per BT-set 100 passages
+  uit 100 documenten; `label` 1 = `nl`, het Nederlandse origineel, `label` 0 = `nl_back`, Gemma 4's rondgang; G4-7.6),
+  ongewijzigd. Engelse bron: `en` van dezelfde `pid` in de trainsplit van de vijf `-nl-en-gemma4`-sets op G4-3's revisies
+  (`$G/input/bt3/`, `g4arm.read_bt`, sha256 per bestand tegen `revisions.json`), gestript. Waarom de testsplit
+  [keuze]: zijn documenten zijn per constructie geen trainingsdocumenten van C2 en zitten niet in de pools van G4-7 en
+  G4-8 (die sloten alle 5.000 documenten van C2 uit, G4-7.2 en G4-8-data.1); hij is gelijk verdeeld over de vijf
+  bronnen; beide teksten passen heel in C2 (zoals C2 getraind is, spec §5.3.2); en C2's scores op deze paren bestaan al
+  (`c2cal7`), zodat judge en C2 op dezelfde paren te vergelijken zijn. Controles (een treffer stopt de meting): per bron
+  precies 100 passages met beide labels; `nl` en `nl_back` van de BT-rij (gestript) gelijk aan de teksten van
+  `classifier.parquet`; geen document (`g4c2.doc_key`) van de testsplit is een document van C2's train-split; geen id
+  `bt:<pid>`, document of gestripte Engelse tekst staat in G4-7's `$RL/data/pool/pool.parquet` (pool, reserve, RL-val)
+  of in G4-8's `$G/data/G4-8/plan/plan.parquet`.
+- Paren waarvan beide teksten na strippen gelijk zijn, worden geteld en gewoon beoordeeld (P̄ is dan symmetrisch).
+- Gerapporteerd (alleen id's): hoeveel fictie-id's in G4-7's pool en in G4-8's plan staan (het anker van G4-7 kwam uit die
+  pool; G4-8 hergebruikte die bronnen).
+
+*FB.3 Judge.* G4-judge.2–4 ongewijzigd: Gemma 4 31B-it @ `842da37`, de MaxText-omzetting, prompt G4-judge.3 letterlijk,
+één prefill, P(A)/P(B)/P(gelijk) uit de logits van de eerste antwoordpositie, beide volgordes; `pairjudge.py score`
+ongewijzigd, prompts over de 4 workers van mbert-mix op sha256 van de uid. Kader `ab`: A = de menselijke of
+oorspronkelijke kant (`human`, `nl`), B = de machinekant (`g40`, `nl_back`); `ba` verwisseld. P̄(mens) = P̄(A beter),
+P̄(machine) = P̄(B beter), P̄(gelijk) (G4-judge.4). Een prompt van meer dan 4.096 tokens wordt niet gescoord (geteld).
+2.000 prompts.
+
+*FB.4 Maten* (`pairjudge.py fbreport`, per proef; intervallen 95% Wilson, tenzij anders vermeld).
+1. Het oordeel van de judge (de grootste van de drie P̄'s, G4-judge.4): aantal en aandeel mens / machine / gelijk.
+2. **Richting**: aandeel paren met P̄(mens) > P̄(machine) (gelijk: ½); gemiddeld P̄(mens), P̄(machine), P̄(gelijk);
+   gemiddelde Δ = P̄(mens) − P̄(machine) met een 95%-bootstrapinterval (10.000 trekkingen over paren, zaad
+   `en-nl-g4arm/0/G4-judge-fb/boot/<proef>`).
+3. **Positie**: omklappen (de greedy oordelen van `ab` en `ba`, teruggezet, noemen tegengestelde winnaars) en
+   inconsistent (G4-judge.5 maat 3); per volgorde het greedy antwoord (eerste positie, tweede positie, gelijk), gemiddeld
+   p_A − p_B, en de massa (mediaan, aantal < 0,5).
+4. **Per bron en lengte**: BT per set (handelingen, raad, dpc, rechtspraak, fineweb); beide proeven per lengteband van
+   de Engelse bron in Gemma 4-tokens (`g4arm.TokenCounter` op `tokenizer-gemma4`, zonder speciale tokens, als het
+   maximum van 256 van G4-7.2): ≤ 128, 129–256, > 256. Per groep n, richting, de drie oordelen, omklappen.
+5. **Classifiers op dezelfde paren, zoals ze er al zijn** (geen nieuwe classify-run): fictie C1 en C2 uit `c2f1123a`
+   (`predictions-c1.parquet`, `predictions-c2.parquet`); BT C2 uit `c2cal7` (model `C2-test`, id `<pid>#1` = `nl`,
+   `<pid>#0` = `nl_back`). C1 op de BT-paren bestaat niet en wordt niet gemaakt. Per classifier: aandeel paren met
+   P(mens) > P(machine) (gelijk: ½); de overeenstemming van de richting met de judge op de paren waar beide een richting
+   hebben (Δ ≠ 0), met de 2 × 2-tabel; Spearman tussen Δ van de judge en Δlogit van de classifier (`g4c2.logit_of`,
+   geknipt op ±12).
+6. **Betekenisfout aan de menselijke kant: niet gemeten.** De prompt van G4-judge.3 geeft één woord; juistheid en
+   natuurlijkheid zitten in één antwoord en zijn er niet uit te scheiden. Een tweede prompt valt buiten deze meting. Het
+   rapport zegt dat.
+
+*FB.5 Wat het niet zegt.*
+- De "waarheid" is de herkomst, niet de kwaliteit. Een menselijke romanvertaling heeft literaire vrijheid (weglaten,
+  toevoegen, herschikken); de rubriek telt dat als betekenisfout, dus een voorkeur voor G4-0 kan de rubriek juist volgen.
+  Bij BT is het Engels Gemma 4's vertaling van het origineel: waar dat Engels iets weglaat of toevoegt, lijkt het
+  origineel tegen de bron een fout te hebben, en de rondgang volgt het Engels.
+- De machinekant is in beide proeven Gemma 4 31B-it (G4-0 met `natural-v1`; de rondgang met `natural-v1-fmt` op fork
+  `2249474`), hetzelfde model als de judge: een voorkeur voor de eigen stijl is niet te scheiden van de vraag.
+- Fictie: 500 passages uit G4-7's anker (Engels van 20–256 Gemma 4-tokens, beide kanten heel in C1 en C2), uit het
+  gelijnde en gefilterde -b1-corpus. BT: C2's testsplit, één passage per document, beide teksten heel in C2; ook langere
+  bronnen dan G4-8's BT-bronnen (≤ 256 tokens), daarom per lengteband gerapporteerd. Geen steekproef van alle fictie of BT.
+- Eén prompt, zero-shot; geen drempel; de meting beslist niets over G4-8, de judge of een volgende arm.
+
+*FB.6 Uitvoer.* `$GJ/fb/data/` (`prompts-w<k>.parquet`, `refs.parquet` zonder tekst, `fbdata.json`),
+`$GJ/fb/scores/w<k>/`, `$GJ/fb/report.md`/`.json`; kopie `mbert-ops/translator-sft/g4-judge-fiction-bt.md` (`.json`),
+alleen tabellen met tellingen en scores. Prompts en teksten blijven in de bucket en op de VM.
+
+*FB.7 Keten* (`mbert-ops/scripts/g4judgefb_run.sh`, kopie in `gs://t5-dutch-english-usc2/hammond/scratch-scripts/`; code
+`pairjudge.py fbdata|fbreport` en `run_pairjudge.sh fbdata|score SET=fb|fbreport` op `en-nl-g4arm8`). Alleen mbert-mix;
+`final_eval_mix.lock` met `flock` tot het eind; mbert-corpus (T3) wordt niet aangeraakt. Code als bundel via de bucket
+naar de 4 workers; elke ssh met `timeout 900` en de ssh-opties van G4-judge.10; vóór elke TPU-stap de TPU van de
+worker(s) vrij. Volgorde: `setup` (`run_g4arm.sh setup`, `ARM=G4-bon`), `fbdata` (w0, CPU), `score` met `SET=fb`
+(4 workers), `fbreport` (w0, CPU). Markers `$G/stages/g4-judge/fb-*.done`; niets wat §16–§19 schreven wordt
+overschreven. Elke stap eindigt op `EXIT 0`, anders `FAILED` en stoppen. [schatting] ~30–40 min.

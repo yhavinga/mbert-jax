@@ -3496,3 +3496,83 @@ met `SET=p1` (4), `choose` (w0, CPU), `judge` met `SET=p2` (4), `poolreport` (w0
 `$G/stages/g4-measure2/` en `$G/stages/g4-pool/`; niets wat eerdere secties schreven wordt overschreven of verwijderd.
 Elke stap eindigt op `EXIT 0`, anders `FAILED` en stoppen; een gemarkeerde stap wordt bij een herstart overgeslagen.
 [schatting] deel 1 ~20–30 min, deel 2 ~1–1,5 u.
+
+## 25. Twee blinde pakketten uit de evaluatiepool: G4-8-s140 tegen de mens en tegen G4-0 best-of-8 (rapportage, beslist niets)
+
+**Vastgelegd 24 nov 2026 (tijdstip: de commit van deze sectie op branch `en-nl-g4arm8`)**, vóór de trekking en vóór
+elke beoordeling [besluit van de hoofdsessie namens Yeb, op advies van Gemini 4 Neon, 24 nov ~14:35; uitwerking door een
+subagent]. Vooraf gelezen: alleen tellingen zonder tekst uit `$P/choose/choice.parquet` en `$P/choose/pairs-meta.parquet`
+(de geschikte bronnen per stratum en groep, hieronder); geen tekst en geen score van een paar. Geen TPU: de pakketten
+worden op co1 gebouwd uit de pool van §24 in de bucket (`g4pool.py blind`); mbert-mix en mbert-corpus (T3) worden niet
+aangeraakt. **Een rapportage: dit beslist niets** en verandert G4-8.0–G4-8.15 en §22–§24 niet; er wordt niets getraind,
+vertaald of gescoord. Claude en GPT zijn geen generator; de beoordelaars zijn verse Claude-subagenten die de hoofdsessie
+start. `P=$G/pool`, `S25=en-nl-g4arm/0/G4-blind25`.
+
+*Blind25.1 Vraag.* Hoe verhoudt G4-8-s140 (greedy, de vertaler sinds 24 nov) zich volgens een blinde beoordelaar met de
+rubriek van protocol.md §4.2.4 tot (P1) de menselijke tekst en (P2) G4-0 best-of-8 met de keuze rubriek ∩ N1 (het doel
+van G4-9, §22 O9 `intersect`; Pool.5), op romans, BT en WMT24++?
+
+*Blind25.2 Pakketten* (de paren van Pool.6; A en B in de pool: A = G4-8-s140, B = de tegenkant).
+- **P2 `G4-8-vs-bo8ri`, 60 paren**: paartype `bo8`, G4-8-s140 greedy tegen G4-0 best-of-8 rubriek ∩ N1. Alleen bronnen
+  waar die keuze een sample is en niet het G4-0-anker (`bo8-rubriek∩N1|reason` = `sample` in `choice.parquet`) én waar
+  de tekst na normalisering van witruimte verschilt van G4-8-s140 (`identical` = false in `pairs-meta.parquet`).
+  Controles (een afwijking stopt): de tekst van de tegenkant is het sample `s<j>` van de keuze en verschilt
+  (genormaliseerd) van G4-0 greedy. Geschikt [gelezen]: romans 37 (per boek 1–7), BT 40 (per bron 5–12), WMT24++ 36.
+- **P1 `G4-8-vs-mens`, 60 paren**: paartype `mens`, G4-8-s140 greedy tegen de menselijke tekst: bij romans de menselijke
+  vertaling, bij BT het Nederlandse origineel, bij WMT24++ de referentie van de testset. Geen FLORES, NTREX, FLAN of
+  idioom. De bronnen zijn disjunct van P2: P2 wordt eerst getrokken, en zijn 60 bronnen vallen voor P1 weg. Geschikt
+  [gelezen]: per stratum 100 paren, geen met gelijke tekst; na P2 dus 80 per stratum.
+- Per pakket **20 romans, 20 BT en 20 WMT24++**.
+
+*Blind25.3 Trekking* (`g4pool.py blind`; naar het scherm alleen ids en tellingen):
+- Volgorde: eerst P2, dan P1.
+- Per pakket en stratum (romans, BT, WMT24++) de geschikte bronnen, gegroepeerd op de kolom `stratum` van de pool
+  (romans: het Engelse boek, 10 groepen; BT: de bron dpc, fineweb, handelingen, raad, rechtspraak; WMT24++: één groep).
+  De groepen in de volgorde van `random.Random(f"{S25}/{pakket}/{stratum}/groups").shuffle` van de gesorteerde
+  groepnamen; per groep de ids in de volgorde van `random.Random(f"{S25}/{pakket}/{stratum}/{groep}").shuffle` van de
+  gesorteerde ids. Dan om de beurt: ronde 1 de eerste id van elke groep in groepvolgorde, ronde 2 de tweede, enzovoort;
+  een lege groep wordt overgeslagen; stoppen bij 20. Minder dan 20 geschikt stopt.
+- **A/B geblokt per stratum**, niet vrij gegooid: van de 20 paren van een stratum is G4-8-s140 bij precies 10 A en bij
+  10 B. De lijst `["A"] * 10 + ["B"] * 10`, geschud met `random.Random(f"{S25}/{pakket}/{stratum}/ab").shuffle`, wordt in
+  de getrokken volgorde toegekend (de waarde is de kant van G4-8-s140).
+- Volgorde van de 60: de paren (stratum, id) gesorteerd, geschud met `random.Random(f"{S25}/{pakket}/order").shuffle`;
+  `blind_id` in die volgorde `vb-001`…`vb-060` (P2) en `vm-001`…`vm-060` (P1).
+- Teksten: bron, A en B uit `$P/choose/pairs.parquet` (de teksten die de judge van Pool.6 las; gecontroleerd tegen
+  `outputs.parquet` via `a_tid` en `b_tid`), aan alle drie alleen de witruimte aan begin en eind weggehaald (`strip`),
+  aan beide kanten gelijk, zodat witruimte de kant niet verraadt [keuze]. Een lege tekst stopt.
+
+*Blind25.4 Uitvoer.* Per pakket `$S/blind/<pakket>/` (de vorm van de eerdere pakketten): `judge-input.jsonl`
+(`blind_id`, `source`, `A`, `B`), `key.jsonl` (`blind_id`; `A` en `B` met de waarde `G4-8-s140` of `base`, waarbij `base`
+de tegenkant is en `base_system` hem noemt: `mens` of `bo8-rubriek∩N1`; `seed`, `set`, `item`, `stratum`, `pair`,
+`a_tid`, `b_tid`, bij P2 `bo8_j`), `select-report.json` (aantallen per stratum en groep, A/B per stratum, geschikt en
+uitgesloten, de zaden, sha256 van de invoer), `review/REVIEWER.md` (de instructie aan de beoordelaar) en na de
+beoordeling `review/judgments.jsonl`. Op co1 per pakket de map van de beoordelaar
+`mbert-ops/translator-sft/blind-review/<pakket>/` met alleen `judge-input.jsonl` en `REVIEWER.md`; zijn uitvoer
+`judgments.jsonl` komt in dezelfde map. De sleutel staat alleen in de bucket en in `mbert-ops/translator-sft/blind-keys/
+<pakket>/` (`key.jsonl`, `select-report.json`), een map die de beoordelaar niet krijgt.
+
+*Blind25.5 Beoordeling* (door de hoofdsessie, niet in deze stap). Per pakket een verse Claude-subagent met alleen zijn
+map. `REVIEWER.md` bevat de rubriek van protocol.md §4.2.4 letterlijk, met de uitvoervorm daar (per paar één JSON-regel
+met `blind_id`, `fout_A`, `fout_B`, `oordeel` ∈ {`A beter`, `B beter`, `gelijk`}, `zekerheid` ∈ {`zeker`, `twijfel`},
+`uitleg`), en verder alleen de namen van het invoer- en het uitvoerbestand en het aantal paren. Laat de hoofdsessie de
+twijfelgevallen opnieuw beoordelen, dan zoals G4-8.13: een andere verse Claude-subagent krijgt per twijfelgeval de bron,
+A, B en de uitleg van de eerste beoordelaar (geen sleutel) en geeft een eindoordeel dat het twijfeloordeel vervangt; hij
+controleert ook 10 zekere oordelen (`random.Random(f"{S25}/{pakket}/check10").sample` van de gesorteerde `blind_id`'s met
+`zekerheid` = `zeker`, 10 stuks); wijkt hij bij meer dan 3 daarvan af, dan beoordeelt hij alle 60 en geldt zijn telling.
+
+*Blind25.6 Telling* (één commando per pakket: `python3 mbert-ops/scripts/blind_tally.py <judgments.jsonl> <key.jsonl>`;
+`g4arm.py tally --arm G4-8-s140` geeft dezelfde aantallen als json). Per stratum en samen: G4-8-s140 beter / tegenkant
+(`base`) beter / gelijk, het aandeel van G4-8-s140 onder de niet-gelijke oordelen, de betekenisfouten van G4-8-s140 en
+van de tegenkant, het aantal twijfel. Regel (c) als protocol.md §5: k/n met k het aantal paren waarin G4-8-s140 beter is
+en n het aantal niet-gelijke, of k/n ≥ 0,60, met de eenzijdige binomiale p = P(X ≥ k) bij X ~ Bin(n, ½); en of de
+betekenisfouten van G4-8-s140 ≤ die van de tegenkant. De telling gebeurt op de oordelen van de eerste ronde (een
+twijfeloordeel telt met het oordeel van de beoordelaar; het aantal twijfel wordt genoemd); na een tweede ronde ook op de
+eindoordelen; beide tellingen worden gerapporteerd.
+
+*Blind25.7 Wat het niet zegt.* Een rapportage: (c), de fouten en p beslissen niets, ook niet over G4-9 of over een
+publicatie. 60 paren, 20 per stratum: kleine n per stratum. P2 bevat alleen bronnen waar de keuze rubriek ∩ N1 een sample
+is (romans 37, BT 41, WMT24++ 38 van de 100 in de pool; Pool.5) en zegt dus niets over de bronnen waar G4-9's doel het
+anker zou zijn. In P1 is de tegenkant geen machine: bij BT is het Nederlandse origineel geen vertaling van het Engels (het
+Engels is Gemma 4's vertaling ervan), de romanboeken zitten in G4-4's training (niet in die van G4-7 en G4-8), en
+WMT24++ komt uit het zoekdeel van G4-5.4. De beoordelaar is een Claude-model; de positie is per stratum geblokt, niet
+gecorrigeerd.

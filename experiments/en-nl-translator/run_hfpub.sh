@@ -112,7 +112,7 @@ smoke)
   for Q in Q4_K_M Q8_0; do
     PORT=$((8091 + k)); k=$((k + 1))
     $LL/build/bin/llama-server -m $D/upload-gguf/gemma-4-31b-it-en-nl-$Q.gguf --host 127.0.0.1 --port $PORT -c 4096 \
-      -t $THREADS $JINJA > $D/out/server-$Q.log 2>&1 &
+      -t $THREADS $JINJA --reasoning off > $D/out/server-$Q.log 2>&1 &
     PID=$!
     for _ in $(seq 180); do curl -sf http://127.0.0.1:$PORT/health > /dev/null && break; sleep 5; done
     curl -sf http://127.0.0.1:$PORT/health > /dev/null || { kill $PID; tail -20 $D/out/server-$Q.log | cut -c1-300; exit 1; }

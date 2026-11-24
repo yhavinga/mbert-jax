@@ -2574,6 +2574,64 @@ Hetzelfde voor `lr_constant` in `trained` (24 nov ~01:35): de volle run `g4arm_G
 verlies 0,114 → 0,074) faalde alleen daarop, met de LR na de warmup overal 4,999999873689376e-05; nu ≤ 1e-6 × 5e-5. De
 training is af en draait niet opnieuw; de herstart draait `adapter` en wat volgt.
 
+*G4-8.15 Aanvulling 24 nov 2026 ~08:40: menselijke steekproef van G4-8-s140 tegen G4-0 uit alle bronnen, rapportage*
+(opdracht Yeb 24 nov ~07:50; uitwerking door een subagent; tijdstip: de commit van deze alinea's op `en-nl-g4arm8`, vóór
+elke stap van deze steekproef op een worker en vóór elke vertaling van romans en BT). Beslist niets en verandert
+G4-8.0–G4-8.14 niet; er wordt niets getraind. Claude en GPT zijn geen generator.
+- **Aanleiding.** V1 en steekproef 2 (`translator-sft/steekproef-yeb-g4-8.md`) kwamen alleen uit WMT24++, FLAN en
+  idioom, terwijl 90% van G4-8's bronnen romans en BT waren (§18). Yeb wil 40 blinde paren van het eindmodel G4-8-s140
+  tegen G4-0, gemengd uit alle bronnen.
+- **Vooraf gelezen** (alleen aantallen, geen tekst): in de evaluatie (`$G/eval/{G4-8-s140,G4-0}/pairs/`) verschillen de
+  twee vertalingen (witruimte genormaliseerd, G4-8-data.4) in het zoekdeel van G4-5.4 bij FLAN 355, WMT24++ 199, FLORES
+  159 en NTREX 346 segmenten; idioom zit alleen in de 100 vaste blinde passages (30 stuks), waarvan er 21 verschillen,
+  12 daarvan niet in steekproef 2.
+- **Romans (nieuw vertaald).** De set `novels` (G4-4.10: 500 passages uit 10 boeken van 10 auteurs,
+  `$G/data/heldout4/eval-novels-meta.parquet`), het Engels van dezelfde rij in `b1-selected.parquet` (gestript; de rij
+  één keer, groep `en_orig`, hetzelfde Engelse boek). De boeken zitten in G4-4's training (G4-4.9), maar niet in de
+  bronnen van G4-7 en G4-8 (cands7 laat ze weg, G4-7.2 en §18); G4-8 begint bij G4-0 (O1), dus voor beide modellen zijn
+  het ongeziene boeken [gevolgtrekking]. Controle (een treffer stopt): geen id `novels:<pid>`, document
+  `novels:<Engels boek-id>` of gestripte Engelse tekst in G4-7's `$RL/data/pool/pool.parquet` of in G4-8's
+  `fresh.parquet`, `plan.parquet` en `targets.parquet`. Daarna pool7's filter (`g4rl.candidate_filter`, geteld): 20–256
+  Gemma 4-tokens, geen 13-gram met het Engels van die vier bestanden, één bron per tekst. Per boek 6 passages (de rijen op
+  pid, geschud met zaad `en-nl-g4arm/0/G4-8/mix/novels/<Engels boek-id>`): **60**.
+- **BT (nieuw vertaald).** C2's testsplit zoals §20 (`pairjudge.fb_bt` ongewijzigd, met zijn controles tegen C2's
+  trainingsdocumenten, G4-7's pool en G4-8's plan), het Engels van Gemma 4 van dezelfde pid; daarbij dezelfde controle
+  tegen G4-8's `fresh.parquet` en `targets.parquet` (een treffer stopt) en dezelfde filter als bij de romans. Per bron
+  (dpc, fineweb, handelingen, raad, rechtspraak) 12 (zaad `en-nl-g4arm/0/G4-8/mix/bt/<bron>`): **60**.
+- **Vertalen** zoals G4-8.7: G4-0 zonder adapter en G4-8-s140 (`$G/G4-8-s140/`, rank 32 / alpha 16 / schaal 0,5
+  gecontroleerd), `translate.py` op fork `f4d8615`, model `gemma4-31b`, `natural-v1`, greedy, per lengteklasse naar de
+  tokens van het Engels (`g4arm.class_of`, tiny–medium) met de slots van `translate_models.yml` en dezelfde terugval bij
+  geheugengebrek als `run_g4arm.sh translate`; daarna `evalsets.py collect`. mbert-mix: w2 vertaalt met G4-0, w3 met
+  G4-8-s140, w0 doet de CPU-stappen.
+- **Keuze van de 40** (alleen paren waarvan de twee vertalingen na normalisering van witruimte verschillen; per set
+  getrokken uit de gesorteerde id's met zaad `en-nl-g4arm/0/G4-8/mix/pick/<set>`):
+  - romans **8**: de boeken in getrokken volgorde, per boek de eerste verschillende passage in getrokken volgorde, één
+    per boek (dus 8 van de 10 boeken; een boek zonder verschillend paar wordt overgeslagen; pas als er minder dan 8
+    boeken zijn een tweede ronde);
+  - BT **10**: 2 per bron;
+  - FLAN **6**, WMT24++ **6** (zonder `is_bad_source`), FLORES **3**, NTREX **2**: uit het zoekdeel van G4-5.4
+    (`split.json`, digest `f953c026…f3`); niet de items van de 100 vaste blinde passages, van `$S/blind/G4-8-replica/`
+    en van `G4-judge-i15` en `G4-judge-anchor-i15` (waaruit V1 kwam);
+  - idioom **5**: de idioom-passages van de 100 vaste blinde passages (alleen daar bestaan idioom-vertalingen van beide
+    modellen), zonder de passages van steekproef 2 (`$S/blind/steekproef-yeb-g4-8/key-map.json`).
+  De volgorde van de 40 geschud (zaad `…/mix/pick/order`); A/B per paar met zaad `…/mix/ab/<set>/<item>`.
+- **Uitvoer.** `mbert-ops/translator-sft/steekproef-yeb-g4-8-mix.md`: bovenaan de instructie (per nummer "A", "B" of
+  "=", eventueel "fout A" / "fout B"), per paar alleen het nummer, de Engelse bron, A en B (geen setnaam), door een
+  script geschreven. Sleutel (nummer → set, item, welke kant G4-8-s140 is) apart in
+  `$S/blind/steekproef-yeb-g4-8-mix/key.json`. Het blinde pakket `$S/blind/G4-8-romans-bt/` (`judge-input.jsonl`:
+  blind_id, source, A, B; apart `key.jsonl`; `select-report.json`) met **alle** verschillende roman- en BT-paren van de
+  120, voor een verse Claude-beoordelaar (rubriek protocol.md §4.2.4; de beoordeling doet de hoofdsessie). Data, vertalingen
+  en tellingen onder `$G/mixsample/`, markers `$G/stages/g4-8-mix/`. Teksten blijven in de bucket en op de VM, behalve het
+  steekproefbestand voor Yeb.
+- **Keten** `mbert-ops/scripts/g4mixsample_run.sh` (kopie in `gs://t5-dutch-english-usc2/hammond/scratch-scripts/`;
+  code `g4mixsample.py`, `run_g4mixsample.sh` op `en-nl-g4arm8`). Alleen mbert-mix, `final_eval_mix.lock` met `flock` tot
+  het eind; vóór elke TPU-stap de TPU van de worker vrij; elke ssh met `timeout 900` en de ssh-opties van G4-judge.10;
+  mbert-corpus (T3) wordt niet aangeraakt; niets wordt verwijderd. Volgorde: setup (`run_g4arm.sh setup`, `ARM=G4-bon`,
+  w0, w2, w3), `data` (w0, CPU), `translate` (w2 G4-0, w3 G4-8-s140), `pick` (w0, CPU). [schatting] ~40–60 min.
+- **Wat het niet zegt.** 40 paren, alleen uit paren die verschillen (het aandeel verschillende per set staat in
+  `pick.json`); de romans zijn "ongeziene boeken" voor G4-0 en G4-8, niet voor G4-4; de BT-bron is het Engels van
+  Gemma 4; FLAN, WMT24++, FLORES en NTREX komen uit het zoekdeel, dat G4-8's keuze van de kandidaat al las (G4-8.8).
+
 ## 20. Meting G4-judge-FB: de judge op fictie en BT
 
 **Vastgelegd 24 nov 2026 (tijdstip: de commit van deze sectie op branch `en-nl-g4arm8`)**, vóór elke stap op een worker

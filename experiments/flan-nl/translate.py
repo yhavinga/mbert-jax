@@ -118,11 +118,15 @@ def user_text(prompt, text, source="en", target="nl", context=None, label=None):
     names = {"source": LANGUAGES[source], "target": LANGUAGES[target], "source_code": source, "target_code": target}
     if not context:
         return prompt["plain"].format(text=text.strip(), **names)
-    turns = "\n".join(prompt["turn"].format(speaker=speaker_attribute(turn.get("label")),
-                                            source_text=turn["source"].strip(),
+    # {label}: the speaker's plain name, for prompts that name it in prose (natural-v1-chat); the others ignore it. A
+    # turn template without {source_text} (natural-v1-ctx, natural-v1-chat) needs no source of the earlier turns.
+    with_source = "{source_text}" in prompt["turn"]
+    turns = "\n".join(prompt["turn"].format(speaker=speaker_attribute(turn.get("label")), label=turn.get("label") or "",
+                                            source_text=turn["source"].strip() if with_source else None,
                                             translation=turn["translation"].strip(), **names)
                       for turn in context)
-    return prompt["context"].format(turns=turns, text=text.strip(), speaker=speaker_attribute(label), **names)
+    return prompt["context"].format(turns=turns, text=text.strip(), speaker=speaker_attribute(label), label=label or "",
+                                    **names)
 
 
 class TurnCodec:

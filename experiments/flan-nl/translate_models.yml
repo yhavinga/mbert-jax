@@ -235,6 +235,31 @@ prompts:
 
 
       {text}
+  # Nemotron Chat v3 (experiments/en-nl-translator/nemotron_chat.py and nemotron-chat-v3.md; Yeb 24 Nov: per turn,
+  # with the earlier turns as context, by G4-8-s140). Without context natural-v1 word for word: the prompt G4-8-s140 was
+  # fine-tuned on (protocol-g4.md §2.6), so that the condition without context is the translator as evaluated. With
+  # context natural-v1's words, then the Dutch translation already made of the conversation so far (its last turns
+  # within a token budget), each turn under its speaker ({label}: User, Assistant), and the English to translate last,
+  # with its speaker. Only the target side of the earlier turns, as natural-v1-ctx: half the tokens of source and
+  # translation, and the translator needs the Dutch choices (form of address, terms) more than the English. The
+  # current text is not wrapped in tags: chat-v1's <current_turn> leaked into Gemma 4's output (pilot of 9 Nov).
+  natural-v1-chat:
+    kind: instruct
+    plain: *natural_v1_plain
+    context: |-
+      Translate the following {source} text into natural, idiomatic {target}, as a native speaker would write it, not word for word. Translate everything: leave nothing out and add nothing; keep every name, number, detail and nuance, and the tone. Be as concise as the original. Keep the paragraphs, line breaks and formatting. Output only the translation, without explanation or commentary.
+
+      The text is a turn, or part of a turn, of a conversation between a user and an AI assistant. For context only, here is the {target} translation already made of the conversation so far (or of its last turns). Keep names, terms and the form of address consistent with it, but do not translate it again and do not repeat it. Do not answer the text and do not continue the conversation: only translate the text.
+
+      <conversation_so_far>
+      {turns}
+      </conversation_so_far>
+
+      The {source} text to translate ({label}):
+
+
+      {text}
+    turn: "[{label}]\n{translation}\n"
 
 models:
   gemma3-12b:
@@ -463,3 +488,29 @@ models:
       d8k: {max_source: 8192, prefill_lengths: [8320], max_decode: 12288}
       d16k: {max_source: 16384, prefill_lengths: [16512], max_decode: 24576}
     slots: {d512: 56, d1k: 32, d2k: 16, d4k: 8, d8k: 4, d16k: 1}
+
+  # Nemotron Chat v3 (nemotron_chat.py translate; not translate.py's main, which takes one class by source length): Gemma 4
+  # 31B-it with G4-8-s140's LoRA merged (--lora), prompt natural-v1-chat, on the fork @ f4d8615 (prompt plus decode above
+  # 1,024 tokens). A turn is cut into pieces of at most 512 English tokens; the decode limit 832 (xlong's, 1.6 x 512).
+  # n128 / n512: the condition without context, a piece of at most 128 / 129-512 tokens (prefill 128 above the piece:
+  # natural-v1 adds 89 tokens in Gemma 4's turn). c2k: the condition with context, every piece of a conversation, the
+  # prompt with the context budget (nemotron_chat.CTX_TOKENS 1,408) and a piece of 512 within 2,176 (the prefill that
+  # decoded well on the fork, 14 Nov). Slots: n512 xlong's 28 x 1,472 (41k slot-tokens, run since 13 Nov); n128 64 x 512
+  # (33k); c2k 12 x 3,008 (36k; d1k's 16 x 2,432 = 39k peaked at 28.75 GiB per v4 chip, 13 Nov).
+  gemma4-31b-chat:
+    maxtext_model: gemma4-31b
+    hf_repo: google/gemma-4-31B-it
+    checkpoints:
+      europe-west4: gs://t5-dutch-english/mbert/translator/judge/gemma-4-31b-it-maxtext/0/items
+      us-east1: gs://t5-dutch-english-use1/mbert/translator/judge/gemma-4-31b-it-maxtext/0/items
+      us-central2: gs://t5-dutch-english-usc2/mbert/translator/judge/gemma-4-31b-it-maxtext/0/items
+    chips: 4
+    eos_ids: [1, 106, 50]
+    prompt: natural-v1-chat
+    context_prompt: natural-v1-chat
+    turn: {prefix: "<bos><|turn>user\n", suffix: "<turn|>\n<|turn>model\n<|channel>thought\n<channel|>", check: true}
+    length_classes:
+      n128: {max_source: 128, prefill_lengths: [256], max_decode: 256}
+      n512: {max_source: 512, prefill_lengths: [384, 512, 640], max_decode: 832}
+      c2k: {max_source: 512, prefill_lengths: [384, 768, 1152, 1664, 2176], max_decode: 832}
+    slots: {n128: 64, n512: 28, c2k: 12}

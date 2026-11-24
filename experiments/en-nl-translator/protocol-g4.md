@@ -2855,3 +2855,127 @@ per deel `c1`, `c2`, `c3`: `n1pairs` (w0, CPU), `judge` met `SET=n1` (4 workers)
 slot `n1report` (w0, CPU). Elke stap eindigt op `EXIT 0`, anders `FAILED` en stoppen; een gemarkeerde stap wordt bij een
 herstart overgeslagen. [schatting] ~2–2,5 u: §18's rubriek-scoring van dezelfde prompts duurde 20 / 45 / 45 min
 (`c1` / `c2` / `c3`, gemeten in de log van `g4d8a1123a`); N1 is korter dan de rubriekprompt.
+
+## 22. G4-9 training: SFT met LoRA op de N1-keuze van G4-8-data
+
+**CONCEPT, NIET GESTART; wacht op Yebs besluit (G4-9 ja of nee, O1, O6).** Opgesteld 24 nov 2026 (~08:00) door een
+subagent op verzoek van de hoofdsessie [opdracht: de training van een mogelijke arm G4-9 klaarzetten zoals G4-8, maar met
+de N1-keuze van §21 als doelen; bouwen, testen en droog draaien, niets trainen; Yeb sliep]. Vooraf gelezen: alleen
+tellingen (de rapporten `g4-8-data-n1.json` van §21 en `g4-8-report.json` van §19, de logregels met tijden van de keten
+`g4t8a`…`g4t8c`, de LEARNINGS-regels van G4-8 en N1); geen tekst (doel, sample, anker, bron) en geen uitslag van G4-9. De
+**definitieve versie** volgt vóór de start: dan vervangt de hoofdsessie deze kop door "Vastgelegd <datum>", vult G4-9.0 in
+met Yebs besluiten en zet het startbestand (G4-9.14). De keten weigert een protocol waarin deze conceptregel nog staat.
+Alles is als §19 (definitief, met G4-8.13 en G4-8.14), behalve de doelen (G4-9.2), de namen, de zaden en de vergelijking
+met G4-8 in het rapport (G4-9.11); waar hieronder "als G4-8.x" staat, geldt §19 letterlijk met `G4-8` vervangen door
+`G4-9` in namen, zaden en plaatsen. Claude en GPT zijn geen judge of generator. `G8=$G/data/G4-8`, `G9=$G/data/G4-9`,
+`RL=$G/rl/G4-7`.
+
+*G4-9.0 Besluiten vóór de start* [open: Yeb]. Vast te leggen, elk als één regel:
+- `O1 [besluit Yeb …]: G4-0` (startmodel; standaard, als §19). Het alternatief G4-8-s140 (verder trainen vanaf de keuze
+  van §19) is **niet gebouwd**: het vraagt het stapelen van adapters zoals G4-6b (`sft_lora.py --base-adapter`,
+  `g4mix.py stack` bij vertalen en samplen, rank 64) en een andere vergelijkingsbasis voor de regel; kiest Yeb dat, dan
+  eerst een codewijziging en een nieuwe versie van deze sectie. **De keten leest deze regel** en weigert een andere
+  waarde dan `G4-0`.
+- `O5 [besluit Yeb …]: 2 epochs, LR 5e-5` (als §19).
+- `O6 [besluit Yeb …]: R-nieuw` of `O6 [besluit Yeb …]: R-oud` (G4-9.10; standaard R-nieuw, als §19). **De keten leest
+  deze regel.**
+- Twijfelgevallen onder R-nieuw [besluit Yeb …]: Yebs oordeel (G4-8.9) of, als Yeb dat weer wil, de tweede blinde ronde
+  van G4-8.13 (dan ook voor de controle van 10 zekere oordelen). Raakt de keten niet (de beoordeling is na `DONE`).
+
+*G4-9.1 Startmodel en LoRA* als G4-8.1: G4-0 zonder adapter, LoRA rank 32 / alpha 16 (schaal 0,5) op de 410 modules van
+`run_sft.sh`, AdamW als G4-1…G4-5, `num_vocab_tiling=8`, MaxText 0.2.5.
+
+*G4-9.2 Doelen* (`g4arm8.py n1targets`, w0, CPU; een stap van de keten **na** het startbestand, zodat er vóór Yebs
+besluit niets nieuws in de bucket komt). De N1-keuze van §21 (G4-8-N1.6): per deel `c1`, `c2`, `c3` de bronnen waar N1
+een kandidaat van §18 (geen fail, QE ≤ QE₀, anders dan het anker) boven het anker zet (P̄_N1 > 0,5), uit
+`$G8/<c>/select-n1/targets.parquet` en `choice.parquet`; samengevoegd tot één `$G9/targets/targets.parquet` in de vorm
+van §18 (G4-8-data.9: dezelfde kolommen, op id gesorteerd; `p_sample` is hier P̄_N1), met `targets.json` (tellingen per
+deel, sha256 van invoer en uitvoer). Gecontroleerd (een afwijking is `FAILED`; er wordt dan niets geschreven):
+- `$G8/n1/report.json` is het rapport van §21 over `c1`, `c2`, `c3`, en elke `choice.parquet` is (sha256) de
+  `choice-n1.parquet` die `n1report` las en tegen de N1-scores controleerde (G4-8-N1.3.4);
+- per deel dekt `choice.parquet` precies de bronnen van dat deel in `$G8/plan/plan.parquet`, en zijn de doelen precies
+  de bronnen met reden `sample`, met dezelfde `j`, P̄ en QE als in `choice.parquet`; elk id één keer;
+- elk doel: deel, chunk en Engels als in het plan, P̄_N1 > 0,5, **QE ≤ QE₀ (+ 1e-9)** (de juistheidsbewaker,
+  opnieuw nagegaan), een niet-lege tekst die (na normalisering van witruimte) niet die van het anker is;
+- de aantallen per deel zijn die van het rapport van §21: **16.349** (FLAN 1.391, romans 7.900, BT 7.058) [gemeten, §21].
+FLAN blijft gemaximeerd (besluit Yeb 23 nov ~16:40): de bronnen zijn die van §18 (10 / 45 / 45), van de doelen is FLAN
+8,5% (1.391 / 16.349). Geen ankerrijen (O3 van §18).
+
+*G4-9.3 Trainingsdata* als G4-8.2 (`g4arm8.py sftset --arm G4-9` op `$G9/targets/targets.parquet`; alle controles van
+G4-8.2 ongewijzigd, ook de lekcontrole), de doorgangen geschud met zaad `en-nl-g4arm/0/G4-9/train/shuffle/<doorgang>`;
+uitvoer `$G9/sft/`. `g4arm.py check --arm G4-9` als G4-8. [schatting] Bij §19 gaven 15.194 doelen 6,78 M tokens per
+doorgang en 205 stappen; 16.349 doelen ≈ 7,3 M tokens per doorgang ≈ 220 stappen.
+
+*G4-9.4 Training* als G4-8.3: LR 5e-5 constant na 10 stappen lineaire warmup, rijen van 4.096, 16 per stap, één
+multi-host-job over de 16 chips van mbert-mix; evaluatie op `books`, `btval`, `own` op stap 0, elke E = ⌈stappen / 6⌉
+stappen en na de laatste. Run `g4arm_G4-9` (een herstart na een mislukte run: een nieuwe letter).
+
+*G4-9.5 Kandidaten* als G4-8.4: de adapters na K₁ = 2E, K₂ = 4E en de laatste stap, namen `G4-9-s<stap>`, naar
+`$G/G4-9-s<stap>/` (rank 32 / alpha 16 / schaal 0,5 gecontroleerd; niets gestapeld).
+
+*G4-9.6 Smoke-test* als G4-8.5 (met G4-8.14: de LR binnen float32-precisie), de smoke-set met zaad
+`en-nl-g4arm/0/G4-9/smoke`, run `g4arm_G4-9_s8`.
+
+*G4-9.7 Per kandidaat, gerapporteerd* als G4-8.6; de RL-val-samples met zaad per worker `en-nl-g4arm/0/G4-9/div/w<k>`,
+voor elk model hetzelfde, ook voor G4-0 zonder adapter (opnieuw gesampled), uitvoer `$G9/sft/div/<model>/`.
+
+*G4-9.8 Evaluatie* als G4-8.7 met `ARM=G4-9`. C1 in één classify-run over de kandidaten, G4-0, G4-4 en **G4-8-s140**
+(de keuze van §19; zijn vertalingen en scores in `$G/eval/G4-8-s140/` worden gelezen, niet opnieuw gemaakt) op
+`$G/naturalness-G4-9/`; C2 en PLL op dezelfde teksten.
+
+*G4-9.9 Keuze (zoekdeel)* als G4-8.8 (`select5` over de kandidaten van G4-9; G4-4 en G4-8-s140 doen niet mee).
+
+*G4-9.10 Beslisregel (beslisdeel), tegen G4-0* als G4-8.9: beide varianten uitgerekend, de regel van G4-9.0 beslist; de
+bootstrap van (b) met zaad `en-nl-g4arm/0/G4-bon/boot/G4-9/b`. Het blinde pakket van de gekozen kandidaat tegen G4-0 in
+`$S/blind/G4-9/` en tegen TG in `$S/blind/G4-9-tg/` als (a1) en (a3) gelden; beoordeling en telling (`g4arm.py tally`,
+`$G/report-G4-9/tally.json`) door de hoofdsessie, daarna `report8` opnieuw met de telling. Onder R-nieuw de
+twijfelgevallen en de 10 zekere oordelen (`random.Random("en-nl-g4arm/0/G4-9/yeb10")`) volgens G4-9.0. [gevolgtrekking]
+Het beslisdeel is na §19 één keer gelezen (de uitslag van G4-8): de keuze van G4-9 kijkt er niet naar, en het besluit
+tegen G4-0 is als bij G4-8, maar een vergelijking "G4-9 tegen G4-8" op hetzelfde beslisdeel is niet meer onafhankelijk
+(G4-9.11 beslist daarom niets).
+
+*G4-9.11 Vergelijking met G4-8 (rapporteren, beslist niets).* Op het beslisdeel de gekozen kandidaat van G4-9 tegen
+G4-8-s140 (de keuze van §19; de keten controleert `selected` in `$G/report-G4-8/report.json`): per set QE van beide, het
+verschil en een 95%-interval (gepaarde bootstrap per set, `g4bon.paired_ci`, 10.000 trekkingen, zaad
+`en-nl-g4arm/0/G4-bon/boot/G4-9/vs-G4-8/qe/<set>`), (a1) van beide; COMET-22 per set met het verschil en "(a3) tegen
+G4-8" (≥ G4-8 − 0,005); C1 "origineel" op WMT24++ (goed) + FLAN van beide met het verschil en een 95%-interval (zaad
+`…/G4-9/vs-G4-8/c1`); C2 van beide met het verschil. [keuze] Geen blinde vergelijking G4-9 tegen G4-8 in deze keten;
+kan na `DONE` als rapportage (`armeval.py blind` met G4-8-s140 als basis) als Yeb dat wil.
+
+*G4-9.12 Rapport* (`g4arm8.py report8 --arm G4-9 --compare G4-8-s140` → `$G/report-G4-9/report.md`/`.json`, kopie
+`mbert-ops/translator-sft/g4-9-report.md`): als G4-8.10, plus G4-9.11.
+
+*G4-9.13 Uitvoer.* `$G9/targets/` (G4-9.2), `$G9/sft/` (set, smoke-set, `check.txt`, RL-val-segmenten, `div/<model>/`),
+`$G9/logs/`, `$G/runs/g4arm_G4-9_s8/`, `$G/runs/g4arm_G4-9/`, `$G/G4-9-s<stap>/`, `$G/eval/G4-9-s<stap>/`,
+`$G/naturalness-G4-9/`, `$G/report-G4-9/`, `$S/blind/G4-9/`, `$S/blind/G4-9-tg/`; markers `$G/stages/g4-9-train/`. Van
+§18–§21 en van G4-8 wordt alleen gelezen; niets wordt overschreven.
+
+*G4-9.14 Keten* (`mbert-ops/scripts/g4arm9_train_run.sh`, dat `g4arm8_train_run.sh` met `ARM8=G4-9` draait; kopieën in
+`gs://t5-dutch-english-usc2/hammond/scratch-scripts/`; code `g4arm8.py`, `run_g4arm8.sh` met `ARM8=G4-9` en `run_g4arm.sh`
+met `ARM=G4-9` op `en-nl-g4arm8`). Alleen mbert-mix (een v4-32: de training over alle 16 chips, de rest per worker);
+mbert-corpus (T3) wordt niet aangeraakt. Wacht eerst op de marker `$G/stages/g4-8-n1/n1report.done` van §21 en
+`$G8/n1/report.json` (beide er al), dan op het startbestand `mbert-ops/g4arm9.train-go` (twee regels: `O6=R-oud` of
+`O6=R-nieuw`, gelijk aan G4-9.0, en `COMMIT=<de gepushte commit met de definitieve §22>`, die afstamt van dit concept en
+van de geteste code; de definitieve §22 heeft precies één O6-regel en precies één O1-regel, `G4-0`), dan op
+`final_eval_mix.lock` (met `flock`, tot het eind gehouden). Volgorde: setup (`FULL=1`; daarna op elke worker ≥ 12 GB vrij
+in `/dev/shm`, anders `FAILED`), `n1targets` (w0), `sftset` (w0), `check` (w0), smoke-run + `smoke8` (w0), de training,
+`adapter` (w0), per kandidaat `translate` en `score` (4 workers), RL-val-samples per model (4 workers), `texts`,
+`classify`, `classify-c2`, `pll` (w0), `report8` (w0), het blinde pakket als (a1) en (a3) gelden; `DONE` met de keuze en de
+regels. Elke stap eindigt op `EXIT 0`, anders `FAILED` en stoppen; een gemarkeerde stap wordt bij een herstart
+overgeslagen. [schatting, naar de gemeten tijden van G4-8 in de ketens `g4t8a`…`g4t8c`] ~3,5 u na de start (3–4 u):
+setup ~3 min, `n1targets` ~3 min, `sftset` + `check` ~5 min, smoke ~22 min, training ~65–70 min (~220 stappen; G4-8: 205
+stappen in 62 min), `adapter` ~2 min, per kandidaat vertalen + scoren ~16 min (3×), RL-val-samples ~26 min, C1/C2/PLL
+~25 min, rapport en blind pakket ~5 min.
+
+*G4-9.15 Wat het niet zegt.*
+- N1 sluit juistheid uit; de enige juistheidsbewaking van de doelen is die van §18 (de fail-filters en QE ≤ QE₀,
+  MetricX-24-QE zonder referentie). Een doel kan een betekenisfout hebben die QE niet ziet (G4-8-N1.8). De N1-doelen zijn
+  niet blind en niet door Yeb bekeken (geen V1 of V3 zoals bij G4-8).
+- De evaluatie en de blinde rubriek (protocol.md §4.2.4: eerst juistheid, dan natuurlijkheid) zijn die van G4-8; C1 is
+  de maat voor "origineel"; (b) blijft onder R-nieuw rapportage.
+- De judge is hetzelfde model als de generator van de samples (Gemma 4 31B-it): een voorkeur voor de eigen stijl is niet
+  te scheiden.
+- Een verschil tussen G4-9 en G4-8 komt uit de doelen (in ~1/3 van de bronnen een ander sample of een andere keuze tussen
+  sample en anker, §21) en hun aantal (16.349 tegen 15.194), en ook uit andere zaden (schudding, smoke-set, RL-val).
+- Geen tweede ronde, geen judge op evaluatie-uitvoer, geen beoordeling van het blinde pakket (die is aan de hoofdsessie
+  en Yeb).

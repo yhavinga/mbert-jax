@@ -267,10 +267,22 @@ def cmd_merge(args):
     shards = sorted({v[0] for v in weights.values()})
     delta_sq = weight_sq = 0.0
     changed = total = merged_n = 0
+    # written again in parts of at most SHARD_BYTES (one tensor read at a time), so that memory holds one part, not a
+    # 50 GB shard; a new index maps every weight to its part
+    parts, part, part_bytes, weight_map, total_size = [], {}, 0, {}, 0
+
+    def flush():
+        nonlocal part, part_bytes
+        if part:
+            name = f"model-{len(parts) + 1:05d}.safetensors"
+            save_file(part, str(out / name), metadata={"format": "pt"})
+            parts.append(name)
+            weight_map.update({k: name for k in part})
+            print(f"PART {json.dumps({'part': name, 'tensors': len(part), 'bytes': part_bytes})}", flush=True)
+            part, part_bytes = {}, 0
+
     for shard in shards:
-        tensors = {}
         with safe_open(base / shard, framework="pt") as f:
-            metadata = f.metadata()
             for key in f.keys():
                 t = f.get_tensor(key)
                 if key in factors:
@@ -279,19 +291,30 @@ def cmd_merge(args):
                     t, d2, w2, n = merge_weight(t, factors[key]["A"], factors[key]["B"], scaling, torch)
                     delta_sq, weight_sq, changed, total, merged_n = (delta_sq + d2, weight_sq + w2, changed + n,
                                                                      total + t.numel(), merged_n + 1)
-                tensors[key] = t.contiguous()
-        save_file(tensors, str(out / shard), metadata=metadata or {"format": "pt"})
-        print(f"SHARD {json.dumps({'shard': shard, 'tensors': len(tensors)})}", flush=True)
-        del tensors
+                size = t.numel() * t.element_size()
+                if part and part_bytes + size > args.shard_bytes:
+                    flush()
+                part[key] = t.contiguous()
+                part_bytes += size
+                total_size += size
+    flush()
     if merged_n != len(factors):
         raise SystemExit(f"merged {merged_n} weights, the adapter has {len(factors)}")
+    if set(weight_map) != set(weights):
+        raise SystemExit(f"{len(weight_map)} weights written, the base model has {len(weights)}")
+    n = len(parts)
+    renamed = {}
+    for k, name in enumerate(parts, 1):
+        final = f"model-{k:05d}-of-{n:05d}.safetensors"
+        (out / name).rename(out / final)
+        renamed[name] = final
+    index = {"metadata": {"total_size": total_size}, "weight_map": {k: renamed[v] for k, v in sorted(weight_map.items())}}
+    (out / "model.safetensors.index.json").write_text(json.dumps(index, indent=2) + "\n")
     for p in sorted(base.iterdir()):
         if p.is_file() and not COPY_SKIP.match(p.name):
             shutil.copy2(p, out / p.name)
-    if (base / "model.safetensors.index.json").exists():
-        shutil.copy2(base / "model.safetensors.index.json", out / "model.safetensors.index.json")
     stats = {"modules": merged_n, "scaling": scaling, "relative_update_norm": (delta_sq / weight_sq) ** 0.5,
-             "elements_changed": changed / total, "shards": len(shards),
+             "elements_changed": changed / total, "shards": n,
              "copied": sorted(p.name for p in out.iterdir() if not p.name.endswith(".safetensors"))}
     (out / "merge.json").write_text(json.dumps(stats, indent=1) + "\n")
     print("MERGE " + json.dumps(stats), flush=True)
@@ -317,6 +340,7 @@ def main(argv=None):
     p.add_argument("--adapter-dir", required=True)
     p.add_argument("--out", required=True)
     p.add_argument("--maxtext-norm", type=float, help="relative_update_norm of translate.py's LORA line")
+    p.add_argument("--shard-bytes", type=int, default=5 * 10 ** 9, help="the merged model's parts, at most")
     p.add_argument("--norm-tolerance", type=float, default=0.01)
     args = parser.parse_args(argv)
     {"convert": cmd_convert, "merge": cmd_merge}[args.command](args)

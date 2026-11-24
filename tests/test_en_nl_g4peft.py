@@ -350,7 +350,9 @@ def test_tiny_gemma4_peft_and_merge(tmp_path):
     # the merge: bf16 weights, W + scaling * B A in float32, then bf16
     model.to(torch.bfloat16).save_pretrained(tmp_path / "base16")
     gp.main(["merge", "--base-dir", str(tmp_path / "base16"), "--adapter-dir", str(adapter_dir),
-             "--out", str(tmp_path / "merged")])
+             "--out", str(tmp_path / "merged"), "--shard-bytes", "4000"])  # several parts
+    index = json.loads((tmp_path / "merged" / "model.safetensors.index.json").read_text())
+    assert len(set(index["weight_map"].values())) > 2 and set(index["weight_map"]) == set(model.state_dict()) - {"lm_head.weight"}
     stats = json.loads((tmp_path / "merged" / "merge.json").read_text())
     assert stats["modules"] == 41 and 0 < stats["elements_changed"] <= 1
     merged = pytest.importorskip("transformers").AutoModelForCausalLM.from_pretrained(tmp_path / "merged",

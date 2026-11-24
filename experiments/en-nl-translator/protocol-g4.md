@@ -3259,3 +3259,11 @@ setup`, `ARM=G4-bon`; w0 met `FULL=1`), `data` (w0, CPU), `judge` (4 workers), d
 (C1) en `classify-c2` (w0, na elkaar) en `comet` (w2, CPU); tot slot `report` op co1 uit de bestanden zonder tekst
 (`refs.parquet`, de scores, de sleutels en antwoorden). Markers `$G/stages/g4-measure/`; niets wat eerdere secties
 schreven wordt overschreven. Elke stap eindigt op `EXIT 0`, anders `FAILED` en stoppen. [schatting] ~35–50 min.
+
+*G4-maat.10 Aanvulling 24 nov 2026 ~12:20, na de uitslag (run `g4m1124a`, code `81f68a6`); verandert G4-maat.1–9 niet.*
+Twee wijzigingen in het rapport, beide na het lezen van de uitslag en daarom zo gemarkeerd: (a) in de tabel
+"betekenisfouten" staat geen rij Claude meer in de kolom van Claude's eigen foutlabels (Claude tegen zijn eigen labels is
+per constructie 100% en zegt niets); (b) een tabel **"hoe vaak kiest een signaal het nieuwe systeem"** per kolom van de
+hoofdtabel (het aandeel paren waar het signaal de kant kiest die niet `base` is), als maat voor de
+selectiekoppeling van G4-maat.7 [niet vooraf vastgelegd; beschrijvend, geen toets]. De run, de scores en de tabellen
+1–7 blijven die van `g4m1124a`; het rapport wordt op co1 opnieuw gemaakt uit dezelfde bestanden zonder tekst.

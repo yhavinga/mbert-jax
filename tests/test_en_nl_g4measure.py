@@ -412,6 +412,11 @@ def test_report_tables_against_yeb_and_claude(world, tmp_path, capsys):
     assert "V1 FLAN" in r["yeb_sets"] and "V1 judgeq" in r["yeb_sets"] and "samen romans" in r["yeb_sets"]
     assert "pakket RB3" in r["claude_sets"] and "set novels" in r["claude_sets"]
     assert r["faults"]["Yeb (fout aan één kant)"]["QE"]["n_ref"] == 1
+    assert "Claude" in r["faults"]["Yeb (fout aan één kant)"] and "Claude" not in r["faults"]["Claude (fout aan één kant)"]
+    # QE picks Yeb's side; where Yeb picks the new system, QE does too
+    ns = r["new_system"]["Yeb samen"]["QE"]
+    assert ns["n"] == 78 and ns["k"] == m["Yeb samen"]["nieuw systeem"]["k"]
+    assert "## 8. Na de uitslag toegevoegd" in (tmp_path / "report" / "report.md").read_text()
     assert r["coverage"]["judge_not_scored"]["n2"] == 1
     md = (tmp_path / "report" / "report.md").read_text()
     assert md.startswith("# G4-maat") and "| QE |" in md and "K1: QE, bij |ΔQE| < 0,2 N1" in md

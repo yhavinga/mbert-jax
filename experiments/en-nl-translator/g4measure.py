@@ -529,12 +529,20 @@ def report_data(refs, scores, yeb, extra):
     margin = {"Yeb samen": margin_table(cols["Yeb samen"]), "Claude alle": margin_table(cols["Claude alle"])}
 
     # meaning errors: the side without the error
-    def fault_table(items):
-        return {row: agreement([(side, choices[p][row]) for p, side in items]) for row in ALL_ROWS}
+    def fault_table(items, rows=ALL_ROWS):
+        return {row: agreement([(side, choices[p][row]) for p, side in items]) for row in rows}
     yeb_fault = [(y["pair"], other(y["fout"])) for y in yeb if y["fout"]]
     claude_fault = [(r["pair"], "B" if r["claude_fout_a"] else "A") for r in refs
                     if r["origin"] == "package" and r["claude_fout_a"] != r["claude_fout_b"]]
-    faults = {"Yeb (fout aan één kant)": fault_table(yeb_fault), "Claude (fout aan één kant)": fault_table(claude_fault)}
+    # Claude against its own error labels says nothing (G4-maat.10): no Claude row there
+    faults = {"Yeb (fout aan één kant)": fault_table(yeb_fault),
+              "Claude (fout aan één kant)": fault_table(claude_fault, SIGNALS + COMBOS + REFERENCE_ROWS)}
+
+    # G4-maat.10, added after the result: how often a signal picks the side that is not the base (the new system)
+    def new_table(pairs_refs):
+        return {row: agreement([(choices[p]["nieuw systeem"], choices[p][row]) for p, _ in pairs_refs])
+                for row in SIGNALS + COMBOS + ("Claude",)}
+    new_system = {c: new_table(v) for c, v in cols.items()}
 
     coverage = {
         "judge_not_scored": {n: sum(scores[r["pair"]]["judge"][n] is None for r in refs) for n in JUDGES.values()},
@@ -545,7 +553,7 @@ def report_data(refs, scores, yeb, extra):
     }
     return {"main": main, "yeb_sets": yeb_sets, "claude_sets": claude_sets,
             "cross": {f"{c}|{v}": n for (c, v), n in sorted(cross.items())}, "claude_vs_claude": cc,
-            "margin": margin, "faults": faults, "coverage": coverage, **extra}
+            "margin": margin, "faults": faults, "new_system": new_system, "coverage": coverage, **extra}
 
 
 # ---------------------------------------------------------------------------------------------------- checks
@@ -660,11 +668,21 @@ def report_text(r):
     out += ["", "## 6. Betekenisfouten: kiest het signaal de kant zonder fout?", "",
             "| signaal | " + " | ".join(r["faults"]) + " |", "|---|" + "---:|" * len(r["faults"])]
     for row in ALL_ROWS:
-        out.append(f"| {label(row)} | " + " | ".join(cell(r["faults"][g][row]) for g in r["faults"]) + " |")
+        out.append(f"| {label(row)} | " + " | ".join(cell(r["faults"][g][row]) if row in r["faults"][g] else ""
+                                                    for g in r["faults"]) + " |")
     out += ["", "## 7. Controles en dekking", "", "| controle | waarde |", "|---|---|"]
     for k, v in {**r["coverage"], **r["checks"]}.items():
         out.append(f"| {k} | {json.dumps(v, ensure_ascii=False)} |")
-    out += ["", "## 8. Wat het niet zegt", "",
+    ns = r["new_system"]
+    out += ["", "## 8. Na de uitslag toegevoegd (niet vooraf vastgelegd, §23 G4-maat.10): hoe vaak kiest een signaal "
+            "het nieuwe systeem?", "",
+            "Het aandeel paren (waar de referentie een kant kiest en het signaal kiest) waar het signaal de kant kiest "
+            "die niet `base` is (V1: de judge-keuze; gemengd: G4-8-s140). Een hoog aandeel op V1 betekent dat de "
+            "overeenstemming met Yeb daar vooral die van de selectie is.", "",
+            "| signaal | " + " | ".join(ns) + " |", "|---|" + "---:|" * len(ns)]
+    for row in SIGNALS + COMBOS + ("Claude",):
+        out.append(f"| {label(row)} | " + " | ".join(cell(ns[c][row]) for c in ns) + " |")
+    out += ["", "## 9. Wat het niet zegt", "",
             "- n is klein; veel vergelijkingen zonder correctie; geen drempel, geen winnaar (§23 G4-maat.7).",
             "- V1 is gekozen met de rubriek-judge en QE ≤ QE₀: rubriek en QE vallen daar grotendeels samen met "
             "'nieuw systeem'. Zo ook de pakketten met een selectie (§23 G4-maat.2).",

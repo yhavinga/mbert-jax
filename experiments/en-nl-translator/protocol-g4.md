@@ -2663,3 +2663,86 @@ naar de 4 workers; elke ssh met `timeout 900` en de ssh-opties van G4-judge.10; 
 worker(s) vrij. Volgorde: `setup` (`run_g4arm.sh setup`, `ARM=G4-bon`), `fbdata` (w0, CPU), `score` met `SET=fb`
 (4 workers), `fbreport` (w0, CPU). Markers `$G/stages/g4-judge/fb-*.done`; niets wat §16–§19 schreven wordt
 overschreven. Elke stap eindigt op `EXIT 0`, anders `FAILED` en stoppen. [schatting] ~30–40 min.
+
+*FB.8 Aanvulling van 24 nov 2026 ~04:40: G4-judge-FB.N, dezelfde judge alleen naar natuurlijkheid of herkomst gevraagd
+(tijdstip: de commit van deze alinea's op `en-nl-g4arm8`), vóór elke stap op een worker en vóór elke uitslag van FB.N*
+[opdracht van de hoofdsessie 24 nov ~04:33, Yeb sliep; binnen de judge-proef van §17; uitwerking door een subagent].
+Vooraf gelezen: het rapport van §20 (`g4-judge-fiction-bt.md`, alleen tellingen en scores): met de prompt van
+G4-judge.3 koos de judge op fictie G4-0 boven de menselijke vertaling (richting mens 17,6%) en op BT de rondgang boven
+het origineel (richting origineel 30,8%), terwijl C1 en C2 op dezelfde paren de menselijke of oorspronkelijke kant
+hoger zetten (82,6–96,4%). Geen tekst, geen prompt-uitvoer en geen score van FB.N gelezen. Een meting: er wordt niets
+getraind, niets vertaald en niets beslist; Claude en GPT zijn geen judge.
+- **Vraag.** Herkent dezelfde Gemma 4 31B-it de menselijke of oorspronkelijke kant wel als je hem alleen naar
+  natuurlijkheid vraagt (N1, met de Engelse bron) of alleen naar herkomst (N2, zonder bron), zonder de juistheid van de
+  rubriek?
+- **Paren.** De 1.000 paren van §20 (FB.2, run `g4jfb1124a`), ongewijzigd: `pairjudge.py fbdata --prompt n1|n2` bouwt
+  ze met dezelfde code en controles opnieuw uit de invoer die §20's `fbdata` op w0 neerzette
+  (`/dev/shm/translator/g4arm/judge-fbdata-g4jfb1124a/in/`) en stopt als (i) de sha256 van de vijf invoerbestanden
+  afwijkt van `$GJ/fb/data/fbdata.json`, (ii) `refs.parquet` afwijkt van die van §20, of (iii) de prompts van G4-judge.3
+  die het uit deze paren maakt niet per uid gelijk zijn aan §20's `prompts-w<k>.parquet` (2.000 prompts, vergeleken op
+  sha256 van de tekst). Daarmee zijn per uid A, B en de Engelse bron die van §20, en elke prompt staat op dezelfde worker.
+- **Prompts** (letterlijk de tekst van de gebruikersbeurt; `{bron}`, `{A}` en `{B}` gestript ingevuld; verder als
+  G4-judge.2: hetzelfde chat-template met één gebruikersbeurt en een lege denkruimte). Kader `ab`: A = de menselijke of
+  oorspronkelijke kant, B = de machinekant; `ba` verwisseld.
+  **N1** (met bron, alleen natuurlijkheid):
+
+```
+Je krijgt een Engelse bron en twee Nederlandse teksten, A en B, met ongeveer dezelfde inhoud.
+
+Oordeel alleen op natuurlijk, oorspronkelijk klinkend Nederlands: welke tekst leest het meest als tekst die oorspronkelijk in het Nederlands is geschreven, en het minst als een vertaling? Laat juistheid uitdrukkelijk buiten beschouwing: weglatingen, toevoegingen en afwijkingen van de Engelse bron tellen niet mee. "gelijk" als er geen duidelijk verschil is.
+
+Engelse bron:
+{bron}
+
+Tekst A:
+{A}
+
+Tekst B:
+{B}
+
+Welke tekst leest het meest als oorspronkelijk Nederlands? Antwoord met één woord: A, B of gelijk.
+```
+
+  **N2** (zonder bron):
+
+```
+Je krijgt twee Nederlandse teksten, A en B, met ongeveer dezelfde inhoud. De ene is oorspronkelijk in het Nederlands geschreven, de andere is een vertaling.
+
+Welke van de twee is oorspronkelijk in het Nederlands geschreven, en welke is de vertaling? "gelijk" als je het verschil niet kunt zien.
+
+Tekst A:
+{A}
+
+Tekst B:
+{B}
+
+Welke tekst is oorspronkelijk in het Nederlands geschreven? Antwoord met één woord: A, B of gelijk.
+```
+
+- **Scoren.** Als FB.3: `pairjudge.py score` ongewijzigd (Gemma 4 31B-it @ `842da37`, de MaxText-omzetting, één
+  prefill, P(A)/P(B)/P(gelijk) uit de logits van de eerste antwoordpositie met de ids van G4-judge.2, beide volgordes,
+  P̄ gemiddeld volgens G4-judge.4), per prompt over de 4 workers van mbert-mix; 2 × 2.000 prompts; een prompt van meer
+  dan 4.096 tokens wordt niet gescoord (geteld). P̄(mens) = P̄(A) in kader `ab`: bij N1 "leest het meest als
+  oorspronkelijk Nederlands", bij N2 "is oorspronkelijk Nederlands".
+- **Maten** (`pairjudge.py fbnreport`): de maten van FB.4 1–5 per prompt en per proef, met code en bootstrapzaad van
+  §20 (`fb_result`), en de uitslag van §20 (de rubriek-prompt, herberekend uit `$GJ/fb/scores/` en gecontroleerd tegen
+  `$GJ/fb/report.json`) ernaast: oordelen, richting (Wilson), gem. P̄ en Δ (bootstrap), omklappen en inconsistent,
+  positie en massa, BT per bron, per lengteband, C1/C2 op dezelfde paren zoals ze er al zijn. Erbij: de samenhang tussen
+  de prompts op dezelfde paren (N1 ~ rubriek, N2 ~ rubriek, N1 ~ N2): richting gelijk op de paren waar beide Δ ≠ 0, met
+  de 2 × 2-tabel, en Spearman tussen de Δ's.
+- **Wat het niet zegt.** Fictie: beide kanten zijn vertalingen uit het Engels; de premisse van N2 (één tekst is
+  oorspronkelijk Nederlands) klopt daar niet, en de menselijke kant geldt, als in §20, als de verwachte. BT: N1 ziet het
+  Engels, dat Gemma 4's vertaling van het origineel is en waar de rondgang van komt; N2 ziet geen Engels. De machinekant
+  is in beide proeven Gemma 4 31B-it, hetzelfde model als de judge. Eén formulering per prompt, zero-shot; geen drempel;
+  beslist niets over G4-8, de judge of een volgende arm.
+- **Uitvoer.** `$GJ/fbn1/data/` en `$GJ/fbn2/data/` (`prompts-w<k>.parquet`, `refs.parquet` zonder tekst,
+  `fbdata.json`), `$GJ/fbn1/scores/w<k>/`, `$GJ/fbn2/scores/w<k>/`, `$GJ/fbn/report.md`/`.json`; kopie
+  `mbert-ops/translator-sft/g4-judge-naturalness-prompts.md` (`.json`), alleen tabellen met tellingen en scores. Prompts
+  en teksten blijven in de bucket en op de VM.
+- **Keten** (`mbert-ops/scripts/g4judgefbn_run.sh`, kopie in `gs://t5-dutch-english-usc2/hammond/scratch-scripts/`; code
+  `pairjudge.py fbdata --prompt|fbnreport` en `run_pairjudge.sh fbndata|score SET=fbn1/fbn2|fbnreport`). Als FB.7: alleen
+  mbert-mix; `final_eval_mix.lock` met `flock` tot het eind; mbert-corpus (T3) wordt niet aangeraakt; code als bundel
+  via de bucket naar de 4 workers; elke ssh met `timeout 900` en de ssh-opties van G4-judge.10; vóór elke TPU-stap de
+  TPU van de worker(s) vrij. Volgorde: `setup` (`ARM=G4-bon`), `fbndata` N1 en N2 (w0, CPU), `score` `SET=fbn1` en
+  `SET=fbn2` (4 workers), `fbnreport` (w0, CPU). Markers `$G/stages/g4-judge/fbn-*.done`; niets wat §16–§20 schreven
+  wordt overschreven. Elke stap eindigt op `EXIT 0`, anders `FAILED` en stoppen. [schatting] ~25–35 min.

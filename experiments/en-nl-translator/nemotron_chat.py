@@ -1678,6 +1678,32 @@ def summary_run(args):
     return agg
 
 
+def qe_join(args):
+    """The QE inputs of some shards of this worker as one file (ids "<shard>#<id>"), for one MetricX run"""
+    rows = []
+    for r in [int(x) for x in args.shards.split(",")]:
+        for x in read_rows(join(args.collect, f"shard-{r:05d}", f"qe-in-w{args.worker}.parquet")):
+            rows.append(dict(x, id=f"{r:05d}#{x['id']}"))
+    write_rows(rows, args.out)
+    print(f"QEJOIN {json.dumps({'shards': args.shards, 'rows': len(rows)})}", flush=True)
+
+
+def qe_split(args):
+    """MetricX's scores of a qe_join file back per shard: <scores>/qe-<shard>.parquet with the ids of collect"""
+    per = collections.defaultdict(list)
+    for x in read_rows(args.scores):
+        shard, sep, rest = x["id"].partition("#")
+        if not sep:
+            raise SystemExit(f"{args.scores}: id {x['id']!r} without a shard")
+        per[shard].append(dict(x, id=rest))
+    want = {f"{int(r):05d}" for r in args.shards.split(",")}
+    if set(per) != want:
+        raise SystemExit(f"{args.scores}: scores of shards {sorted(per)}, not {sorted(want)}")
+    for shard, rows in per.items():
+        write_rows(rows, join(args.out, f"qe-{shard}.parquet"))
+    print(f"QESPLIT {json.dumps({k: len(v) for k, v in sorted(per.items())})}", flush=True)
+
+
 # ---------------------------------------------------------------------------------------------------- main
 
 def main(argv=None):
@@ -1732,6 +1758,15 @@ def main(argv=None):
     p.add_argument("--scores", required=True)
     p.add_argument("--out", required=True)
     p.add_argument("--qe-max", default=str(QE_MAX))
+    p = sub.add_parser("qe-join")
+    p.add_argument("--collect", required=True)
+    p.add_argument("--shards", required=True)
+    p.add_argument("--worker", type=int, required=True)
+    p.add_argument("--out", required=True)
+    p = sub.add_parser("qe-split")
+    p.add_argument("--scores", required=True)
+    p.add_argument("--shards", required=True)
+    p.add_argument("--out", required=True)
     p = sub.add_parser("summary")
     p.add_argument("--data", required=True)
     p.add_argument("--gen", required=True)
@@ -1739,7 +1774,8 @@ def main(argv=None):
     p.add_argument("--json", required=True)
     args = parser.parse_args(argv)
     return {"sample": sample, "translate": translate_run, "collect": collect, "report": report, "blind": blind,
-            "wildchat": wildchat, "prepare": prepare_run, "final": final_run, "summary": summary_run}[args.command](args)
+            "wildchat": wildchat, "prepare": prepare_run, "final": final_run, "summary": summary_run,
+            "qe-join": qe_join, "qe-split": qe_split}[args.command](args)
 
 
 if __name__ == "__main__":

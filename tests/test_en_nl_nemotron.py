@@ -413,3 +413,118 @@ def test_collect_refuses_a_missing_translation_without_context(tmp_path):
     nc.write_rows(rows[1:], victim)
     with pytest.raises(SystemExit, match="noctx: 1 pieces without a translation"):
         nc.collect(Namespace(data=str(data), gen=str(gen), out=str(tmp_path / "c"), conds="ctx,noctx", leaf=r"w\d+"))
+
+
+# ---------------------------------------------------------------------------------------------------- the full run
+
+def test_shards_take_every_line_once_by_where_it_starts():
+    import random
+
+    rng = random.Random(3)
+    lines = [("x" * rng.randint(0, 40)).encode() for _ in range(300)]
+    data = b"\n".join(lines) + b"\n"
+    calls = []
+
+    def fetch(a, b):
+        calls.append((a, b))
+        assert 0 <= a <= b < len(data)
+        return data[a:b + 1]
+
+    for size_shard, margin in ((50, 8), (64, 1), (1000, 3), (17, 100)):
+        got = []
+        for r in range(-(-len(data) // size_shard)):
+            got += nc.shard_lines(r, fetch, size=len(data), shard_bytes=size_shard, margin=margin)
+        assert got == [x for x in lines if x.strip()]
+    no_final_newline = b"aaa\nbbbb"
+    assert nc.shard_lines(0, lambda a, b: no_final_newline[a:b + 1], size=8, shard_bytes=6, margin=1) == [b"aaa", b"bbbb"]
+    assert nc.shard_lines(1, lambda a, b: no_final_newline[a:b + 1], size=8, shard_bytes=6, margin=1) == []
+
+
+def test_wildchat_rows_get_their_prompt_back_and_lmsys_never_goes():
+    wild = row(seed=nc.WILDCHAT, messages=[{"role": "user", "content": None}, {"role": "assistant", "content": "Yes."}])
+    wild["messages"][0]["content"] = None
+    wild["metadata"]["seed_prompt_sha256"] = nc.prompt_hash("Is it raining?")
+    prompts = {nc.prompt_hash("Is it raining?"): (None, "Is it raining?")}
+    restored = nc.restore_row(wild, prompts)
+    assert restored["messages"][1]["content"] == "Is it raining?" and wild["messages"][1]["content"] is None
+    conv, why = nc.conversation(restored, nc.FULL_SEEDS)
+    assert why is None and conv["turns"][0]["text"] == "Is it raining?"
+    assert nc.restore_row(wild, {}) is None
+    assert nc.conversation(restored) == (None, "seed_not_lmarena")
+    assert nc.conversation(row(seed=nc.LMSYS), nc.FULL_SEEDS) == (None, "seed_lmsys")
+    assert nc.conversation(row(seed="other/set"), nc.FULL_SEEDS) == (None, "seed_other")
+    lm = row()
+    assert nc.restore_row(lm, {}) is lm
+
+
+def test_seed_messages_follow_prepare_chat_prompts():
+    conv = [{"role": "system", "content": "Be brief."}, {"role": "user", "content": "Hi"}, {"role": "user", "content": "x"}]
+    assert nc.seed_messages(conv) == ("Be brief.", "Hi")
+    assert nc.seed_messages([{"role": "assistant", "content": "Hello"}]) == (None, "Hello")
+    assert nc.seed_messages([]) == (None, None)
+
+
+def test_prepare_shard_keeps_every_passing_conversation_on_the_shards_worker():
+    lines = [json.dumps(row(uuid=f"u{i}", seed=nc.LMARENA[i % 2])).encode() for i in range(5)]
+    lines.append(json.dumps(row(uuid="l", seed=nc.LMSYS)).encode())
+    convs, turns, pieces, pool, info = nc.prepare_shard(lines, 6, words, lambda t: "en", {})
+    assert len(convs) == 5 and {c["worker"] for c in convs} == {6 % nc.WORKERS} and {c["shard"] for c in convs} == {6}
+    assert info["left_out"] == {"seed_lmsys": 1} and info["kept"] == 5 and len(pool) == 5
+    assert all(p["pid"].startswith(p["conv"]) for p in pieces) and info["pieces"] == len(pieces)
+
+
+def test_final_adds_qe_per_message_and_leaves_out_what_is_above_the_maximum():
+    chat = [{"uuid": "a", "messages": [{"role": "user", "content": "x"}, {"role": "assistant", "content": "y"}]},
+            {"uuid": "b", "messages": [{"role": "user", "content": "x"}, {"role": "assistant", "content": "y"}]},
+            {"uuid": "c", "messages": [{"role": "user", "content": "x"}, {"role": "assistant", "content": "y"}]}]
+    meta = []
+    qe = {}
+    for conv, scores in (("a", (1.0, 2.0, 4.0)), ("b", (1.0, 12.0, 1.0)), ("c", (1.0, None, 1.0))):
+        for k, (turn, piece, q) in enumerate(((0, 0, scores[0]), (1, 0, scores[1]), (1, 1, scores[2]))):
+            pid = f"{conv}|t{turn}|p{piece}"
+            meta.append({"cond": "ctx", "pid": pid, "conv": conv, "turn": turn, "tokens": 10 * (k + 1), "failed": False})
+            if q is not None:
+                qe[f"ctx|{pid}"] = q
+    rows, counts = nc.final_shard(chat, meta, qe, "ctx", qe_max=10.0)
+    assert [r["uuid"] for r in rows] == ["a"] and counts == {"complete": 3, "no_qe": 1, "qe_above_max": 1, "kept": 1}
+    assert rows[0]["messages"][1]["qe"] == pytest.approx((2.0 * 20 + 4.0 * 30) / 50, abs=1e-3)
+    rows, counts = nc.final_shard(chat, meta, qe, "ctx", qe_max=None)
+    assert [r["uuid"] for r in rows] == ["a", "b"]
+
+
+def test_collect_of_one_condition_in_a_shard_layout(tmp_path):
+    data, pieces = build_data(tmp_path, n_convs=8)
+    pieces = [dict(p, worker=2) for p in pieces]
+    nc.write_rows(pieces, data / "pieces.parquet")
+    gen = build_gen(tmp_path, pieces, fail_pid="conv001|t2|p0")
+    shard = tmp_path / "gen-shard"
+    for cls_dir in (gen / "ctx" / "c2k").iterdir():
+        if cls_dir.name == "w2":
+            (shard / "ctx" / "c2k").mkdir(parents=True)
+            cls_dir.rename(shard / "ctx" / "c2k" / "shard-00006")
+    info = nc.collect(Namespace(data=str(data), gen=str(shard), out=str(tmp_path / "c"), conds="ctx", leaf=r"shard-\d+"))
+    assert info["summary"]["ctx"]["complete"] == 7 and list(info["qe_rows"]) == ["w2"]
+    with pytest.raises(SystemExit, match="DONE of"):
+        nc.collect(Namespace(data=str(data), gen=str(shard), out=str(tmp_path / "c2"), conds="ctx,noctx",
+                             leaf=r"shard-\d+"))
+
+
+def test_the_shards_of_the_workers_cover_the_file_once():
+    assert sorted(r for w in range(nc.WORKERS) for r in nc.shards_of(w)) == list(range(nc.SHARDS))
+    assert nc.SHARDS * nc.SHARD_BYTES >= nc.FILE_BYTES > (nc.SHARDS - 1) * nc.SHARD_BYTES
+
+
+def test_qe_join_and_split_give_every_shard_its_own_ids_back(tmp_path):
+    col = tmp_path / "collect"
+    for r in (1, 5):
+        nc.write_rows([{"id": f"ctx|c{r}|t0|p0", "source": "a", "hypothesis": "b"},
+                       {"id": f"ctx|c{r}|t1|p0", "source": "c", "hypothesis": "d"}],
+                      col / f"shard-{r:05d}" / "qe-in-w1.parquet")
+    nc.qe_join(Namespace(collect=str(col), shards="1,5", worker=1, out=str(tmp_path / "in.parquet")))
+    joined = nc.read_rows(tmp_path / "in.parquet")
+    assert [x["id"] for x in joined][:1] == ["00001#ctx|c1|t0|p0"] and len(joined) == 4
+    nc.write_rows([{"id": x["id"], "qe_source_hypothesis": 1.5} for x in joined], tmp_path / "qe.parquet")
+    nc.qe_split(Namespace(scores=str(tmp_path / "qe.parquet"), shards="1,5", out=str(tmp_path / "scores")))
+    assert [x["id"] for x in nc.read_rows(tmp_path / "scores" / "qe-00005.parquet")] == ["ctx|c5|t0|p0", "ctx|c5|t1|p0"]
+    with pytest.raises(SystemExit, match="not"):
+        nc.qe_split(Namespace(scores=str(tmp_path / "qe.parquet"), shards="1,5,9", out=str(tmp_path / "s2")))

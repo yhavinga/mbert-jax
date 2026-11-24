@@ -12,13 +12,26 @@
 #   bash run_nemotron.sh report        w0 (CPU): nemotron_chat.py report (no text) -> $T/report.md, $T/report.json
 #   bash run_nemotron.sh blind         w0 (CPU): nemotron_chat.py blind -> $T/blind/package/ (judge-input.jsonl,
 #                                      REVIEWER.md), the key $T/blind/key.jsonl
+# The full run (Yeb 24 Nov ~14:55: the whole chat split; nemotron_full_run.sh, after mbert-ops/nemotron.full-go), under
+# $F, every stage per shard (a shard = the lines that start in 128 MiB of chat.jsonl; shard r on worker r mod 4), a shard
+# with its marker skipped, files read and written in the bucket from Python (nothing left on a worker):
+#   bash run_nemotron.sh fwildchat     w1 (CPU): WildChat-1M's first prompts by sha256, straight from HF -> $F/wildchat/
+#   bash run_nemotron.sh fprepare      every worker (CPU): its shards from HF, filters, pieces -> $F/data/shard-<r>/
+#   COND=ctx|noctx bash run_nemotron.sh fgen    every worker (its TPU): translate --jobs over its shards, one engine
+#                                      per class -> $F/gen/<cond>/<cls>/shard-<r>/
+#   COND=... bash run_nemotron.sh fcollect      every worker (CPU): collect per shard -> $F/collect/shard-<r>/
+#   bash run_nemotron.sh fqe           every worker (its TPU): MetricX-24 QE, its shards in groups of 8 -> $F/scores/
+#   COND=... QE_MAX=... bash run_nemotron.sh ffinal   every worker (CPU): -> $F/out/chat-nl-<r>.jsonl, final-<r>.json
+#   bash run_nemotron.sh fsummary      w0 (CPU): the counts of every stage -> $F/summary.json
 # A stage whose output is in the bucket already prints that and ends in EXIT 0; nothing is removed or overwritten
 # (translate goes on from the waves in the bucket). The code is beside this script. TAG names the jobs of one chain.
 set -euo pipefail
-STAGE=${1:?a stage: data gen collect qe report blind}
+STAGE=${1:?a stage: data gen collect qe report blind, or fwildchat fprepare fgen fcollect fqe ffinal fsummary}
 R=gs://t5-dutch-english-usc2/mbert/translator
 N=$R/nemotron
 T=${T:-$N/trial}
+F=${F:-$N/full}
+QE_GROUP=8                                                      # shards per MetricX run in the full run
 G=$R/sft/g4arm
 ADAPTER=$G/G4-8-s140                                            # the translator (Yeb, 24 Nov ~11:15)
 DECODE_CKPT=$R/judge/gemma-4-31b-it-maxtext/0/items            # the conversion every Gemma 4 decode uses
@@ -82,6 +95,10 @@ need() {  # need <bucket path>...: the data a stage reads
 
 ready() {
   [ -x "$FPY" ] && [ -s "$TOK_DEC/tokenizer.json" ] || { echo "w$W: no fork venv or tokenizer (run_g4arm.sh setup)"; exit 1; }
+}
+
+shards_of_worker() {  # the full run's shards of this worker, as 5 digits (nemotron_chat.shards_of)
+  JAX_PLATFORMS=cpu $FPY -I -c "import sys; sys.path.insert(0, '$CODE'); import nemotron_chat as nc; print(' '.join('%05d' % r for r in nc.shards_of($W)))"
 }
 
 # A worker of the v4-32 as a TPU of its own 4 chips (run_g4arm.sh)
@@ -242,6 +259,140 @@ gsutil -m -q cp $X/package/judge-input.jsonl $X/package/REVIEWER.md $T/blind/pac
 gsutil -q cp $X/key/blind.json $T/blind/blind.json
 gsutil -q cp $X/key/key.jsonl $T/blind/key.jsonl
 echo "NEMOBLIND_DONE $T/blind/"
+EOF
+)
+  detach "$NAME" bash "$f"
+  ;;
+fwildchat)
+  only 1
+  ready
+  NAME=nemo_fwildchat_$TAG
+  gsutil -q stat "$F/wildchat/wildchat.json" && there_before "$NAME" "NEMOFWILDCHAT_DONE $F/wildchat/ (there before)"
+  [ -s ~/.cache/huggingface/token ] || { echo "w$W: no ~/.cache/huggingface/token"; exit 1; }
+  f=$(body "$NAME" <<EOF
+set -euo pipefail
+export JAX_PLATFORMS=cpu OMP_NUM_THREADS=8 HF_HUB_DISABLE_PROGRESS_BARS=1
+nice -n 19 $FPY -I -u $CODE/nemotron_chat.py wildchat --out $F/wildchat
+echo "NEMOFWILDCHAT_DONE $F/wildchat/"
+EOF
+)
+  detach "$NAME" bash "$f"
+  ;;
+fprepare)
+  ready
+  NAME=nemo_fprepare_$TAG
+  need "$F/wildchat/wildchat.json"
+  [ -s ~/.cache/huggingface/token ] || { echo "w$W: no ~/.cache/huggingface/token"; exit 1; }
+  f=$(body "$NAME" <<EOF
+set -euo pipefail
+$CPU
+nice -n 19 $FPY -I -u $CODE/nemotron_chat.py prepare --worker $W --wildchat $F/wildchat --tokenizer $TOK_DEC --out $F/data
+echo "NEMOFPREPARE_DONE w$W"
+EOF
+)
+  detach "$NAME" bash "$f"
+  ;;
+fgen)
+  COND=${COND:?COND=ctx or noctx}
+  case $COND in ctx) CLASSES="c2k" ;; noctx) CLASSES="n128 n512" ;; *) echo "COND is ctx or noctx, not $COND"; exit 1 ;; esac
+  ready
+  NAME=nemo_fgen_${COND}_$TAG
+  tpu_free
+  need "$ADAPTER/adapter.npz" "$ADAPTER/adapter.json" "${DECODE_CKPT%/0/items}/0/commit_success.txt"
+  X=$WX/fgen-$COND-$TAG
+  LORA=$X/adapter
+  mkdir -p "$LORA"
+  gsutil -q cp "$ADAPTER/adapter.npz" "$ADAPTER/adapter.json" "$LORA/"
+  python3 -c "import json, sys; a = json.load(open(sys.argv[1])); assert (a['rank'], a['alpha'], a['scale']) == (32, 16.0, 0.5), a" "$LORA/adapter.json" \
+    || { echo "$ADAPTER/adapter.json is not rank 32, alpha 16"; exit 1; }
+  # one job line per shard of this worker; every shard has its prepare.json (fprepare ran)
+  SHARDS=$(shards_of_worker)
+  for r in $SHARDS; do gsutil -q stat "$F/data/shard-$r/prepare.json" || { echo "no $F/data/shard-$r/prepare.json"; exit 1; }; done
+  for c in $CLASSES; do
+    for r in $SHARDS; do echo "$F/data/shard-$r/pieces.parquet $F/gen/$COND/$c/shard-$r"; done > "$X/jobs-$c.txt"
+  done
+  f=$(body "$NAME" <<EOF
+set -uo pipefail
+$ONE_HOST
+export JAX_COMPILATION_CACHE_DIR=$G_SHM/jax_cache
+mkdir -p $G_SHM/work
+$PREFLIGHT
+for c in $CLASSES; do
+  echo "== $COND \$c w$W \$(date -u +%T) \$(wc -l < $X/jobs-\$c.txt) shards, the LoRA of $ADAPTER"
+  $FPY -u $CODE/nemotron_chat.py translate --jobs $X/jobs-\$c.txt --cond $COND --cls \$c --worker $W --ckpt $DECODE_CKPT --tokenizer $TOK_DEC --lora $LORA --work-dir $G_SHM/work || exit \$?
+  for r in $SHARDS; do gsutil -q stat $F/gen/$COND/\$c/shard-\$r/DONE.json || { echo "no $F/gen/$COND/\$c/shard-\$r/DONE.json"; exit 1; }; done
+done
+echo "NEMOFGEN_DONE w$W $COND"
+EOF
+)
+  detach "$NAME" bash "$f"
+  ;;
+fcollect)
+  COND=${COND:?COND=ctx or noctx}
+  ready
+  NAME=nemo_fcollect_$TAG
+  SHARDS=$(shards_of_worker)
+  f=$(body "$NAME" <<EOF
+set -euo pipefail
+$CPU
+for r in $SHARDS; do
+  gsutil -q stat $F/collect/shard-\$r/collect.json && continue
+  nice -n 19 $FPY -I -u $CODE/nemotron_chat.py collect --data $F/data/shard-\$r --gen $F/gen --leaf shard-\$r --conds $COND --out $F/collect/shard-\$r
+done
+echo "NEMOFCOLLECT_DONE w$W"
+EOF
+)
+  detach "$NAME" bash "$f"
+  ;;
+fqe)
+  ready
+  NAME=nemo_fqe_$TAG
+  [ -d "$MX_ROOT/metricx-24-hybrid-xxl-v2p6-bfloat16" ] || { echo "w$W: no MetricX-24 XXL in $MX_ROOT (run_g4arm.sh setup)"; exit 1; }
+  tpu_free
+  X=$WX/fqe-$TAG
+  mkdir -p "$X"
+  # the shards without scores, in groups of QE_GROUP: one MetricX run per group, its input and output files overwritten
+  TODO=""
+  for r in $(shards_of_worker); do gsutil -q stat "$F/scores/qe-$r.parquet" || TODO="$TODO $r"; done
+  QGROUPS=$(echo $TODO | xargs -r -n $QE_GROUP | tr ' ' ',')
+  f=$(body "$NAME" <<EOF
+set -euo pipefail
+$ONE_HOST
+export JAX_COMPILATION_CACHE_DIR=$G_SHM/jax_cache_metricx
+$PREFLIGHT
+for g in $QGROUPS; do
+  $FPY -I -u $CODE/nemotron_chat.py qe-join --collect $F/collect --shards \$g --worker $W --out $X/qe-in.parquet
+  $FPY -I -u $CODE/metricx_qe.py score --pairs $X/qe-in.parquet --pair source:hypothesis --model xxl --root $MX_ROOT --out $X/qe.parquet
+  $FPY -I -u $CODE/nemotron_chat.py qe-split --scores $X/qe.parquet --shards \$g --out $F/scores
+done
+echo "NEMOFQE_DONE w$W"
+EOF
+)
+  detach "$NAME" bash "$f"
+  ;;
+ffinal)
+  COND=${COND:?COND=ctx or noctx}
+  QE_MAX=${QE_MAX:?QE_MAX=<number> or none}
+  ready
+  NAME=nemo_ffinal_$TAG
+  f=$(body "$NAME" <<EOF
+set -euo pipefail
+$CPU
+nice -n 19 $FPY -I -u $CODE/nemotron_chat.py final --worker $W --cond $COND --collect $F/collect --scores $F/scores --out $F/out --qe-max $QE_MAX
+echo "NEMOFFINAL_DONE w$W"
+EOF
+)
+  detach "$NAME" bash "$f"
+  ;;
+fsummary)
+  only 0
+  ready
+  NAME=nemo_fsummary_$TAG
+  f=$(body "$NAME" <<EOF
+set -euo pipefail
+$CPU
+nice -n 19 $FPY -I -u $CODE/nemotron_chat.py summary --data $F/data --gen $F/gen --out $F/out --json $F/summary.json
+echo "NEMOFSUMMARY_DONE $F/summary.json"
 EOF
 )
   detach "$NAME" bash "$f"

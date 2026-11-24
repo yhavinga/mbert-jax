@@ -201,3 +201,56 @@ tempo van FLAN-nl ~14 uur voor 100K gesprekken, maar dat was TranslateGemma 27B 
    niet van GPT-4o komt, en alleen als de controleerbare eisen het vertalen overleven).
 3. QE-drempel, code-regel, veiligheidsfilter.
 4. De volle run (100K) op mbert-mix, of op beide VM's na T3 (~2 dec).
+
+## 10. Amendement 1: de volle run over het hele chatdeel (24 nov ~15:15, vóór enige uitslag van de proef)
+
+Besluit Yeb (24 nov ~14:55, via de hoofdsessie): Nemotron Chat v3 helemaal vertalen, het hele chatdeel, met de
+standaarden van deze spec; de volle run start pas met het startbestand van de hoofdsessie (mbert-mix doet eerst een
+andere klus). Dit amendement vervangt §1 "fase 1: 100.000 lmarena" voor de volle run; de proef blijft zoals in §7.
+
+**Standaarden (Yeb kan elk omdraaien)** [keuze]:
+
+| vraag | standaard | waarom | omdraaien |
+|---|---|---|---|
+| WildChat-gesprekken | **ja**, met de eerste vraag teruggezet uit `allenai/WildChat-1M` @ `7d6490e` (ODC-BY), op sha256 zoals `prepare_chat_prompts.py` van NVIDIA; een rij waarvan de hash niet gevonden wordt valt af (`wildchat_not_restored`) | "het hele chatdeel"; ODC-BY staat het toe; de eerste vraag is van een mens, de rest GLM-5 | `FULL_SEEDS` in `nemotron_chat.py` zonder WildChat |
+| lmsys-gesprekken | **nee, nooit** | licentie verbiedt doorgeven (§2) | – |
+| `instruction_following` | **nee** | deels GPT-4o-vragen (tulu-3-personas), controleerbare eisen overleven vertaling niet | nieuwe spec nodig |
+| codegesprekken | **eruit** (filter §3) | besluit Yeb 9 nov (codetaken niet); codeblokken vertalen vraagt maskeren | filter weg + maskeren, nieuwe proef |
+| conditie | **regel hieronder** | proef | `COND=` in het startbestand |
+| QE-drempel | **10** (gesprek eruit als een stuk QE > 10 heeft, of als een stuk geen QE heeft) | MetricX-schaal 0–25; > 10 is bij de vertaler zeldzaam (p95 mainset 5,6) | `QE_MAX=` in het startbestand (`none` = alles houden) |
+| `reasoning_content` | niet vertaald, niet in de uitvoer | §1 | – |
+
+**Conditie** (vastgelegd vóór de uitslag): de volle run gebruikt **met context** (`ctx`) als in de proef alle drie
+gelden, anders **zonder** (`noctx`): (a) mislukte stukken na herkansing bij ctx ≤ die bij noctx + 1,0 procentpunt;
+(b) gemiddelde gepaarde QE-verschil ctx − noctx ≤ +0,10; (c) `tag_leak` na herkansing ≤ 0,5% van de ctx-stukken.
+Het blinde pakket (40 beurten) beslist hier niet; een latere beoordeling kan de keuze herzien (Yeb).
+
+**Aantallen** [gemeten op 32 bereiken van 8 MB, 9.106 rijen, proef 24 nov]: `seed_dataset` lmarena (100k + 55k) en
+WildChat en lmsys in de verhouding van `sample.json` (zie het proefrapport); van de lmarena-rijen haalde 63% de filters.
+Extrapolatie naar het hele bestand (637K rijen volgens de kaart) in het proefrapport; de echte aantallen geeft
+`fprepare` per shard (`prepare.json`) vóór er een TPU draait.
+
+**Indeling**: een shard = de regels van `data/chat.jsonl` waarvan de eerste byte in een blok van 128 MiB ligt: 127
+shards, elk ~5.000 rijen, elke regel precies één keer (getest). Shard r op worker r mod 4 (32/32/32/31). Alles wordt
+rechtstreeks van HF gelezen (HTTP-bereiken op revisie `be3b3e0`) en rechtstreeks in de bucket geschreven vanuit Python:
+niets blijft achter op een worker, niets via co1.
+
+**Uitvoer** in `gs://t5-dutch-english-usc2/mbert/translator/nemotron/full/`:
+
+| map | inhoud | marker |
+|---|---|---|
+| `wildchat/` | `prompts-<0-f>.parquet` (sha256, system, user), `wildchat.json` | `wildchat.json` |
+| `data/shard-<r>/` | `conversations`, `turns`, `pieces`, `pieces-meta`, `pool-meta` (.parquet), `prepare.json` | `prepare.json` |
+| `gen/<cond>/<cls>/shard-<r>/` | `wave-<w>.parquet` (vertalingen, controles), `DONE.json` (tempo) | `DONE.json` |
+| `collect/shard-<r>/` | `chat-nl-<cond>.jsonl`, `turns-nl.parquet`, `pieces-result-meta.parquet`, `qe-in-w<k>.parquet`, `collect.json` | `collect.json` |
+| `scores/` | `qe-<r>.parquet` (MetricX-24 QE per stuk) | het bestand |
+| `out/` | **`chat-nl-<r>.jsonl`** (het eindformaat van §5, met `qe` per bericht), `final-<r>.json` | `final-<r>.json` |
+| `stages/` | een marker per stap van de keten | – |
+| `summary.json` | de tellingen van alle stappen, zonder tekst | – |
+
+**Keten**: `mbert-ops/scripts/nemotron_full_run.sh` (back-up in `gs://…usc2/hammond/scratch-scripts/`). Wacht op
+`mbert-ops/nemotron.full-go` (regels `COND=ctx|noctx`, `COMMIT=<sha van en-nl-nemotron>`, `QE_MAX=<getal>|none`),
+neemt pas dan `flock` op `final_eval_mix.lock`, controleert de TPU vóór elke TPU-stap, en loopt
+fwildchat → fprepare → fgen → fcollect → fqe → ffinal → fsummary. Elke stap per shard hervatbaar: een shard met zijn
+marker wordt overgeslagen, een vertaling gaat verder na de laatste golf in de bucket; de keten zelf slaat stappen met een
+marker in `stages/` over. Een herstart = dezelfde opdracht met een nieuwe TAG. mbert-corpus (T3) wordt niet aangeraakt.

@@ -42,6 +42,15 @@ DATASET = "nvidia/Nemotron-SFT-Instruction-Following-Chat-v3"
 REVISION = "be3b3e04ef605ac9d3f8f35b9d5a632f4a3a3402"
 FILE_BYTES = 17_042_669_218  # data/chat.jsonl at REVISION (x-linked-size)
 LMARENA = ("lmarena-ai/arena-human-preference-100k", "lmarena-ai/arena-human-preference-55k")
+WILDCHAT = "allenai/WildChat-1M"
+WILDCHAT_REVISION = "7d6490e462285cf85d91eabea0f9a954fbddcd1f"
+WILDCHAT_FILES = 14
+LMSYS = "lmsys/lmsys-chat-1m"
+FULL_SEEDS = LMARENA + (WILDCHAT,)    # the full run (Yeb 24 Nov ~14:55: the whole chat split; lmsys never)
+SHARD_BYTES = 128 * 2 ** 20           # a shard of the full run: the lines that start in 128 MiB of chat.jsonl
+SHARDS = -(-FILE_BYTES // SHARD_BYTES)
+FETCH_MARGIN = 8 * 2 ** 20
+QE_MAX = 10.0                         # the full run's default: a conversation with a piece above it is left out
 SEED = "nemotron-chat-v3/trial"
 N_TRIAL = 200
 WORKERS = 4
@@ -102,18 +111,89 @@ def seed_int(key):
     return int(stable(key)[:8], 16)
 
 
+# Files are local paths or gs:// URLs: the full run reads and writes the bucket from Python, so that no copy is left on
+# a worker's /dev/shm (w0 has ~10 GB free) and nothing has to be removed there.
+_CLIENT = []
+
+
+def gcs():
+    if not _CLIENT:
+        from google.cloud import storage
+
+        _CLIENT.append(storage.Client())
+    return _CLIENT[0]
+
+
+def blob(url):
+    bucket, _, name = url[len("gs://"):].partition("/")
+    if not bucket or not name:
+        raise ValueError(f"not a gs://bucket/object URL: {url}")
+    return gcs().bucket(bucket).blob(name)
+
+
+def join(base, *parts):
+    return "/".join([str(base).rstrip("/")] + [str(p).strip("/") for p in parts])
+
+
+def read_bytes(path):
+    path = str(path)
+    return blob(path).download_as_bytes() if path.startswith("gs://") else Path(path).read_bytes()
+
+
+def write_bytes(path, data):
+    path = str(path)
+    if path.startswith("gs://"):
+        from google.cloud.storage.retry import DEFAULT_RETRY
+
+        blob(path).upload_from_string(data, retry=DEFAULT_RETRY)
+        return
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    Path(path).write_bytes(data)
+
+
+def exists(path):
+    path = str(path)
+    return blob(path).exists() if path.startswith("gs://") else Path(path).exists()
+
+
+def list_files(root, pattern):
+    """The files under root (recursively) whose path relative to root matches the regex pattern, sorted"""
+    root = str(root).rstrip("/")
+    regex = re.compile(pattern)
+    if root.startswith("gs://"):
+        bucket, _, prefix = root[len("gs://"):].partition("/")
+        names = [b.name for b in gcs().list_blobs(bucket, prefix=prefix + "/")]
+        rel = [n[len(prefix) + 1:] for n in names]
+    else:
+        rel = [str(q.relative_to(root)) for q in Path(root).rglob("*") if q.is_file()]
+    return [join(root, r) for r in sorted(rel) if regex.fullmatch(r)]
+
+
+def read_json(path):
+    return json.loads(read_bytes(path))
+
+
+def write_json(obj, path):
+    write_bytes(path, (json.dumps(obj, indent=1) + "\n").encode())
+
+
 def read_rows(path, columns=None):
+    import io
+
     import pyarrow.parquet as pq
 
-    return pq.read_table(path, columns=columns).to_pylist()
+    return pq.read_table(io.BytesIO(read_bytes(path)), columns=columns).to_pylist()
 
 
 def write_rows(rows, path):
+    import io
+
     import pyarrow as pa
     import pyarrow.parquet as pq
 
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    pq.write_table(pa.Table.from_pylist(rows), path, compression="zstd")
+    buf = io.BytesIO()
+    pq.write_table(pa.Table.from_pylist(rows), buf, compression="zstd")
+    write_bytes(path, buf.getvalue())
 
 
 def quantiles(xs, qs=(0.05, 0.5, 0.9, 0.95, 0.99)):
@@ -152,13 +232,16 @@ def offset_of(path):
     return int(m.group(1))
 
 
-def conversation(row):
-    """(conversation, None) or (None, reason): an lmarena conversation of user and assistant turns in turn, starting
-    with the user and ending with the assistant, after an empty system message (lmarena's rows have one)."""
+def conversation(row, seeds=LMARENA):
+    """(conversation, None) or (None, reason): a conversation of a seed in seeds (the trial: lmarena) of user and
+    assistant turns in turn, starting with the user and ending with the assistant, after an empty system message
+    (lmarena's rows have one; WildChat's is null, also after restore_row). lmsys-chat-1m never (its licence)."""
     meta = row.get("metadata") or {}
     seed = meta.get("seed_dataset")
-    if seed not in LMARENA:
-        return None, "seed_not_lmarena"
+    if seed == LMSYS:
+        return None, "seed_lmsys"
+    if seed not in seeds:
+        return None, "seed_not_lmarena" if seeds == LMARENA else "seed_other"
     turns = []
     for k, m in enumerate(row.get("messages") or []):
         role, content = m.get("role"), m.get("content")
@@ -238,13 +321,28 @@ def blocks(core):
 
 
 def sentences(block, sep_after):
-    """[(part, separator)] of a block cut after sentence ends and at line breaks; the last part takes sep_after"""
-    out, start = [], 0
+    """[(part, separator)] of a block cut after sentence ends and at line breaks; the last part takes sep_after. An
+    empty part (a line break right after the spaces behind a sentence end) gives its separator to the part before it,
+    so that ''.join(p + s) is the block + sep_after, character for character."""
+    out, start, pending = [], 0, ""
     for m in SENTENCE.finditer(block):
-        out.append((block[start:m.start()], m.group(0)))
+        part = block[start:m.start()]
+        if part:
+            out.append([pending + part, m.group(0)])
+            pending = ""
+        elif out:
+            out[-1][1] += m.group(0)
+        else:
+            pending += m.group(0)
         start = m.end()
-    out.append((block[start:], sep_after))
-    return [(p, s) for p, s in out if p] or [(block, sep_after)]
+    last = pending + block[start:]
+    if last:
+        out.append([last, sep_after])
+    elif out:
+        out[-1][1] += sep_after
+    else:
+        return [(block, sep_after)]
+    return [tuple(x) for x in out]
 
 
 def pack(units, count, limit):
@@ -606,7 +704,23 @@ def run_waves(units_by_conv, cond, translate_wave, results=None, broken=None, fi
         w += 1
 
 
+def translate_jobs(args):
+    """[(pieces, out)]: --pieces and --out, or the lines "<pieces> <out>" of --jobs (the full run: one per shard)"""
+    if bool(args.jobs) == bool(args.pieces or args.out):
+        raise SystemExit("give --pieces and --out, or --jobs")
+    if args.jobs:
+        jobs = [tuple(line.split()) for line in Path(args.jobs).read_text().splitlines() if line.strip()]
+        if any(len(j) != 2 for j in jobs):
+            raise SystemExit(f"{args.jobs}: a line is not '<pieces> <out>'")
+        return jobs
+    if not (args.pieces and args.out):
+        raise SystemExit("--pieces and --out go together")
+    return [(args.pieces, args.out)]
+
+
 def translate_run(args):
+    """Every job of translate_jobs with one engine, made at the first job with work: a job with DONE.json in its out
+    is skipped, one with waves there goes on after them; DONE.json after its last wave."""
     import io
 
     import jax
@@ -622,184 +736,204 @@ def translate_run(args):
     if (jax.device_count(), jax.process_count()) != (model["chips"], 1):
         raise SystemExit(f"needs one process with {model['chips']} chips, has {jax.process_count()} process(es) with "
                          f"{jax.device_count()} devices")
-    pieces = [p for p in read_rows(args.pieces) if p["worker"] == args.worker]
-    turn_roles = {}
-    for p in pieces:
-        turn_roles[(p["conv"], p["turn"])] = {"role": p["role"]}
-    units = [p for p in pieces if cond == "ctx" or lo < p["tokens"] <= hi]
-    by_conv = collections.defaultdict(list)
-    for u in sorted(units, key=lambda u: (u["conv"], u["turn"], u["piece"])):
-        by_conv[u["conv"]].append(u)
-    pieces_of = collections.defaultdict(lambda: collections.defaultdict(list))
-    for p in sorted(pieces, key=lambda p: (p["conv"], p["turn"], p["piece"])):
-        pieces_of[p["conv"]][p["turn"]].append(p)
+    jobs = translate_jobs(args)
     client = tr.gcs_client()
-    out = args.out.rstrip("/")
-    done = sorted(tr.done_shards(out, client))
-    results, broken = {}, set()
-    for name in done:
-        for r in pq.read_table(io.BytesIO(tr.blob_of(f"{out}/{name}", client).download_as_bytes())).to_pylist():
-            results[r["pid"]] = r
-            if r["failed"]:
-                broken.add(r["conv"])
-    first_wave = len(done)
-    print(f"{args.cond}/{args.cls} w{args.worker}: {len(units)} units of {len(by_conv)} conversations, {len(results)} "
-          f"done in {first_wave} waves before; shapes {json.dumps(shapes)}", flush=True)
-    if not next_wave(by_conv, results, broken, cond):
-        # nothing (left) to translate: the marker says so, unless an earlier start wrote it with its totals
-        if not tr.blob_of(f"{out}/DONE.json", client).exists():
-            local = Path(args.work_dir) / "nemotron"
-            local.mkdir(parents=True, exist_ok=True)
-            marker = local / f"DONE-{cond}-{args.cls}-w{args.worker}.json"
-            marker.write_text(json.dumps({"cond": cond, "cls": args.cls, "worker": args.worker, "units": len(units),
-                                          "convs": len(by_conv), "note": "nothing left to translate at this start"}) + "\n")
-            tr.upload(marker, f"{out}/DONE.json", client)
-            marker.unlink()
-        print(f"NEMODONE {json.dumps({'cond': cond, 'cls': args.cls, 'worker': args.worker, 'units': len(units), 'note': 'all done before'})}",
-              flush=True)
-        return None
+    st = {}
 
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
+    def engine():
+        """tokenizer, codec, identify_nl and the device, made once"""
+        if st:
+            return st
+        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
+        codec = tr.ModelPrompts(tokenizer, model)
+        codec.check(["Hello.", "How are you?"], [None, [{"label": "User", "translation": "Hallo."}]], [None, "Assistant"])
+        print(f"MAXTEXT {json.dumps({'model': args.model, 'prompt': model['prompt'], 'context_prompt': model.get('context_prompt'), 'lora': args.lora, 'ckpt': args.ckpt, **tr.maxtext_source(), 'patches': tr.patch_maxtext()})}", flush=True)
+        started = time.time()
+        engine_args = argparse.Namespace(model=args.model, ckpt=args.ckpt, work_dir=args.work_dir,
+                                         tokenizer=args.tokenizer, copies=None)
+        eng, params = tr.make_engine(engine_args, shapes, model["chips"])
+        if args.lora:
+            params = tr.load_lora(params, args.lora)
+        st.update(tokenizer=tokenizer, codec=codec, device=tr.EngineSlots(eng, params, shapes["prefill_lengths"]),
+                  identify_nl=langid_identifier(["nl", "en", "de", "fr", "es", "it", "pt", "af"]),
+                  engine_seconds=time.time() - started)
+        print(f"engine ready in {st['engine_seconds']:.0f} s", flush=True)
+        return st
 
-    def count(text):
-        return len(tokenizer(text, add_special_tokens=False)["input_ids"])
+    def read_pieces(src):
+        if src.startswith("gs://"):
+            return pq.read_table(io.BytesIO(tr.blob_of(src, client).download_as_bytes())).to_pylist()
+        return read_rows(src)
 
-    codec = tr.ModelPrompts(tokenizer, model)
-    probe_ctx = [{"label": "User", "translation": "Hallo."}]
-    codec.check(["Hello.", "How are you?"], [None, probe_ctx], [None, "Assistant"])
-    identify_nl = langid_identifier(["nl", "en", "de", "fr", "es", "it", "pt", "af"])
-    print(f"MAXTEXT {json.dumps({'model': args.model, 'prompt': model['prompt'], 'context_prompt': model.get('context_prompt'), 'lora': args.lora, 'ckpt': args.ckpt, **tr.maxtext_source(), 'patches': tr.patch_maxtext()})}", flush=True)
-    started = time.time()
-    engine_args = argparse.Namespace(model=args.model, ckpt=args.ckpt, work_dir=args.work_dir, tokenizer=args.tokenizer,
-                                     copies=None)
-    engine, params = tr.make_engine(engine_args, shapes, model["chips"])
-    if args.lora:
-        params = tr.load_lora(params, args.lora)
-    device = tr.EngineSlots(engine, params, shapes["prefill_lengths"])
-    engine_seconds = time.time() - started
-    print(f"engine ready in {engine_seconds:.0f} s", flush=True)
-    local = Path(args.work_dir) / "nemotron" / f"{cond}-{args.cls}-w{args.worker}"
-    local.mkdir(parents=True, exist_ok=True)
-    totals = collections.Counter()
+    def upload_json(stats, out, name):
+        local = Path(args.work_dir) / "nemotron"
+        local.mkdir(parents=True, exist_ok=True)
+        marker = local / f"{name}-{stable(out)[:12]}.json"
+        marker.write_text(json.dumps(stats) + "\n")
+        tr.upload(marker, f"{out}/{name}.json", client)
+        marker.unlink()
 
-    def prompt_of(u, done_results):
-        if cond == "noctx":
-            ids = codec.encode(u["text"])
-            return ids, {"context_items": 0, "context_tokens": 0, "context_cut": False}
-        items = history([turn_roles[(u["conv"], t)] for t in range(u["turn"] + 1)], pieces_of[u["conv"]],
-                        done_results, u["turn"], u["piece"])
-        chosen, cut = fit_context(items, count)
-        while True:
-            ids = codec.encode(u["text"], chosen or None, current_label(u["role"], u["piece"]) if chosen else None)
-            if len(ids) <= PROMPT_MAX or not chosen:
-                break
-            chosen, cut = chosen[1:], True
-        if len(ids) > shapes["prefill_lengths"][-1]:
-            raise RuntimeError(f"{u['pid']}: a prompt of {len(ids)} tokens, more than {shapes['prefill_lengths'][-1]}")
-        return ids, {"context_items": len(chosen), "context_tokens": sum(item_cost(i, count) for i in chosen),
-                     "context_cut": cut}
+    all_stats = []
+    for src, out in jobs:
+        out = out.rstrip("/")
+        if tr.blob_of(f"{out}/DONE.json", client).exists():
+            print(f"NEMODONE {json.dumps({'out': out, 'note': 'DONE.json there before'})}", flush=True)
+            continue
+        pieces = [p for p in read_pieces(src) if p["worker"] == args.worker]
+        turn_roles = {(p["conv"], p["turn"]): {"role": p["role"]} for p in pieces}
+        units = [p for p in pieces if cond == "ctx" or lo < p["tokens"] <= hi]
+        by_conv = collections.defaultdict(list)
+        for u in sorted(units, key=lambda u: (u["conv"], u["turn"], u["piece"])):
+            by_conv[u["conv"]].append(u)
+        pieces_of = collections.defaultdict(lambda: collections.defaultdict(list))
+        for p in sorted(pieces, key=lambda p: (p["conv"], p["turn"], p["piece"])):
+            pieces_of[p["conv"]][p["turn"]].append(p)
+        done = sorted(tr.done_shards(out, client))
+        results, broken = {}, set()
+        for name in done:
+            for r in pq.read_table(io.BytesIO(tr.blob_of(f"{out}/{name}", client).download_as_bytes())).to_pylist():
+                results[r["pid"]] = r
+                if r["failed"]:
+                    broken.add(r["conv"])
+        first_wave = len(done)
+        print(f"{cond}/{args.cls} w{args.worker} {out}: {len(units)} units of {len(by_conv)} conversations, "
+              f"{len(results)} done in {first_wave} waves before; shapes {json.dumps(shapes)}", flush=True)
+        base = {"cond": cond, "cls": args.cls, "worker": args.worker, "out": out, "units": len(units),
+                "convs": len(by_conv)}
+        if not next_wave(by_conv, results, broken, cond):
+            upload_json(base | {"note": "nothing left to translate at this start", "broken": len(broken)}, out, "DONE")
+            print(f"NEMODONE {json.dumps(base | {'note': 'nothing left'})}", flush=True)
+            continue
+        e = engine()
+        tokenizer, codec, device, identify_nl = e["tokenizer"], e["codec"], e["device"], e["identify_nl"]
 
-    def decode(prompts):
-        t0 = time.time()
-        outputs = tr.decode_all(prompts, shapes["slots"], device, shapes["max_decode"], args.sync_every,
-                                model["eos_ids"])
-        return outputs, time.time() - t0
+        def count(text):
+            return len(tokenizer(text, add_special_tokens=False)["input_ids"])
 
-    def translate_wave(w, wave, done_results):
-        prompts, info = zip(*(prompt_of(u, done_results) for u in wave))
-        outputs, seconds = decode(list(prompts))
-        rows = {}
-        for u, ids, meta, (tokens, ended) in zip(wave, prompts, info, outputs):
-            nl = tokenizer.decode(tokens, skip_special_tokens=True).strip()
-            flags = hard_flags(u["text"], nl, ended, identify_nl)
-            rows[u["pid"]] = {"pid": u["pid"], "conv": u["conv"], "turn": u["turn"], "piece": u["piece"],
-                              "role": u["role"], "cond": cond, "cls": args.cls, "worker": args.worker, "wave": w,
-                              "attempt": 0, "text_nl": nl, "ended": bool(ended), "tokens_in": len(ids),
-                              "tokens_out": len(tokens) + int(bool(ended)), "flags0": json.dumps(flags),
-                              "flags": json.dumps(flags), "failed": bool(flags), **meta}
-        retry = [k for k, u in enumerate(wave) if rows[u["pid"]]["failed"]]
-        retry_seconds = 0.0
-        if retry:
-            device.sample(RETRY_T, seed_int(f"{SEED}/retry/{cond}/{args.cls}/w{args.worker}/wave{w}"))
-            outputs2, retry_seconds = decode([prompts[k] for k in retry])
-            device.sampling = {}
-            totals["retry_tokens_out"] += sum(len(t) + int(bool(e)) for t, e in outputs2)
-            for k, (tokens, ended) in zip(retry, outputs2):
-                u = wave[k]
+        local = Path(args.work_dir) / "nemotron" / stable(out)[:12]
+        local.mkdir(parents=True, exist_ok=True)
+        totals = collections.Counter()
+
+        def prompt_of(u, done_results):
+            if cond == "noctx":
+                return codec.encode(u["text"]), {"context_items": 0, "context_tokens": 0, "context_cut": False}
+            items = history([turn_roles[(u["conv"], t)] for t in range(u["turn"] + 1)], pieces_of[u["conv"]],
+                            done_results, u["turn"], u["piece"])
+            chosen, cut = fit_context(items, count)
+            while True:
+                ids = codec.encode(u["text"], chosen or None, current_label(u["role"], u["piece"]) if chosen else None)
+                if len(ids) <= PROMPT_MAX or not chosen:
+                    break
+                chosen, cut = chosen[1:], True
+            if len(ids) > shapes["prefill_lengths"][-1]:
+                raise RuntimeError(f"{u['pid']}: a prompt of {len(ids)} tokens, more than {shapes['prefill_lengths'][-1]}")
+            return ids, {"context_items": len(chosen), "context_tokens": sum(item_cost(i, count) for i in chosen),
+                         "context_cut": cut}
+
+        def decode(prompts):
+            t0 = time.time()
+            outputs = tr.decode_all(prompts, shapes["slots"], device, shapes["max_decode"], args.sync_every,
+                                    model["eos_ids"])
+            return outputs, time.time() - t0
+
+        def translate_wave(w, wave, done_results, out=out, local=local, totals=totals):
+            prompts, info = zip(*(prompt_of(u, done_results) for u in wave))
+            outputs, seconds = decode(list(prompts))
+            rows = {}
+            for u, ids, meta, (tokens, ended) in zip(wave, prompts, info, outputs):
                 nl = tokenizer.decode(tokens, skip_special_tokens=True).strip()
                 flags = hard_flags(u["text"], nl, ended, identify_nl)
-                rows[u["pid"]].update(attempt=1, text_nl=nl, ended=bool(ended), tokens_out=len(tokens) + int(bool(ended)),
-                                      flags=json.dumps(flags), failed=bool(flags))
-        n_in = sum(r["tokens_in"] for r in rows.values())
-        n_out0 = sum(len(o[0]) + int(bool(o[1])) for o in outputs)
-        stat = {"wave": w, "units": len(wave), "tokens_in": n_in, "tokens_out": n_out0, "seconds": round(seconds, 2),
-                "retried": len(retry), "retry_seconds": round(retry_seconds, 2),
-                "failed": sum(r["failed"] for r in rows.values()), "full": len(wave) >= shapes["slots"]}
-        for key in ("units", "tokens_in", "tokens_out", "seconds", "retried", "retry_seconds", "failed"):
-            totals[key] += stat[key]
-        if stat["full"]:
-            totals["full_tokens_out"] += n_out0
-            totals["full_seconds"] += seconds
-        totals["waves"] += 1
-        path = local / f"wave-{w:03d}.parquet"
-        write_rows([rows[u["pid"]] for u in wave], path)
-        tr.upload(path, f"{out}/wave-{w:03d}.parquet", client)
-        path.unlink()
-        print(f"WAVE {json.dumps(stat | {'out_per_s': round(n_out0 / max(seconds, 1e-9))})}", flush=True)
-        return rows
+                rows[u["pid"]] = {"pid": u["pid"], "conv": u["conv"], "turn": u["turn"], "piece": u["piece"],
+                                  "role": u["role"], "cond": cond, "cls": args.cls, "worker": args.worker, "wave": w,
+                                  "attempt": 0, "text_nl": nl, "ended": bool(ended), "tokens_in": len(ids),
+                                  "tokens_out": len(tokens) + int(bool(ended)), "flags0": json.dumps(flags),
+                                  "flags": json.dumps(flags), "failed": bool(flags), **meta}
+            retry = [k for k, u in enumerate(wave) if rows[u["pid"]]["failed"]]
+            retry_seconds = 0.0
+            if retry:
+                device.sample(RETRY_T, seed_int(f"{SEED}/retry/{out}/wave{w}"))
+                outputs2, retry_seconds = decode([prompts[k] for k in retry])
+                device.sampling = {}
+                totals["retry_tokens_out"] += sum(len(t) + int(bool(x)) for t, x in outputs2)
+                for k, (tokens, ended) in zip(retry, outputs2):
+                    u = wave[k]
+                    nl = tokenizer.decode(tokens, skip_special_tokens=True).strip()
+                    flags = hard_flags(u["text"], nl, ended, identify_nl)
+                    rows[u["pid"]].update(attempt=1, text_nl=nl, ended=bool(ended),
+                                          tokens_out=len(tokens) + int(bool(ended)), flags=json.dumps(flags),
+                                          failed=bool(flags))
+            n_in = sum(r["tokens_in"] for r in rows.values())
+            n_out0 = sum(len(o[0]) + int(bool(o[1])) for o in outputs)
+            stat = {"wave": w, "units": len(wave), "tokens_in": n_in, "tokens_out": n_out0,
+                    "seconds": round(seconds, 2), "retried": len(retry), "retry_seconds": round(retry_seconds, 2),
+                    "failed": sum(r["failed"] for r in rows.values()), "full": len(wave) >= shapes["slots"]}
+            for key in ("units", "tokens_in", "tokens_out", "seconds", "retried", "retry_seconds", "failed"):
+                totals[key] += stat[key]
+            if stat["full"]:
+                totals["full_tokens_out"] += n_out0
+                totals["full_seconds"] += seconds
+            totals["waves"] += 1
+            path = local / f"wave-{w:03d}.parquet"
+            write_rows([rows[u["pid"]] for u in wave], path)
+            tr.upload(path, f"{out}/wave-{w:03d}.parquet", client)
+            path.unlink()
+            print(f"WAVE {json.dumps(stat | {'out_per_s': round(n_out0 / max(seconds, 1e-9))})}", flush=True)
+            return rows
 
-    results, broken, waves = run_waves(by_conv, cond, translate_wave, results, broken, first_wave)
-    skipped = sum(1 for u in units if u["pid"] not in results)
-    stats = {"cond": cond, "cls": args.cls, "worker": args.worker, "units": len(units), "convs": len(by_conv),
-             "engine_seconds": round(engine_seconds, 1), "waves_run": waves, "waves_before": first_wave,
-             "shapes": shapes, **{k: (round(v, 2) if isinstance(v, float) else v) for k, v in totals.items()},
-             "broken": len(broken), "skipped": skipped, "lora": args.lora, "model": args.model}
-    marker = local / "DONE.json"
-    marker.write_text(json.dumps(stats) + "\n")
-    tr.upload(marker, f"{out}/DONE.json", client)
-    marker.unlink()
-    print(f"NEMODONE {json.dumps(stats)}", flush=True)
-    return stats
+        results, broken, waves = run_waves(by_conv, cond, translate_wave, results, broken, first_wave)
+        stats = base | {"engine_seconds": round(e["engine_seconds"], 1) if len(all_stats) == 0 else 0.0,
+                        "waves_run": waves, "waves_before": first_wave, "shapes": shapes,
+                        **{k: (round(v, 2) if isinstance(v, float) else v) for k, v in totals.items()},
+                        "broken": len(broken), "skipped": sum(1 for u in units if u["pid"] not in results),
+                        "lora": args.lora, "model": args.model}
+        upload_json(stats, out, "DONE")
+        all_stats.append(stats)
+        print(f"NEMODONE {json.dumps(stats)}", flush=True)
+    print(f"NEMOJOBS {json.dumps({'jobs': len(jobs), 'translated': len(all_stats)})}", flush=True)
+    return all_stats
 
 
 # ---------------------------------------------------------------------------------------------------- collect
 
-def read_gen(gen_dir):
-    """{cond: {pid: row}} and the DONE stats [{...}] of the local copy gen/<cond>/<cls>/w<k>/"""
+def read_gen(gen_dir, leaf=r"w\d+"):
+    """{cond: {pid: row}} and the DONE stats [{...}] of gen/<cond>/<cls>/<leaf>/ (the trial: w<k>; the full run:
+    shard-<r>), a local directory or a gs:// prefix"""
     results = collections.defaultdict(dict)
     stats = []
-    for path in sorted(Path(gen_dir).glob("*/*/w*/wave-*.parquet")):
+    for path in list_files(gen_dir, rf"(ctx|noctx)/(c2k|n128|n512)/{leaf}/wave-\d+\.parquet"):
         for r in read_rows(path):
             if r["pid"] in results[r["cond"]]:
                 raise SystemExit(f"{path}: {r['pid']} translated twice in {r['cond']}")
             results[r["cond"]][r["pid"]] = r
-    for path in sorted(Path(gen_dir).glob("*/*/w*/DONE.json")):
-        stats.append(json.loads(path.read_text()))
+    for path in list_files(gen_dir, rf"(ctx|noctx)/(c2k|n128|n512)/{leaf}/DONE\.json"):
+        stats.append(read_json(path))
     return results, stats
 
 
 def collect(args):
-    data = Path(args.data)
-    pieces = read_rows(data / "pieces.parquet")
-    turns = read_rows(data / "turns.parquet")
-    convs = read_rows(data / "conversations.parquet")
-    results, stats = read_gen(args.gen)
-    if set(results) != {"ctx", "noctx"}:
-        raise SystemExit(f"{args.gen}: translations of {sorted(results)}, not ctx and noctx")
+    data = args.data
+    pieces = read_rows(join(data, "pieces.parquet"))
+    turns = read_rows(join(data, "turns.parquet"))
+    convs = read_rows(join(data, "conversations.parquet"))
+    conds = tuple(args.conds.split(","))
+    results, stats = read_gen(args.gen, args.leaf)
+    workers = sorted({p["worker"] for p in pieces})
     expected = {(s["cond"], s["cls"], s["worker"]) for s in stats}
-    want = {(c, k, w) for k, (c, _, _) in CLASSES.items() for w in range(WORKERS)}
+    want = {(c, k, w) for k, (c, _, _) in CLASSES.items() if c in conds for w in workers}
     if expected != want:
-        raise SystemExit(f"{args.gen}: DONE of {sorted(expected)}, not of every class and worker")
+        raise SystemExit(f"{args.gen}: DONE of {sorted(expected)}, not of every class of {conds} and worker {workers}")
+    for cond in conds:
+        results.setdefault(cond, {})
     pieces_of = collections.defaultdict(list)
     for p in sorted(pieces, key=lambda p: (p["conv"], p["turn"], p["piece"])):
         pieces_of[(p["conv"], p["turn"])].append(p)
     turns_of = collections.defaultdict(list)
     for t in sorted(turns, key=lambda t: (t["conv"], t["turn"])):
         turns_of[t["conv"]].append(t)
-    out = Path(args.out)
+    out = args.out
     meta_rows, turn_rows, qe = [], [], collections.defaultdict(list)
     summary = {}
-    for cond in ("ctx", "noctx"):
+    for cond in conds:
         res = results[cond]
         missing = [p["pid"] for p in pieces if p["pid"] not in res]
         broken = {r["conv"] for r in res.values() if r["failed"]}
@@ -879,23 +1013,22 @@ def collect(args):
                                           "translator": "G4-8-s140 (Gemma 4 31B-it + LoRA)",
                                           "prompt": "natural-v1-chat" if cond == "ctx" else "natural-v1",
                                           "context": cond == "ctx"}})
-        path = out / f"chat-nl-{cond}.jsonl"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("".join(json.dumps(x, ensure_ascii=False) + "\n" for x in chat), encoding="utf-8")
+        chat_bytes = "".join(json.dumps(x, ensure_ascii=False) + "\n" for x in chat).encode()
+        write_bytes(join(out, f"chat-nl-{cond}.jsonl"), chat_bytes)
         summary[cond] = {"pieces": dict(c), "flags0": dict(flags0), "flags": dict(flags1),
                          "by_role": {k: dict(v) for k, v in by_role.items()}, "convs": len(convs),
                          "complete": complete, "broken": len(broken), "missing_pieces": len(missing),
-                         "turns": dict(tc), "chat_bytes": path.stat().st_size,
+                         "turns": dict(tc), "chat_bytes": len(chat_bytes),
                          "chat_bytes_en": sum(len(t["text"].encode()) for t in turns)}
-    write_rows(meta_rows, out / "pieces-result-meta.parquet")
-    write_rows(turn_rows, out / "turns-nl.parquet")
-    for k in range(WORKERS):
+    write_rows(meta_rows, join(out, "pieces-result-meta.parquet"))
+    write_rows(turn_rows, join(out, "turns-nl.parquet"))
+    for k in workers:
         if not qe.get(k):
             raise SystemExit(f"no piece with a translation on w{k}: nothing for its QE")
-        write_rows(qe[k], out / f"qe-in-w{k}.parquet")
-    info = {"protocol": PROTOCOL, "summary": summary, "done": stats,
-            "qe_rows": {f"w{k}": len(qe.get(k, [])) for k in range(WORKERS)}}
-    (out / "collect.json").write_text(json.dumps(info, indent=1) + "\n")
+        write_rows(qe[k], join(out, f"qe-in-w{k}.parquet"))
+    info = {"protocol": PROTOCOL, "conds": conds, "summary": summary, "done": stats,
+            "qe_rows": {f"w{k}": len(qe.get(k, [])) for k in workers}}
+    write_json(info, join(out, "collect.json"))
     print(f"NEMOCOLLECT {json.dumps({c: {k: summary[c][k] for k in ('complete', 'convs', 'broken')} | summary[c]['pieces'] for c in summary})}",
           flush=True)
     return info
@@ -1236,6 +1369,315 @@ def blind(args):
     return info
 
 
+# ---------------------------------------------------------------------------------------------------- the full run
+
+def hf_token():
+    """The HF token of this VM (~/.cache/huggingface/token, put there through stdin); never printed"""
+    path = Path.home() / ".cache" / "huggingface" / "token"
+    token = path.read_text().strip() if path.exists() else ""
+    if not token:
+        raise SystemExit(f"no HF token in {path}")
+    return token
+
+
+def http_range(url, start, end, token, tries=5):
+    """Bytes start..end (inclusive) of url, retried with a pause; exactly that many bytes or an error"""
+    import urllib.request
+
+    for attempt in range(tries):
+        try:
+            request = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}",
+                                                           "Range": f"bytes={start}-{end}"})
+            with urllib.request.urlopen(request, timeout=600) as response:
+                data = response.read()
+            if len(data) != end - start + 1:
+                raise IOError(f"{len(data)} bytes for the range {start}-{end}")
+            return data
+        except Exception as error:  # noqa: BLE001 - every failure is retried, the last one raised
+            if attempt == tries - 1:
+                raise
+            print(f"range {start}-{end}: {error!r}, again in {30 * (attempt + 1)} s", flush=True)
+            time.sleep(30 * (attempt + 1))
+    raise AssertionError("unreachable")
+
+
+def shard_lines(r, fetch, size=FILE_BYTES, shard_bytes=SHARD_BYTES, margin=FETCH_MARGIN):
+    """The lines of the file whose first byte lies in shard r's bytes [r x shard_bytes, (r + 1) x shard_bytes), each
+    without its newline; fetch(start, end) gives bytes start..end inclusive. Over all shards every line once."""
+    start, end = r * shard_bytes, min((r + 1) * shard_bytes, size)
+    if start >= size:
+        return []
+    s0 = max(start - 1, 0)
+    data = fetch(s0, min(end + margin, size) - 1)
+    if start == 0:
+        pos = 0
+    else:
+        k = data.find(b"\n")
+        while k < 0:
+            if s0 + len(data) >= size:
+                return []
+            data += fetch(s0 + len(data), min(s0 + len(data) + margin, size) - 1)
+            k = data.find(b"\n")
+        pos = k + 1
+    lines = []
+    while s0 + pos < end:
+        k = data.find(b"\n", pos)
+        while k < 0:
+            if s0 + len(data) >= size:
+                k = len(data)
+                break
+            data += fetch(s0 + len(data), min(s0 + len(data) + margin, size) - 1)
+            k = data.find(b"\n", pos)
+        lines.append(data[pos:k])
+        pos = k + 1
+    return [line for line in lines if line.strip()]
+
+
+def seed_messages(conversation):
+    """(system, first user content) of a WildChat-1M row's conversation, as prepare_chat_prompts.py of the Nemotron
+    repo @ REVISION (extract_source_seed_messages): the first system content, the first user content, else the first
+    message's content"""
+    system = user = None
+    for m in conversation or []:
+        if not isinstance(m, dict) or m.get("content") is None:
+            continue
+        if m.get("role") == "system" and system is None:
+            system = m["content"]
+        if m.get("role") == "user":
+            user = m["content"]
+            break
+    if user is None and conversation and isinstance(conversation[0], dict) and isinstance(conversation[0].get("content"), str):
+        user = conversation[0]["content"]
+    return system, user
+
+
+def prompt_hash(text):
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def restore_row(row, prompts):
+    """A WildChat row with its withheld system and first user content put back from prompts {sha256: (system, user)}
+    (prepare_chat_prompts.py's restore_chat_jsonl); None when its hash is not there. Other rows unchanged."""
+    meta = row.get("metadata") or {}
+    if meta.get("seed_dataset") != WILDCHAT:
+        return row
+    found = prompts.get(meta.get("seed_prompt_sha256"))
+    if found is None:
+        return None
+    messages = [dict(m) for m in row.get("messages") or []]
+    if messages and messages[0].get("role") == "system":
+        messages[0]["content"] = found[0]
+    first = next((k for k, m in enumerate(messages) if m.get("role") == "user"), None)
+    if first is None:
+        return None
+    messages[first]["content"] = found[1]
+    return dict(row, messages=messages)
+
+
+def wildchat(args):
+    """The first prompts of WildChat-1M at WILDCHAT_REVISION, straight from HF (huggingface_hub's file system, nothing
+    on disk), as 16 parquet files by the first hex digit of their sha256: {sha256, system, user}"""
+    import pyarrow.parquet as pq
+    from huggingface_hub import HfFileSystem
+
+    fs = HfFileSystem(token=hf_token())
+    files = sorted(fs.glob(f"datasets/{WILDCHAT}@{WILDCHAT_REVISION}/data/*.parquet"))
+    if len(files) != WILDCHAT_FILES:
+        raise SystemExit(f"{WILDCHAT}@{WILDCHAT_REVISION}: {len(files)} parquet files, not {WILDCHAT_FILES}")
+    per = collections.defaultdict(dict)
+    counts = collections.Counter()
+    for f in files:
+        with fs.open(f, "rb") as handle:
+            for batch in pq.ParquetFile(handle).iter_batches(columns=["conversation"], batch_size=4096):
+                for conv in batch.column(0).to_pylist():
+                    counts["rows"] += 1
+                    system, user = seed_messages(conv)
+                    if user is None:
+                        counts["no_user"] += 1
+                        continue
+                    h = prompt_hash(user)
+                    if h in per[h[0]]:
+                        counts["same_prompt"] += 1
+                        continue
+                    per[h[0]][h] = (system, user)
+        print(f"WILDCHAT {json.dumps({'file': f.rsplit('/', 1)[-1], **counts})}", flush=True)
+    for d in "0123456789abcdef":
+        write_rows([{"sha256": h, "system": v[0], "user": v[1]} for h, v in sorted(per[d].items())],
+                   join(args.out, f"prompts-{d}.parquet"))
+    info = {"dataset": WILDCHAT, "revision": WILDCHAT_REVISION, "files": len(files), **counts,
+            "prompts": sum(len(v) for v in per.values())}
+    write_json(info, join(args.out, "wildchat.json"))
+    print(f"NEMOWILDCHAT {json.dumps(info)}", flush=True)
+    return info
+
+
+def read_prompts(root):
+    out = {}
+    for d in "0123456789abcdef":
+        for r in read_rows(join(root, f"prompts-{d}.parquet")):
+            out[r["sha256"]] = (r["system"], r["user"])
+    return out
+
+
+def shards_of(worker, workers=WORKERS, shards=SHARDS):
+    return [r for r in range(shards) if r % workers == worker]
+
+
+def prepare_shard(lines, r, count, identify, prompts):
+    """The tables of shard r: every conversation that passes the filters (no draw), all on worker r % WORKERS"""
+    worker = r % WORKERS
+    reasons, seeds = collections.Counter(), collections.Counter()
+    conversations, turns, pieces, pool = [], [], [], []
+    for line in lines:
+        row = json.loads(line.decode("utf-8"))
+        seeds[(row.get("metadata") or {}).get("seed_dataset")] += 1
+        restored = restore_row(row, prompts)
+        if restored is None:
+            reasons["wildchat_not_restored"] += 1
+            continue
+        conv, why = conversation(restored, FULL_SEEDS)
+        if conv is not None:
+            conv, why = prepare(conv, count, identify)
+        if why:
+            reasons[why] += 1
+            continue
+        pool.append(conv)
+        c = conv
+        conversations.append({"conv": c["uuid"], "seed": c["seed"], "stratum": c["stratum"], "turns": len(c["turns"]),
+                              "assistant": c["n_assistant"], "tokens": c["tokens"], "worker": worker,
+                              "train_turns": c["train_turns"], "reasoning_chars": c["reasoning_chars"], "shard": r})
+        for i, t in enumerate(c["turns"]):
+            turns.append({"conv": c["uuid"], "turn": i, "role": t["role"], "message": t["message"], "text": t["text"],
+                          "lead": t["lead"], "trail": t["trail"], "pieces": len(t["pieces"]), "tokens": t["tokens"],
+                          "worker": worker})
+            for j, p in enumerate(t["pieces"]):
+                pieces.append({"pid": f"{c['uuid']}|t{i}|p{j}", "conv": c["uuid"], "turn": i, "piece": j,
+                               "n_pieces": len(t["pieces"]), "role": t["role"], "text": p["text"],
+                               "sep_after": p["sep"], "tokens": p["tokens"], "worker": worker, "stratum": c["stratum"]})
+    info = {"shard": r, "worker": worker, "rows": len(lines), "seeds": dict(seeds), "left_out": dict(reasons),
+            "kept": len(conversations), "kept_seeds": dict(collections.Counter(c["seed"] for c in conversations)),
+            "turns": len(turns), "pieces": len(pieces), "pieces_short": sum(p["tokens"] <= SHORT_MAX for p in pieces),
+            "tokens": sum(c["tokens"] for c in conversations),
+            "tokens_short": sum(p["tokens"] for p in pieces if p["tokens"] <= SHORT_MAX),
+            "tokens_long": sum(p["tokens"] for p in pieces if p["tokens"] > SHORT_MAX),
+            "chars_en": sum(len(t["text"].encode()) for t in turns)}
+    return conversations, turns, pieces, [pool_meta_row(c) for c in pool], info
+
+
+def prepare_run(args):
+    """Every shard of this worker (r = worker mod 4) that has no prepare.json yet: its lines straight from HF (HTTP
+    ranges at REVISION, nothing on disk), WildChat's prompts put back, the filters, the pieces, to <out>/shard-<r>/"""
+    from transformers import AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained(args.tokenizer)
+
+    def count(text):
+        return len(tok(text, add_special_tokens=False)["input_ids"])
+
+    identify = langid_identifier()
+    token = hf_token()
+    url = f"https://huggingface.co/datasets/{DATASET}/resolve/{REVISION}/data/chat.jsonl"
+    todo = [r for r in (shards_of(args.worker) if args.shards is None else [int(x) for x in args.shards.split(",")])
+            if not exists(join(args.out, f"shard-{r:05d}", "prepare.json"))]
+    print(f"prepare w{args.worker}: {len(todo)} shards to do", flush=True)
+    prompts = read_prompts(args.wildchat) if todo else {}
+    for r in todo:
+        t0 = time.time()
+        lines = shard_lines(r, lambda a, b: http_range(url, a, b, token))
+        conversations, turns, pieces, pool, info = prepare_shard(lines, r, count, identify, prompts)
+        d = join(args.out, f"shard-{r:05d}")
+        write_rows(conversations, join(d, "conversations.parquet"))
+        write_rows(turns, join(d, "turns.parquet"))
+        write_rows(pieces, join(d, "pieces.parquet"))
+        write_rows([{k: v for k, v in p.items() if k not in ("text", "sep_after")} for p in pieces],
+                   join(d, "pieces-meta.parquet"))
+        write_rows(pool, join(d, "pool-meta.parquet"))
+        info["seconds"] = round(time.time() - t0, 1)
+        write_json(info, join(d, "prepare.json"))  # last: the shard's marker
+        print(f"PREPARED {json.dumps({k: info[k] for k in ('shard', 'rows', 'kept', 'pieces', 'tokens', 'seconds')})}",
+              flush=True)
+    print(f"NEMOPREPARE {json.dumps({'worker': args.worker, 'done': len(todo)})}", flush=True)
+
+
+def final_shard(chat_rows, meta, qe, cond, qe_max=QE_MAX):
+    """(rows, counts): the shard's conversations of chat-nl-<cond>.jsonl with each message's QE (its pieces' MetricX-24
+    QE weighted by English tokens); a conversation with a message without QE, or with a piece above qe_max, is left
+    out (no gaps). qe_max None keeps them all."""
+    tq = turn_qe(meta, qe, cond)
+    worst = collections.defaultdict(float)
+    for m in meta:
+        if m["cond"] == cond:
+            q = qe.get(f"{cond}|{m['pid']}")
+            if q is not None:
+                worst[m["conv"]] = max(worst[m["conv"]], q)
+    out, counts = [], collections.Counter()
+    for row in chat_rows:
+        counts["complete"] += 1
+        qs = [tq.get((row["uuid"], k)) for k in range(len(row["messages"]))]
+        if any(q is None for q in qs):
+            counts["no_qe"] += 1
+            continue
+        if qe_max is not None and worst[row["uuid"]] > qe_max:
+            counts["qe_above_max"] += 1
+            continue
+        out.append(dict(row, messages=[dict(m, qe=round(q, 3)) for m, q in zip(row["messages"], qs)]))
+    counts["kept"] = len(out)
+    return out, dict(counts)
+
+
+def final_run(args):
+    """Every shard of this worker with a collect.json and QE scores and no final.json: out/chat-nl-<r>.jsonl"""
+    qe_max = None if args.qe_max.lower() == "none" else float(args.qe_max)
+    done = 0
+    for r in shards_of(args.worker):
+        c = join(args.collect, f"shard-{r:05d}")
+        target = join(args.out, f"chat-nl-{r:05d}.jsonl")
+        marker = join(args.out, f"final-{r:05d}.json")
+        if exists(marker) or not exists(join(c, "collect.json")):
+            continue
+        scores = join(args.scores, f"qe-{r:05d}.parquet")
+        if not exists(scores):
+            raise SystemExit(f"shard {r}: collect.json but no {scores}")
+        chat = [json.loads(x) for x in read_bytes(join(c, f"chat-nl-{args.cond}.jsonl")).decode().splitlines() if x]
+        meta = read_rows(join(c, "pieces-result-meta.parquet"))
+        qe = {x["id"]: x["qe_source_hypothesis"] for x in read_rows(scores)}
+        rows, counts = final_shard(chat, meta, qe, args.cond, qe_max)
+        write_bytes(target, "".join(json.dumps(x, ensure_ascii=False) + "\n" for x in rows).encode())
+        write_json({"shard": r, "cond": args.cond, "qe_max": qe_max, **counts}, marker)
+        done += 1
+        print(f"FINAL {json.dumps({'shard': r, **counts})}", flush=True)
+    print(f"NEMOFINAL {json.dumps({'worker': args.worker, 'done': done})}", flush=True)
+
+
+def summary_run(args):
+    """The full run in numbers (text-free): per stage the shards done and the sums of their counts"""
+    agg = {}
+    for name, root, pattern in (("prepare", args.data, r"shard-\d+/prepare\.json"),
+                                ("final", args.out, r"final-\d+\.json")):
+        files = list_files(root, pattern)
+        tot = collections.Counter()
+        for f in files:
+            for k, v in read_json(f).items():
+                if isinstance(v, (int, float)) and not isinstance(v, bool) and k not in ("shard", "worker", "qe_max"):
+                    tot[k] += v
+                elif isinstance(v, dict):
+                    for kk, vv in v.items():
+                        if isinstance(vv, (int, float)):
+                            tot[f"{k}.{kk}"] += vv
+        agg[name] = {"shards": len(files), **dict(sorted(tot.items()))}
+    gen = collections.Counter()
+    for f in list_files(args.gen, r"(ctx|noctx)/(c2k|n128|n512)/shard-\d+/DONE\.json"):
+        d = read_json(f)
+        gen["shards"] += 1
+        for k in ("units", "tokens_in", "tokens_out", "seconds", "retry_seconds", "failed", "broken"):
+            gen[k] += d.get(k, 0)
+    agg["gen"] = dict(gen)
+    agg["shards_total"] = SHARDS
+    write_json(agg, args.json)
+    print(f"NEMOSUMMARY {json.dumps(agg)}", flush=True)
+    return agg
+
+
 # ---------------------------------------------------------------------------------------------------- main
 
 def main(argv=None):
@@ -1247,11 +1689,12 @@ def main(argv=None):
     p.add_argument("--n", type=int, default=N_TRIAL)
     p.add_argument("--out", required=True)
     p = sub.add_parser("translate")
-    p.add_argument("--pieces", required=True)
+    p.add_argument("--pieces", default=None, help="the pieces (a local file or gs://), with --out")
+    p.add_argument("--jobs", default=None, help="a file of lines '<pieces> <out>' (the full run: one per shard)")
     p.add_argument("--cond", required=True, choices=("ctx", "noctx"))
     p.add_argument("--cls", required=True, choices=sorted(CLASSES))
     p.add_argument("--worker", type=int, required=True)
-    p.add_argument("--out", required=True, help="the bucket directory of this condition, class and worker")
+    p.add_argument("--out", default=None, help="the bucket directory of this condition, class and worker")
     p.add_argument("--ckpt", required=True)
     p.add_argument("--tokenizer", required=True)
     p.add_argument("--model", default="gemma4-31b-chat")
@@ -1262,6 +1705,8 @@ def main(argv=None):
     p.add_argument("--data", required=True)
     p.add_argument("--gen", required=True)
     p.add_argument("--out", required=True)
+    p.add_argument("--conds", default="ctx,noctx", help="the conditions translated (the full run: one)")
+    p.add_argument("--leaf", default=r"w\d+", help="the directory of a class's output (the full run: shard-<r>)")
     p = sub.add_parser("report")
     p.add_argument("--data", required=True)
     p.add_argument("--collect", required=True)
@@ -1272,9 +1717,29 @@ def main(argv=None):
     p.add_argument("--collect", required=True)
     p.add_argument("--out", required=True, help="the package's directory (judge-input.jsonl, REVIEWER.md)")
     p.add_argument("--key", required=True)
+    p = sub.add_parser("wildchat")
+    p.add_argument("--out", required=True)
+    p = sub.add_parser("prepare")
+    p.add_argument("--worker", type=int, required=True)
+    p.add_argument("--shards", default=None, help="comma-separated shards (default: those of the worker)")
+    p.add_argument("--wildchat", required=True, help="the prompts of `wildchat`")
+    p.add_argument("--tokenizer", required=True)
+    p.add_argument("--out", required=True)
+    p = sub.add_parser("final")
+    p.add_argument("--worker", type=int, required=True)
+    p.add_argument("--cond", required=True, choices=("ctx", "noctx"))
+    p.add_argument("--collect", required=True)
+    p.add_argument("--scores", required=True)
+    p.add_argument("--out", required=True)
+    p.add_argument("--qe-max", default=str(QE_MAX))
+    p = sub.add_parser("summary")
+    p.add_argument("--data", required=True)
+    p.add_argument("--gen", required=True)
+    p.add_argument("--out", required=True)
+    p.add_argument("--json", required=True)
     args = parser.parse_args(argv)
-    return {"sample": sample, "translate": translate_run, "collect": collect, "report": report,
-            "blind": blind}[args.command](args)
+    return {"sample": sample, "translate": translate_run, "collect": collect, "report": report, "blind": blind,
+            "wildchat": wildchat, "prepare": prepare_run, "final": final_run, "summary": summary_run}[args.command](args)
 
 
 if __name__ == "__main__":

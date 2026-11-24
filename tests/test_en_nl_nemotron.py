@@ -88,6 +88,29 @@ def test_split_turn_keeps_every_character_and_respects_the_limit():
     assert len(pieces) > 3
 
 
+def test_sentences_keep_the_separator_of_an_empty_part():
+    for block in ("First one. \nSecond one.", "A. \n\tB? C!\n", "x:\n\ny", "End. ", "\nStart"):
+        parts = nc.sentences(block, "\n\n")
+        assert "".join(p + s for p, s in parts) == block + "\n\n" and all(p for p, _ in parts)
+
+
+def test_split_turn_gives_any_text_back_or_refuses_it():
+    import random
+
+    rng = random.Random(7)
+    alphabet = ["word", "w", ".", "?", ":", " ", "  ", "\t", "\n", "\n\n", " \n", "\r", "```", "~~~", "`x`", "#", "- ",
+                "\u00a0", "\u2028", "\x0b", "\x85", " ```py\n"]
+    for _ in range(20000):
+        text = "".join(rng.choice(alphabet) for _ in range(rng.randint(1, 60)))
+        if not text.strip():
+            continue
+        try:
+            lead, pieces, trail = nc.split_turn(text, words, limit=rng.choice([1, 3, 8, 40]))
+        except nc.Unsplittable:
+            continue
+        assert lead + "".join(p + s for p, s in pieces) + trail == text
+
+
 def test_a_fenced_block_longer_than_a_piece_cannot_be_split():
     with pytest.raises(nc.Unsplittable, match="fence"):
         nc.split_turn("Intro.\n\n```\n" + "x " * 50 + "\n```", words, limit=20)
@@ -348,7 +371,7 @@ def test_collect_report_and_blind_end_to_end(tmp_path):
     fail = "conv007|t2|p0"
     gen = build_gen(tmp_path, pieces, fail_pid=fail)
     col = tmp_path / "collect"
-    info = nc.collect(Namespace(data=str(data), gen=str(gen), out=str(col)))
+    info = nc.collect(Namespace(data=str(data), gen=str(gen), out=str(col), conds="ctx,noctx", leaf=r"w\d+"))
     s = info["summary"]
     assert s["noctx"]["complete"] == 50 and s["ctx"]["complete"] == 49 and s["ctx"]["broken"] == 1
     assert s["ctx"]["pieces"]["failed"] == 1 and s["ctx"]["flags"] == {"empty": 1}
@@ -389,4 +412,4 @@ def test_collect_refuses_a_missing_translation_without_context(tmp_path):
     rows = nc.read_rows(victim)
     nc.write_rows(rows[1:], victim)
     with pytest.raises(SystemExit, match="noctx: 1 pieces without a translation"):
-        nc.collect(Namespace(data=str(data), gen=str(gen), out=str(tmp_path / "c")))
+        nc.collect(Namespace(data=str(data), gen=str(gen), out=str(tmp_path / "c"), conds="ctx,noctx", leaf=r"w\d+"))

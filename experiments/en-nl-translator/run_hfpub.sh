@@ -49,7 +49,7 @@ llama)
   echo "LLAMA {\"tag\": \"$LLAMA_TAG\", \"commit\": \"$(git -C $LL rev-parse HEAD)\"}" ;;
 download)
   if [ ! -s $D/base/done.txt ]; then
-    $V/bin/hf download $BASE_REPO --revision $BASE_REV --local-dir $D/base --quiet > /dev/null
+    $V/bin/hf download $BASE_REPO --revision $BASE_REV --local-dir $D/base > /dev/null
     echo "$BASE_REPO@$BASE_REV" > $D/base/done.txt
   fi
   mkdir -p $D/mt $D/eval/arm $D/eval/base $D/out

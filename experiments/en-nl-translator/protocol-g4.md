@@ -3267,3 +3267,232 @@ per constructie 100% en zegt niets); (b) een tabel **"hoe vaak kiest een signaal
 hoofdtabel (het aandeel paren waar het signaal de kant kiest die niet `base` is), als maat voor de
 selectiekoppeling van G4-maat.7 [niet vooraf vastgelegd; beschrijvend, geen toets]. De run, de scores en de tabellen
 1–7 blijven die van `g4m1124a`; het rapport wordt op co1 opnieuw gemaakt uit dezelfde bestanden zonder tekst.
+
+## 24. Meting G4-maat2 en de evaluatiepool: twee judge-prompts en een schone pool (voorbereiding, beslist niets)
+
+**Vastgelegd 24 nov 2026 (tijdstip: de commit van deze sectie op branch `en-nl-g4arm8`)**, vóór elke stap van deze
+meting op een worker en vóór elke uitslag [besluit van de hoofdsessie namens Yeb, op advies van Gemini 4 Neon, 24 nov
+~12:40, binnen Yebs regel "voorbereidend werk mag"; geen training, geen nieuwe arm, G4-9 niet starten; uitwerking door
+een subagent]. Vooraf gelezen: de rapporten van §20, FB.8 en §23 (alleen tellingen en scores); met één leesopdracht op
+mbert-mix w0 de aantallen van `$G/data/eval/evalsets.parquet` per set, deel van G4-5.4 en lengteband (geen tekst);
+de veldnamen en id's van de sleutels van Yebs drie steekproeven. Geen tekst (bron, vertaling, roman) en geen score van
+deze meting. Een meting en een voorbereiding: er wordt niets getraind en niets beslist; er wordt geen pakket voor Yeb en
+geen blind pakket gemaakt (dat besluit Yeb later: stoppen of een menselijke proef van ~96 paren). Claude en GPT zijn geen
+judge of generator; de bestaande Claude-oordelen dienen alleen als vergelijking. `GM=$G/measure`, `GM2=$G/measure2`,
+`P=$G/pool`, `GJ=$G/judge`, `G8=$G/data/G4-8`, `MS=$G/mixsample`.
+
+### 24.1 Deel 1: twee nieuwe judge-prompts
+
+*G4-maat2.1 Vraag.* De rubriek-judge (§17) kiest bij mens tegen machine de machine (§20: fictie 17,6%, BT 30,8% richting
+mens); N1 en N2 (FB.8) herkennen de menselijke kant, maar N1-keuzes die van de rubriek afwijken zijn minder juist
+(G4-9.V3N1); tegen Yeb is geen signaal duidelijk beter (§23). Gemeten wordt of een judge die alleen trouw meet (A1),
+een judge die natuurlijkheid voorop zet met een fout als veto (J-nat), en twee vooraf vastgelegde combinaties
+(A1-veto → N1, A1-veto → N2) de menselijke kant herkennen, de foutloze kant kiezen en stabiel zijn bij het verwisselen
+van A en B, en hoe vaak ze dezelfde kant kiezen als Yeb en Claude. Rapportage; geen winnaar, geen besluit.
+
+*G4-maat2.2 Judge en prompts.* De judge van G4-judge.2–4 ongewijzigd: Gemma 4 31B-it @ `842da37`, de MaxText-omzetting,
+`pairjudge.py score` ongewijzigd (één prefill, P(A)/P(B)/P(gelijk) uit de logits van de eerste antwoordpositie met de
+ids van G4-judge.2, het chat-template met één gebruikersbeurt en een lege denkruimte), elk paar in beide volgordes,
+P̄ volgens G4-judge.4 (`pairjudge.combine`), een prompt van meer dan 4.096 tokens niet gescoord (geteld). De tekst van de
+gebruikersbeurt, letterlijk (`{bron}`, `{A}` en `{B}` gestript ingevuld, `pairjudge.user_text`):
+
+**A1** (alleen trouw aan de bron; stijl genegeerd):
+
+```
+Je beoordeelt vertalingen uit het Engels in het Nederlands. Je krijgt de Engelse bron en twee Nederlandse vertalingen, A en B. Je weet niet hoe of door wie ze zijn gemaakt; probeer dat niet te raden.
+
+Oordeel alleen op trouw aan de bron: welke vertaling geeft de betekenis van de Engelse bron het volledigst en het juistst weer? Tel alleen betekenisfouten:
+- een weglating: iets uit de bron ontbreekt in de vertaling;
+- een toevoeging: de vertaling zegt iets wat niet in de bron staat;
+- een verkeerde betekenis: de vertaling zegt iets anders dan de bron, ook als een idioom of vaste uitdrukking zo is vertaald dat de betekenis verandert.
+Laat stijl, woordkeus, zinsbouw en natuurlijkheid uitdrukkelijk buiten beschouwing: een stijve of letterlijke vertaling is even goed als een vloeiende, zolang de betekenis klopt. "gelijk" als er geen duidelijk verschil in betekenisfouten is.
+
+Engelse bron:
+{bron}
+
+Vertaling A:
+{A}
+
+Vertaling B:
+{B}
+
+Welke vertaling is getrouwer aan de bron? Antwoord met één woord: A, B of gelijk.
+```
+
+**J-nat** (natuurlijkheid eerst, een fout als veto):
+
+```
+Je beoordeelt vertalingen uit het Engels in het Nederlands. Je krijgt de Engelse bron en twee Nederlandse vertalingen, A en B. Je weet niet hoe of door wie ze zijn gemaakt; probeer dat niet te raden.
+
+Kies de vertaling met het natuurlijkste Nederlands: de tekst die het meest leest als tekst die oorspronkelijk in het Nederlands is geschreven, en het minst als een vertaling. Alleen als die vertaling een duidelijke betekenisfout of weglating heeft (iets uit de bron ontbreekt, of de vertaling zegt iets anders dan de bron) en de andere niet, kies je de andere. Woordkeus, stijl en zinsbouw zijn geen betekenisfout zolang de betekenis klopt. "gelijk" als er geen duidelijk verschil is.
+
+Engelse bron:
+{bron}
+
+Vertaling A:
+{A}
+
+Vertaling B:
+{B}
+
+Welke vertaling kies je? Antwoord met één woord: A, B of gelijk.
+```
+
+Er wordt geen prompt gezocht of bijgesteld; deze twee liggen hier vast.
+
+*G4-maat2.3 Keuze per paar en de combinaties* (vooraf vastgelegd, geen andere). Een judge kiest de kant met de hoogste
+P̄ (het teken van P̄(A) − P̄(B), G4-maat.4; gelijk of niet gescoord: geen keuze). **A1-veto → N1**: is
+|P̄_A1(A) − P̄_A1(B)| ≥ **0,2**, dan de kant van A1; anders de keuze van N1. **A1-veto → N2**: idem met N2. [keuze] De
+marge 0,2 is die van §23 (K1, K2 en de tabel per marge), vooraf gekozen en niet gezocht; er wordt niets op Yebs paren,
+op de Claude-paren of op de fictie/BT-paren afgesteld.
+
+*G4-maat2.4 Paren.*
+- **Fictie/BT** (1.000 paren van §20, run `g4jfb1124a`, kader `ab`: A = de menselijke of oorspronkelijke kant). De teksten
+  komen uit §20's prompts `$GJ/fb/data/prompts-w<k>.parquet`: per paar wordt de prompt `ab` van G4-judge.3 ontleed in
+  bron, A en B (het begin en eind van de template en de twee scheidingen `\n\nVertaling A:\n` en `\n\nVertaling B:\n`
+  elk precies één keer; anders stopt de stap) en gecontroleerd: dezelfde drie teksten geven precies §20's prompts `ab`
+  en `ba` en FB.8's prompts N1 en N2 (`$GJ/fbn1/data/`, `$GJ/fbn2/data/`), per uid; de paren zijn die van §20's
+  `refs.parquet`. Een afwijking stopt vóór er iets geschreven wordt.
+- **§23** (1.438 paren: Yebs 80 en de 14 blinde Claude-pakketten): de teksten van `$GM/data/pairs.parquet`; de prompts
+  rubriek, N1 en N2 die daaruit opnieuw gemaakt worden moeten per uid (sha256 van de tekst) die van §23 zijn
+  (`$GM/data/prompts-w<k>.parquet`), anders stopt de stap.
+- Prompts: A1 en J-nat × (1.000 + 1.438) paren × 2 volgordes = 9.752; daarbij de reproductie (G4-maat2.7) 200 × 3 × 2 =
+  1.200; samen 10.952, over de 4 workers op sha256 van de uid.
+
+*G4-maat2.5 Toets (vooraf vastgelegd; rapportage, beslist niets).* Voor A1, J-nat, A1-veto → N1 en A1-veto → N2:
+- **(a)** richting mens/origineel > **70%** op de 1.000 fictie/BT-paren samen: een judge telt 1 als P̄(mens) >
+  P̄(machine), ½ bij gelijke P̄ (FB.4.2); een combinatie 1 als ze de menselijke kant kiest, 0 de machinekant, ½ zonder
+  keuze; een niet gescoord paar telt niet (geteld). Per proef (fictie, BT) ernaast.
+- **(b)** ≥ **65%** de foutloze kant op de **263** Claude-paren met precies één kant `fout` (§23 G4-maat.6.6): k / n,
+  n = de paren waar het signaal een keuze maakt (n_ref − n apart).
+- **(c)** omklappen bij verwisselen ≤ **20%**, op de 1.000 fictie/BT-paren en op de 1.438 §23-paren apart (beide moeten
+  het halen): een prompt omklapt als de greedy oordelen van `ab` en `ba` (de grootste van p_A, p_B, p_gelijk van die
+  ene prompt), teruggezet in het kader van het paar, tegengestelde winnaars noemen (G4-judge.5.3); een combinatie omklapt
+  als ze, toegepast op de genormaliseerde kansen van één volgorde (teruggezet) in plaats van P̄, in `ab` en `ba`
+  tegengestelde kanten kiest.
+Bestaande signalen in dezelfde tabel ter vergelijking (rubriek, N1, N2 op de fictie/BT-paren uit §20 en FB.8's scores
+herberekend; op de §23-paren uit §23's scores).
+
+*G4-maat2.6 Maten* (`g4measure2.py report1`, op co1 uit bestanden zonder tekst). (1) De toets van G4-maat2.5 met
+gehaald/niet per criterium. (2) Fictie/BT per proef en signaal: oordelen mens / machine / gelijk, richting (Wilson),
+gem. P̄ en Δ (bootstrap als §20), omklappen, inconsistent (`pairjudge.fb_result`; voor de combinaties alleen richting en
+omklappen). (3) De tabellen van §23 (`g4measure.report_data` met de nieuwe rijen; de bestaande signalen QE, COMET-22,
+C1, C2, rubriek, N1, N2, lengte, K1–K4, Claude, nieuw systeem, positie A uit §23's scores, niet opnieuw berekend):
+hoofdtabel (Yeb V1, gemengd, samen; Claude alle, Gemma 4 tegen Gemma 4, zonder paarselectie), per set en pakket, per
+marge (ook A1 en J-nat), betekenisfouten (Yeb en Claude), hoe vaak een signaal het nieuwe systeem kiest. (4) Omklappen
+op de §23-paren per prompt. (5) Controles: de reproductie, de paarcontroles, dekking. Kopie
+`mbert-ops/translator-sft/g4-measure2.md` (`.json`).
+
+*G4-maat2.7 Reproductie* (een afwijking stopt vóór het rapport). 200 §23-paren
+(`random.Random("en-nl-g4arm/0/G4-maat2/repro").sample` van de gesorteerde paar-id's) worden met rubriek, N1 en N2
+opnieuw gescoord met precies §23's prompttekst (uid `repro/<paar>/<prompt>/<volgorde>`): per prompt |Δ| ≤ 1e-5
+(float32-precisie) voor p_A, p_B en p_gelijk tegen §23's scores en hetzelfde greedy oordeel, en per paar dezelfde kant.
+
+*G4-maat2.8 Wat het niet zegt.* Als G4-maat.7 en FB.5/FB.8: n van Yeb is klein (74 niet-gelijke oordelen); V1 en
+pakketten met een selectie zijn met de rubriek gekozen; Claude oordeelde met de rubriek; de herkomst is bij fictie/BT de
+"waarheid", niet de kwaliteit (literaire vrijheid, BT-Engels is Gemma 4's vertaling); de judge is Gemma 4 31B-it, het
+model achter de meeste vertalingen. Eén formulering per prompt, zero-shot. De toets beslist niets.
+
+### 24.2 Deel 2: een schone evaluatiepool
+
+*Pool.1 Doel.* ~400–500 achtergehouden Engelse bronnen met per bron de vertalingen van G4-8-s140, G4-0 en G4-7-i15,
+G4-0's best-of-8 met vier vooraf vastgelegde keuzes, de menselijke vertaling waar die bestaat, en alle scores, zodat een
+latere menselijke proef (als Yeb daartoe besluit) zonder nieuwe TPU-stap getrokken kan worden. Er wordt nu niets
+getrokken of aan iemand voorgelegd.
+
+*Pool.2 Bronnen* (vaste aantallen; per stratum op id gesorteerd, geschud met het zaad, de eerste n; een tekort stopt):
+- **romans 100**: de set `novels` (G4-4.10: 500 passages, 10 boeken; `$G/data/heldout4/eval-novels-meta.parquet`), Engels
+  en menselijke vertaling (`en`, `nl`) van de rij in `b1-selected.parquet` (groep `en_orig`), zonder de 60 bronnen van
+  G4-8.15 (`$MS/data/data.json`); de controles van G4-8.15 (geen id, document of gestript Engels in G4-7's pool of in
+  G4-8's `fresh`, `plan`, `targets`: een treffer stopt) en zijn filter (`g4rl.candidate_filter`: 20–256 Gemma 4-tokens,
+  geen 13-gram met het Engels van die vier bestanden, één bron per tekst); 10 per boek, zaad
+  `en-nl-g4arm/0/G4-maat2/pool/novels/<boek>`. De boeken zitten niet in de bronnen van G4-7 en G4-8 (G4-8.15).
+- **BT 100**: §20's BT-paren (C2's testsplit, `pairjudge.fb_bt` ongewijzigd met zijn controles), Engels = Gemma 4's
+  Engels, de menselijke kant = het Nederlandse origineel (`nl`); zonder de 60 van G4-8.15; dezelfde controles en filter;
+  20 per bron (dpc, fineweb, handelingen, raad, rechtspraak), zaad `…/pool/bt/<bron>`.
+- **WMT24++ 100**, **FLORES 40**, **NTREX 40**, **FLAN 40**: de sets `wmt24pp`, `flores`, `ntrex`, `flan` van
+  `evalsets.parquet`, alleen het **zoekdeel** van G4-5.4 (`split.json`, digest `f953c026…f3`), 20–256 Gemma 4-tokens
+  [gelezen: 322 / 387 / 636 / 422, WMT24++ zonder `is_bad_source`], niet `is_bad_source`, geen item van de 100 vaste
+  blinde passages en geen item dat Yeb zag (V1: de items van `G4-judge-i15` en `G4-judge-anchor-i15` in
+  `steekproef-yeb/key-map.json`; de gemengde steekproef: `steekproef-yeb-g4-8-mix/key.json`); dezelfde controles en
+  filter als de romans; zaad `…/pool/<set>`. Referentie (menselijke vertaling) bij WMT24++, FLORES en NTREX die van de
+  testset; FLAN zonder.
+- **idioom**: de idioompassages van de 100 vaste blinde passages (rijen `blind-NNN`, 30), 20–256 tokens, zonder die
+  van Yebs steekproef 2 (`steekproef-yeb-g4-8/key-map.json`) en de gemengde steekproef; alle overige; geen referentie.
+- **FLAN ≤ 10%**: FLAN = min(40, ⌊(alle andere bronnen) / 9⌋).
+- **Niet**: de TEST-split van hammond (geen bron komt uit hammond), het beslisdeel van G4-5.4 van alle sets [keuze: ook
+  FLORES, NTREX en FLAN, zodat het beslisdeel ongelezen blijft], europarl, en niets uit de trainingsdata van G4-7 en G4-8
+  (de controles hierboven).
+
+*Pool.3 Vertalingen* (fork `f4d8615`, model `gemma4-31b`, prompt `natural-v1`, `translate.py`, klasse `medium`, alle
+bronnen ≤ 256 tokens; als het anker en de samples van G4-8-data.2–3). Greedy (`--copies 1`): G4-0 zonder adapter (w1),
+G4-8-s140 (`$G/G4-8-s140/`, w2) en G4-7-i15 (`$G/G4-7-i15/`, w3), de LoRA's rank 32 / alpha 16 / schaal 0,5 gecontroleerd
+en samengevoegd. Samples: G4-0 zonder adapter, 8 per bron bij T = 1 (`--copies 8 --sample samples=1.0:<zaad>`, zaad
+`g4rl.seed_int("en-nl-g4arm/0/G4-maat2/pool/sample/w0")`, w0). Het anker van best-of-8 = G4-0 greedy. Gerapporteerd
+(geen stop): bij de bronnen uit de evaluatiesets hoe vaak de greedy tekst (witruimte genormaliseerd) gelijk is aan de
+bestaande evaluatie-uitvoer van hetzelfde model (`$G/eval/<model>/pairs/`, vertaald per lengteklasse).
+
+*Pool.4 Scores per tekst* (per bron: de drie greedy vertalingen, de 8 samples, de menselijke tekst). **QE**: MetricX-24
+hybrid XXL bf16 zonder referentie (`metricx_qe.py score --pair source:hypothesis --model xxl`, een lege tekst zonder
+score, als G4-8-data.2), over de 4 workers. **COMET-22** met de referentie bij WMT24++, FLORES en NTREX (`comet_score.py`,
+CPU, w2) [keuze als §23: niet bij romans en BT]. **C1** (`run_arms.sh classify` ongewijzigd) en **C2**
+(`naturalness.py classify --max-length 1024`, als `classify-c2`) op alle teksten (w0).
+
+*Pool.5 Best-of-8 met vier keuzes.* Fail en kandidaat als G4-8-data.4 (`g4arm8.source_candidates` ongewijzigd: niet af,
+lus, leeg, Engels over, ℓ/ℓ₀ buiten [0,67; 1,5], QE > 7,5; kandidaat = geen fail, QE ≤ QE₀ (+ 1e-9), tekst anders dan
+het anker; gelijke teksten één keer, sleutel het eerste sample). Een bron waarvan het anker niet in orde is
+(`g4rl.anchor_ok`) of geen QE heeft, krijgt geen kandidaten (geteld). Elke kandidaat tegen het anker met **rubriek**,
+**N1** en **A1** (kader `ab`: A = sample), beide volgordes. Per bron, elke keuze met het anker als terugval:
+- **rubriek-of-anker** (janchor, G4-8-data.6): k = de kandidaat met de hoogste P̄_rubriek(sample) (gelijk: lagere QE, dan
+  het eerdere sample); het sample als P̄ > 0,5, anders het anker (`g4arm8.choose8`);
+- **N1** (G4-8-N1.6): idem met P̄_N1;
+- **rubriek ∩ N1** (het doel van §22 O9 `intersect`): het sample als rubriek en N1 een sample met dezelfde `j` kozen,
+  anders het anker;
+- **A1-veto → N1**: per kandidaat beslist A1 als |P̄_A1(sample) − P̄_A1(anker)| ≥ 0,2 (het sample als P̄_A1(sample) groter
+  is), anders de regel van N1 (het sample als P̄_N1(sample) > 0,5); onder de kandidaten waar dat het sample geeft de
+  hoogste P̄_N1(sample) (gelijk: lagere QE, dan het eerdere sample); geen: het anker.
+
+*Pool.6 Paren voor een latere menselijke proef* (alle vijf prompts: rubriek, N1, N2, A1, J-nat; beide volgordes;
+kader `ab`: A = de eerstgenoemde): **mens** G4-8-s140 tegen de menselijke tekst (romans, BT-origineel, WMT24++, FLORES,
+NTREX); **bo8** G4-8-s140 tegen G4-0 best-of-8 rubriek ∩ N1 (bij terugval G4-0 greedy); **i15** G4-8-s140 tegen
+G4-7-i15; **keuze** de rubriekkeuze tegen de N1-keuze waar hun teksten verschillen. Paren met (genormaliseerd) gelijke
+teksten worden geteld en niet gescoord. Er wordt geen paar getrokken, geen pakket en geen steekproefbestand gemaakt.
+
+*Pool.7 Reproductie* (een afwijking stopt vóór het rapport). QE van 400 kanten van 200 §23-paren
+(`random.Random("en-nl-g4arm/0/G4-pool/repro-qe").sample` van de gesorteerde paar-id's) in dezelfde QE-stap: grootste
+|Δ| tegen §23's `metricx.parquet` ≤ **0,06**. Rubriek, N1 en N2 van 100 §23-paren (`…/G4-pool/repro-judge`) in de eerste
+judge-stap met §23's prompttekst: als G4-maat2.7 (|Δ| ≤ 1e-5, zelfde greedy oordeel, zelfde kant).
+
+*Pool.8 Rapport* (`g4pool.py report`, w0, alleen tellingen en scores, geen tekst; `$P/report.md`/`.json`, kopie
+`mbert-ops/translator-sft/g4-pool.md`): bronnen per stratum (geschikt, gefilterd, uitgesloten, getrokken; FLAN-aandeel);
+per systeem (G4-0, G4-8-s140, G4-7-i15, de vier best-of-8-keuzes, mens) en stratum n, gem. QE, gem. COMET-22 (nieuws),
+C1 (gem. P(origineel) en aandeel ≥ 0,5), gem. C2, leeg/niet af; de best-of-8-keuzes (sample of anker per keuze en
+stratum, overeenstemming tussen keuzes, kandidaten en fails); per paartype en prompt n, gelijke teksten, richting voor A
+(Wilson), gem. P̄(A), P̄(B); de controles van Pool.3 en Pool.7.
+
+*Pool.9 Uitvoer* (alles onder `$P`): `data/` (`sources.parquet` met tekst, `sources-meta.parquet` zonder, `segments.parquet`,
+`data.json`), `gen/<model>/` en `samples/` (de vertalingen), `texts/` (`texts.parquet`, `qe-in-w<k>.parquet`,
+`comet-in.parquet`, `texts.json`), `scores/` (`qe-w<k>.parquet`, `comet.parquet`), `naturalness/` (`texts.parquet`,
+`predictions.parquet`, `predictions-c2.parquet`), `judge1/` en `judge2/` (`data/`, `scores/w<k>/`), `choose/`
+(`cands.parquet`, `choice.parquet` en `pairs-meta.parquet` zonder tekst, `outputs.parquet` en `pairs.parquet` met tekst),
+`report.md`/`.json`; markers `$G/stages/g4-pool/`. Teksten blijven in de bucket en op de VM; naar co1 alleen het rapport.
+
+*Pool.10 Wat het niet zegt.* De pool is een voorraad, geen uitslag: de gemiddelden per systeem zijn automatische maten
+(QE, COMET-22, C1, C2) en judge-oordelen van Gemma 4 31B-it, het model achter G4-0, G4-8-s140 en G4-7-i15. FLAN, WMT24++,
+FLORES en NTREX komen uit het zoekdeel, dat bij G4-7 en G4-8 voor de keuze van de kandidaat gelezen is. De romanboeken
+zitten in G4-4's training, niet in die van G4-7 en G4-8. Het BT-origineel is geen vertaling van het Engels (het Engels
+is Gemma 4's vertaling ervan).
+
+### 24.3 Keten
+
+*G4-maat2.K* (`mbert-ops/scripts/g4measure2_run.sh`, kopie in `gs://t5-dutch-english-usc2/hammond/scratch-scripts/`; code
+`g4measure2.py`, `g4pool.py` en `run_g4measure2.sh` op `en-nl-g4arm8`). Alleen mbert-mix; `final_eval_mix.lock` met
+`flock` tot het eind; mbert-corpus (T3) wordt niet aangeraakt. Code als bundel via de bucket naar de 4 workers; elke ssh
+met `timeout 900` en de ssh-opties van G4-judge.10; vóór elke TPU-stap de TPU van de worker(s) vrij. Deel 1: `setup`
+(`run_g4arm.sh setup`, `ARM=G4-bon`; w0 en w2 met `FULL=1`), `data1` (w0, CPU), `judge` met `SET=m2` (4 workers),
+`report1` op co1 uit de bestanden zonder tekst. Deel 2: `pooldata` (w0, CPU), `generate` (w0 samples, w1–w3 greedy),
+`texts` (w0, CPU), `qe` (4 workers), `classify` en `classify-c2` (w0) en `comet` (w2, CPU), `cands` (w0, CPU), `judge`
+met `SET=p1` (4), `choose` (w0, CPU), `judge` met `SET=p2` (4), `poolreport` (w0, CPU). Markers
+`$G/stages/g4-measure2/` en `$G/stages/g4-pool/`; niets wat eerdere secties schreven wordt overschreven of verwijderd.
+Elke stap eindigt op `EXIT 0`, anders `FAILED` en stoppen; een gemarkeerde stap wordt bij een herstart overgeslagen.
+[schatting] deel 1 ~20–30 min, deel 2 ~1–1,5 u.

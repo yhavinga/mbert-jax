@@ -3576,3 +3576,79 @@ anker zou zijn. In P1 is de tegenkant geen machine: bij BT is het Nederlandse or
 Engels is Gemma 4's vertaling ervan), de romanboeken zitten in G4-4's training (niet in die van G4-7 en G4-8), en
 WMT24++ komt uit het zoekdeel van G4-5.4. De beoordelaar is een Claude-model; de positie is per stratum geblokt, niet
 gecorrigeerd.
+
+## 26. Publicatie van G4-8-s140 op Hugging Face: omzetting en controles (beslist niets over de vertaler)
+
+**Vastgelegd 24 nov 2026 (tijdstip: de commit van deze sectie op branch `hf-g4-8`, vanaf `en-nl-g4arm8` @ `29ccb82`)**,
+vóór elke stap op een worker [besluit Yeb, 24 nov ~14:50; uitwerking door een subagent]. Yeb besliste: publiceren als
+`yhavinga/gemma-4-31b-it-en-nl-lora` (de PEFT-adapter) en `yhavinga/gemma-4-31b-it-en-nl-GGUF` (Q4_K_M en Q8_0, voor LM
+Studio en llama.cpp), beide **openbaar**; **geen** gemerged bf16-repo; de kaarten noemen **geen** details over romans
+(geen aandelen, aantallen of roman-uitslagen). Het model is G4-8-s140 (`$G/G4-8-s140/adapter.npz`, `adapter.json`:
+rank 32, alpha 16, schaal 0,5, 410 modules, 244.858.880 parameters, float32) op `google/gemma-4-31B-it` @
+`842da3794eaa0b77d5f08bae87a17459d91ff475`. `H=$G/hf` (us-central2). Alles op de **CPU van één worker van mbert-mix**
+(geen TPU), onder `flock` op `mbert-ops/final_eval_mix.lock`, na de Nemotron-proef; mbert-corpus (T3) wordt niet
+aangeraakt. Het basismodel komt rechtstreeks van HF naar de worker. Naar het scherm alleen ids, aantallen en scores.
+
+*HF.1 Omzetting* (`g4peft.py convert`, tests `tests/test_en_nl_g4peft.py`). MaxText 0.2.5 zet Gemma 4 om met
+kernel = W.T.reshape(vorm) (`param_mapping.GEMMA4_MAXTEXT_TO_HF_PARAM_HOOK_FN`, `reshape_kernel`; geen schaling van de
+query), en qwix telt x·A·B·schaal op met A over de gecontraheerde assen van de kernel (`translate.lora_delta`). Dus met
+A2 = A als (in, rank) en B2 = B als (rank, uit): PEFT `lora_A` = A2ᵀ (rank, in), `lora_B` = B2ᵀ (uit, rank), `r` 32,
+`lora_alpha` 16 (PEFT-schaal 0,5). Namen: `decoder/layers_<i>/self_attention/{query,key,value,out}` en
+`mlp/{wi_0,wi_1,wo}` → `model.language_model.layers.<i>.self_attn.{q,k,v,o}_proj` en `mlp.{gate,up,down}_proj` van
+`Gemma4ForConditionalGeneration` (wat `AutoModelForCausalLM` voor het basismodel laadt). `target_modules` is een regex
+die alleen die zeven projecties van de tekstdecoder raakt, niet de vision tower. De 10 globale lagen
+(`full_attention`, `attention_k_eq_v`) hebben geen `v_proj`: hun value is de uitvoer van `k_proj` vóór `k_norm`, in
+MaxText (`attentions.py`: `value = key` bij `share_kv_projections`) en in transformers (`value_states = key_states` als
+`v_proj` ontbreekt), dus de LoRA op `k_proj` werkt in beide op key en value. Elke module wordt gecontroleerd tegen de
+config (precies de 410) en tegen de vorm van zijn gewicht in de safetensors-headers van het basismodel. De factoren
+blijven float32 (zoals getraind). Versies op de worker: transformers 5.23.0, peft 0.22.0, torch 2.9.1 (CPU).
+
+*HF.2 Controle van de omzetting* (`g4hfcheck.py select` en `check`; vooraf vastgelegd).
+- Bronnen: uit de MaxText-evaluatie van G4-8-s140 (`$G/eval/G4-8-s140/pairs/`) en G4-0 (`$G/eval/G4-0/pairs/`) per set
+  **FLORES, NTREX en WMT24++ 10 bronnen (30)**; geen romans en geen FLAN. Alleen segmenten die aan beide kanten schoon
+  zijn gedecodeerd (`ended`, niet `empty`, geen `decode_loop`, geen `english_left`, dezelfde bron) en waarvan prompt +
+  uitvoer ≤ 1.000 tokens is (onder het venster van 1.024); per set `random.Random("en-nl-g4arm/0/G4-8-hf/check/<set>")
+  .sample` van de gesorteerde ids. Voor de smoke-test (HF.5) 8 andere FLORES-bronnen met
+  `random.Random("en-nl-g4arm/0/G4-8-hf/smoke/flores")`.
+- Teacher-forced in transformers, bf16 op de CPU: de prompt van het eigen chat-template van het model (één user-beurt,
+  generation prompt, thinking uit), gecontroleerd gelijk aan Gemma 4's beurt rond `natural-v1` (zoals training en
+  evaluatie), dan de greedy uitvoer van de MaxText-evaluatie en `<turn|>`; per positie de argmax van de logits tegen het
+  volgende token.
+- **Eisen (een eis die niet gehaald wordt: stoppen, niets publiceren):**
+  1. basismodel + PEFT-adapter tegen de uitvoer van G4-8-s140: **≥ 99% van de tokens gelijk** (`adapter:arm`);
+  2. ketencontrole: het basismodel zonder adapter (`disable_adapter`) tegen de uitvoer van G4-0: **≥ 99%** (`base:base`);
+  3. PEFT laadt alle 410 modules met precies de factoren uit het bestand.
+- Gerapporteerd, geen eis: het basismodel zonder adapter tegen de uitvoer van G4-8-s140 (`base:arm`) en het verschil
+  `adapter:arm` − `base:arm` (laat zien dat de adapter het model verplaatst).
+
+*HF.3 Gebruiksvoorbeeld.* De `transformers` + `peft`-code van de adapterkaart wordt letterlijk uitgevoerd
+(`g4hfcheck.py example`; de twee model-id's vervangen door de lokale mappen), greedy, op 4 van de FLORES-bronnen van de
+smoke-test. Eis: alle 4 niet leeg en Nederlands volgens langid. Gerapporteerd: chrF tegen G4-8-s140's MaxText-uitvoer
+en het aantal exact gelijke. Na de upload: de bestanden op HF byte-gelijk (sha256) aan de lokale.
+
+*HF.4 Merge en GGUF.*
+- Merge (`g4peft.py merge`): W + 0,5 · `lora_B` @ `lora_A` in float32, dan bf16, zoals `translate.py --lora` in MaxText
+  samenvoegt; de overige bestanden van het basismodel (config, tokenizer, chat-template, processor) ongewijzigd.
+  **Eis:** de relatieve norm van de update binnen 1% van die van MaxText voor dezelfde adapter (0,0017412984739521172,
+  regel `LORA` van `g4t8c`; MaxText rekende op de TPU, dus niet bitgelijk); het aandeel gewijzigde elementen
+  gerapporteerd (MaxText 0,3503).
+- **Eis:** het gemergede model teacher-forced tegen de uitvoer van G4-8-s140 ≥ 99% (`model:arm`, zelfde 30 bronnen).
+- llama.cpp **v1.0.0** (tag, commit `b1b770d90d94cad9e9ea5b993bdbc383a522fb28`, 13 nov 2026; Gemma 4 in
+  `conversion/gemma.py`), op de CPU gebouwd; `convert_hf_to_gguf.py --outtype bf16` op het gemergede model (het
+  chat-template van het basismodel gaat mee), dan `llama-quantize` naar **Q4_K_M** en **Q8_0**, **zonder imatrix**
+  (geen kalibratiedata uit privédata). De bf16-GGUF wordt niet gepubliceerd.
+
+*HF.5 Smoke-test GGUF* (`g4hfcheck.py smoke`): per quant `llama-server` op de CPU; het prompt dat het chat-template
+in de GGUF maakt (`/apply-template`) tegen Gemma 4's beurt rond `natural-v1`; dan `/v1/chat/completions` met
+temperature 0 op de 8 FLORES-bronnen. **Eis:** alle 8 niet leeg en Nederlands volgens langid. Gerapporteerd: template
+gelijk (aantal), chrF tegen G4-8-s140's MaxText-uitvoer, exact gelijke.
+
+*HF.6 Kaarten* (`mbert-ops/translator-sft/hf-card-lora.md`, `hf-card-gguf.md`): op zichzelf, Engels, met het
+TRC-dankwoord; de prompts in de kaarten letterlijk `natural-v1` (`g4hfcheck.py cards`). Metadata: adapter
+`base_model: google/gemma-4-31B-it`, `base_model_relation: adapter`, `library_name: peft`; GGUF `base_model:
+yhavinga/gemma-4-31b-it-en-nl-lora`, `base_model_relation: quantized` (de GGUF is die adapter gemerged en
+gekwantiseerd; een gemerged repo bestaat niet); beide `license: apache-2.0`, `pipeline_tag: translation`.
+
+*HF.7 Upload* pas na "upload go" van de hoofdsessie, vanaf de worker (`hf`-CLI; `hf_transfer` gebruikt
+huggingface_hub ≥ 1.0 niet meer, het snelle pad is `hf_xet` met `HF_XET_HIGH_PERFORMANCE=1`), HF-token via stdin. Na de
+upload de bestandslijst en sha256 op HF tegen de lokale bestanden, en `private` = false.

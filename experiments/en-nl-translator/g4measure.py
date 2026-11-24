@@ -472,14 +472,21 @@ def label(row):
     return COMBO_LABELS.get(row, row)
 
 
-def report_data(refs, scores, yeb, extra):
+def report_data(refs, scores, yeb, extra, added=(), added_margins=(), extend=None):
+    """added: rows after K1-K4 that extend(r, s, choice, margin) puts into each pair's choices (and added_margins
+    into its margins), as §24 does for its new judges; without them the tables of §23"""
     by_pair = {r["pair"]: r for r in refs}
+    signal_rows = SIGNALS + COMBOS + tuple(added)
+    all_rows = signal_rows + ("Claude",) + REFERENCE_ROWS
+    claude_cols = signal_rows + REFERENCE_ROWS
     choices, margins = {}, {}
     for r in refs:
         choices[r["pair"]], margins[r["pair"]] = pair_signals(r, scores[r["pair"]])
+        if extend is not None:
+            extend(r, scores[r["pair"]], choices[r["pair"]], margins[r["pair"]])
         choices[r["pair"]]["Claude"] = (lambda v: v if v in SIDES else None)(claude_in_frame(r, by_pair))
 
-    def table(pairs_refs, rows=ALL_ROWS):
+    def table(pairs_refs, rows=all_rows):
         return {row: agreement([(ref, choices[p][row]) for p, ref in pairs_refs]) for row in rows}
 
     yeb_noneq = [y for y in yeb if y["verdict"] in SIDES]
@@ -489,7 +496,7 @@ def report_data(refs, scores, yeb, extra):
     claude_rows = [r for r in refs if r["origin"] == "package" and r["claude"] in SIDES]
     for g, pkgs in GROUPS.items():
         cols[f"Claude {g}"] = [(r["pair"], r["claude"]) for r in claude_rows if r["package"] in pkgs]
-    main = {c: table(v, ALL_ROWS if c.startswith("Yeb") else SIGNALS + COMBOS + REFERENCE_ROWS) for c, v in cols.items()}
+    main = {c: table(v, all_rows if c.startswith("Yeb") else claude_cols) for c, v in cols.items()}
 
     per_set = {}
     for y in yeb_noneq:
@@ -506,7 +513,7 @@ def report_data(refs, scores, yeb, extra):
     for r in claude_rows:
         claude_sets.setdefault(f"pakket {r['package']}", []).append((r["pair"], r["claude"]))
         claude_sets.setdefault(f"set {r['set']}", []).append((r["pair"], r["claude"]))
-    claude_sets = {g: table(v, SIGNALS + COMBOS + REFERENCE_ROWS) for g, v in claude_sets.items()}
+    claude_sets = {g: table(v, claude_cols) for g, v in claude_sets.items()}
 
     # Claude against Yeb on the shared pairs; Claude against Claude on G4-8
     cross = collections.Counter()
@@ -520,7 +527,7 @@ def report_data(refs, scores, yeb, extra):
     # per margin
     def margin_table(pairs_refs):
         out = {}
-        for row in ("QE", "rubriek", "N1", "N2"):
+        for row in ("QE", "rubriek", "N1", "N2") + tuple(added_margins):
             for lo_hi, test in (("< 0,2", lambda m: m < MARGIN), ("≥ 0,2", lambda m: m >= MARGIN)):
                 items = [(ref, choices[p][row]) for p, ref in pairs_refs
                          if margins[p][row] is not None and test(margins[p][row])]
@@ -529,19 +536,19 @@ def report_data(refs, scores, yeb, extra):
     margin = {"Yeb samen": margin_table(cols["Yeb samen"]), "Claude alle": margin_table(cols["Claude alle"])}
 
     # meaning errors: the side without the error
-    def fault_table(items, rows=ALL_ROWS):
+    def fault_table(items, rows=all_rows):
         return {row: agreement([(side, choices[p][row]) for p, side in items]) for row in rows}
     yeb_fault = [(y["pair"], other(y["fout"])) for y in yeb if y["fout"]]
     claude_fault = [(r["pair"], "B" if r["claude_fout_a"] else "A") for r in refs
                     if r["origin"] == "package" and r["claude_fout_a"] != r["claude_fout_b"]]
     # Claude against its own error labels says nothing (G4-maat.10): no Claude row there
     faults = {"Yeb (fout aan één kant)": fault_table(yeb_fault),
-              "Claude (fout aan één kant)": fault_table(claude_fault, SIGNALS + COMBOS + REFERENCE_ROWS)}
+              "Claude (fout aan één kant)": fault_table(claude_fault, claude_cols)}
 
     # G4-maat.10, added after the result: how often a signal picks the side that is not the base (the new system)
     def new_table(pairs_refs):
         return {row: agreement([(choices[p]["nieuw systeem"], choices[p][row]) for p, _ in pairs_refs])
-                for row in SIGNALS + COMBOS + ("Claude",)}
+                for row in signal_rows + ("Claude",)}
     new_system = {c: new_table(v) for c, v in cols.items()}
 
     coverage = {

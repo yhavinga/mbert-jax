@@ -580,3 +580,13 @@ stappen (`SYSTEM_METRICS_EVERY=25`, nieuw in `start_t3.sh`, alleen voor de smoke
 `PLAN_T2`, de `DONE`-regel met `VRAAG 1`, en een gegeven `T3_COMMIT` vervangt nu de vastgepinde commit in
 `dx/t3/commit.txt` (de eerste start schreef daar `d31b234`; zonder deze wijziging nam een latere herstart zonder
 `T3_COMMIT` weer de oude code).
+
+### Amendement 2 (27 nov 2026, hoofdsessie; vóór de herstart van de tak-eval)
+
+De tak-eval (`eval_t3.sh t3-epoch2-1306000`, keten `t3a1122b`) faalde op DBRD@1024: `RESOURCE_EXHAUSTED`, de
+HLO-tijdelijke buffers van T3 (317M) vragen 31,46G HBM, een v4-chip heeft 30,75G (w2, seeds 42–45, 27 nov 13:48–14:50).
+DBRD@1024 draait daarom met `--batch-size 6 --gradient-accumulation-steps 8` in plaats van `12` en `4`: dezelfde
+effectieve batch (6 × 4 chips × 8 = 192), dezelfde LR, epochs en optimizer (optax.MultiSteps). T2's DBRD@1024 (12 × 4 × 4)
+blijft zoals hij is; het verschil in micro-batch is het enige verschil in de opzet en wordt in het rapport genoemd. De
+andere taken veranderen niet. De beslisregel, de seeds en de drempel (amendement 1, door Yeb bevestigd 24 nov) blijven.
+

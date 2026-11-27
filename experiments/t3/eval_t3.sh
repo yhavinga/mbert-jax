@@ -16,7 +16,8 @@
 # pos-lassysmall or pos-alpino (scripts/dumb/finetune_extra.py), or "blimp" (scripts/eval_blimp_nl.py), "memtest"
 # (experiments/final-v2/memtest.py) or "heldout" (scripts/eval_windows.py on both held-out sets). Seeds 42-46 for
 # dbrd1024, dbrd512, sicknl, squadnl and conll2002, 42-44 for the POS tasks (protocol.md, amendment 1):
-#   dbrd1024  finetune.py --task dbrd --max-length 1024, 12 per chip x 4 chips x 4 accumulation = 192, padding to 128
+#   dbrd1024  finetune.py --task dbrd --max-length 1024, 6 per chip x 4 chips x 8 accumulation = 192, padding to 128
+#             (amendment 2: T2 ran 12 x 4 x 4; T3 at 12 needs 31.46G of HBM, above the 30.75G of a v4 chip)
 #   dbrd512   the same at --max-length 512 (the command of eval_robbert.sh at 5398bb9 for T2's DBRD@512)
 #   sicknl    finetune.py --task sicknl --max-length 512, 64 x 4 x 1 = 256, no padding
 #             all three --epochs 3, constant LR 5e-5, AdamW with weight decay 0.01
@@ -157,7 +158,7 @@ for spec in $*; do
   gsutil -q stat \$result < /dev/null && { echo "\$job: a result exists, skipped"; continue; }
   echo "\$(date +%H:%M:%S) \$job"
   case \$task in
-    dbrd1024) JAX_COMPILATION_CACHE_DIR=\$HOME/dumb/jaxcache $PY -u scripts/dumb/finetune.py --checkpoint \$CK --task dbrd --output $ROOT/runs/\$job --epochs 3 --batch-size 12 --gradient-accumulation-steps 4 --learning-rate 5e-5 --max-length 1024 --pad-to-multiple-of 128 --seed \$seed ;;
+    dbrd1024) JAX_COMPILATION_CACHE_DIR=\$HOME/dumb/jaxcache $PY -u scripts/dumb/finetune.py --checkpoint \$CK --task dbrd --output $ROOT/runs/\$job --epochs 3 --batch-size 6 --gradient-accumulation-steps 8 --learning-rate 5e-5 --max-length 1024 --pad-to-multiple-of 128 --seed \$seed ;;
     dbrd512) JAX_COMPILATION_CACHE_DIR=\$HOME/dumb/jaxcache $PY -u scripts/dumb/finetune.py --checkpoint \$CK --task dbrd --output $ROOT/runs/\$job --epochs 3 --batch-size 12 --gradient-accumulation-steps 4 --learning-rate 5e-5 --max-length 512 --pad-to-multiple-of 128 --seed \$seed ;;
     memtest) ( cd \$HOME/mbert-t3 && gsutil -q cp $OUT/memtest/memsample.parquet $OUT/memtest/memsample.json $ROOT/ && [ "\$(md5sum $ROOT/memsample.parquet | cut -d' ' -f1)" = "\$($PYT -c "import json; print(json.load(open('$ROOT/memsample.json'))['md5'])")" ] && PYTHONPATH=src $PYT -u experiments/final-v2/single_host.py experiments/final-v2/memtest.py --checkpoint $CKPT --sample $ROOT/memsample.parquet --tokenizer yhavinga/dutch-llama-tokenizer $SHAPE --output \$result ) ;;
     heldout) ( cd \$HOME/mbert-t3 && PYTHONPATH=src $PYT -u experiments/final-v2/single_host.py scripts/eval_windows.py --checkpoint $CKPT --eval-file \$HOME/heldout.parquet --tokenizer yhavinga/dutch-llama-tokenizer --windows 1024 $SHAPE --output \$result && PYTHONPATH=src $PYT -u experiments/final-v2/single_host.py scripts/eval_windows.py --checkpoint $CKPT --eval-file $HELDOUT_V2 --tokenizer yhavinga/dutch-llama-tokenizer --windows 1024 $SHAPE --output $OUT/heldout-eval/$NAME--fw2optout.json ) ;;
